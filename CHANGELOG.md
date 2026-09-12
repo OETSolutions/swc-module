@@ -49,6 +49,14 @@ Full redesign of the 2022 RP2040 reference board. Design complete and routed;
   series R → IC.
 - **Power.** `U1` XL1509-5.0 buck (`L1` 47 µH, `D7` freewheel) and `U2`
   AMS1117-3.3; `D2`/`D3` diode-OR at +5 V.
+- **C1/C2 bulk input caps re-sourced** from `C3151829` (ROQANG RVT1H101M0607) to
+  **`C46550415`** (jieerrui JVJ50V100M6x8). Same 100 µF/50 V ±20 %,
+  2000 hrs @105 °C, `SMD,D6.3xL7.7mm` part in the identical `CP_Elec_6.3x7.7`
+  footprint, so **no layout change** — it adds a published 140 mA @120 Hz ripple
+  rating the ROQANG never listed, and widens operation to −55…+105 °C. The
+  motive was JLCPCB's **`PCBA Type`** field: the ROQANG part is `Standard Only`
+  and forced the order onto Standard PCBA. `U3` is also `Standard Only` and
+  still does — see [MANUFACTURING.md §3](MANUFACTURING.md#3-pcba-type--the-economicstandard-decision).
 - **Connectors onto the board edge**: all four screw terminals on the left edge,
   USB-C on the top-left edge. The 2022 design's separate per-channel terminals
   were consolidated into one input (`J2`) and one output (`J3`), each with a GND

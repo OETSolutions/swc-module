@@ -15,7 +15,7 @@ schematic/PCB parity errors. **Not yet ordered.**
 | --- | --- |
 | **Board** | 54.0 × 102.0 mm, 4-layer, 1.6 mm, rounded corners r ≈ 2.83 mm |
 | **EDA** | KiCad 10 (`SWC.kicad_pcb` / `.kicad_sch` / `.kicad_pro`) |
-| **Assembly** | JLCPCB, Economic PCBA, 5-off |
+| **Assembly** | JLCPCB, 5-off — **Economic if `U3` can be cleared, otherwise Standard** ([MANUFACTURING.md §3](MANUFACTURING.md#3-pcba-type--the-economicstandard-decision)) |
 | **Parts** | 34 unique LCSC part types, JLCPCB-assembled |
 | **MCU** | ESP32-S3-WROOM-1-N4, native USB-CDC + USB-JTAG |
 

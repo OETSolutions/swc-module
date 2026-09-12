@@ -3,13 +3,16 @@
 Sourcing, BOM generation, assembly cost and fabrication output. For the circuit
 itself see [DESIGN.md](DESIGN.md); for the front page see [README.md](README.md).
 
-Target: **JLCPCB, 4-layer, 5-off, Economic PCBA.**
+Target: **JLCPCB, 4-layer, 5-off.** The service level is **Economic if `U3`
+can be cleared, Standard otherwise** — see §3; it is not currently reachable
+because of `U3`, whatever the Extended-part count does.
 
 - [1. BOM generation](#1-bom-generation)
 - [2. Part list](#2-part-list)
-- [3. Assembly cost](#3-assembly-cost)
-- [4. Fabrication output](#4-fabrication-output)
-- [5. Ordering decisions](#5-ordering-decisions)
+- [3. PCBA type — the Economic/Standard decision](#3-pcba-type--the-economicstandard-decision)
+- [4. Assembly cost](#4-assembly-cost)
+- [5. Fabrication output](#5-fabrication-output)
+- [6. Ordering decisions](#6-ordering-decisions)
 
 ## 1. BOM generation
 
@@ -40,13 +43,13 @@ Extended-tier parts, most expensive first:
 | J5 | AUX_IN, 4P | C42377749 | Kangnex | 0.3250 |
 | U6 | TLV9004IPWR (quad, 1 pkg) | C2058050 | TI | 0.2413 |
 | J2, J3 | SWC_IN / SWC_OUT, 3P | C72334 | Kangnex | 0.2143 |
-| BZ1 | TMB12A05 | C96093 | Huaneng | 0.1919 |
 | L1 | 47 µH | C408471 | Sunlord | 0.1939 |
+| BZ1 | TMB12A05 | C96093 | Huaneng | 0.1919 |
 | J4 | USB-C 2.0 16P | C165948 | Korean Hroparts | 0.1856 |
 | U8 | USBLC6-2SC6 | C7519 | ST | 0.1825 |
 | J1 | 12V_DC_IN, 2P | C8465 | Kangnex | 0.1336 |
+| C1, C2 | 100 µF/50 V | C46550415 | jieerrui | 0.0815 |
 | F1 | 1.5 A, 1812 | C883154 | BHFUSE | 0.0792 |
-| C1, C2 | 100 µF/50 V | C3151829 | ROQANG | 0.0631 |
 | F2 | 1.0 A, 0805 | C46640991 | hongjiacheng | 0.0429 |
 | RT1 | 10 k B3380 NTC | C316397 | Sunlord | 0.0179 |
 
@@ -54,7 +57,50 @@ Three *other* BOM parts are Preferred Extended and therefore already exempt on
 Economic: C17840 (82 k), C19077573 (SMBJ18A) and C7420333 (BAT54S, five
 placements). Seventeen more codes are Basic.
 
-## 3. Assembly cost
+## 3. PCBA type — the Economic/Standard decision
+
+This is a **different axis from the Extended tier above**, and it is the one that
+decides which assembly service the order can use.
+
+Every JLCPCB part carries a **`PCBA Type`** field, with two values:
+`Economic and Standard`, or **`Standard Only`**. A single `Standard Only` part
+forces the **whole order** onto Standard PCBA. Being *Extended* does **not** do
+this — an Extended part with `Economic and Standard` is fine on Economic, it
+just costs one feeders-loading fee (below). The tier tables in §2 and the fee
+table in §4 say nothing about this flag; only the part's own page does.
+
+The board has **two** `Standard Only` parts:
+
+| Ref | Value | LCSC | Mfr | PCBA type |
+| --- | --- | --- | --- | --- |
+| C1, C2 | 100 µF/50 V | ~~C3151829~~ → **C46550415** | ~~ROQANG~~ → jieerrui | ~~Standard Only~~ → Economic and Standard |
+| U3 | ESP32-S3-WROOM-1-N4 | C2913197 | Espressif | **Standard Only** |
+
+C1/C2 were swapped to `C46550415` (jieerrui JVJ50V100M6x8) on 2026-09-11. It is
+the same 100 µF/50 V, ±20 %, 2000 hrs @105 °C, `SMD,D6.3xL7.7mm` part in the
+identical `CP_Elec_6.3x7.7` footprint, so **no layout change**; it adds a
+published ripple rating (140 mA @120 Hz) that the ROQANG part never listed, and
+wider −55…+105 °C operation. The LCSC code, MPN, manufacturer, description and
+datasheet in the schematic were all updated; the BOM regeneration below carries
+them through. Several equally valid `Economic and Standard` alternatives exist
+(C47023117, C3445238, C42389919, C2980173 — see the Aluminum Electrolytic SMD
+subcategory); C46550415 was chosen on stock (460 k) and published ripple.
+
+**U3 is not replaceable.** Every Espressif ESP32-S3 in the WROOM-1, WROOM-1U and
+MINI-1 families is `Standard Only` — all nine WROOM-1 variants, all five
+WROOM-1U, and all MINI-1. The only `Economic and Standard` ESP32-S3 options are
+third-party DOIT modules on a different footprint and the bare
+`ESP32-S3FH4R2` chip (QFN-56), so moving U3 off Standard is a **board
+revision**, not a BOM substitution. **Until U3 moves, the board goes Standard
+regardless of C1/C2.**
+
+Consequence for the order: because U3 forces Standard anyway, the C1/C2 swap
+does *not* by itself change the service. It is still worth making — it is a
+better-specified part at comparable cost, and it removes one of the two
+blockers so that U3 becomes the only thing standing between this board and
+Economic PCBA.
+
+## 4. Assembly cost
 
 The charge from JLCPCB is a **feeders-loading fee per unique Extended part
 type** on Economic PCBA, **$3.07 each** as of its 2026-09-09 pricing table.
@@ -67,10 +113,10 @@ This board has **14 Extended part types**, so the loading line is
 **14 × $3.07 ≈ $43**.
 
 The brief asked for Extended parts only when there is no alternative, so this was
-tested rather than assumed. **It cannot be designed away by substitution**, and
-the earlier assessment that it could was wrong on both count and premise.
-Thirteen of the fourteen sit in subcategories that contain **no no-fee part at
-all**:
+tested rather than assumed. The **~$43 loading line itself** cannot be designed
+away by substitution, and the earlier assessment that it could was wrong on both
+count and premise. Thirteen of the fourteen sit in subcategories that contain
+**no no-fee part at all**:
 
 | Subcategory | Basic | Preferred | Extended |
 | --- | --- | --- | --- |
@@ -94,9 +140,11 @@ needs 3 V minimum, which breaks a 3.3 V single-supply rail-to-rail signal chain.
 The nearest on paper is the MCP6002 — viable only as part of a deliberate
 two-package redesign, not a substitution.
 
-The ~$43 is therefore a **purchasing decision, not a design one**.
+The ~$43 is therefore a **purchasing decision, not a design one**. (Note that
+this is a separate question from §3: the loading line is what it is, but the
+*service level* it is charged under is set by `PCBA Type`, not by the count.)
 
-## 4. Fabrication output
+## 5. Fabrication output
 
 Gerbers, drill, position files and the assembly BOM are produced by the kicad MCP
 server's export tools with the project as the default export directory — see
@@ -107,7 +155,7 @@ Board data: 54.00 × 102.00 mm outline, 4-layer (F.Cu / In1.Cu / In2.Cu / B.Cu),
 1.6 mm, rounded corners r ≈ 2.83 mm, five copper zones. Fabrication and
 solder-mask minimums are in [DESIGN.md §5](DESIGN.md#5-design-rules-and-stackup).
 
-## 5. Ordering decisions
+## 6. Ordering decisions
 
 ### 4-layer vs 2-layer
 

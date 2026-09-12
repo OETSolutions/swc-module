@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "pcbparts": {
+      "disabled": false,
+      "type": "http",
+      "url": "https://pcbparts.dev/mcp"
+    },
+    "kicad": {
+      "command": "uvx",
+      "args": ["--from", "mcp-server-kicad", "mcp-server-kicad"],
+      "cwd": "."
+    }
+  }
+}

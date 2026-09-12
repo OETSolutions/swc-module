@@ -1,0 +1,11 @@
+[mcp_servers.pcbparts]
+url = "https://pcbparts.dev/mcp"
+enabled = true
+default_tools_approval_mode = "approve"
+
+[mcp_servers.kicad]
+command = "uvx"
+args = ["--from", "mcp-server-kicad", "mcp-server-kicad"]
+cwd = "."
+enabled = true
+default_tools_approval_mode = "approve"

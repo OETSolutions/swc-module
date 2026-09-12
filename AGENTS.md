@@ -65,7 +65,7 @@ than a custom PCB. [DESIGN.md §2](DESIGN.md#2-prior-design).
 
 | Block | Parts | Notes |
 | --- | --- | --- |
-| MCU | `U3` ESP32-S3-WROOM-1-N4 (C2913197) | native USB device/CDC; **no on-chip DAC** (S3 has none); ADC ceiling 2.9 V |
+| MCU | `U3` DOIT ESPS3-32-N4 (C49164655) — an ESP32-S3 WROOM-1 clone | native USB device/CDC; **no on-chip DAC** (S3 has none); ADC ceiling 2.9 V |
 | DAC | `U4` MCP4728 (C478093) | 12-bit quad, **on +3V3 with VREF = VDD → 0–3.3 V FS** (not the 4.096 V internal-ref mode), EEPROM power-on. A/B = ch 1 signal/gain; C/D = ch 2 signal/gain |
 | I²C | `R5`/`R6` 10 kΩ pull-ups | DAC and S3 are both 3.3 V → **no level shifter** |
 | Analog out | `U6` TLV9004IPWR quad (C2058050) | **closed-loop integrator servo** (R46 100k + C24 100nF), not an open-loop buffer; gain = 1 + R58/R61 |

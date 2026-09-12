@@ -17,7 +17,7 @@ schematic/PCB parity errors. **Not yet ordered.**
 | **EDA** | KiCad 10 (`SWC.kicad_pcb` / `.kicad_sch` / `.kicad_pro`) |
 | **Assembly** | JLCPCB, Economic PCBA, 5-off |
 | **Parts** | 34 unique LCSC part types, JLCPCB-assembled |
-| **MCU** | ESP32-S3-WROOM-1-N4, native USB-CDC + USB-JTAG |
+| **MCU** | DOIT ESPS3-32-N4 (ESP32-S3-WROOM-1 clone), native USB-CDC + USB-JTAG |
 
 ## Why this exists
 

@@ -22942,7 +22942,7 @@
 				)
 			)
 		)
-		(property "Datasheet" "https://wmsc.lcsc.com/wmsc/upload/file/pdf/v2/lcsc/C3151829.pdf"
+		(property "Datasheet" "https://wmsc.lcsc.com/wmsc/upload/file/pdf/v2/lcsc/C46550415.pdf"
 			(at 52.07 34.29 0)
 			(hide yes)
 			(show_name no)
@@ -22953,7 +22953,7 @@
 				)
 			)
 		)
-		(property "Description" "100µF ±20% 50V SMD aluminium electrolytic, 6.3×7.7mm"
+		(property "Description" "100µF ±20% 50V SMD aluminium electrolytic, 6.3×7.7mm, 140mA ripple"
 			(at 52.07 34.29 0)
 			(hide yes)
 			(show_name no)
@@ -22964,7 +22964,7 @@
 				)
 			)
 		)
-		(property "Manufacturer" "ROQANG"
+		(property "Manufacturer" "jieerrui"
 			(at 52.07 34.29 0)
 			(hide yes)
 			(show_name no)
@@ -22975,7 +22975,7 @@
 				)
 			)
 		)
-		(property "MPN" "RVT1H101M0607"
+		(property "MPN" "JVJ50V100M6x8"
 			(at 52.07 34.29 0)
 			(hide yes)
 			(show_name no)
@@ -22986,7 +22986,7 @@
 				)
 			)
 		)
-		(property "LCSC" "C3151829"
+		(property "LCSC" "C46550415"
 			(at 52.07 34.29 0)
 			(hide yes)
 			(show_name no)
@@ -25823,7 +25823,7 @@
 				)
 			)
 		)
-		(property "Datasheet" "https://wmsc.lcsc.com/wmsc/upload/file/pdf/v2/lcsc/C3151829.pdf"
+		(property "Datasheet" "https://wmsc.lcsc.com/wmsc/upload/file/pdf/v2/lcsc/C46550415.pdf"
 			(at 111.76 34.29 0)
 			(hide yes)
 			(show_name no)
@@ -25834,7 +25834,7 @@
 				)
 			)
 		)
-		(property "Description" "100µF ±20% 50V SMD aluminium electrolytic, 6.3×7.7mm"
+		(property "Description" "100µF ±20% 50V SMD aluminium electrolytic, 6.3×7.7mm, 140mA ripple"
 			(at 111.76 34.29 0)
 			(hide yes)
 			(show_name no)
@@ -25845,7 +25845,7 @@
 				)
 			)
 		)
-		(property "Manufacturer" "ROQANG"
+		(property "Manufacturer" "jieerrui"
 			(at 111.76 34.29 0)
 			(hide yes)
 			(show_name no)
@@ -25856,7 +25856,7 @@
 				)
 			)
 		)
-		(property "MPN" "RVT1H101M0607"
+		(property "MPN" "JVJ50V100M6x8"
 			(at 111.76 34.29 0)
 			(hide yes)
 			(show_name no)
@@ -25867,7 +25867,7 @@
 				)
 			)
 		)
-		(property "LCSC" "C3151829"
+		(property "LCSC" "C46550415"
 			(at 111.76 34.29 0)
 			(hide yes)
 			(show_name no)

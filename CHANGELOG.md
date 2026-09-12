@@ -55,8 +55,17 @@ Full redesign of the 2022 RP2040 reference board. Design complete and routed;
   footprint, so **no layout change** — it adds a published 140 mA @120 Hz ripple
   rating the ROQANG never listed, and widens operation to −55…+105 °C. The
   motive was JLCPCB's **`PCBA Type`** field: the ROQANG part is `Standard Only`
-  and forced the order onto Standard PCBA. `U3` is also `Standard Only` and
-  still does — see [MANUFACTURING.md §3](MANUFACTURING.md#3-pcba-type--the-economicstandard-decision).
+  and forced the order onto Standard PCBA.
+- **`U3` MCU module re-sourced** from `C2913197` (Espressif ESP32-S3-WROOM-1-N4)
+  to **`C49164655`** (DOIT `ESPS3-32-N4`), also to clear a `Standard Only`
+  flag — every Espressif ESP32-S3 WROOM-1/‑1U/MINI-1 variant is `Standard Only`.
+  The DOIT module is a verified clone of the WROOM-1: 18 × 25.5 × 3 mm, all 41
+  pins identical by number and function (IO19/IO20 = USB D−/D+, `RXD0`/`TXD0` =
+  IO44/IO43, EPAD = GND), and the same land pattern, so it fits
+  `RF_Module:ESP32-S3-WROOM-1` with **no PCB change**. Trade-offs: third-party
+  single source (645 stock), DOIT's own FCC ID, and no PSRAM option that is
+  Economic-eligible. With both flags cleared the order should qualify for
+  Economic PCBA — see [MANUFACTURING.md §3](MANUFACTURING.md#3-pcba-type--the-economicstandard-decision).
 - **Connectors onto the board edge**: all four screw terminals on the left edge,
   USB-C on the top-left edge. The 2022 design's separate per-channel terminals
   were consolidated into one input (`J2`) and one output (`J3`), each with a GND

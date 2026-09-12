@@ -3,9 +3,9 @@
 Sourcing, BOM generation, assembly cost and fabrication output. For the circuit
 itself see [DESIGN.md](DESIGN.md); for the front page see [README.md](README.md).
 
-Target: **JLCPCB, 4-layer, 5-off.** The service level is **Economic if `U3`
-can be cleared, Standard otherwise** — see §3; it is not currently reachable
-because of `U3`, whatever the Extended-part count does.
+Target: **JLCPCB, 4-layer, 5-off, Economic PCBA.** Both parts that had forced
+Standard PCBA have now been cleared (see §3), so Economic is reachable — confirm
+on the quote at order time.
 
 - [1. BOM generation](#1-bom-generation)
 - [2. Part list](#2-part-list)
@@ -38,8 +38,8 @@ Extended-tier parts, most expensive first:
 
 | Ref | Value | LCSC | Mfr | $/1 |
 | --- | --- | --- | --- | --- |
-| U3 | ESP32-S3-WROOM-1-N4 | C2913197 | Espressif | 4.1136 |
 | U4 | MCP4728T-E/UN | C478093 | Microchip | 2.6141 |
+| U3 | ESPS3-32-N4 (ESP32-S3) | C49164655 | DOIT | 2.4787 |
 | J5 | AUX_IN, 4P | C42377749 | Kangnex | 0.3250 |
 | U6 | TLV9004IPWR (quad, 1 pkg) | C2058050 | TI | 0.2413 |
 | J2, J3 | SWC_IN / SWC_OUT, 3P | C72334 | Kangnex | 0.2143 |
@@ -69,36 +69,50 @@ this — an Extended part with `Economic and Standard` is fine on Economic, it
 just costs one feeders-loading fee (below). The tier tables in §2 and the fee
 table in §4 say nothing about this flag; only the part's own page does.
 
-The board has **two** `Standard Only` parts:
+The board had **two** `Standard Only` parts. Both are now cleared:
 
-| Ref | Value | LCSC | Mfr | PCBA type |
-| --- | --- | --- | --- | --- |
-| C1, C2 | 100 µF/50 V | ~~C3151829~~ → **C46550415** | ~~ROQANG~~ → jieerrui | ~~Standard Only~~ → Economic and Standard |
-| U3 | ESP32-S3-WROOM-1-N4 | C2913197 | Espressif | **Standard Only** |
+| Ref | Was | Now | PCBA type |
+| --- | --- | --- | --- |
+| C1, C2 | C3151829 (ROQANG RVT1H101M0607) | **C46550415** (jieerrui JVJ50V100M6x8) | `Standard Only` → **Economic and Standard** |
+| U3 | C2913197 (Espressif ESP32-S3-WROOM-1-N4) | **C49164655** (DOIT ESPS3-32-N4) | `Standard Only` → **Economic and Standard** |
 
-C1/C2 were swapped to `C46550415` (jieerrui JVJ50V100M6x8) on 2026-09-11. It is
-the same 100 µF/50 V, ±20 %, 2000 hrs @105 °C, `SMD,D6.3xL7.7mm` part in the
-identical `CP_Elec_6.3x7.7` footprint, so **no layout change**; it adds a
-published ripple rating (140 mA @120 Hz) that the ROQANG part never listed, and
-wider −55…+105 °C operation. The LCSC code, MPN, manufacturer, description and
-datasheet in the schematic were all updated; the BOM regeneration below carries
-them through. Several equally valid `Economic and Standard` alternatives exist
-(C47023117, C3445238, C42389919, C2980173 — see the Aluminum Electrolytic SMD
-subcategory); C46550415 was chosen on stock (460 k) and published ripple.
+**C1/C2** are the same 100 µF/50 V, ±20 %, 2000 hrs @105 °C,
+`SMD,D6.3xL7.7mm` part in the identical `CP_Elec_6.3x7.7` footprint — **no
+layout change**. The replacement adds a published ripple rating (140 mA @120 Hz)
+the ROQANG part never listed, and widens operation to −55…+105 °C. Alternatives
+in the same class: C47023117, C3445238, C42389919, C2980173.
 
-**U3 is not replaceable.** Every Espressif ESP32-S3 in the WROOM-1, WROOM-1U and
-MINI-1 families is `Standard Only` — all nine WROOM-1 variants, all five
-WROOM-1U, and all MINI-1. The only `Economic and Standard` ESP32-S3 options are
-third-party DOIT modules on a different footprint and the bare
-`ESP32-S3FH4R2` chip (QFN-56), so moving U3 off Standard is a **board
-revision**, not a BOM substitution. **Until U3 moves, the board goes Standard
-regardless of C1/C2.**
+**U3** is a genuine drop-in, not a redesign. Every Espressif ESP32-S3 in the
+WROOM-1, WROOM-1U and MINI-1 families is `Standard Only` (all nine WROOM-1
+variants, all five WROOM-1U, all MINI-1), so the replacement is a third-party
+module that clones the WROOM-1 land pattern. The DOIT `ESPS3-32-N4` is verified
+against its own datasheet as identical on all three axes:
 
-Consequence for the order: because U3 forces Standard anyway, the C1/C2 swap
-does *not* by itself change the service. It is still worth making — it is a
-better-specified part at comparable cost, and it removes one of the two
-blockers so that U3 becomes the only thing standing between this board and
-Economic PCBA.
+- **Size** 18 × 25.5 × 3 mm — the WROOM-1 drawing, same orientation, PCB antenna
+  at the module top and therefore away from the pads.
+- **Pinout** all 41 pins identical by number and function, including
+  IO19 = `USB_D-`, IO20 = `USB_D+`, pin 15/16 = IO3/IO46, pins 36/37 =
+  `RXD0`/`TXD0` (= IO44/IO43), pin 41 = `EPAD` (ground).
+- **Land pattern** pad 0.85 × 1.2 mm on 1.27 mm pitch, 1.5 mm pad, 2.015 mm
+  edge setback, EPAD span 10.29 mm offset 7.5 mm from the edge, nine 0.9 × 0.9 mm
+  EPAD vias at 1.4/1.4/0.5 mm spacing.
+
+So `RF_Module:ESP32-S3-WROOM-1` is the correct footprint for it and **no PCB
+change is required**. Caveats to weigh before ordering, none of them mechanical:
+it is a third-party module (single-source, 645 in stock vs the WROOM-1's 5084,
+and DOIT's own FCC ID rather than Espressif's — relevant if the product is ever
+certified); it is −40…+85 °C, the same as the WROOM-1; and DOIT has no module
+with PSRAM that is `Economic and Standard`, so this route assumes 4 MB flash and
+no PSRAM.
+
+The only `Economic and Standard` alternative family is the **ESP32-C3-WROOM-02**
+(C2934560, verified `Economic and Standard`), but it is a different, smaller
+module (20 × 18 mm, 19 pads) and a different chip — no native USB-OTG
+peripheral, a single core, and it does not support PSRAM — so it is a board
+redesign *and* a firmware port. Not recommended.
+
+**With both parts cleared, nothing on the BOM is `Standard Only`, so the order
+should qualify for Economic PCBA.**
 
 ## 4. Assembly cost
 

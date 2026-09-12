@@ -24921,7 +24921,7 @@
 				(justify left)
 			)
 		)
-		(property "Value" "ESP32-S3-WROOM-1-N4"
+		(property "Value" "ESPS3-32-N4"
 			(at 274.574 101.346 0)
 			(show_name no)
 			(do_not_autoplace no)
@@ -24943,7 +24943,7 @@
 				)
 			)
 		)
-		(property "Datasheet" "https://wmsc.lcsc.com/wmsc/upload/file/pdf/v2/lcsc/C2913197.pdf"
+		(property "Datasheet" "https://wmsc.lcsc.com/wmsc/upload/file/pdf/v2/lcsc/C49164655.pdf"
 			(at 271.78 72.39 0)
 			(hide yes)
 			(show_name no)
@@ -24954,7 +24954,7 @@
 				)
 			)
 		)
-		(property "Description" "ESP32-S3 Wi-Fi/BLE module, 4MB flash, PCB antenna, 3.0-3.6V"
+		(property "Description" "ESP32-S3 module, 25.5×18mm 41-pin WROOM-1 form factor, 4MB flash, PCB antenna"
 			(at 271.78 72.39 0)
 			(hide yes)
 			(show_name no)
@@ -24965,7 +24965,7 @@
 				)
 			)
 		)
-		(property "Manufacturer" "Espressif Systems"
+		(property "Manufacturer" "DOIT"
 			(at 271.78 72.39 0)
 			(hide yes)
 			(show_name no)
@@ -24976,7 +24976,7 @@
 				)
 			)
 		)
-		(property "MPN" "ESP32-S3-WROOM-1-N4"
+		(property "MPN" "ESPS3-32-N4"
 			(at 271.78 72.39 0)
 			(hide yes)
 			(show_name no)
@@ -24987,7 +24987,7 @@
 				)
 			)
 		)
-		(property "LCSC" "C2913197"
+		(property "LCSC" "C49164655"
 			(at 271.78 72.39 0)
 			(hide yes)
 			(show_name no)
@@ -29406,6 +29406,14 @@
 			)
 		)
 	)
+	(symbol_instances
+		(path "/86333354-7408-43cf-8645-72f26da3f74f/bdfc9201-2ae5-4790-b433-e74bc99be33e"
+			(reference "U3")
+			(unit 1)
+			(value "ESPS3-32-N4")
+			(footprint "RF_Module:ESP32-S3-WROOM-1")
+		)
+)
 	(sheet_instances
 		(path "/"
 			(page "1")

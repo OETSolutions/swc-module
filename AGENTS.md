@@ -255,16 +255,15 @@ PCBA-type and assembly-fee analysis, the ordering decisions — is in
 
 Three things agents need to know before touching the order:
 
-- **The board currently builds `Standard`, and the reason is `U3` — not the
-  Extended count.** JLCPCB decides Economic-vs-Standard assembly by a part's
-  **`PCBA Type`** field (`Economic and Standard` vs `Standard Only`), which is a
-  **separate axis from Basic/Extended** and is **not** visible to the `pcbparts`
-  MCP. One `Standard Only` part forces the whole order to Standard. `C1`/`C2`
-  were moved off their `Standard Only` part on 2026-09-11; `U3`
-  (ESP32-S3-WROOM-1-N4, C2913197) remains, and **every** Espressif
-  ESP32-S3-WROOM-1 / -1U / -MINI-1 variant is `Standard Only` — so clearing it
-  is a board revision, not a substitution. Check the part's own JLCPCB page;
-  the tier tables say nothing about this flag. See `MANUFACTURING.md` §3.
+- **Both `Standard Only` parts have been cleared, so Economic is reachable.**
+  JLCPCB decides Economic-vs-Standard assembly by a part's **`PCBA Type`** field
+  (`Economic and Standard` vs `Standard Only`), a **separate axis from
+  Basic/Extended** that is **not** visible to the `pcbparts` MCP; one
+  `Standard Only` part forces the whole order to Standard. `C1`/`C2` moved to
+  C46550415 and `U3` to the DOIT `ESPS3-32-N4` (C49164655), a verified
+  pin- and land-pattern-identical WROOM-1 clone — **check the part's own JLCPCB
+  page, not the tier tables**, and re-confirm before every order. See
+  `MANUFACTURING.md` §3.
 - The outline is **54 × 102 mm**, above JLCPCB's ≤100 × 100 mm promotional tier,
   so it is area-priced. The `swc-jlcpcb-4layer-size-threshold` memory has the
   exact trim arithmetic if that is ever revisited; **do not trim unprompted**.

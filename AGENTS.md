@@ -131,12 +131,34 @@ Board facts (regenerate, do not hand-maintain):
 ## MCP servers
 
 Configured in `.mcp.json` (Claude Code) and `.codex/config.toml` (Codex) with
-identical contents. Both take absolute paths for every parameter.
+the same servers. **Path forms differ by client — see the note below the table.**
 
 | Server | Endpoint | Use for |
 | --- | --- | --- |
 | **kicad** | `uvx --from mcp-server-kicad mcp-server-kicad` — <https://github.com/ProductOfAmerica/mcp-server-kicad> | All schematic/PCB reads and writes, ERC/DRC, BOM/netlist/gerber/Gerber exports, 3D export |
 | **pcbparts** | `https://pcbparts.dev/mcp` — <https://github.com/Averyy/pcbparts-mcp> | Component search & stock (`jlc_search`, `jlc_stock_check`), cross-reference (`mouser_get_part`, `digikey_get_part`), `board_search`/`board_get` reference designs, `get_design_rules` |
+| **freecad** | `${HOME}/mcp/freecad-mcp/{.venv/bin/python,freecad_mcp_server.py}` — <https://github.com/blwfish/freecad-mcp> | FreeCAD 3D CAD: parametric modeling (booleans, pad/pocket, fillet/chamfer, shell, patterns), CAM toolpaths, mesh ops, spatial queries, screenshots. Requires FreeCAD running with the AICopilot addon, or a headless instance via `spawn_freecad_instance()`. Pairs with the `freecad-modeling-order` skill |
+
+**Never commit a path containing a literal username.** The two clients expand
+environment variables differently, so the same server is spelled two ways:
+
+| Client | Form | Why |
+| --- | --- | --- |
+| Claude Code (`.mcp.json`) | `${HOME}/…` in BOTH `command` and `args` | Claude Code documents `${VAR}` / `${VAR:-default}` expansion in `command`, `args`, `env`, `url`, `headers`. Bare `$HOME` is **not** expanded — braces are required. |
+| Codex (`.codex/config.toml`) | `command = "bash"`, `args = ["-c", "exec \"$HOME/…\" …"]` | Codex (v0.154) does **not** expand `${VAR}` at all — it passes the text through literally and fails ENOENT. The shell wrapper is the machine-independent form. Use `-c`, not `-lc`: a login shell sources your profile, whose output can corrupt MCP's stdio framing. |
+
+Neither client expands `~` in `command` or `args` (verified — ENOENT), even
+though `claude mcp list` may echo the tilde back rather than showing the failure.
+
+The freecad server shares a single install with other projects (it lives in the
+home MCP collection at `~/mcp/freecad-mcp/`, *not* inside this repo), so it is
+registered per-project through `.mcp.json` rather than installed per-project.
+Its 39 tools are dispatcher-style — e.g. `part_operations(operation="box")`,
+`partdesign_operations(operation="fillet")`,
+`spatial_query(operation="interference_check")`. Verify the link with
+`check_freecad_connection()` before any other call. Call fillet/chamfer **last**
+(see the `freecad-modeling-order` skill); in headless mode there is no
+interactive edge selection, so those operations need the GUI.
 
 The kicad server is configured with this project as its default schematic,
 board, symbol library, and export directory, so its tools work with no path

@@ -9,6 +9,10 @@
       "command": "uvx",
       "args": ["--from", "mcp-server-kicad", "mcp-server-kicad"],
       "cwd": "."
+    },
+    "freecad": {
+      "command": "${HOME}/mcp/freecad-mcp/.venv/bin/python",
+      "args": ["${HOME}/mcp/freecad-mcp/freecad_mcp_server.py"]
     }
   }
 }

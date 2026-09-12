@@ -9,3 +9,12 @@ args = ["--from", "mcp-server-kicad", "mcp-server-kicad"]
 cwd = "."
 enabled = true
 default_tools_approval_mode = "approve"
+
+[mcp_servers.freecad]
+# Codex (v0.154) does NOT expand ${VAR} in command/args -- it passes them
+# literally. A shell wrapper is the machine-independent form here. (Claude
+# Code, in .mcp.json, uses ${HOME} instead; see AGENTS.md.)
+command = "bash"
+args = ["-c", "exec \"$HOME/mcp/freecad-mcp/.venv/bin/python\" \"$HOME/mcp/freecad-mcp/freecad_mcp_server.py\""]
+enabled = true
+default_tools_approval_mode = "approve"

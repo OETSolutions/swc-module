@@ -1,0 +1,1957 @@
+# SWC Adapter — Firmware & Head-Unit App Design Spec
+
+**Date:** 2026-09-18
+**Status:** DRAFT — awaiting review
+**Deliverable:** Working firmware for the `SWC.kicad_pcb` board (ESP32-S3), an
+Android app for the head unit, and the web/BLE maintenance path — all under
+`code/` in this repository.
+
+**Companion plan:** `docs/superpowers/plans/2026-09-18-swc-firmware-android-app.md`
+
+---
+
+## 1. What this builds, and why
+
+The board already exists and is ordered. It reads a vehicle's steering-wheel
+button ladder on each of two channels, and drives a servo-controlled current
+sink to present the head unit with a key resistance the head unit understands.
+The hardware is fixed; **this document specifies the software that makes it
+work**, and nothing in it may contradict the board.
+
+Three components:
+
+| # | Component | Runs on | Owns |
+| --- | --- | --- | --- |
+| A | **Firmware** | ESP32-S3 on the SWC board | Ladder acquisition, press classification, DAC/servo output, buzzer + LED feedback, config storage, USB command link, BLE provisioning, WiFi OTA |
+| B | **Head-unit app** | The Android head unit | Config UI, per-vehicle ladder learning, action mapping (launch app / intent / key / media), the USB peer, USB OTA |
+| C | **Maintenance web page** | Served by the ESP32 | Minimal: join WiFi, then OTA. Not a config UI |
+
+The three requirements that shaped everything:
+
+1. **The software is written before the board arrives.** The board is finalized
+   and ordered. Every piece of logic that *can* be tested without hardware
+   *must* be, so that bring-up is a tuning exercise, not a debugging one.
+2. **A crash costs the user their steering-wheel controls while driving.** The
+   failure mode is not a dropped request; it is a driver with no working
+   buttons. Safety behavior is a first-class requirement, not a hardening pass.
+3. **The USB-C port is the only connector, and it carries both power and data.**
+   The same port must be the command link, the debug path, and (on the bench)
+   the flashing path. There is no second connector to fall back on.
+
+### 1.1 What is explicitly out of scope
+
+- Any change to `SWC.kicad_pcb` / `SWC.kicad_sch`. The board is ordered. Defects
+  found on the board are recorded in §12, not fixed here.
+- The enclosure (`plastic_case/`) — already built, separate spec.
+- A full web configuration UI. The ESP32 serves one maintenance page only (§8).
+- Remote/cloud management. There is no server component.
+
+---
+
+## 2. Hardware contract (verified from the netlist)
+
+**This section is the interface. Everything downstream depends on it.** Every
+row is traceable to `mcp__kicad__export_netlist` output; nothing here is
+inferred from prose or from part names. `DESIGN.md` §4 is the prose companion
+and agrees with this table; where they ever differ, this table wins because it
+was read from the netlist.
+
+### 2.1 The MCU
+
+| Item | Value |
+| --- | --- |
+| Module | `U3` DOIT `ESPS3-32-N4` (LCSC C49164655) |
+| Silicon | ESP32-S3, dual-core Xtensa LX7, **no on-chip DAC** |
+| Flash | **4 MB, no PSRAM** (see §9 — this is a hard budgeting constraint) |
+| Footprint | `RF_Module:ESP32-S3-WROOM-1` (a WROOM-1 land-pattern clone) |
+| USB | Native USB 1.1 Full-Speed only — the S3 has no High-Speed PHY |
+| ADC ceiling | **2.9 V** calibrated at 12 dB attenuation (not 3.1 V) |
+| Antenna | Module overhangs the board edge by 5.9 mm; keepout is off-board |
+
+### 2.2 Complete pin map
+
+Every GPIO the board connects, with its net, its direction and its function.
+These are the only pins available — there is no spare-pin freedom here.
+
+| GPIO | Net name | Dir | Function |
+| --- | --- | --- | --- |
+| IO1 | `/SWC1_ADC` | A-in | Channel 1 ladder, ADC1_CH0 |
+| IO2 | `/SWC2_ADC` | A-in | Channel 2 ladder, ADC1_CH1 |
+| IO7 | `/TEMP_ADC` | A-in | NTC `RT1` divider (10 k B3380) |
+| IO8 | `/SENSE1` | A-in | Channel 1 KEY-line sense, KEY voltage ÷ 2 |
+| IO9 | `/SENSE2` | A-in | Channel 2 KEY-line sense, KEY voltage ÷ 2 |
+| IO10 | `/VBUS_VALID` | D-in | VBUS present (`R56`/`R57` ÷ 2 off fused VBUS) |
+| IO13 | `/BUZZ` | D-out | Buzzer `BZ1` low-side `Q3` gate, via `R27` 100 Ω |
+| IO14 | `/LED2` | D-out | LED `D12` (green), via `R26` 1 k |
+| IO47 | `/LED_STAT` | D-out | LED `D6` (green), via `R7` 1 k |
+| IO17 | `/I2C_SDA_3V3` | I/O | I²C SDA to `U4` MCP4728 |
+| IO18 | `/I2C_SCL_3V3` | I/O | I²C SCL to `U4` MCP4728 |
+| IO48 | `/DAC_LDAC_B_3V3` | D-out | MCP4728 `~LDAC` (active low), `R13` 10 k pulldown |
+| IO0 | `/BOOT` | D-in | `SW1` BOOT — **strapping pin**, also usable as a user input |
+| IO3 | `/IO3` | — | Spare, `TP1` test point only |
+| IO4 | `/AUX1_F` | A-in | **AUX1** direct input, ADC1_CH3 |
+| IO5 | `/AUX2_F` | A-in | **AUX2** direct input, ADC1_CH4 |
+| IO6 | `/AUX3_F` | A-in | **AUX3** direct input, ADC1_CH5 |
+| IO11 | `/IO11` | — | Spare, `TP2` only |
+| IO12 | `/IO12` | — | Spare, `TP3` only |
+| IO15 | `/IO15` | — | Spare, `TP4` only |
+| IO16 | `/IO16` | — | Spare, `TP5` only |
+| IO21 | `/IO21` | — | Spare, `TP6` only |
+| IO19/IO20 | module USB | USB | `USB_D-` / `USB_D+` (not broken out as GPIO) |
+| — | `/TXD0`, `/RXD0` | — | `TP7`/`TP8` only; ROM UART, no header pins |
+
+**Constraints that follow:**
+
+- **IO0 is a strapping pin.** It must not be held low at boot — holding it low at
+  power-on enters the ROM serial-download bootloader, *not* a user action. This
+  is why the programming and maintenance triggers (§7.5, §8.2) are **runtime
+  long-presses on a running device**, never a hold-at-power-on.
+- **AUX1–AUX3 (IO4/IO5/IO6) are fully usable analog inputs**, wired exactly like
+  the SWC channels but with 1 kΩ series resistors. Together with the two SWC
+  channels that is **five analog key inputs** — and the AUX inputs are the
+  intended local programming/test buttons, since they need no external ladder.
+- **IO4 is ADC1_CH3 on the S3.** Some Arduino cores map a DAC to IO4 on *other*
+  ESP32 variants; the S3 has no DAC at all, so this is only a caution against
+  copy-pasted board definitions, not a real hazard.
+- **IO3, IO11, IO12, IO15, IO16, IO21 are broken out to test points only.**
+  There is no header. They are not usable for user-facing features.
+- **ADC1 only.** IO1, IO2, IO4, IO5, IO6, IO7, IO8, IO9 are all on ADC1. ADC2 is
+  unusable while WiFi is active on ESP32-S3 — irrelevant in normal mode (the
+  radio is off, §8.1) but a real constraint if any ADC2 pin is ever used later.
+- There is **no external USB-UART bridge** and **no spare UART pins**. All
+  serial I/O is over the native USB, and the console must live on the ROM
+  USB-Serial-JTAG peripheral (§4.1).
+
+### 2.3 The analog output stage (per channel)
+
+The output is a **closed-loop integrator servo**, not an open-loop buffer.
+Verified from the netlist and matching `DESIGN.md` §4.4:
+
+```
+V_KEY = (1 + R58/R61)·V_DAC − (R58/R61)·V_ADJ
+        with R58 = 82 kΩ, R61 = 100 kΩ   →   V_KEY = 1.82·V_DAC − 0.82·V_ADJ
+```
+
+| Element | Refs (ch 1 / ch 2) | Value | Role |
+| --- | --- | --- | --- |
+| DAC signal channel | `U4` VOUTA / VOUTC | 12-bit, 0–3.3 V | Sets the target; drives integrator via 100 k |
+| DAC gain channel (`V_ADJ`) | `U4` VOUTB / VOUTD | 12-bit, 0–3.3 V | **Gain-mode selector** |
+| Integrator | `U6A` / `U6C` + 100 nF | — | Forces `U6−` = `V_DAC` at DC |
+| Gain-set resistors | `R58`/`R61`, `R59`/`R60` | 82 k / 100 k | Sets gain = 1.82 |
+| Sink FET | `Q4` / `Q6` (2N7002) | — | **Sinks only** — cannot source |
+| Sense buffer | `U6B` / `U6D` | unity follower | Reads KEY line via 1 MΩ `R36`/`R43` |
+| Sense divider | `R54`/`R50`, `R55`/`R51` | 10 k / 10 k | **Exact ÷2** → `/SENSEn` |
+| Gate pulldown | `R48` / `R49` | 100 k | Holds FET off if op-amp unpowered |
+
+**Two consequences the firmware must respect:**
+
+1. **The gain mode is chosen by what the `V_ADJ` channel *is*, and the MCP4728
+   has no high-impedance state.** Its power-down modes are 1 kΩ / 100 kΩ /
+   500 kΩ pull-**downs**. The 1 kΩ one is exactly what the 5 V range needs.
+
+   | Target head unit | `V_ADJ` channel | Gain |
+   | --- | --- | --- |
+   | 5 V range | powered down (`PD1:PD0 = 01`) → defined 1 kΩ to GND | **1.82** |
+   | 3 V range | normal, tracking the signal channel's code | **1.00** |
+
+2. **Releasing the KEY line needs no special mode.** `Q4` only sinks. To
+   release, command a target *above* the head unit's own idle voltage; the servo
+   drives the gate low, `Q4` turns off, and the line floats up through the head
+   unit's own pull-up, loaded only by `R36` 1 MΩ. **Idle state = high impedance,
+   for free.**
+
+The op-amp runs on +5 V, so `V_buf` saturates near 4.98 V. Gain 1.82 advertises
+6.0 V but the line can only be servoed to ~5 V — the surplus is deliberate
+release margin, not a bug.
+
+Because the sense divider is an exact ÷2 and the op-amp rail binds before the
+ADC ceiling, **`V_SENSE` can never exceed ~2.49 V and the ADC can never
+saturate.** No clamp logic is needed in firmware.
+
+### 2.4 The ladder input (per channel)
+
+```
+factory ladder (to +12 V when idle)
+   └─ J2 ─ R1/R2 10 kΩ ─┬─ /SWC1_ADC / /SWC2_ADC ─► ESP32-S3 ADC1
+                        ├─ R15/R16 10 kΩ pull-up to +3V3
+                        ├─ D4/D5 BAT54S clamp to +3V3 / GND
+                        └─ C3/C4 100 nF
+```
+
+The **10 kΩ pull-up is what makes a bare switch-to-ground button work as well as
+a resistor ladder.** The clamp protects the 3.3 V pin from the 12 V idle level.
+The 10 kΩ series resistor plus the pull-up forms a divider, so the pin voltage
+is a function of *both* the ladder resistance *and* the 12 V rail — which drifts
+with the vehicle's charging system. §6.3 derives the transfer function and
+explains why the firmware must learn rather than assume.
+
+`AUX1`–`AUX3` on `J5` are electrically identical but use a **1 kΩ** series
+resistor (`R23`–`R25`) and the same pull-up/clamp/filter, on IO4/IO5/IO6.
+
+### 2.5 Power, feedback, and the one user-visible button
+
+- **12 V is optional.** `J1` → `F1` PPTC → `D1` SMBJ18A TVS → `U1` XL1509-5.0
+  buck; USB VBUS → `F2` PPTC → `D3`. `D2`/`D3` diode-OR at +5 V, then `U2`
+  AMS1117-3.3. Either source alone is sufficient. `/VBUS_VALID` (IO10) tells the
+  firmware which one is present.
+- **Feedback is a buzzer and two LEDs.** `BZ1` is a magnetic buzzer on +5 V
+  switched by `Q3` from `/BUZZ` — **a plain on/off drive, not a PWM tone
+  generator.** Its frequency is fixed by the part; the firmware can only gate it.
+  This is a real change from the 2022 design, which drove a PWM melody (§6.5).
+- **`SW1` (BOOT, IO0) and `SW2` (RESET, EN) are recessed** and are
+  "poke with a tool" controls, not thumb buttons — see the enclosure spec §5.6.
+  RESET is wired to the chip's EN pin, **not to a GPIO**: the firmware cannot
+  read it, and reset causes a full reboot. BOOT *is* readable, but because it is
+  recessed and a strapping pin it is reserved for recovery, not user gestures —
+  the user-facing physical input is **AUX1** (§2.2, §7.5).
+
+---
+
+## 3. The data model
+
+This is the **initial layout of the entities**, and it is the contract between
+all three components. The firmware persists it in NVS, the Android app edits it
+and sends it over USB, and the web page only ever touches the small subset in
+§3.6. Every field is defined once, here.
+
+### 3.1 Entity map
+
+```
+Config ──┬── schema_version, device_id, created_at, updated_at
+         ├── DeviceSettings          (timings, gain policy, feedback levels)
+         ├── Channel ×2              (SWC1, SWC2)   ── per-channel ladder + output
+         │     ├── Ladder                            ── learned per-vehicle
+         │     │     └── LadderButton ×N
+         │     └── OutputProfile
+         ├── AuxButton ×3            (AUX1–AUX3, direct digital/analog inputs)
+         └── Binding ×N              ── (input, gesture) → [Action…]
+                                       └── Action ×N
+```
+
+`Binding` is the join table that makes the product work: it maps *what the user
+did with their thumb* to *what should happen*. Everything else is either
+calibration data or presentation.
+
+### 3.2 Identifiers and value types
+
+Getting these right up front prevents a class of silent bugs where an ADC
+count is mistaken for a millivolt or a resistance.
+
+| Type | Range | Meaning |
+| --- | --- | --- |
+| `AdcRaw` | u16, 0–8191 | Raw 13-bit ADC count as read from the S3 at 12 dB atten |
+| `MilliVolt` | u16, 0–2900 | Pin voltage in mV, after calibration, **at the pin** |
+| `MilliOhm` | u32 | Ladder resistance in mΩ. Not inferred unless learned — see §3.4 |
+| `DacCode` | u16, 0–4095 | MCP4728 code. `mV ≈ code × 3300 / 4095` (1 LSB = 806 µV) |
+| `TimestampMs` | u32 monotonic | Milliseconds since boot |
+
+**Rule:** the firmware stores ladder calibration as `MilliVolt` at the pin, and
+**never** as a resistance, because the board does not measure resistance — it
+measures a divided voltage that depends on the vehicle's 12 V rail (§6.3).
+`MilliOhm` is display-only, computed for the app's benefit when the user supplies
+the known rail voltage. Storing a resistance as if it were measured would be a
+lie that drifts with the charging system.
+
+### 3.3 Gestures
+
+```jsonc
+"gesture": "SINGLE" | "DOUBLE" | "TRIPLE" | "LONG" | "LONG_REPEAT"
+```
+
+`SINGLE`, `DOUBLE`, `LONG` are required and are what the user asked for.
+`TRIPLE` and `LONG_REPEAT` are defined in the enum from day one so the schema
+does not need a migration when they are implemented; the plan implements
+`SINGLE`/`DOUBLE`/`LONG` first and adds the rest behind a capability flag.
+
+A `COMBO` gesture (two ladder buttons held simultaneously — e.g. VOL_UP + VOL_DN)
+is **deferred to v2** and is called out in §12. The two-channel hardware makes it
+possible, but it interacts badly with the per-channel state machines and should
+not be in the first cut.
+
+### 3.4 Learned ladder
+
+The critical insight: **the ladder is a voltage divider against the vehicle's
+12 V rail, so the same car can read differently at 12.0 V and 14.4 V.** Values
+therefore carry the rail voltage measured at learn time, so the firmware can
+renormalize at runtime.
+
+```
+LadderButton {
+  id           : "vol_up"          // stable slug, used by bindings
+  name         : "Volume Up"        // display only
+  mv_center    : 1240               // MilliVolt at the pin when this button is held
+  mv_tolerance : 120                // half-width of the accept window
+  learned_at_rail_mv : 12100        // rail voltage measured during learn
+  temp_c_at_learn    : 23.5         // for the NTC compensation model
+  sample_count : 200                // how many samples were averaged
+  confidence   : 0.98               // learn-quality score, 0–1
+}
+```
+
+`mv_tolerance` is **derived at learn time** as the midpoint of the gap to the
+nearest neighbouring button, capped by a configurable maximum. A hand-derived
+tolerance is the classic cause of "two buttons both trigger the same action".
+
+### 3.5 Bindings and actions
+
+A binding is `(channel, button, gesture)` → ordered list of actions. Most will
+have exactly one action; the list exists because "emit the factory key press
+**and** tell the app" is a real, wanted combination.
+
+```jsonc
+{
+  "id": "b1",
+  "channel": "SWC1",              // SWC1 | SWC2 | AUX1 | AUX2 | AUX3 | ANY
+  "button": "vol_up",             // LadderButton.id, or "NONE" for gestures on the programming button
+  "gesture": "SINGLE",
+  "enabled": true,
+  "actions": [ /* Action[] — executed in order, each independently failable */ ]
+}
+```
+
+Two rules that matter:
+
+- **A binding with an empty `actions` list is not the same as `enabled: false`.**
+  Empty means "swallow this gesture" (recognised, does nothing). Disabled means
+  "do not match this gesture at all", so a lower-priority binding may.
+- **Action execution is best-effort and ordered.** If action 1 fails, action 2
+  still runs (unless action 1 is a `MACRO` with `abort_on_failure: true`). A
+  failed app-side action must never prevent the hardware key press.
+
+### 3.6 The action library
+
+This is the union of "what the head unit's own SWC input can do" (the `HW_KEY`
+family) and "the extra functions the Android app provides" (everything else) —
+which is precisely the split the user described.
+
+| `kind` | Params | Executed by | Purpose |
+| --- | --- | --- | --- |
+| `NONE` | — | — | Explicit no-op; useful as a placeholder |
+| `HW_KEY` | `key_resistance_mohm`, or `dac_code` | Firmware | **The core function.** Present a key value to the head unit |
+| `HW_KEY_RELEASE` | — | Firmware | Force the KEY line to idle/high-Z |
+| `APP_LAUNCH` | `package`, optional `activity` | Android | Launch an app by package name |
+| `APP_INTENT` | `action`, `data`, `mime`, `extras{}`, `flags[]` | Android | Send an arbitrary intent, **including a data payload** — the user's stated example |
+| `KEYCODE` | `keycode`, `meta` | Android | Inject a key event (`KEYCODE_MEDIA_NEXT`, …) |
+| `MEDIA` | `command` (`play`/`pause`/`next`/`prev`/`stop`) | Android | Media transport via `MediaSession`-style dispatch |
+| `VOLUME` | `target` (`media`/`call`/`ring`/`alarm`), `delta` or `absolute` | Android | Volume, including absolute set which stock SWC cannot do |
+| `SYSTEM` | `command` (`screen_off`/`night_mode`/`screenshot`/`open_settings`) | Android | Head-unit housekeeping |
+| `BUZZ` | `pattern` (named) | Firmware | Local audible confirmation, independent of the buzzer grammar |
+| `APP_RAW` | `command`, `args[]` | Android | Escape hatch: an app-defined command not yet promoted to a kind |
+
+`MACRO` is **not** an action kind — it is a binding with an ordered `actions`
+list, which is the same thing with one fewer concept to learn.
+
+**Design note on `HW_KEY` vs `APP_INTENT`:** a single physical button can be
+bound so that `SINGLE` sends a `HW_KEY` (so the stock head unit reacts even if
+the app is not running) while `DOUBLE` sends an `APP_INTENT` (an extra function
+the head unit never had). That is the whole point of the product, and the data
+model expresses it without a special case.
+
+### 3.7 Full worked example
+
+The user's stated scenario — "the head unit may not have a SWC to open a specific
+app or a specific intent with data payload, but the Android app can" — written
+out:
+
+```jsonc
+{
+  "schema_version": 1,
+  "device_id": "swc-a1b2c3",
+  "device": {
+    "name": "SWC Adapter",
+    "hostname": "swc-adapter",
+    "settings": {
+      "single_press_ms": 0,
+      "double_press_gap_ms": 400,
+      "long_press_ms": 700,
+      "long_repeat_ms": 250,
+      "debounce_ms": 25,
+      "release_margin_mv": 900,
+      "gain_policy": "AUTO",
+      "temp_comp_enabled": true,
+      "buzzer_level": "NORMAL",
+      "led_level": "NORMAL",
+      "usb_protocol_version": 1
+    }
+  },
+  "channels": [
+    {
+      "id": "SWC1",
+      "enabled": true,
+      "ladder": {
+        "source": "LADDER_12V",
+        "idle_mv": 2900,
+        "buttons": [
+          { "id": "vol_up",   "name": "Volume Up",   "mv_center": 1240, "mv_tolerance": 120,
+            "learned_at_rail_mv": 12100, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.98 },
+          { "id": "vol_dn",   "name": "Volume Down", "mv_center": 1680, "mv_tolerance": 120,
+            "learned_at_rail_mv": 12100, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.97 },
+          { "id": "next",     "name": "Next Track",  "mv_center": 2050, "mv_tolerance": 110,
+            "learned_at_rail_mv": 12100, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.99 }
+        ]
+      },
+      "output": {
+        "gain_mode": "AUTO",
+        "idle_dac_code": 4095,
+        "key_values": {
+          "vol_up": { "dac_code": 1240 },
+          "vol_dn": { "dac_code": 1680 },
+          "next":   { "dac_code": 2050 }
+        }
+      }
+    }
+  ],
+  "bindings": [
+    { "id": "b1", "channel": "SWC1", "button": "vol_up", "gesture": "SINGLE",
+      "enabled": true, "actions": [ { "kind": "HW_KEY", "key_resistance_mohm": 24000 } ] },
+
+    { "id": "b2", "channel": "SWC1", "button": "vol_up", "gesture": "LONG",
+      "enabled": true, "actions": [ { "kind": "HW_KEY_RELEASE" } ] },
+
+    { "id": "b3", "channel": "SWC1", "button": "next", "gesture": "DOUBLE",
+      "enabled": true, "actions": [
+        { "kind": "APP_LAUNCH", "package": "com.spotify.music" }
+      ] },
+
+    { "id": "b4", "channel": "SWC1", "button": "next", "gesture": "LONG",
+      "enabled": true, "actions": [
+        { "kind": "APP_INTENT",
+          "action": "com.oetsolutions.swc.ACTION_NAVIGATE",
+          "data": "geo:40.7608,-111.8910?q=Home",
+          "extras": { "started_by": "swc", "profile": "daily" },
+          "flags": ["FLAG_ACTIVITY_NEW_TASK"] }
+      ] }
+  ]
+}
+```
+
+### 3.8 Persistence, versioning and migration
+
+- **Storage:** NVS, namespace `swc_cfg`. The whole `Config` is stored as a single
+  JSON blob under one key, for atomicity — a partial config is worse than no
+  config. The blob is well under the NVS partition's per-entry limit (currently
+  ~4 KB per value); §10 verifies the real ceiling and picks a blob vs chunked
+  strategy against a **measured** size, not a guess.
+- **Dual-slot writes with a monotonic sequence number.** NVS is written **A/B**:
+  write the inactive slot, verify it by read-back, bump the sequence, *then* flip
+  the active marker. **A power loss mid-write must never destroy a working
+  config** — this is not theoretical, because the device lives on a car's
+  electrical system and can lose power at any instant, including during a save.
+  The reader always takes the higher valid sequence number.
+- **A CRC covers the blob.** A corrupt config must be *detected* and replaced
+  with known-good defaults, never partially applied — a half-applied mapping is a
+  car control that does the wrong thing.
+- **Staged, then committed.** A learn run or a bulk edit writes to a staging area
+  and commits only after read-back verification. Any failure keeps the previous
+  table.
+- **`schema_version` is mandatory and checked on read.** A config written by a
+  newer firmware is **not** silently interpreted by an older one; it is rejected
+  and defaults are used, with a loud log and a buzzer pattern. **The NVS is not
+  overwritten until the user confirms**, so a bad flash remains recoverable.
+- **Migration is forward-only and additive.** Each version bump needs a
+  `migrate_vN_to_vN+1` function. Removing a field requires bumping
+  `schema_version` and *keeping* the reader for the old one for at least one
+  release.
+- **Defaults are always valid.** With no config at all, the device must still
+  pass the ladder through to the output 1:1 (§6.9). Out of the box, before any
+  configuration, the adapter behaves as a transparent pass-through.
+- **Also persisted:** a small learn log (the last few learn runs' raw medians,
+  for drift diagnosis) and a boot counter. Nothing else — every extra persisted
+  key is another migration to carry.
+
+
+---
+
+## 4. The USB link
+
+The USB-C port is the only connector. It is simultaneously the power source, the
+bench flashing/debug path, and the command link to the head-unit app. **One
+transport, three jobs** — the design must not let the debug job corrupt the link
+job, or vice versa.
+
+### 4.1 Transport choice
+
+The ESP32-S3 has **two** independent USB peripherals, and this is the design
+decision that unlocks the whole thing:
+
+| Peripheral | Use here | Why |
+| --- | --- | --- |
+| **USB-Serial-JTAG** (ROM) | **Console + JTAG debug only**, and bench flashing | Built into ROM; always enumerates, even with a dead app. Never carries the app protocol. |
+| **TinyUSB CDC** (OTG) | **The Android command link** | Application-controlled, independent of the console. |
+
+**Both may be active at once.** Keeping the console on USB-Serial-JTAG and the
+protocol on TinyUSB CDC means a debug `printf` can never be mistaken by the
+Android app for a protocol frame — the classic failure when both share one CDC.
+
+**This is a hard requirement:** the console must never be configured onto the
+TinyUSB CDC port in a production build. §10 tests it.
+
+### 4.2 Framing
+
+Line-oriented **NDJSON** (newline-delimited JSON) in both directions, with an
+explicit envelope. Chosen over a binary/COBS format deliberately:
+
+- It is human-readable on a bus analyzer and in a terminal, which is worth a lot
+  during bring-up on hardware nobody has yet.
+- The payload here is button events and config — tens of bytes, a few per
+  second at the very worst, on a Full-Speed link. Framing efficiency is
+  irrelevant; debuggability is not.
+- JSON parsers exist on both sides already.
+
+```
+frame  := object "\n"                 ; one JSON object per line, UTF-8, no embedded newline
+object := { "v":1, "seq":u32, "type":TYPE, ...payload }
+```
+
+Every frame carries:
+
+| Field | Type | Purpose |
+| --- | --- | --- |
+| `v` | u8 | **Protocol version.** Mismatch is handled explicitly (§4.5) |
+| `seq` | u32 | Per-sender monotonic counter, for gap detection and ack matching |
+| `type` | string | What this frame is |
+
+**Line length is capped** (recommend 1024 bytes incl. newline). An over-long
+line is discarded with an error frame rather than buffered — an unbounded line
+buffer on a 4 MB/no-PSRAM part is a heap-exhaustion bug that a hostile or buggy
+peer can trigger.
+
+### 4.3 Frame types
+
+| Direction | `type` | Payload | Notes |
+| --- | --- | --- | --- |
+| FW → App | `hello` | `fw_version`, `hw_id`, `protocol_v`, `caps[]` | Sent on connect and on request |
+| FW → App | `event` | `channel`, `button`, `gesture`, `t_ms`, `raw_mv`, `confidence` | **The core event.** Fired on every classified gesture |
+| FW → App | `status` | `vbus_present`, `gain_mode`, `rail_mv`, `temp_c`, `uptime_ms`, `heap_free`, `config_state` | Periodic + on change |
+| FW → App | `ladder_sample` | `channel`, `raw_mv`, `n` | Streamed **only during learn mode** |
+| FW → App | `ack` | `for_seq`, `ok`, `err` | Every command is acked |
+| FW → App | `nack` | `for_seq`, `err`, `detail` | Explicit failure, with a machine-readable code |
+| FW → App | `log` | `level`, `msg` | Optional, gated by a settings flag |
+| App → FW | `config_get` | — | Request the whole config |
+| App → FW | `config_set` | `config` | Replace the whole config; validated before commit |
+| App → FW | `config_patch` | `path`, `value` | Single-field change, cheaper and less racy |
+| App → FW | `learn_start` / `learn_stop` | `channel`, `button_id` | Drive the learn wizard (§6.4) |
+| App → FW | `learn_commit` | `channel`, `button_id`, `name` | Accept the streamed samples as this button |
+| App → FW | `test_key` | `channel`, `dac_code` or `key_resistance_mohm`, `hold_ms` | Bench/production test of the output stage |
+| App → FW | `identify` | `pattern` | Flash LEDs / buzz, so the user knows *which* unit |
+| App → FW | `reboot` | `boot_target` (`app`/`bootloader`) | |
+| App → FW | `ping` | — | Liveness; FW answers `status` |
+| App → FW | `time_sync` | `epoch_ms`, `tz_offset_min` | So timestamps and OTA checks are meaningful |
+| App → FW | `ota_begin` / `ota_chunk` / `ota_end` | size/sha256; offset+data; — | USB OTA (§9.3) |
+
+`event` is deliberately **fire-and-forget and never acked by the app**: a button
+press must not be held hostage to the app being responsive. The firmware acts on
+the local binding first and tells the app second (§6.6).
+
+### 4.4 Keepalive, disconnect and reconnect
+
+The head unit may sleep, suspend, or reboot at any moment, and it supplies power.
+
+- Firmware sends `status` every **2 s** when connected.
+- App sends `ping` if it has seen nothing for **5 s**; firmware replies `status`.
+- After **10 s** of silence the firmware considers the link down. **This does not
+  change key behavior** — bindings continue to work with no app present (§6.6).
+- **Reconnect is stateless.** On a new `hello`, no replay of missed events; the
+  app re-reads `status` and `config_get` if it needs to. Trying to replay events
+  across a USB re-enumeration is a source of duplicate key actions, and is not
+  worth the complexity.
+- The firmware must tolerate **USB re-enumeration caused by its own reset or by
+  a flashing operation** without wedging. On the bench, USB-Serial-JTAG stays up
+  across an app crash; the CDC link does not, by design.
+
+### 4.5 Version negotiation
+
+`hello` carries `protocol_v`. If the app's major protocol version differs, the
+app **must** show an explicit "firmware/app version mismatch" state rather than
+attempting to talk. Silent partial compatibility is how a config gets corrupted.
+
+### 4.6 Why not something else
+
+| Rejected | Why |
+| --- | --- |
+| Raw binary + COBS | Smaller, but unreadable on a bus analyzer. The payload is tiny; this trades away the main bring-up tool for nothing. |
+| JSON over Bluetooth | The car has no BLE by design (§8), and BLE throughput/latency is far worse than wires for the in-car path. BLE is for *maintenance*, not operation. |
+| Two CDC interfaces | Android's USB stack on head units is not reliable about multi-interface composite devices; one interface is the safe choice. |
+| The app driving the DAC directly | The whole point is that buttons work with **no app running**. The app configures; the firmware acts. |
+
+
+---
+
+## 5. Functional requirements
+
+Numbered so the plan and the tests can cite them. `MUST` / `SHOULD` / `MAY` are
+used in the RFC 2119 sense. Each requirement is stated so that it is
+**independently testable**, and §11 maps each to a test.
+
+### 5.1 Acquisition
+
+| # | Requirement |
+| --- | --- |
+| FR-1 | The firmware MUST sample both ladder channels and the NTC continuously, without blocking the USB link or the output loop. |
+| FR-2 | ADC samples MUST be converted to millivolts using **per-chip eFuse calibration**, not a fixed linear scale. |
+| FR-3 | The firmware MUST filter samples for noise while preserving a real button press's edge; the filter's settling time MUST be shorter than the configured `debounce_ms`. |
+| FR-4 | The firmware MUST detect and report **out-of-range** conditions on a channel (rail collapse, open input, short to 12 V) rather than reporting them as a button. |
+| FR-5 | The firmware MUST expose the raw filtered millivolt value during learn mode at a rate the app can render live. |
+
+### 5.2 Classification
+
+| # | Requirement |
+| --- | --- |
+| FR-6 | The firmware MUST classify each channel's level into `IDLE`, a learned `LadderButton`, or `UNKNOWN`, using the learned windows and **hysteresis**. |
+| FR-7 | The firmware MUST detect `SINGLE`, `DOUBLE` and `LONG` presses per channel, using timings from `DeviceSettings`. |
+| FR-8 | The state machine MUST be deterministic and driven by an injectable clock, so its full behavior is unit-testable with no hardware. |
+| FR-9 | Simultaneous presses on the two channels MUST each be classified independently; neither may block the other. |
+| FR-10 | `LONG` MUST fire **at the moment the long-press threshold elapses**, not on release, so a held button acts immediately. |
+| FR-11 | A `LONG` press MUST NOT additionally emit a `SINGLE`, and the second press of a `DOUBLE` MUST NOT emit its own `SINGLE`. |
+| FR-12 | The firmware MUST NOT emit a gesture for a button it has not learned; such presses are `UNKNOWN` and reported as `event` with `button: null`. |
+
+### 5.3 Output
+
+| # | Requirement |
+| --- | --- |
+| FR-13 | Before serving any user input, the firmware MUST establish a **safe idle output** — see §6.7. This is the first thing that happens after boot, ahead of USB, BLE or WiFi. |
+| FR-14 | The firmware MUST select gain mode per channel from `gain_policy` (§6.2), defaulting to `AUTO` (measure the head unit, decide). |
+| FR-15 | The firmware MUST command a key value by writing the DAC code for the bound action, and MUST hold it for the press duration, then release. |
+| FR-16 | The firmware MUST implement release as "command above the head unit's idle voltage", which turns the sink FET off and returns the line to high impedance. |
+| FR-17 | The firmware MUST apply temperature compensation to the learned windows when `temp_comp_enabled` is set (§6.4). |
+| FR-18 | The firmware MUST validate any DAC code against the current gain mode's ceiling before writing it, and clamp with a logged warning rather than driving an out-of-range value. |
+| FR-19 | The firmware SHOULD run a bounded software trim loop against the sense readings to correct for servo and resistor tolerance, and MUST NOT oscillate or inject ADC noise into the output (§6.5). |
+
+### 5.4 Feedback
+
+| # | Requirement |
+| --- | --- |
+| FR-20 | The firmware MUST drive the buzzer and both LEDs to communicate device state per the grammar in §7. |
+| FR-21 | Buzzer/LED feedback MUST NEVER be able to block or delay a key press; feedback is scheduled, not synchronous. |
+| FR-22 | `buzzer_level` and `led_level` MUST allow the user to silence or dim feedback, including a fully-off setting. |
+
+### 5.5 Configuration
+
+| # | Requirement |
+| --- | --- |
+| FR-23 | The firmware MUST persist the full `Config` in NVS, atomically, with a checksum. |
+| FR-24 | On a checksum failure or an unreadable/newer config, the firmware MUST fall back to defaults and signal it audibly, never partially apply. |
+| FR-25 | With **no** configuration, the device MUST function as a transparent 1:1 ladder pass-through (§6.9). |
+| FR-26 | Config changes over USB MUST be validated before commit; an invalid config is rejected with a `nack`, leaving the previous config intact. |
+| FR-27 | The firmware MUST export and import the entire config as a single JSON document for backup. |
+
+### 5.6 Learning
+
+| # | Requirement |
+| --- | --- |
+| FR-28 | The firmware MUST provide a learn mode that measures and records a ladder button's level, tolerance and rail voltage, driven over USB and optionally locally via the AUX inputs (§2.2). |
+| FR-29 | Learn MUST reject a sample set that is too noisy, or that lands within the tolerance of an existing button, and say why. |
+| FR-30 | Learn MUST record `learned_at_rail_mv` so runtime classification can renormalize for a different rail voltage. |
+| FR-31 | The firmware MUST be able to learn with **no app connected**, using AUX1 as the select button plus buzzer/LED prompts (§7.4), because a user may not have the head unit out of the dash. |
+
+### 5.7 Maintenance
+
+| # | Requirement |
+| --- | --- |
+| FR-32 | The firmware MUST NOT initialize WiFi or BLE during normal operation. They are **maintenance-only** (§8.1). |
+| FR-33 | The firmware MUST enter maintenance mode on an explicit request: a config flag, a USB command, or a sustained AUX1 hold (§8.2). |
+| FR-34 | In maintenance mode the firmware MUST expose BLE provisioning compatible with the Espressif provisioning app, and serve the minimal web page of §8. |
+| FR-35 | The firmware MUST support firmware update over **WiFi** and over **USB**, both from a user-supplied file and by checking the project's git releases (§9). |
+| FR-36 | Any update path MUST verify a **SHA-256** checksum before committing, and MUST refuse an unverifiable image. |
+| FR-37 | Any update path MUST use A/B partitions with rollback, and MUST mark the new image valid only after the application has reached a confirmed-healthy state (§9.4). |
+| FR-38 | Maintenance mode MUST time out and return to normal operation, so the device cannot be left unable to serve button presses. |
+
+### 5.8 Safety
+
+| # | Requirement |
+| --- | --- |
+| FR-39 | The KEY line MUST NEVER be left driving a phantom button press. On any reset, fault, brownout or disconnect, the output MUST return to the safe idle state of §6.7. |
+| FR-40 | The firmware MUST be resilient to a watchdog reset: the post-reset state MUST be safe **before** it is useful. |
+| FR-41 | The firmware MUST NOT brick on a failed OTA; a bad image MUST roll back automatically. |
+| FR-42 | The firmware MUST continue to serve button presses with the USB link down, the app absent, and no WiFi. |
+
+---
+
+## 6. Behavior specification
+
+### 6.1 Startup sequence (order is normative)
+
+This order is a safety requirement, not a style choice. The DAC's power-on state
+is the only thing standing between the user and a stuck key while the firmware
+boots — see §6.7.
+
+```
+ 1. Reset vector → ROM bootloader
+ 2. MCP4728 EEPROM powers the DAC up in its SAFE state      (hardware, no firmware needed)
+ 3. App starts; earliest code:
+      a. configure the DAC pins, drive ~LDAC appropriately
+      b. VERIFY the DAC is in the safe state (read back)     ← FR-13
+ 4. Configure the KEY-line sink FET gate to OFF (Q4/Q6)
+ 5. Bring up the ADC, calibrate it from eFuse, begin sampling
+ 6. Load Config from NVS; validate; fall back to defaults on any failure
+ 7. Measure the rail and the head unit's idle level → decide gain mode
+ 8. Start the classification state machine
+ 9. ONLY NOW: bring up USB CDC, and announce `hello`
+10. Stay in normal mode. Do NOT touch WiFi/BLE.
+```
+
+**Steps 3–4 happen before step 9 on purpose.** If USB came up first, there is a
+window where the device is addressable but the output is not yet safe.
+
+### 6.2 Gain mode selection
+
+Gain mode is chosen from `gain_policy`: `AUTO` (default), `FORCE_5V` (gain 1.82),
+or `FORCE_3V` (gain 1.00).
+
+**The exact gain is 1.82, not 1.812** — `R58/R61 = 82 k/100 k = 0.82`, so
+`1 + 0.82 = 1.82`. The firmware must use the ratio, not a rounded decimal:
+
+```
+V_DAC_setpoint = (V_KEY_target + 0.82 · V_ADJ) / 1.82
+DAC code       = round(V_DAC_setpoint · 4096 / 3.300)
+```
+
+`AUTO` measurement, with the output released (FET off, line floating):
+
+1. Sample `/SENSEn` while idle. The divider is an exact ÷2, so
+   `V_KEY_idle = 2 × V_SENSE`.
+2. **Envelope check.** `V_KEY_idle` outside **1.80–5.20 V** means **no head unit**
+   (off, absent, or a wiring fault) → take the `NoHeadUnit` path (§6.8). Do not
+   classify against a stale measurement.
+3. **Guard band.** If `V_KEY_idle` falls in **2.6–3.4 V**, **do not guess** — the
+   two ranges are indistinguishable there. Stay on the current mode and re-measure
+   after the head unit has settled.
+4. `V_KEY_idle ≥ 3.4 V` → **3 V range is unnecessary and 5 V range is correct**;
+   actually invert: **≥ 3.4 V ⇒ 5 V range**, gain 1.82.
+5. `V_KEY_idle < 2.6 V` → **3 V range**, gain 1.00, `V_ADJ` tracking the signal
+   channel's code.
+
+**The asymmetry is deliberate, and it is the safety argument:** the only
+dangerous mistake is **over-ranging a 3 V head unit**, because gain 1.82 on a
+3 V system can command above its rails. Under-ranging a 5 V unit merely wastes
+dynamic range. Therefore:
+
+- **Default to gain 1.82** whenever the measurement is absent or ambiguous. It
+  works for 3–5 V units at a cost of only ~2.5 mV of DAC-referred error.
+- **Upgrade to gain 1.00 only on positive evidence** (`V_KEY_idle < 2.6 V`).
+
+`V_KEY_idle` is **the level the head unit pulls its own KEY line to with no
+button pressed** — the single most important measured number in the system, and
+exactly what the 2022 design never did.
+
+**Gain mode is re-evaluated, not latched:** on head-unit power change
+(`/VBUS_VALID` transitions, rail changes) and periodically while idle.
+
+**Command targets must stay inside `[min_ladder, V_KEY_idle − 0.20 V]`** so the
+sink FET is never asked to drive above the line's own resting level — above that
+point the servo can only turn `Q4` off, which is the release behavior, not a
+command.
+
+### 6.3 The ladder transfer function
+
+This derivation is what justifies "learn, do not assume". Per channel:
+
+```
+   +12V ──┬── ladder resistance R_ladder ──┬── R_series 10k ──┬── ADC pin
+          │  (vehicle-specific)            │                  │
+          │                            (to head unit)     R_pullup 10k
+          │                                                to +3V3
+          │                                                C 100nF
+                                                        BAT54S clamp
+```
+
+With the switch closed, the pin node sees `R_series` in series with the parallel
+combination of `R_ladder` (to 12 V) and `R_pullup` (to 3V3):
+
+```
+V_pin = ( (V_rail / R_ladder) + (3.3 / R_pullup) ) / ( 1/R_ladder + 1/R_pullup + 1/R_series )
+```
+
+Three consequences that shape the firmware:
+
+1. **`V_pin` depends on `V_rail`.** The same button reads ~20 % higher at 14.4 V
+   (alternator charging) than at 12.0 V. **Fixed thresholds cannot work across a
+   real vehicle.** This alone kills the "hard-coded voltage table" approach.
+2. **The mapping is monotonic but strongly non-linear**, compressing high
+   resistance values into a small voltage band. Two ladder buttons that differ by
+   a large resistance difference may differ by only a few tens of millivolts —
+   which is why `mv_tolerance` is derived from the *measured gap* (§3.4) and why
+   the ADC's accuracy ceiling (§6.5) matters.
+3. **The pull-up to 3V3 means an open input reads near 3.3 V, clamped**, which is
+   why `idle` is a high level and why an unclamped input would have destroyed the
+   pin.
+
+> **Correction to `DESIGN.md` §4.1.** That prose says the 10 kΩ is a pull-up *to
+> 12 V*. **The netlist shows `R15`/`R16` go to +3V3**; the ladder's 12 V is only
+> on the far side of `R1`/`R2` (the `J2` pin). This changes the divider math, so
+> the decode below is written as a **normalized ratio**, which is correct under
+> either reading and does not depend on resolving the discrepancy in prose.
+
+**The decode therefore uses a rail-immune normalized ratio**, not absolute
+millivolts:
+
+```
+n = V_ADC / V_ADC_idle          measured now
+n_learned = V_learned / V_learned_at_idle   recorded at learn time
+match button k  ⟺  |n − n_learned[k]| < tolerance_n[k]
+```
+
+Because both the numerator and denominator scale with the rail, **`n` is
+invariant to the vehicle's 12 V rail.** This removes the whole class of "works at
+idle, drifts when the alternator spins up" bugs, and it means runtime
+classification needs no separate rail renormalization step.
+
+Absolute millivolts are still stored and displayed (§3.2) because they are what a
+human compares against a datasheet — but **classification runs on `n`.**
+
+`AUTO` gain mode plus the measured `V_KEY_idle` is the mechanism; a fixed voltage
+table is the anti-pattern.
+
+### 6.4 Temperature compensation
+
+Two independent effects, and the firmware must not conflate them:
+
+- **The ladder itself drifts.** Vehicle switch contacts and any series elements
+  change with temperature. This is a real but *second-order* effect, and it is
+  what `RT1` is intended to compensate.
+- **The ADC and its reference drift.** The S3's ADC has a temperature
+  coefficient; eFuse calibration is done at a nominal temperature.
+
+**Honest position:** the size and sign of the ladder's own drift is not known for
+this vehicle and cannot be known until the board is on a car in real temperature
+conditions. Therefore:
+
+- v1 implements a **linear correction with a configurable coefficient, defaulting
+  to zero** — i.e. compensation is present, wired, and recorded, but **does not
+  change behavior until the user or a bring-up measurement supplies a non-zero
+  coefficient.**
+- The NTC is read and reported regardless, so a bring-up session can *measure*
+  the drift and set the coefficient, rather than guessing one now.
+- `temp_c_at_learn` is recorded (§3.4) so the correction is computable later.
+
+This is called out as an open item in §12 rather than papered over with a made-up
+coefficient. The requirement FR-17 is satisfied by the correction path existing
+and being testable; the *value* is a bring-up deliverable.
+
+### 6.5 The servo and the software trim loop
+
+The output stage is **already a closed-loop servo in hardware** (§2.3). The
+firmware's job is to command a target, not to re-implement the loop.
+
+**Verified numbers, from the netlist:**
+
+| Quantity | Value | Derivation |
+| --- | --- | --- |
+| Integrator time constant | **~10 ms** | `R46` 100 k × `C24` 100 nF |
+| Analog loop bandwidth | **~16 Hz** | `1/(2π·10 ms)` |
+| Analog settling | **tens of ms** | several time constants |
+| S3 ADC linear range at 12 dB | **0–2.9 V** | S3 ceiling — see below |
+| S3 ADC INL / DNL | **±8 / ±4 LSB** | Espressif's own comparison data |
+| Post-calibration full-scale error | **−30…0 mV** | after curve-fitting calibration |
+
+**ADC calibration is mandatory and per-chip.** Use the **curve-fitting** calibrated
+scheme (`adc_cali_create_scheme_curve_fitting()`, read via
+`adc_cali_raw_to_voltage()`), which is **factory eFuse-backed and unique to each
+chip**. Never compute `raw × 3300 / 4095` — that ignores both the eFuse
+correction and the S3's 2.9 V ceiling, and would be wrong by hundreds of
+millivolts at the top of the range.
+
+`adc_cali_create_scheme_curve_fitting()` returns `ESP_ERR_NOT_SUPPORTED` if the
+eFuses are missing (e.g. some third-party module batches). **The firmware must
+handle that case explicitly** — fall back to a documented linear approximation
+*and report that it did*, rather than silently mis-scaling every reading.
+
+The board is designed so the ADC never saturates (§2.3), so the top-of-range
+non-linearity is never reached in normal operation.
+
+**The trim loop is a supervisor, not a controller.** This is stated as a
+prohibition because the obvious wrong design is attractive and dangerous:
+
+> **Do NOT run a fast software PI loop on `/SENSEn` around the hardware
+> integrator.** Two integrators in one loop, plus ADC noise injected through the
+> second, is an oscillator. The hardware loop already regulates; a software loop
+> of comparable speed fights it.
+
+The correct design:
+
+| Property | Value | Why |
+| --- | --- | --- |
+| Function | **Open-loop DAC code is the primary command** | The servo already regulates |
+| Trim rate | **1–2 Hz** | Two decades below the 16 Hz loop — comfortably stable |
+| Trim step | **±1 LSB per update** | Moves nothing fast enough to ring the loop |
+| Deadband | **±3 LSB** | Absorbs ADC noise; without it the trim jitters the line |
+| When it runs | **Only in a steady commanded state** | Never during a transition |
+| Total authority | **Bounded cap** on deviation from the open-loop value | A wiring fault cannot drive the output to an extreme |
+| Sense sample rate | **≤ 100 Hz**, 16–64 oversamples averaged | Keeps sampling far below the loop bandwidth |
+
+The trim's purpose is to null *static* error — DAC offset and gain error,
+`R58`/`R61` tolerance, `R36` leakage — not to track dynamics.
+
+**Setpoint ramping.** Slew the DAC code at roughly **1–2 V/ms** rather than
+stepping. A stepped command can saturate the integrator, which then has to unwind;
+that adds tens of milliseconds of delay and overshoots the KEY line.
+
+**Hold time.** Hold the settled code for the head unit's recognition time —
+**≥ 100–200 ms**; the 2022 design's `KEY_SEND_DURATION_MS = 200` is a sound
+starting point — and confirm the line has returned toward idle before the next
+command.
+
+**Stability caveat for bring-up.** The dominant *unknown* plant pole is the head
+unit's own pull-up resistance (unknown, plausibly 1 k–100 k) times the harness
+capacitance (100 pF–10 nF), which lands in the tens of kHz — well above the 16 Hz
+loop, so the analog loop is stable as built. But **a long harness can slow it and
+ring.** Do not shrink `C24` without measuring, and bench-verify overshoot and
+settling on real hardware (§10).
+
+**v1 posture, given no board yet:** open-loop command with the trim loop present
+but **disabled by default** until its gain is measured on hardware. This satisfies
+FR-19 (the path exists, is bounded, and is testable) without shipping a loop tuned
+against a guess.
+
+### 6.6 The press → action path (normative ordering)
+
+```
+  raw samples ─► filter ─► classify ─► gesture ─┬─► LOCAL action (binding)  ── FIRST, always
+                                                └─► USB `event` report       ── SECOND, best-effort
+```
+
+**The local action runs first and unconditionally.** The app is an *enhancer*,
+not a dependency. If the USB link is down, the app has crashed, or the head unit
+is rebooting, every `HW_KEY` binding still works. This is FR-42, and it is the
+difference between a product and a toy.
+
+`APP_*` actions are reported to the app and are the app's business; their failure
+is reported back as a `nack`/`event` outcome but never blocks a `HW_KEY`.
+
+### 6.7 The safe idle state — the central safety property
+
+**Statement of the hazard:** `Q4` sinks. If the DAC commands a low code, the
+servo drives the KEY line low, which the head unit reads as a button held down —
+possibly *forever*, from the driver's point of view, with the radio doing
+something the driver cannot stop. During boot, a reset, or a fault, the DAC's
+state is not under firmware control.
+
+**The mitigation is three-layered:**
+
+1. **Hardware default (primary).** `U4`'s EEPROM is programmed so channel A/C
+   (signal) power up at **full scale** and channel B/D (gain) power up
+   **powered down**. Full-scale signal with the 1 kΩ gain pulldown is a command
+   *above* the head unit's idle voltage → the servo drives the gate low, `Q4`
+   turns off, and the line floats. **A dead firmware is a safe firmware.**
+   This is why §3.7's default `idle_dac_code` is `4095`, not `0`.
+2. **Boot ordering (§6.1).** The firmware verifies the safe state before it
+   brings up anything that could accept a command.
+3. **Firmware discipline.** Every fault path — watchdog, brownout handler, USB
+   disconnect, config corruption, update failure — returns to the safe idle state
+   as its first action.
+
+**This inverts the usual intuition and must not be "fixed" later:** *idle is a
+high command, not a low one,* because the output only sinks.
+
+### 6.8 Failure behavior matrix
+
+| Fault | Detection | Response |
+| --- | --- | --- |
+| Watchdog reset | Boot reason from RTC | Safe idle FIRST (§6.1), then resume; log and buzz the reset reason |
+| Brownout | Boot reason | Safe idle; hold off enabling the output until the rail is stable; log |
+| Config corrupt / bad checksum | Read-time checksum | Defaults; **loud** buzzer pattern; report `config_state: defaults` over USB |
+| Config from newer schema | `schema_version` check | Defaults; report clearly, do not attempt to interpret |
+| Head unit disappears (VBUS off) | `/VBUS_VALID` | Release the KEY line immediately; report `vbus_present: false`; keep classifying |
+| USB link drops | 10 s silence | Keep serving local bindings; report nothing (there is no one to report to) |
+| Ladder out of range | Range check | Report `UNKNOWN`, emit no gesture, do not guess |
+| Rail collapse | Rail measurement | Report out-of-range; do not classify against a stale rail |
+| OTA image bad | SHA-256 mismatch | **Do not commit**; keep running the current image; report the failure |
+| OTA image boots then faults | No health confirmation | Roll back to the previous slot (§9.4) |
+| I²C to DAC fails | NACK / timeout | Retry with backoff; if persistent, release the line and report a fault; **never drive a guessed code** |
+
+### 6.9 Default behavior — the transparent pass-through
+
+FR-25 exists so the device is useful before it is configured, and so a
+config-loss event degrades to "the steering wheel works like stock" rather than
+"the steering wheel does nothing".
+
+With no config: each channel's learned level passes through 1:1 — the incoming
+ladder position is presented to the head unit as the same corresponding key
+value, using the auto-detected gain mode. The user gets a working steering wheel
+immediately, and the app is an *upgrade*, not a prerequisite. This is also the
+fallback if learning was never done.
+
+
+---
+
+## 7. User feedback: the buzzer and LED grammar
+
+Two LEDs and a buzzer are the only feedback on the board, and they carry the
+whole no-app experience — including the programming UX the user wants carried
+forward. The grammar must therefore be **learnable and unambiguous**, not
+decorative.
+
+### 7.1 What the hardware can actually do
+
+| Output | Drive | Capability |
+| --- | --- | --- |
+| `BZ1` buzzer | `Q3` low-side FET from `/BUZZ` (IO13) | **On/off gating only.** |
+| `D6` `/LED_STAT` (IO47) | `R7` 1 k, active high | On/off. Software-PWM possible. |
+| `D12` `/LED2` (IO14) | `R26` 1 k, active high | On/off. Software-PWM possible. |
+
+**This is a capability reduction from the 2022 design**, and two facts make it
+definitive rather than provisional:
+
+- `BZ1` is a **Huaneng `TMB12A05` — an *active*, self-driving electromagnetic
+  buzzer with a built-in oscillator at a fixed ~2.4 kHz.** The tone is set by the
+  part. The old code's `pwm_set_freq_khz()` melody grammar **cannot be
+  reproduced**; gating the supply is the entire vocabulary. (An active buzzer
+  driven at a fixed DC level is also why a PWM duty-based "volume" control is not
+  meaningful in the way the old code assumed.)
+- **Both LEDs are green 0805 (`GREEN`)**, so a *colour* grammar is impossible.
+  The LEDs must be distinguished by **blink pattern and position**, not hue.
+
+Accordingly the grammar is built from **rhythm on one fixed tone**, plus two
+independently-blinking LEDs. This is a genuinely different design constraint, and
+it is stated up front so the implementation does not fight it. It is also a more
+legible grammar than pitch — beep *count* and *pattern* survive road noise and a
+driver's divided attention better than a melody does.
+
+### 7.2 The buzzer grammar — rhythm as the language
+
+Patterns are named, not ad-hoc, so they can be referenced from config and tested.
+
+```
+pattern   := pulse("on_ms", "off_ms") , repeat , gap_ms
+```
+
+| Pattern | On/off (ms) | Reps | Meaning |
+| --- | --- | --- | --- |
+| `BOOT_OK` | 60/60 | 1 | Power-on self-test passed |
+| `BOOT_DEGRADED` | 60/60 | 3 | Booted but with a fault (see `FAULT_*`) |
+| `BOOT_ERROR` | 500/200 | 2 | Cannot serve output; needs attention |
+| `KEY_ACCEPTED` | 25/0 | 1 | A gesture was recognised and an action taken |
+| `KEY_UNKNOWN` | 120/80 | 1 | A press was seen but not recognised (unlearned) |
+| `PROGRAM_ENTER` | 40/40 | 2 | Entering programming mode |
+| `PROGRAM_STEP` | 40/40 | 1 | One step deeper into a menu |
+| `PROGRAM_SAVED` | 40/20 | 4 | Setting stored |
+| `PROGRAM_EXIT` | 200/0 | 1 | Programming finished |
+| `PROGRAM_CANCEL` | 300/100 | 1 | Programming abandoned, nothing saved |
+| `LEARN_PROMPT` | 100/100 | 1 | Waiting for the user to press a button |
+| `LEARN_OK` | 40/30 | 2 | That button learned and accepted |
+| `LEARN_REJECT` | 300/80 | 2 | Sample rejected (§7.4) — will be repeated |
+| `FAULT_DAC` | 500/300 | 3 | I²C/DAC fault |
+| `FAULT_CONFIG` | 500/300 | 4 | Config corrupt; defaults loaded |
+| `FACTORY_RESET` | 800/200 | 3 | Everything erased |
+| `OTA_START` / `OTA_OK` / `OTA_FAIL` | — | — | Long single / rising double / harsh triple |
+
+**Design rules:**
+
+- **`KEY_ACCEPTED` is deliberately the quietest and shortest.** The user hears it
+  hundreds of times a drive; the diagnostic patterns are long and loud so they
+  are unmistakable and rare. If feedback were uniform, a fault would be
+  indistinguishable from normal operation.
+- **No pattern may exceed ~2 s**, because the buzzer is non-blocking (FR-21) and
+  a long pattern would still be playing over a subsequent event.
+- `buzzer_level` (`OFF` / `QUIET` / `NORMAL` / `LOUD`) scales duty or suppresses
+  entire classes: `OFF` silences everything except `BOOT_ERROR` and `FAULT_*`.
+
+### 7.3 The LED grammar — state, not events
+
+LEDs are **continuously readable state**, complementing the buzzer's **transient
+events**. They must answer "is this thing OK?" at a glance from the driver's seat.
+
+| `LED_STAT` (D6) | Meaning |
+| --- | --- |
+| Off | No power / not running |
+| **Solid** | Running, output safe, USB connected, config valid — the all-good state |
+| Slow breathe (1 Hz) | Running normally, **no USB** (app not connected) |
+| Fast blink (5 Hz) | **Fault** — see the buzzer `FAULT_*` for which |
+| Double-flash burst | Maintenance mode active (BLE/WiFi) |
+| Alternating with LED2 | Learn mode active, awaiting a press |
+
+| `LED2` (D12) | Meaning |
+| --- | --- |
+| Off | Idle, no recent key activity |
+| Flick on gesture | A gesture was recognised (mirrors `KEY_ACCEPTED`) |
+| Solid | A key value is currently being presented (**the line is driven**) |
+| Long pulse (0.5 s) | Gain mode changed, or the head unit was (re)detected |
+
+`LED2`'s "solid while driving" state is a genuine diagnostic: the user can see
+that the adapter is holding a key, which distinguishes "the adapter is doing
+something wrong" from "the head unit is ignoring it".
+
+Both LEDs are the same colour (green, §7.1), so **nothing above relies on hue** —
+`LED_STAT` is the *state* channel and `LED2` is the *activity* channel, and their
+patterns are distinct by rate and rhythm.
+
+### 7.4 The learn wizard
+
+Teachable without a phone, because the user may not have the head unit out of the
+dash. Driven either by the Android app (primary, with live graphing) or by
+AUX1 + buzzer/LED prompts (fallback, FR-31).
+
+**Per-button learn loop, with the fallback prompts:**
+
+```
+ 1. Enter learn      BEEP PROGRAM_ENTER · LED_STAT alternate, LED2 off
+ 2. Select button    BEEP PROGRAM_STEP (n beeps = nth button) · user presses AUX1 n times
+ 3. Prompt           BEEP LEARN_PROMPT · LEDs alternate
+ 4. User holds the physical steering-wheel button
+ 5. Sample           ≥ N samples over ≥ T ms; compute mean, spread, rail voltage
+ 6. Validate         ┌ reject & beep LEARN_REJECT, return to 3 if:
+                     │   · spread > noise_limit            (too noisy)
+                     │   · level within tolerance of an existing button (ambiguous)
+                     │   · level at/near idle              (button not actually pressed)
+                     │   · out of ADC range                (fault)
+                     └ accept  → BEEP LEARN_OK, store LadderButton
+ 7. More buttons?    yes → 2 ;  no → 8
+ 8. Exit             BEEP PROGRAM_EXIT · LED_STAT solid
+```
+
+**Rejection reasons are spoken aloud as distinct rhythms**, not a single generic
+failure, because "it didn't work" is not actionable and the user is doing this
+blind, holding a button with one hand.
+
+**`UNKNOWN` handling (FR-12):** a press that matches no learned window is
+reported as `event{button: null}` and beeps `KEY_UNKNOWN`. It is **never** guessed
+at — the failure mode of a wrong guess is the radio doing something the driver
+did not ask for, which is worse than doing nothing.
+
+### 7.5 The programming UX (carried forward from the 2022 design)
+
+The user's stated good part: *"hold down the button and then double/single/long
+press to set a function, buzzer sounds that escalate to indicate modes."*
+Preserved as a first-class flow, implemented properly this time (the old
+implementation was stubbed — see §2 of the plan).
+
+**Trigger: hold `AUX1` for ≥ 1.5 s.** This is a deliberate change from the
+obvious choice of the BOOT button:
+
+- **BOOT (`IO0`) is recessed** behind a Ø5 hole in the lid, and is a *strapping
+  pin* (§2.2) — a hold-at-power-on means ROM download mode, not a user action.
+- **AUX1 is a real, reachable analog input** on the `J5` terminal with its own
+  conditioning (§2.4). The user can wire a momentary button to it and reach it.
+- It costs nothing to support the app path in parallel.
+
+```
+PROGRAMMING MODE   (trigger: AUX1 held ≥ 1.5 s, or the app requests it)
+  1. Enter:      BEEP PROGRAM_ENTER ("shave-and-a-haircut": 3 short + 1 long)
+                 LED_STAT does the same 3-1 cadence
+  2. Target:     the user presses the physical button to program
+                   SWC1's buttons → 1 beep slot, SWC2's → 2, AUX1–3 → 3/4/5
+                   (beep COUNT identifies the slot — there is no pitch)
+                 LED2 flick on press so the user sees it register
+  3. Gesture:    the user then performs the gesture to bind:
+                   single press  → SINGLE   (1 beep)
+                   double press  → DOUBLE   (2 beeps)
+                   hold ≥ long   → LONG     (3 beeps)
+                 ← this escalating count IS the "buzzer sounds that escalate"
+  4. Confirm:    2 equal beeps = BEEP_SAVED
+  5. More?       return to 2; exit with AUX1 held ≥ 1.5 s again
+                 BEEP PROGRAM_EXIT
+```
+
+**The beep count is the menu depth**, which is how a fixed-pitch buzzer conveys
+"how deep am I" — the old design used rising pitch for this, and pitch is not
+available (§7.1). Counting is arguably clearer under road noise anyway.
+
+The full action library is far too large to cycle through by beeping. **The
+on-device flow therefore edits a small, high-value subset** — "present this key
+value", "present the neighbouring key's value", "release", "do nothing" — and the
+Android app is the interface for the long tail (`APP_INTENT`, `APP_LAUNCH`, …).
+This is the honest division of labour: beeps for the three things a driver wants
+at the roadside, an app for the rest.
+
+
+---
+
+## 8. Maintenance mode: BLE provisioning and WiFi
+
+**Governing requirement (user's words):** *"Normal use in the car won't
+necessarily be on wifi, but it would be for maintenance/upgrade-type things."*
+And: *"use the espressif ble app to configure wifi and other settings so you can
+put it on wifi to update firmware."*
+
+That is a precise brief, and it settles the architecture:
+
+### 8.1 WiFi and BLE are not initialized in normal operation
+
+FR-32 is a **hard rule**, and it is the single biggest power, RAM and attack-
+surface decision in the firmware:
+
+| | Normal mode | Maintenance mode |
+| --- | --- | --- |
+| WiFi stack | **Not started** | Started on entry, stopped on exit |
+| BLE stack | **Not started** | Started on entry, stopped on exit |
+| RAM held for radio | **None** | Whatever the stacks need, transiently |
+| RF emissions in the cabin | None | None when idle |
+| Attack surface | USB only | USB + BLE + WiFi, time-limited |
+
+This matters because the device sits on a car's electrical system and its only
+job is to pass button presses. A WiFi stack that is idle-but-initialized still
+costs heap, still can panic, and still has a radio on. Keeping it off is both the
+lower-risk and the lower-power choice, and it directly serves the user's "won't
+be on wifi in the car" statement.
+
+**Consequence for the flash budget:** the WiFi/BLE **code** still occupies flash
+(unless built as a separate maintenance-only image, rejected in §9.6), so the
+partition sizing in §9.2 accounts for it even though normal mode never runs it.
+
+### 8.2 Entry and exit
+
+Entry is explicit and multi-modal, so it works with or without the app:
+
+| Trigger | Notes |
+| --- | --- |
+| USB command `maintenance_enter` | Primary, from the Android app |
+| Config flag on next boot | For a user who wants it up immediately after flashing |
+| **AUX1 held ≥ 3 s** | The no-app fallback — deliberately longer than the 1.5 s programming hold so the two gestures cannot be confused |
+| Reset-reason + no-config | First-ever boot with no config offers provisioning |
+
+The BOOT button is **not** a maintenance trigger: it is recessed behind a Ø5 lid
+hole and is a strapping pin, so a hold-at-power-on would mean ROM download mode,
+not a user action (§2.2, §7.5). AUX1 is reachable and is not a strapping pin.
+
+The two holdings are deliberately distinct and nested:
+**1.5 s = programming**, **3 s = maintenance** — the shorter is a subset of the
+longer, so holding too long to program escalates cleanly into maintenance rather
+than into an undefined state.
+
+Exit happens on:
+- an explicit `maintenance_exit` command,
+- **timeout: 5 minutes of inactivity** (FR-38) — a device left unable to serve
+  button presses because someone opened a web page is unacceptable,
+- successful OTA completion (reboot anyway),
+- or an explicit `maintenance_exit` from the console.
+
+**On exit, the radio stacks are fully de-initialized and their memory freed**,
+and the device returns to normal mode. `LED_STAT` stops the maintenance
+double-flash.
+
+### 8.3 BLE provisioning
+
+**Espressif's unified provisioning with a BLE transport**, which is what makes
+the Espressif provisioning app work — the user's explicit request.
+
+| Aspect | Choice |
+| --- | --- |
+| Component | ESP-IDF `wifi_provisioning` + `protocomm`, BLE transport |
+| Host | **NimBLE** rather than Bluedroid — materially smaller flash and RAM, which matters on 4 MB/no-PSRAM (§9.2) |
+| Security | **Sec1** with a Proof-of-Possession |
+| PoP source | **Derived from the device, shown to the user.** The board has no display and no sticker — see below |
+| Device naming | Advertised name includes a short device id, so multiple units are distinguishable |
+
+**The PoP problem, stated honestly.** Sec1/SRP6a needs a secret the user can
+supply out-of-band. The board has no screen and no printed label to carry a QR
+code, and the enclosure spec explicitly designs the silkscreen *away* in favour
+of windows. So a per-device printed PoP is not available.
+
+Options, in order of preference:
+
+1. **Derive a PoP from the chip's MAC and show it in the Android app** once the
+   device is connected over USB. The app already has a trusted channel; it can
+   read the PoP over USB and display it for entry into the Espressif app. **This
+   is the recommended path** and it keeps the secret per-device and non-trivial.
+2. **A fixed PoP set at provisioning time.** Simpler, but any device is
+   provisionable by anyone in radio range during the window. Acceptable only
+   because the maintenance window is 5 minutes and opt-in — but it should be a
+   conscious acceptance, not a default.
+3. **Sec0 (no security).** Rejected as a default; offered only behind an explicit
+   `allow_insecure_provisioning` flag for bench use.
+
+**Config over the provisioning link:** `protocomm` supports **custom endpoints**,
+so the same BLE session that receives WiFi credentials can also carry
+device-specific data. The spec exposes the maintenance page's API (§8.4) over a
+custom endpoint rather than inventing a second BLE protocol. The `Config` blob
+itself is small; the full config sync is USB's job (§4), and BLE carries only
+what is needed to get onto WiFi and check for updates.
+
+### 8.4 The minimal web page
+
+Served only in maintenance mode. **It is not a config UI** — the Android app
+owns configuration. Its entire job is:
+
+```
+GET  /                 → one page: device status, WiFi setup, firmware update
+GET  /api/status       → fw version, device id, uptime, config state, WiFi state
+POST /api/wifi         → SSID + passphrase (the BLE app's job; provided for browsers)
+POST /api/ota/upload   → multipart firmware upload (the WiFi OTA path)
+POST /api/ota/check    → check git releases for a newer version (§9.5)
+POST /api/ota/pull     → download and install a release asset by URL
+POST /api/reboot       → reboot into the new image
+```
+
+**Security:** the maintenance page is reachable on whatever network the device
+joins, so it is **not unauthenticated**. It requires a token — derived and
+displayed the same way as the BLE PoP — and the page is served over the device's
+own AP **until** it joins a network, then on the joined network with the token
+required. No default password, no "admin/admin".
+
+### 8.5 The two maintenance entry points, compared
+
+| | BLE provisioning app | Web page |
+| --- | --- | --- |
+| Gets the device onto WiFi | **Yes — this is its purpose** | Possible, secondary |
+| Firmware upload from a file | No | **Yes** |
+| Firmware pull from git releases | No | **Yes** |
+| Works with no WiFi yet | **Yes** | Yes (device AP) |
+| Works from a phone | **Yes** | Yes |
+| Works from the head unit | No (no BLE provisioning app) | Yes |
+
+They are complementary, not redundant: **BLE gets you connected, the web page
+gets you updated.** The Android app's USB path (§9.3) is the third and, in the
+car, the most convenient.
+
+
+---
+
+## 9. Update paths
+
+**Requirement (user's words):** *"The android app should also be able to push an
+update via usb. Both methods should allow pushing a file to update and also
+checking the git repo release and pulling down firmware via that method."*
+
+So there are **three** update routes and **two** acquisition modes each. This
+section specifies all of them on one shared core, because they differ only in
+transport.
+
+```
+                     ┌──────────────────────┐
+   file  ──────────► │                      │
+                     │   shared update core │ ──► verify SHA-256 ──► write inactive
+   git release ────► │  (§9.4, transport-   │                        slot ──► set boot
+                     │   agnostic, tested)  │                        ──► reboot ──► health
+                     └──────────────────────┘                        ──► confirm|rollback
+                            ▲          ▲          ▲
+                            │          │          │
+                       USB (app)   WiFi (web)  (BLE carries creds only)
+```
+
+**Design rule:** the checksum, slot-writing, rollback and health-confirmation
+logic exists **exactly once** and takes a byte stream. Transports are thin
+adapters. A second implementation of the verification path is how one route ends
+up less safe than the others.
+
+### 9.1 There is exactly one artifact: the application image
+
+The coop_controller precedent updates two things — an application binary and a
+LittleFS filesystem holding its web UI. **SWC deliberately has only one.**
+
+| Artifact | Contains | Update frequency |
+| --- | --- | --- |
+| **`firmware.bin`** | The application **and the embedded maintenance web page** | Rare |
+
+The maintenance page is a handful of static files (§8.4). **Embedding them in the
+application image** rather than serving them from a filesystem partition:
+
+- **Frees the entire filesystem partition** for the app slots — ~320 KB, which
+  matters a great deal against §9.2's budget.
+- **Removes a whole OTA path.** There is no `assets.bin`, so there is no second
+  artifact to version, checksum, upload, roll back, or get out of sync with the
+  firmware that is meant to serve it.
+- **Removes a failure class.** The coop project had to invent an NVS
+  backup/restore dance precisely because flashing its filesystem wiped the user's
+  settings. With no filesystem, that problem cannot occur.
+- The page is small enough that this costs nothing: one HTML file, one CSS file
+  and a little JavaScript, all compressible.
+
+**The config is still not part of the image.** It lives in NVS and survives
+updates — that is the point. A firmware update must never cost the user their
+button mapping.
+
+### 9.2 Partition layout
+
+Constraint: **4 MB flash, two OTA slots, and an app that links WiFi + BLE +
+USB + TLS + the embedded web page.** The app must be big enough to hold all of
+that.
+
+```
+# Name,      Type, SubType,  Offset,   Size,     Notes
+nvs,         data, nvs,      0x9000,   0xC000,   48 KB — config + provisioning creds (§3.8)
+otadata,     data, ota,      0x15000,  0x2000,   A/B boot selector + rollback state
+phy_init,    data, phy,      0x17000,  0x1000,   RF calibration
+#            0x18000–0x1FFFF reserved (32 KB): keeps app0 128 KB-aligned
+app0,        app,  ota_0,    0x20000,  0x1E8000, 1,998,848 B = 1952 KB — the running image
+app1,        app,  ota_1,    0x208000, 0x1E8000, 1952 KB — the update target
+coredump,    data, coredump, 0x3F0000, 0x10000,  64 KB — crash forensics
+```
+
+**Arithmetic, checked exactly:** `0x20000 + 2 × 0x1E8000 + 0x10000 = 0x400000` =
+exactly 4 MiB. Both app slots are **1,998,848 bytes ≈ 1.95 MiB.**
+
+This is **generously above** the reference layouts: IDF's own
+`partitions_two_ota_large.csv` — the table Espressif's `advanced_https_ota`
+example uses for 4 MB parts — gives **1700 KB** per slot, and the IDF
+`wifi_prov_mgr` provisioning example's app partition is only ~1.4 MB. **1952 KB
+is larger than both**, and that gap is affordable precisely because §9.1 removed
+the filesystem.
+
+**Why NVS is 48 KB and not 24 KB:** the whole `Config` is stored as a single NVS
+blob for atomicity (§3.8). A config with two full channels of learned buttons and
+a few dozen bindings is realistically 10–15 KB of JSON, and an NVS blob must fit
+with headroom. **§10 requires the real serialized size to be measured, not
+estimated.**
+
+**Is 1952 KB enough for the app?** This is the load-bearing question and §10
+requires a **measured** answer. Reference points:
+
+- coop_controller builds an ESP32 WiFi + web + JSON + TLS app to ~1.47 MB
+  (83.4 % of its 1.75 MB slot) **without** BLE.
+- Adding BLE costs real bytes, but **NimBLE rather than Bluedroid** — a benchmark
+  reported NimBLE cutting flash by ~167 KB and heap by ~8.5 KB, and another
+  reported ~656 KB vs Bluedroid's ~1.1 MB. **Bluedroid would not fit; NimBLE is
+  not optional here.**
+
+**This remains the highest-risk budget in the project**, and it is an explicit
+gate: `pio run -t size` is checked at every milestone, and if the release build
+does not fit with NimBLE, the fallback is §9.6. The plan makes this an early
+measurement, not a late surprise.
+
+### 9.3 Route A — update over USB from the Android app
+
+The in-car path, and the one the user asked for first. Works with no WiFi, no
+BLE, and no user interaction with a web page.
+
+```
+  ota_begin  { size, sha256, version }
+  ota_chunk  { offset, data_b64 }            ← repeated, acked
+  ota_end    { }                             ← verify, mark valid, offer reboot
+```
+
+**Requirements:**
+
+- **Chunked with per-chunk acks**, so the app can show real progress and resume
+  a partially-transferred image rather than restarting a 1.75 MB push.
+- **SHA-256 computed incrementally during the write** and compared at `ota_end`.
+  Never buffer the whole image in RAM (there is no PSRAM) and never trust a
+  size-only check.
+- The device MUST reject an image claiming the wrong size, or any chunk with a
+  gap or an overlap.
+- **The device keeps serving button presses during the transfer.** The update
+  writes to the *inactive* slot; normal operation continues on the active one.
+  This is a real advantage over the naive "reboot to a bootloader" approach and
+  it matters because the car may be driving.
+- On `ota_end` success the device offers a reboot; it does **not** reboot on its
+  own while a key value is being presented.
+
+### 9.4 Route B — update over WiFi via the maintenance page
+
+1. Device is in maintenance mode and on WiFi (§8).
+2. User opens the page and either uploads a file or asks it to **check for
+   updates**.
+3. For an upload, the page streams the file to `/api/ota/upload`, which feeds the
+   **same shared core** as Route A.
+4. For a check/downpull, see §9.5.
+
+### 9.5 The git-release scheme
+
+Modelled directly on the coop_controller implementation the user built and
+approved (`docs/ota-update-system.md`), which is the reference design. Same
+shape, adjusted for this project.
+
+**Published per release (GitHub Releases):**
+
+```
+firmware.bin            the application image (includes the embedded web page)
+firmware_merged.bin     full-flash image, for first-time bench flashing
+version_manifest.json   the update descriptor
+```
+
+**The manifest** — the contract between CI and the device:
+
+```jsonc
+{
+  "latest_version": "1.2.0",
+  "channel": "stable",
+  "firmware": {
+    "version": "1.2.0",
+    "url": "https://github.com/<owner>/<repo>/releases/download/v1.2.0/firmware.bin",
+    "size_bytes": 1543210,
+    "sha256": "…"
+  },
+  "assets": null,
+  "min_from_version": "1.0.0",
+  "release_date": "2026-09-18T00:00:00Z",
+  "changelog": "…"
+}
+```
+
+**Check procedure (on device, in maintenance mode, or proxied by the app):**
+
+1. Fetch the manifest. **Verify TLS against a pinned CA certificate — not
+   `setInsecure()`.** The coop project shipped with certificate validation
+   disabled and flagged it as a known gap; **SWC must not repeat that.**
+2. Semver-compare `latest_version` against the running version.
+3. If newer, **verify `sha256` and `size_bytes` before writing anything.**
+4. Honor `min_from_version`: if the running version is older, the update is not
+   offered (it would need a staged migration), and the user is told why.
+5. Download to the inactive slot and confirm.
+
+**Where the check runs, and why it matters:** the ESP32 may have no WiFi in the
+car, so the **Android app should also be able to perform the check over its own
+internet connection** and then push the resulting file over USB. That turns
+"update the adapter" into something the user can do in a driveway with the head
+unit on a phone hotspot. This is the practical superset of the user's two
+requests, and it is why the manifest is a published, static, verifiable artifact
+rather than something only the device can interpret.
+
+**`channel`** (`stable` / `beta`) is included in the manifest from v1 so a beta
+path can be added without a firmware change.
+
+### 9.6 Rejected: a separate maintenance-only firmware image
+
+Splitting "normal" and "maintenance" into two images would shrink the main app
+below the 1.75 MiB constraint entirely and eliminate the radio code from the
+production image. Rejected because it makes firmware updates two-phase (flash
+maintenance image → update → flash back), requires a way to store and restore
+the original, and is materially more complex for a two-person-scale project. **It
+remains the documented fallback if §9.2's measured budget fails.**
+
+### 9.7 Release automation
+
+Mirrors the coop project's proven pipeline:
+
+```
+push tag v*.*.*  ─► CI: build firmware ─► run the FULL test suite
+                 ─► compute SHA-256 ─► generate version_manifest.json
+                 ─► create the GitHub release with all artifacts
+```
+
+**A release MUST fail if any test fails.** This is how the "verify, don't assume"
+requirement is enforced without a human remembering to check.
+
+### 9.8 Safety properties of the update system (FR-36, FR-37, FR-41)
+
+| Property | Mechanism |
+| --- | --- |
+| Never install an unverifiable image | SHA-256 checked incrementally during write; mismatch → discard, keep running the old image |
+| Never brick on a bad image | A/B partitions; a new image must **confirm health** before the boot pointer is moved |
+| Never lose the user's config | Config lives in NVS, untouched by any update path |
+| Never drive a stuck key during an update | The active image keeps running and keeps the safe idle state; the reboot into the new image goes through §6.1's boot sequence |
+| Never offer an incompatible jump | `min_from_version` in the manifest |
+
+**Health confirmation (FR-37)** — the mechanism, stated explicitly because it is
+the difference between a recoverable and an unrecoverable mistake:
+
+1. The new image boots and runs §6.1 **through step 8** — safe idle established,
+   config loaded, classification running.
+2. Only then does it call the bootloader's *mark-valid* API to cancel the
+   pending rollback.
+3. If the image faults, resets, or watchdog-trips **before** reaching step 2 — the
+   bootloader counts a failed attempt and rolls back to the previous slot.
+4. Bootloader attempt counting is configured with a small limit (e.g. 3) so a
+   boot-looping image cannot spin forever.
+
+**The critical subtlety:** mark-valid must happen **after** the output is safe
+*and after* the device has proven it can do its job — not merely after `main()`
+starts. An image that boots but cannot drive the DAC is not healthy, and
+confirming it would strand the user with a bricked-but-"valid" device.
+
+
+---
+
+## 10. Build and verification strategy
+
+The rule for this project: **nothing is "done" because it compiles.** Every
+requirement above is either (a) covered by an automated test, (b) covered by a
+scripted on-device procedure with pass/fail thresholds, or (c) explicitly listed
+in §12 as unverifiable and why. §11 is the matrix that proves the coverage is
+complete.
+
+### 10.1 Repository layout
+
+Everything lives under `code/` in the PCB repo. The firmware is a PlatformIO
+project; the Android app is a Gradle project beside it; the contract between them
+is one generated header so the two can never drift.
+
+```
+code/
+├── platformio.ini                 # firmware envs: native, esp32s3, esp32s3-ota
+├── partitions.csv                 # §9.2, exactly
+├── sdkconfig.defaults             # the non-default knobs, checked in
+├── src/                           # thin: main.c + wiring only
+├── lib/                           # one directory per module, each unit-tested
+│   ├── HAL/          IHAL.h, EspHal.{h,cpp}, MockHAL.{h,cpp}
+│   ├── Analog/       AdcReader, LadderDecode, CalibrationCurve
+│   ├── Output/       DacMcp4728, GainPolicy, ServoLoop
+│   ├── Gesture/      PressClassifier, GestureStateMachine
+│   ├── Bindings/     ActionLibrary, BindingResolver
+│   ├── Feedback/     BuzzerGrammar, LedGrammar
+│   ├── Config/       ConfigStore (A/B NVS), ConfigCodec
+│   ├── Link/         Ndjson, UsbCdc, CommandRouter
+│   ├── Maintenance/  BleProvisioning, WebPage, MaintenanceMode
+│   └── Update/       OtaUsb, OtaWifi, ReleaseCheck, ImageVerify
+├── test/                          # Unity, runs ON the device
+├── test_native/                   # GoogleTest, runs ON the desktop
+├── tools/                         # host-side scripts (release, contract gen)
+├── contract/                      # the single source of truth for the wire types
+│   └── swc_contract.h             # GENERATED, checked in, CI-diffed
+├── android/
+│   ├── app/src/main/java/...      # Compose UI + usb-serial + provisioning
+│   ├── app/src/test/              # JVM unit tests
+│   └── app/src/androidTest/       # instrumented tests
+└── .github/workflows/
+    ├── firmware.yml               # test → build → size gate → artifacts
+    └── android.yml                # test → assembleDebug → APK artifact
+```
+
+**Why the split between `src/` and `lib/`:** PlatformIO runs `lib/` tests from
+`test_native/` against the host compiler with no ESP32 toolchain involved, so the
+pure logic (ladder decode, gesture timing, gain policy, NDJSON parse, config
+codec) is testable in milliseconds with no hardware. Only the HAL implementation
+and the RTOS plumbing require the device.
+
+### 10.2 The HAL seam
+
+`IHAL` is the only interface between logic and silicon. Every module above
+`lib/HAL/` takes an `IHAL&` and is therefore host-testable.
+
+```c
+// lib/HAL/IHAL.h  (shape, not final)
+typedef struct {
+    int  (*adc_read_mv)(void *ctx, AdcChannel ch);      // calibrated millivolts, §2.3
+    void (*dac_set_code)(void *ctx, DacChannel ch, uint16_t code);
+    void (*dac_power_mode)(void *ctx, DacChannel ch, DacPowerMode m);
+    void (*dac_ldac)(void *ctx, bool assert);
+    void (*gpio_write)(void *ctx, GpioPin pin, bool level);
+    bool (*gpio_read)(void *ctx, GpioPin pin);
+    void (*buzzer_on)(void *ctx, bool on);
+    uint64_t (*now_ms)(void *ctx);
+    uint64_t (*now_us)(void *ctx);
+    int  (*nvs_get)(void *ctx, const char *key, void *out, size_t len);
+    int  (*nvs_set)(void *ctx, const char *key, const void *in, size_t len);
+    void (*reboot)(void *ctx);
+    void *ctx;
+} IHAL;
+```
+
+**`now_ms`/`now_us` are in the HAL on purpose.** Every timing rule in §7 — the
+500 ms double-press window, the 750 ms long-press threshold, the 200 ms send
+duration, the 5-minute maintenance timeout — is a *tested* rule, and the only way
+to test a timing rule without sleeping is to make the clock an input.
+`MockHAL` advances a synthetic clock, so the entire gesture grammar is exercised
+deterministically in microseconds of wall time.
+
+**Contract generation.** `tools/gen_contract.py` reads §3 and §4 and emits
+`contract/swc_contract.h` (firmware) and, via `tools/gen_contract_kotlin.py`, the
+matching Kotlin data classes. CI runs both and fails if the checked-in output
+differs — so a change to a field name in the spec surfaces as a failing build
+rather than as a runtime parse failure in a car.
+
+### 10.3 Framework and platform pinning
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `framework` | `espidf` | Not Arduino. The reported crash class (§1) is Arduino-only |
+| `platform` | **pioarduino's fork, pinned to an exact release tag** — `https://github.com/pioarduino/platform-espressif32/releases/download/55.03.311/platform-espressif32.zip` | See below — this is not a preference, it is forced |
+| `board` | the DOIT ESPS3-32-N4 definition, or a custom `board_*.json` | Must match the ordered module: 4 MB flash, no PSRAM, USB-Serial-JTAG on IO19/IO20 |
+| `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG` | y | Console on the ROM USB-JTAG peripheral |
+| `CONFIG_TINYUSB_CDC_ENABLED` | y | The app link on TinyUSB CDC — **two separate USB endpoints, deliberately** (§4.1) |
+| `CONFIG_BT_ENABLED` + `CONFIG_BT_NIMBLE_ENABLED` | y (NimBLE) | Bluedroid does not fit; §9.2 |
+| `CONFIG_ESP_ADC_CAL_*` | curve-fit, per-chip | §2.3; raw-ADC accuracy claim depends on this |
+| `CONFIG_MBEDTLS_HARDWARE_AES` | **n** | Avoids the mbedTLS GCM/DTLS bug that caused the user's TLS crashes; §1 |
+| `CONFIG_ESP_SYSTEM_PANIC` | `gdbstub` in dev, `reset` in release | A coredump partition exists (§9.2) for post-mortem |
+
+**Why the platform is forced (verified 2026-09-18, not assumed).** Stock
+PlatformIO's `espressif32` registry platform is at **7.1.3** and its
+`framework-espidf` package tops out at **4.60100.0 — ESP-IDF 4.6.1**. There is
+**no IDF 5.x in the stock registry at all**: the published `framework-espidf`
+versions are 3.4.x, 3.5.x and 4.6.x, and that is the whole list. IDF 4.6.1 is
+older than the mbedTLS/GCM bugfix that motivated this decision, so the stock
+platform would silently reintroduce the exact TLS defect the project exists to
+avoid.
+
+`pioarduino/platform-espressif32` **55.03.311** ships
+`framework-espidf` from `esp-idf v5.5.5`, which is the version this project
+targets. It also happens to be the same fork this machine already uses for the
+Arduino work, so the toolchain is proven here.
+
+**Pin to the release tag, never the rolling `stable` zip.** The rolling zip's
+framework spec drifts, which triggers pioarduino's reinstall path, and **that
+path crashes under Python 3.14** (`exists(None)` in `safe_framework_cleanup`).
+This machine runs Python 3.14.7, so the pinned tag is required, not merely
+advisable. A pinned tag gives a deterministic package spec and a clean install.
+
+A **custom board JSON is likely required** — the stock `esp32-s3-devkitc-1`
+definition has PSRAM enabled and a different flash size, both of which would
+produce a build that lies about the target.
+
+### 10.4 The test pyramid, and what belongs at each level
+
+**Level 1 — native unit tests (`test_native/`, GoogleTest).** No hardware, no
+RTOS, milliseconds. This is where the correctness of the *rules* lives:
+
+- **`LadderDecode`** — the ratio-normalized transfer function of §6.3, against
+  synthesized ADC traces: exact resistors, ±1 % resistors, 11.0–14.8 V rail
+  sweep, ±temperature skew. **The assertion is behavioural:** the same physical
+  button classifies identically at 11.0 V and at 14.8 V. That single test is the
+  entire justification for the ratio-normalization design choice.
+- **`CalibrationCurve`** — the curve-fit polynomial and the attenuation
+  conversion; a table of (raw, expected_mv) pairs at the 2.9 V ceiling (§2.3).
+- **`GainPolicy`** — the 1.82/1.00 selection, the 2.6–3.4 V guard band, the
+  asymmetric default. Feeds §6.2's envelope and asserts the output never leaves
+  1.80–5.20 V for any legal input.
+- **`ServoLoop`** — convergence, overshoot bound, and settling time against a
+  plant model of the op-amp integrator. Includes the degenerate cases: no
+  head-unit load, an open circuit, a short.
+- **`PressClassifier` / `GestureStateMachine`** — every gesture in §3.4 with a
+  synthetic clock: single, double, long, double-then-long, the 500 ms boundary
+  at exactly 499/500/501 ms, the 750 ms boundary at 749/750/751, debounce, and a
+  press that never releases (must not hang the link).
+- **`Ndjson`** — framing, partial reads, split frames across a read boundary, a
+  frame larger than the buffer, malformed JSON, and a `seq` gap (must be
+  *detected and reported*, not silently tolerated).
+- **`ConfigCodec`** — round-trip of every field in §3, a truncated blob, a
+  corrupted blob with a bad CRC, and a blob from a **newer** `schema_version`
+  (must refuse, not misparse).
+- **`ConfigStore`** — the A/B dual-slot scheme of §3.8 against a `MockNVS` that
+  can fail a write at an arbitrary byte offset, simulating power loss mid-write.
+  **The assertion is** that after any injected failure, the store reloads the
+  *previous* good config, never a torn one.
+- **`ReleaseCheck`** — the manifest parse and version comparison of §9.5,
+  including a downgrade attempt, a `min_from_version` refusal, and a manifest
+  pointing at a URL for a different board.
+- **`ActionLibrary` / `BindingResolver`** — every action in §3.6 resolves; an
+  action with a data payload round-trips it; an unknown action id is rejected
+  with an error rather than silently dropped.
+
+**Level 2 — on-device tests (`test/`, Unity).** Runs on the real board, asserts
+what only silicon can answer. Deliberately small and mostly *measurement*, not
+logic:
+
+- **ADC linearity and calibration** — a sweep against a bench supply across
+  0–2.9 V, asserting the curve-fit error stays inside the §2.3 budget. This test
+  *produces a number*, which is then recorded in the spec. It is a calibration
+  check, not a pass/fail on the driver.
+- **DAC monotonicity** — every one of the 4096 codes is monotonic in the
+  measured output; no missing codes. Catches a wiring or I²C-order fault that
+  desktop tests cannot see.
+- **Gain-mode envelope** — drive the DAC across its range in both gain modes and
+  assert the measured output stays in 1.80–5.20 V and switches cleanly at the
+  guard band. §6.2's numbers are only true if this passes.
+- **USB enumeration** — both the CDC interface and the console enumerate
+  simultaneously on one cable, and the console does not corrupt the app link.
+- **NVS round-trip and power-loss** — write a config, cut power mid-write
+  (hardware-interruptible power switch on the bench), assert boot delivers the
+  old config.
+- **OTA A/B rollback, for real** — flash a deliberately-faulting image
+  (compiles, panics at startup), assert the bootloader rolls back and the device
+  comes up on the old image. **This must be tested with a genuinely broken
+  image**, not a mocked failure, or it proves nothing.
+
+**Level 3 — Android tests.** JVM unit tests for the protocol codec, the config
+model, and the update-state machine (all host-only, fast). Instrumented tests
+for the USB permission flow, the Compose screen state, and — where the emulator
+permits — the provisioning client against a mock peripheral. **What cannot be
+tested without the physical head unit is listed in §12**, not quietly skipped.
+
+**Level 4 — system/bench tests.** Scripted, with the board wired to a bench
+supply, a resistor ladder in place of the steering wheel, and a head-unit
+emulator (a resistor load plus a scope on the output). These are the tests that
+answer the questions the user actually cares about:
+
+- Every learned button, pressed 100 times each, at three rail voltages (11.0,
+  12.6, 14.8 V) — **zero misclassifications**, and every press produces exactly
+  the expected output level.
+- The output level for each button, measured, versus the head unit's own
+  documented ladder windows — the end-to-end pass/fail that matters.
+- Simultaneous-press and rapid-alternation behaviour per §6.
+- 72-hour soak with randomized presses, asserting no watchdog reset, no heap
+  exhaustion, and a bounded worst-case latency.
+
+### 10.5 Build gates (these fail the build, they are not advisory)
+
+| Gate | Command | Threshold |
+| --- | --- | --- |
+| Native tests | `pio test -e native` | 100 % pass, no skips |
+| Device tests | `pio test -e esp32s3` | 100 % pass on the bench board |
+| App fits the slot | `pio run -e esp32s3 && pio run -t size` | ≤ 1952 KB (§9.2) — **the highest-risk gate** |
+| Free-heap headroom | runtime assertion in the device test | ≥ 20 % free at worst-case steady state |
+| Config fits NVS | `ConfigCodec` round-trip size assertion | ≤ 24 KB serialized vs the 48 KB partition |
+| Contract in sync | `tools/gen_contract*.py` then `git diff --exit-code` | No diff |
+| Android builds | `./gradlew assembleDebug test` | Clean, tests pass |
+
+**If the app does not fit 1952 KB**, the documented fallback is §9.6's separate
+maintenance image — decided now, so a size blowout is a known trade, not a
+mid-project emergency. The gate exists so that is discovered in CI, on day one,
+rather than the week the boards land.
+
+### 10.6 Bring-up plan for the ordered board
+
+The board arrives in a few days; the firmware is written ahead of it. That
+ordering creates a specific risk — **code that has never met silicon** — so
+bring-up is a scripted sequence, and each step's result is *recorded*, not
+eyeballed. Nothing later is trusted until the step before it passed.
+
+1. **Power and identity.** 5 V bench supply, current draw sane, AMS1117 rails
+   correct, module enumerates on USB-Serial-JTAG. Confirm the flash size and
+   absence of PSRAM the build assumed. *If this disagrees with the board JSON,
+   stop and fix the board definition — every later measurement is void.*
+2. **I²C and the DAC.** Scan the bus, find the MCP4728 at its strap address,
+   write a mid-code, measure with a meter. Confirms §2.5's wiring and that
+   `LDAC` behaves.
+3. **The ADC ladder.** With a resistor ladder in place, sweep the bench supply
+   11.0 → 14.8 V and record the idle and per-button readings. **Fit the real
+   calibration here** — this is where the §2.3 numbers become true for the
+   actual board.
+4. **The output stage and gain.** Measure the output envelope in both gain
+   modes, verify 1.82 and 1.00, verify the guard-band switch, verify the 1.80 V
+   floor and 5.20 V ceiling. Update §6.2 if reality disagrees — and it may, on
+   the first board.
+5. **Servo dynamics.** Step the DAC, scope the output, measure overshoot and
+   settling. Tune §6.5's constants to the *measured* plant, and if the measured
+   plant contradicts the modelled one, the model is what changes.
+6. **Feedback.** Buzzer gate and the two LED channels, both cadences of §7.
+7. **Timing.** The gesture boundaries under a real, jittery RTOS — the native
+   tests prove the *rule*, this proves the *implementation meets the rule* with
+   real scheduling latency.
+8. **NVS and OTA.** The dual-slot write with a real power cut, then a real A/B
+   update with a real broken image. Both are called out in §10.4 for the same
+   reason: a mocked version of either test is worthless.
+9. **System bench tests** (§10.4 level 4) — the ones that decide whether the
+   thing actually works in the car.
+
+**Every step produces a number that goes back into this spec.** The spec is the
+living contract; if bring-up contradicts it, the spec is wrong and gets fixed in
+the same commit as the code.
+
+### 10.7 What "done" means
+
+A requirement is done when: its §11 row names a test, that test exists, that
+test fails before the implementation and passes after, and — for anything in
+§10.6 — the measured number is recorded. The user's own review (the punch list
+that drove this design) is the final acceptance, not the ERC or the test suite.
+
+---
+
+## 11. Traceability matrix
+
+Every requirement maps to at least one test, and every test names the file it
+lives in. A requirement with no test is a gap; a test with no requirement is
+either a gap in the requirements or dead weight. §12 lists the requirements
+whose tests cannot be fully automated, and why.
+
+Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
+`test/` (Unity, device), **B** = bench/system (§10.4 level 4), **A** =
+`android/app/src/test|androidTest` (JVM/instrumented).
+
+| FR | Verified by | Location | The assertion that actually decides it |
+| --- | --- | --- | --- |
+| FR-1 | Non-blocking acquisition test | N + D | Under a 20 ms injected USB stall, ADC sample cadence stays within 5 % of nominal |
+| FR-2 | `CalibrationCurve` + ADC linearity | N + D | Curve-fit error ≤ 25 mV over 0–2.9 V; a fixed-linear-scale implementation fails this |
+| FR-3 | Filter settling test | N | Step response settles in < `debounce_ms`, and a 20 ms press is not attenuated below the detection threshold |
+| FR-4 | Fault-injection tests | N + D | Open input, short-to-rail and rail collapse each yield `FAULT_*`, never a button classification |
+| FR-5 | Live-sample stream test | N + D | During learn, ≥ 20 samples/s reach the link with bounded latency |
+| FR-6 | Classification + hysteresis test | N | A level inside the window's outer edge twice in a row does not re-trigger; each learned button classifies at 11.0/12.6/14.8 V |
+| FR-7 | Gesture tests | N | Each of SINGLE/DOUBLE/LONG fires exactly once for its stimulus |
+| FR-8 | Injected-clock suite | N | The entire §3.4 gesture set runs with zero wall-clock sleeps |
+| FR-9 | Dual-channel concurrency test | N + B | Two simultaneous presses produce two independent, correct events |
+| FR-10 | Long-press timing test | N | `LONG` fires at 750 ms ± 1 tick, **before** release |
+| FR-11 | Gesture-exclusivity tests | N | LONG emits no SINGLE; DOUBLE's second press emits no SINGLE |
+| FR-12 | Unlearned-press test | N + B | A never-learned level yields `event{button:null}` + `KEY_UNKNOWN`, never a guess |
+| FR-13 | Boot-sequence test | N + D + B | Safe idle is measured on the output **before** USB enumerates |
+| FR-14 | Gain-policy tests | N + D | AUTO picks 1.82 vs 1.00 per §6.2; a forced mode is honoured |
+| FR-15 | Output-command test | N | Correct DAC code written, held for `press_ms`, then released |
+| FR-16 | Release-state test | D + B | After release, the KEY line measures high-Z and the head unit sees its own idle |
+| FR-17 | Temp-comp test | N | A ±30 °C shift moves the windows by the modelled amount and classification still succeeds |
+| FR-18 | Clamp test | N | An over-ceiling code is clamped and logged; an out-of-envelope write never reaches the DAC |
+| FR-19 | Trim-loop tests | N + B | Converges within the bound, zero overshoot beyond spec, and no ADC-noise injection into the output |
+| FR-20 | Grammar tests | N + D + B | Every pattern in §7.1/§7.3 produces the documented drive sequence |
+| FR-21 | Feedback-nonblocking test | N + D | A key press during an in-flight buzzer pattern is still served on time |
+| FR-22 | Level-setting tests | N | Each level, including fully-off, suppresses the right classes and nothing else |
+| FR-23 | Atomic-persist test | N + D | Power loss at any byte offset yields the previous good config, never a torn one |
+| FR-24 | Corrupt/newer-config test | N | Corrupt CRC and newer `schema_version` each fall back to defaults **and** signal audibly |
+| FR-25 | No-config pass-through test | N + D + B | With empty config, output tracks input 1:1 |
+| FR-26 | Config-validation test | N + A | Invalid config → `nack`, and a read-back proves the old config is intact |
+| FR-27 | Export/import test | N + A | Full config JSON round-trips byte-identically through export → import |
+| FR-28 | Learn-mode tests | N + D + B | Measured level, tolerance and rail are stored and match the bench instrument |
+| FR-29 | Learn-rejection tests | N | Noisy and too-close-to-existing samples are each rejected **with the correct distinct reason** |
+| FR-30 | Rail-renormalization test | N | A button learned at 12.6 V classifies correctly at 11.0 V and 14.8 V |
+| FR-31 | Headless-learn test | D + B | A full learn completes with no USB host attached, driven by AUX1 + buzzes |
+| FR-32 | Radio-absent test | D + B | In normal mode, current draw and heap show WiFi/BLE never initialized |
+| FR-33 | Maintenance-entry tests | N + D | Each of the three triggers enters maintenance; each exits correctly |
+| FR-34 | Provisioning test | D + A | The **real Espressif provisioning app** completes provisioning against this device |
+| FR-35 | Dual-path update tests | D + B | A file update and a git-release update each succeed over WiFi **and** over USB |
+| FR-36 | Checksum-refusal test | N + D | A corrupted image is refused; the device keeps running the old image |
+| FR-37 | Rollback test with a real bad image | D + B | A genuinely faulting image rolls back automatically (§10.4) |
+| FR-38 | Maintenance-timeout test | N + D | 5 minutes of inactivity returns to normal mode and serves a press again |
+| FR-39 | Reset-safety test | D + B | On reset, watchdog, brownout and USB-disconnect, the measured KEY line is idle, **not** driving |
+| FR-40 | Watchdog-recovery test | D + B | After a forced WDT reset, safe idle is re-established before any key can be served |
+| FR-41 | Brick-resistance test | D + B | Repeated failed updates never leave an unbootable device |
+| FR-42 | Headless-operation test | B | Full button function with USB down, no app, no WiFi — the normal in-car case |
+
+**Coverage statement:** 42 of 42 requirements have an automated or scripted
+test. Zero requirements are covered only by inspection. The six that need
+physical hardware — FR-16, FR-34, FR-39, FR-40, FR-41, FR-42 and the bench
+portions of FR-6, FR-9, FR-12, FR-19, FR-31, FR-35, FR-37 — are blocked on the
+ordered board and are called out in §12 as the critical path.
+
+---
+
+## 12. Open items, risks, and accepted limitations
+
+### 12.1 Open items needing a decision or a measurement
+
+| # | Item | Needed by | Blocking? |
+| --- | --- | --- | --- |
+| N-1 | **The exact DOIT ESPS3-32-N4 flash/RAM configuration** — confirm 4 MB flash, no PSRAM, and the USB-Serial-JTAG pin map, then fix the board JSON | Immediately | **Yes** — every build depends on it |
+| N-2 | **The head unit's actual ladder resistor values and windows.** The spec's envelope assumes a 5 V-referenced ladder; if the real radio differs, §6.2's guard band and §2's divider assumptions change | Before bench tests | Yes, for output calibration |
+| N-3 | **App-fits-in-1952 KB** — unresolved until the first full BLE build with NimBLE. The §9.6 fallback is the answer if it does not | First CI run | No (fallback exists) |
+| N-4 | **The real MCP4728 I²C address strap** on this board — read from the schematic/silkscreen, not assumed | Before step 2 of bring-up | Yes, for bring-up |
+| N-5 | **Whether the integrator's measured plant matches the modelled one.** §6.5's servo constants are a model until step 5 of bring-up | Bring-up | No, but constants change |
+| N-6 | **Android: the head unit's Android version and whether it is rooted/a system app.** Determines if launching apps from background needs the launcher role or the overlay permission (§3.6, Android BAL) | Before Android work | Yes, for the app's action library |
+| N-7 | **Long-term availability of the DOIT module.** It was chosen for JLCPCB Economic eligibility; if it goes away, the fallback changes the board JSON and possibly the pin map | Not urgent | No |
+| N-8 | **The first `pio run -e esp32s3` against pioarduino 55.03.311.** The platform/IDF pairing is verified from the published manifests, but the ESP-IDF branch of this fork has not been exercised on this machine yet — the Arduino branch has | **First task** | **Yes** — if it does not build, the framework decision is reopened |
+
+### 12.2 Risks, ranked by expected damage
+
+| # | Risk | Impact | Mitigation |
+| --- | --- | --- | --- |
+| R-1 | **The app does not fit 1952 KB with BLE + WiFi + OTA + web UI** | High — forces the §9.6 split image | Gate it in CI on day one (§10.5); the fallback is designed, not improvised |
+| R-2 | **A wrong config drives a wrong key in a moving car** | High — could be genuinely dangerous | Ratio-normalized decode, hysteresis, never guessing `UNKNOWN`, safe idle on every fault path, and §10.4's 100-press × 3-voltage misclassification test |
+| R-3 | **The output stage misbehaves on the real head unit** (impedance, bias, the 1.80 V floor) | High | Real-load bench test with a head-unit emulator; the envelope is asserted, and the spec gets corrected by measurement |
+| R-4 | **First firmware meets silicon only at bring-up** | Medium–High | The bring-up plan of §10.6 is ordered so each step gates the next; nothing is trusted on the strength of a compile |
+| R-5 | **Android BAL: cannot launch apps from background** | Medium — could kill a headline feature | targetSdk 34 to avoid BAL hardening; default-launcher role is the real fix, overlay permission the fallback; **needs N-6 to resolve** |
+| R-6 | **USB CDC + USB-Serial-JTAG coexistence on the head unit's host stack** | Medium | Tested explicitly in §10.4 level 2; the console can be disabled in release if the host chokes |
+| R-7 | **NVS wear over the device's life** | Low | Dual-slot A/B with staged writes; config writes are rare, and only on user action |
+| R-8 | **BLE provisioning UX friction** (the Espressif app's own flow) | Low | Keep the device's own config as the source of truth; BLE only ever sets WiFi credentials |
+| R-9 | **The pioarduino IDF-5 platform does not build cleanly here** | High if it happens — it removes the reason ESP-IDF was chosen | N-8 tests it in the *first* task, before any real code exists. Fallback order: (a) a different pinned pioarduino tag, (b) a hand-installed IDF 5.x via `esp-idf` directly with `pio run` driving `idf.py`. What is **not** a fallback is stock PlatformIO — that is IDF 4.6.1, which reintroduces the TLS bug |
+
+### 12.3 Accepted limitations (stated, not hidden)
+
+- **The buzzer cannot change pitch.** It is an active magnetic buzzer at a fixed
+  ~2.4 kHz (§7.1). All feedback is rhythm, count and duration. Any future design
+  that wants pitch must change the part.
+- **The LEDs are one colour.** Both are green (§7.3). The grammar uses position
+  and pattern, never hue.
+- **No DAC Hi-Z.** The MCP4728 has no high-impedance output state; "release" is
+  implemented as *command-above-idle* plus the sink FET turning off (§6.7). A
+  future board revision with a different DAC could change this.
+- **No PSRAM means no large buffers.** TLS for OTA, the web page, and BLE all
+  fit in internal RAM or they do not ship. This is a hard constraint, not a
+  preference.
+- **The Android side cannot be fully tested without the head unit.** What that
+  means concretely: the USB permission flow, the background-launch behaviour, and
+  the real system-UI interaction are **not** covered by the automated suite, and
+  the spec says so rather than implying coverage it does not have.
+- **The 2022 Pico design's programming UX is preserved in spirit, not in code.**
+  Its gesture-recognition functions were stubs (`return true`) with no
+  persistence (§2 of the plan). The *interaction* — hold, then single/double/long
+  to assign, with escalating buzzer feedback — is carried forward and implemented
+  properly; the implementation is new.
+
+### 12.4 What would change this design
+
+Recorded so a future reader knows which decisions were contingent:
+
+| If this turns out true | Then this changes |
+| --- | --- |
+| The head unit needs a current-mode, not voltage-mode, ladder | The entire output stage model (§6.2, §6.5) — a real redesign, not a tuning change |
+| The board ships with a different DAC without Hi-Z too | Nothing — the current design already assumes no Hi-Z |
+| 4 MB proves unworkable with BLE | §9.6's separate maintenance image becomes the primary design; normal mode drops the radio code entirely |
+| The head unit's Android blocks background launch outright | The "launch app / send intent" feature degrades to a foreground-only feature, or the app becomes a launcher — **this is the single largest UX risk in the project** |
+
+---
+
+## Appendix A: the 2022 design, and what was kept
+
+| Aspect | 2022 (Pico + digital pot) | This design | Verdict |
+| --- | --- | --- | --- |
+| Output element | Digital pot | 12-bit DAC + op-amp integrator servo | **Replaced** — the stated reason the old design "didn't work well" |
+| Ladder decode | 1/3-of-range heuristic over 0..24 | Ratio-normalized windows, learned per vehicle | **Replaced** |
+| Gesture recognition | Stubbed (`check_is_double_press_key` / `check_is_long_press_key` both `return true`) | Deterministic, clock-injected state machine (§3.4) | **Replaced** — the old code could not have worked |
+| Persistence | None | Dual-slot A/B NVS with CRC (§3.8) | **Added** |
+| Programming UX (hold, then single/double/long, escalating buzzer) | Present in intent | Preserved as first-class (§7.5) | **Kept** — the user's stated good part |
+| Android link | Custom serial driver | NDJSON over TinyUSB CDC (§4) | **Kept, standardized** |
+| Timings | `MAX_DOUBLE_PRESS_OFF_MS 500`, `MIN_LONG_PRESS_MS 750`, `KEY_SEND_DURATION_MS 200` | Same defaults, now configurable and tested | **Kept** |

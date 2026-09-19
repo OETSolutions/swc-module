@@ -372,6 +372,57 @@ the app is not running) while `DOUBLE` sends an `APP_INTENT` (an extra function
 the head unit never had). That is the whole point of the product, and the data
 model expresses it without a special case.
 
+**An action has no id.** It is identified by its `kind` (the 11 above) plus its
+params. An earlier revision of the plan invented a numeric action-id table
+(`1–63`) and treated ladder-button slugs (`VOL_UP`) as action *names*; the spec
+defines neither, and a generated contract must not synthesize them. `VOL_UP` is
+a `LadderButton.id`, used in a binding's `button` field — never an action name.
+
+**Cardinality (v1), fixed by the NVS budget rather than by preference:**
+
+| Limit | Value | Why |
+| --- | --- | --- |
+| Bindings, total | **32** | They are a top-level table, not per-channel; 32 covers 2 channels × several gestures × the AUX inputs |
+| Actions per binding | **2** | Both bounds come from the partition — see below |
+| Ladder buttons per channel | 16 | Fits `LadderProfile`'s fixed array |
+| AUX buttons | 3 | AUX1–AUX3 |
+
+**String field widths are also a budget input, not a preference.** A provable
+staging bound has to cover every field at its declared maximum, so the widths
+below are load-bearing — widening any of them re-opens the partition arithmetic:
+
+| Field | Width | Holds |
+| --- | --- | --- |
+| `Action.target` | **40** | `com.oetsolutions.swc.ACTION_NAVIGATE` (34); a longer intent action must be refused by validation, not truncated |
+| `Action.payload` | **48** | `geo:40.7608,-111.8910?q=Home` (28); a full street address does **not** fit and is refused |
+| `Binding.id`, `LadderButton.id`, `Binding.button` | **16** | Slugs, e.g. `vol_up`, `next` |
+| `ChannelConfig.name`, `LadderButton.name` | **16** | Display labels |
+
+**Measured (§3.8's method), and re-measured 2026-09-19 after a defect:** the
+structural worst case is every string field at its width above, 2 channels × 16
+buttons, 3 AUX, and 32 bindings × 2 actions. That is **22,407 B** as JSON →
+**11 chunks**; two slots plus `cfg_seq` cost **46,496 B of the partition's 48,384
+B usable bytes (96 %)**.
+
+**An earlier revision of this paragraph quoted the same 11 chunks / 46,496 B /
+96 % for a configuration it did not measure.** It said 32 bindings × 2 actions
+while the figure is only reproducible at **one** action per binding (20,741 B →
+11 chunks). At 2 actions with the *unbounded* widths that revision also declared
+(`target[64] payload[128] name[24]`), the same arithmetic gives **30,021 B → 15
+chunks → 63,392 B = 131 % — an overflow, not a fit.** Two numbers in one
+paragraph describing two different data models, which is why a rewrite that
+swept for contradictions *between* documents did not catch it. The widths table
+above is what makes the two agree: at 40/48/16/16 the figure is real.
+
+The step up is now measured too: 3 actions per binding at these widths needs
+**14 chunks = 59,168 B = 122 %** and does not fit. So 2 is not a round number
+chosen for comfort; it is the largest value the existing partition stores with
+both slots present, and the string widths are what buy it. Enlarging NVS would
+cost app-slot space and re-open the §9.2 partition layout — and note the 48 KB is
+not the config's alone: §9.2 records that WiFi provisioning credentials live in
+the same `nvs` partition, so the two-slot budget above is an upper bound on what
+the config can ever have.
+
 ### 3.7 Full worked example
 
 The user's stated scenario — "the head unit may not have a SWC to open a specific
@@ -468,23 +519,36 @@ out:
 
   This is the one place where "measure, then decide" is mandatory rather than
   preferred, because the answer changes the persistence code.
-  **Measured, 2026-09-18 — the answer is "it does not fit, so a slot is
-  chunked."** On IDF 5.5.5 the ceiling is `ENTRY_SIZE × (ENTRY_COUNT − 1)` =
-  32 × 125 = **4000 bytes** (`nvs_page.cpp` returns `ESP_ERR_NVS_VALUE_TOO_LONG`
-  above it), and the worst-case `Config` — 2 channels × 16 buttons × 32 bindings —
-  is **~17.8 KB** as JSON. **Even a realistic config (~3.9 KB) sits on that
-  ceiling and a moderate one (~7.9 KB) exceeds it**, so a single-value slot fails
-  on the common case, not a hypothetical one; the chunked branch above is the one
-  that ships. Chunk size is a fixed 2048 B and the count is bounded (9 worst
-  case). Two worst-case slots cost **79 % of the partition's usable entry space**
-  (38,016 B of 48,384 B), so it fits, but the margin is thinner than "48 KB"
-  suggests. Each 2048-byte chunk is one NVS *key*, and NVS charges **2112 B** for
-  it — a 32-byte metadata entry, the 2048 payload bytes, and a 32-byte
-  `BLOB_IDX` entry written once per key (`nvs_storage.cpp:353`; the
+  **Measured, 2026-09-18; re-measured 2026-09-19 — the answer is "it does not
+  fit, so a slot is chunked."** On IDF 5.5.5 the ceiling is `ENTRY_SIZE ×
+  (ENTRY_COUNT − 1)` = 32 × 125 = **4000 bytes** (`nvs_page.cpp` returns
+  `ESP_ERR_NVS_VALUE_TOO_LONG` above it), and the worst-case `Config` — §3.5's
+  cardinality (32 top-level bindings × 2 actions, 2 channels × 16 buttons, 3 AUX)
+  at §3.5's string widths — is **~21.9 KB** as JSON. **Even a realistic config
+  (~3.9 KB) sits on that ceiling and a moderate one (~7.9 KB) exceeds it**, so a
+  single-value slot fails on the common case, not a hypothetical one; the chunked
+  branch above is the one that ships. Chunk size is a fixed 2048 B and the count
+  is bounded (**11 worst case**). Two worst-case slots cost **96 % of the
+  partition's usable entry space** (46,496 B of 48,384 B), so it fits, but with
+  almost no margin — which is why §3.5's action-per-binding cap is 2 **and** why
+  §3.5 fixes the string widths. Each 2048-byte chunk is one NVS *key*, and NVS
+  charges **2112 B** for it — a 32-byte metadata entry, the 2048 payload bytes,
+  and a 32-byte `BLOB_IDX` entry written once per key (`nvs_storage.cpp:353`; the
   `writeItem` span at `nvs_page.cpp:185` covers only the first two). An earlier
   revision of this figure counted 2080 B and so understated the two-slot cost by
   576 B. This is recorded here because a "measure, then decide" rule with no
   recorded measurement is an assumption with extra steps.
+
+  **Two earlier revisions of this paragraph were wrong in the same way,** and the
+  correction is recorded rather than quietly applied. The first said "32
+  bindings" while computing from a *per-channel* binding model (2 × 32 = 64
+  bindings, ~17.8 KB). The second quoted **21,411 B → 11 chunks → 96 %** as the
+  worst case at 32 bindings × 2 actions — but that figure is only reproducible at
+  **one** action per binding. At 2 actions with the widths that revision declared
+  (`target[64] payload[128] name[24]`) the same arithmetic gives **30,021 B → 15
+  chunks → 131 %**, an overflow. The measurement and the cardinality table
+  described different configurations *in the same paragraph*. §3.5's width table
+  is the fix, and the figure above is now the one that table produces.
 - **Dual-slot writes with a monotonic sequence number.** NVS is written **A/B**:
   write the inactive slot, verify it by read-back, bump the sequence, *then* flip
   the active marker. **A power loss mid-write must never destroy a working

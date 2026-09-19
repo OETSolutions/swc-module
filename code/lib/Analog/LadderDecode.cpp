@@ -45,11 +45,20 @@ ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int i
 
     // Nearest-centre match, so two overlapping windows resolve deterministically
     // to whichever button the user actually pressed rather than to array order.
+    //
+    // The centre and half-width are DERIVED from millivolts against the LEARNED
+    // idle, not read from stored ratio fields (spec 3.4/3.5: storing both forms
+    // does not fit the NVS budget). Deriving is also the more correct of the two:
+    // the learned idle is the rail the mv_center values were measured at, so the
+    // ratio is the same number either way, but a stored copy could drift from it.
     int best = -1;
     int best_distance = 0;
     for (uint8_t i = 0; i < profile.count && i < kLadderMaxButtons; ++i) {
-        const int centre = profile.buttons[i].ratio_permille;
-        const int half   = profile.buttons[i].tolerance_permille;
+        const int centre = LadderRatioPermille(profile.buttons[i].mv_center,
+                                               profile.learned_idle_mv);
+        const int half   = LadderRatioPermille(profile.buttons[i].mv_tolerance,
+                                               profile.learned_idle_mv);
+        if (centre < 0 || half < 0) continue;
         const int distance = abs(ratio - centre);
         if (distance > half) continue;
         if (best < 0 || distance < best_distance) {

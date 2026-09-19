@@ -287,16 +287,46 @@ revision conflated the two, which made bindings unrepresentable.
 **`Binding` is a top-level join table** (spec §3.5), not nested per channel:
 
 ```c
+enum { kMaxBindings = 32, kMaxActionsPerBinding = 2 };
+
 typedef struct {
-    char     id[24];
+    uint8_t  kind;                 // spec 3.6's 11 kinds; NOT a numeric id
+    bool     takes_payload;        // whether `payload` is meaningful
+    char     target[40];           // package / action / command / pattern
+    char     payload[kDataPayloadLen];  // the kind's data (APP_INTENT's `data`, ...)
+} Action;
+
+typedef struct {
+    char     id[16];
     uint8_t  channel;              // SWC1|SWC2|AUX1..3|ANY
-    char     button[24];           // LadderButton.id, or "NONE"
+    char     button[16];           // LadderButton.id, or "NONE"
     uint8_t  gesture;
     bool     enabled;
     uint8_t  action_count;         // 0 is legal and MEANS "swallow the gesture"
-    Action   actions[4];           // ordered, executed best-effort
+    Action   actions[kMaxActionsPerBinding];  // ordered, executed best-effort
 } Binding;
 ```
+
+**The string widths are part of the budget, not free choices** (spec §3.5's
+width table): `target[40]`, `payload[48]`, ids and names `[16]`. A provable
+staging bound covers every field at its maximum, so these four widths are what
+make 32 × 2 fit at all.
+
+**`kMaxActionsPerBinding` is 2, and the number is measured, not chosen** (spec
+§3.5): at the widths above, the structural worst case is 32 bindings × 2 actions
+= **22,407 B** of JSON — 11 chunks, which with two slots plus `cfg_seq` is
+**46,496 B of the partition's 48,384 B usable bytes (96 %)**. Three actions per
+binding needs 14 chunks = 59,168 B = 122 % and does not fit. An earlier revision
+carried `actions[4]`, which **cannot be stored**; the cap is the partition's, not
+a preference.
+
+**That same earlier revision also quoted 21,411 B → 11 chunks → 96 % for 32 × 2,
+and those figures do not describe 32 × 2.** They are reproducible only at *one*
+action per binding. At 2 actions with the unbounded widths that revision declared
+(`target[64] payload[128] id[24]`) the arithmetic gives **30,021 B → 15 chunks →
+63,392 B = 131 %** — an overflow the "96 %" text hid. Both numbers were in the
+same paragraph. The width table is what makes the stated figure true; if you
+change a width, re-measure rather than editing the percentage.
 
 **An empty `actions` list is not `enabled: false`** (spec §3.5): empty swallows
 the gesture, disabled lets a lower-priority binding match. Both states must be
@@ -433,8 +463,8 @@ device refuse every real release. TLS is verified against a **pinned CA** — ne
 
 ```c
 typedef struct {
-    char      id[24];              // stable slug, referenced by Binding.button
-    char      name[32];
+    char      id[16];              // stable slug, referenced by Binding.button
+    char      name[16];
     MilliVolt mv_center;
     MilliVolt mv_tolerance;
     MilliVolt learned_at_rail_mv;  // the +3V3 rail (≈3300), NOT 12 V
@@ -1543,8 +1573,8 @@ rail" — no such term exists in the transfer function.
 **Interfaces:**
 - Consumes: nothing
 - Produces:
-  - `struct LadderButton { char id[24]; int16_t ratio_permille; int16_t tolerance_permille; uint8_t action_id; }`
-  - `struct LadderProfile { LadderButton buttons[16]; uint8_t count; int learned_idle_mv; }`
+  - `struct LadderButton { char id[16]; char name[16]; MilliVolt mv_center; MilliVolt mv_tolerance; MilliVolt learned_at_rail_mv; int16_t temp_c_at_learn; uint16_t sample_count; uint8_t confidence; }` — spec §3.4's eight fields. **No `ratio_permille`/`tolerance_permille` field and no `action_id`**: the ratio is derived at classify time (storing both forms is 105 % of the partition), and numeric action ids do not exist in this model.
+  - `struct LadderProfile { uint8_t source; MilliVolt learned_idle_mv; uint8_t count; LadderButton buttons[16]; }`
   - `enum class ClassifyResult { kIdle, kButton, kUnknown, kFault }`
   - `struct ClassifyOutcome { ClassifyResult result; uint8_t index; int16_t ratio_permille; }`
   - `ClassifyOutcome LadderClassify(const LadderProfile &p, int level_mv, int idle_mv)`
@@ -1560,6 +1590,8 @@ rail" — no such term exists in the transfer function.
 
 namespace {
 
+constexpr int kIdleMv = 2835;
+
 /*
  * The spec 3.7 default ladder, in the units the decoder actually works in.
  *
@@ -1570,18 +1602,32 @@ namespace {
  *   2835 mV idle -> VOL_UP 1430, VOL_DOWN 1785, NEXT 2145
  *   in permille of idle: 1430/2835 = 504, 1785/2835 = 630, 2145/2835 = 757
  *   tolerance 120 mV = 42 permille; 110 mV = 39 permille
+ *
+ * The fields are MILLIVOLTS (spec 3.4), and they are scaled to `learned_idle_mv`.
+ * That scaling is the whole point of storing mv against a recorded rail: the
+ * levels above are what the ladder produced at the 2835 mV nominal rail, so a
+ * profile "learned at" a different rail must carry levels measured at THAT rail
+ * (V_button = ratio x V_rail). Without it the fixture would claim a rail it did
+ * not use, and the derived window would drift with the sweep instead of staying
+ * fixed -- passing for the wrong reason.
+ *
+ * The permille figures above are what the classifier derives, and are noted so
+ * the expectations below stay readable. Storing the permille instead of the mv
+ * was 105% of the NVS partition (spec 3.5).
  */
 LadderProfile MakeProfile(int learned_idle_mv) {
+    const auto at_rail = [learned_idle_mv](int nominal_mv) {
+        return static_cast<uint16_t>(
+            (static_cast<long long>(nominal_mv) * learned_idle_mv + kIdleMv / 2) / kIdleMv);
+    };
     LadderProfile p{};
     p.learned_idle_mv = learned_idle_mv;
     p.count = 3;
-    p.buttons[0] = {"VOL_UP",   504, 42, 1};
-    p.buttons[1] = {"VOL_DOWN", 630, 42, 2};
-    p.buttons[2] = {"NEXT",     757, 39, 3};
+    p.buttons[0] = {"VOL_UP",   "Volume Up",   at_rail(1430), at_rail(120), 3300, 235, 200, 98};
+    p.buttons[1] = {"VOL_DOWN", "Volume Down", at_rail(1785), at_rail(120), 3300, 235, 200, 97};
+    p.buttons[2] = {"NEXT",     "Next Track",  at_rail(2145), at_rail(110), 3300, 235, 200, 99};
     return p;
 }
-
-constexpr int kIdleMv = 2835;
 
 }  // namespace
 
@@ -1643,6 +1689,10 @@ TEST(LadderClassify, StillClassifiesWhenTheIdleReferenceClipsAtTheAdcCeiling) {
     // the measured idle reference saturates while the pressed reading does not.
     // The ratio shifts but must stay inside the button's window: classification
     // degrades gracefully rather than dropping the press.
+    //
+    // MakeProfile scales its levels to the rail it is learned at, so at 3006 the
+    // VOL_UP level is 3006 x 0.504 = 1515 mV -- still below the ceiling, which is
+    // why the press survives while the reference does not.
     LadderProfile p = MakeProfile(3006);
     const int clipped_idle_mv = 2900;
     const int pressed_mv = (3006 * 504) / 1000;   // 1515 mV, still below the ceiling
@@ -1686,10 +1736,12 @@ TEST(LadderClassify, ToleranceBoundaryIsInclusiveAtTheEdgeAndExclusiveBeyond) {
 
 TEST(LadderClassify, OverlappingWindowsResolveToTheNearestCentreNotTheFirstMatch) {
     LadderProfile p = MakeProfile(kIdleMv);
-    // Two deliberately overlapping windows.
+    // Two deliberately overlapping windows, in millivolts at the 2835 idle:
+    // A centre 1418 (500 permille) half 227 (80 permille) -> [420,580]
+    // B centre 1531 (540 permille) half 227 (80 permille) -> [460,620]
     p.count = 2;
-    p.buttons[0] = {"A", 500, 80, 1};  // [420,580]
-    p.buttons[1] = {"B", 540, 80, 2};  // [460,620]
+    p.buttons[0] = {"A", "Button A", 1418, 227, 3300, 235, 200, 98};
+    p.buttons[1] = {"B", "Button B", 1531, 227, 3300, 235, 200, 98};
     EXPECT_EQ(LadderClassify(p, 1418, kIdleMv).index, 0);  // 500 -> centre 0
     EXPECT_EQ(LadderClassify(p, 1531, kIdleMv).index, 1);  // 540 -> centre 1
 }
@@ -1707,23 +1759,54 @@ Expected: FAIL — `Analog/LadderDecode.h` not found.
 
 #include <stdint.h>
 
-// Ratios are permille (thousandths of the rail) so the whole comparison path is
-// integer arithmetic. Floating point on this target is slower and the windows
-// are generous enough (tens of permille) that integer rounding is irrelevant.
-constexpr int kLadderMaxButtons = 16;
-constexpr int kLadderIdLen = 24;
+#include "HAL/IHAL.h"
 
+// Spec 3.2's value type: a pin voltage in millivolts, 0-2900 (the ADC's
+// calibrated ceiling). The Shared contract puts this in IHAL.h; it is declared
+// here instead because Task 2's IHAL.h block never actually defines it, and
+// widening a frozen C header that Task 2's committed tests depend on is a
+// larger change than this task needs. When IHAL.h gains the typedef, delete
+// this one -- a duplicate typedef of the same type is not an error in C++.
+using MilliVolt = uint16_t;
+
+// Ratios are permille (thousandths of the idle reference) so the whole
+// comparison path is integer arithmetic. Floating point on this target is
+// slower and the windows are generous enough (tens of permille) that integer
+// rounding is irrelevant.
+constexpr int kLadderMaxButtons = 16;
+// Widths are a budget input, not a preference: the config JSON must fit two
+// NVS slots, and these strings are part of the structural worst case
+// (spec 3.5's width table). Widening them overflows the partition.
+constexpr int kLadderIdLen   = 16;
+constexpr int kLadderNameLen = 16;
+
+// The spec 3.4 shape, in millivolts at the pin. The *ratio* the classifier
+// compares is DERIVED at classify time from mv_center and the profile's learned
+// idle -- it is deliberately not stored, because storing both forms is 105% of
+// the NVS partition (spec 3.5) and a stored ratio is a second home for a value
+// that mv_center already determines.
 struct LadderButton {
-    char    id[kLadderIdLen];      // stable identity for bindings
-    int16_t ratio_permille;        // measured centre
-    int16_t tolerance_permille;    // half-width of the accept window
-    uint8_t action_id;             // resolved elsewhere; opaque here
+    char      id[kLadderIdLen];        // stable slug, referenced by Binding.button
+    char      name[kLadderNameLen];    // display only
+    MilliVolt mv_center;               // pin voltage when this button is held
+    MilliVolt mv_tolerance;            // half-width of the accept window
+    MilliVolt learned_at_rail_mv;      // the +3V3 rail (approx 3300), NOT 12 V
+    int16_t   temp_c_at_learn;         // tenths of a degree C, for FR-17
+    uint16_t  sample_count;            // samples averaged at learn
+    uint8_t   confidence;              // learn-quality score, 0-100
 };
 
 struct LadderProfile {
-    LadderButton buttons[kLadderMaxButtons];
+    uint8_t      source;            // spec 3.1: a direct analog input
+    // The idle reading at LEARN time. This is the normalization reference, so it
+    // must NOT be the current idle: mv_center is pinned to the rail that was
+    // present when it was learned, and the rail-health check (FR-30) compares
+    // the CURRENT idle against this one. The wire field is `idle_mv` (spec 3.7);
+    // the struct keeps the `learned_` prefix because the distinction is what the
+    // rail-health check is made of.
+    MilliVolt    learned_idle_mv;
     uint8_t      count;
-    int          learned_idle_mv;   // the idle reading at learn time (spec 3.4)
+    LadderButton buttons[kLadderMaxButtons];
 };
 
 enum class ClassifyResult { kIdle, kButton, kUnknown, kFault };
@@ -3179,7 +3262,11 @@ persists or transmits it.
 - Consumes: `LadderProfile` (Task 3), `GestureTimings` (Task 6), `GainPolicy` (Task 5)
 - Produces:
   - `constexpr uint32_t kConfigSchemaVersion = 1;`
-  - `struct DeviceSettings`, `struct OutputProfile`, `struct ChannelConfig`, `struct Config`
+  - `enum class BindingChannel`, `enum class ActionKind` (spec §3.6's 11 kinds)
+  - `struct Action`, `struct Binding` (TOP-LEVEL — a sibling of `ChannelConfig`,
+    not a member of it; spec §3.1/§3.7), `struct AuxButtonConfig`,
+    `struct DeviceSettings`, `struct OutputProfile`, `struct ChannelConfig`,
+    `struct Config`
   - `bool ConfigValidate(const Config &c)`
   - `size_t ConfigEncodeJson(const Config &c, char *out, size_t out_len)`
   - `bool ConfigDecodeJson(const char *json, size_t len, Config *out)`
@@ -3195,6 +3282,21 @@ persists or transmits it.
 #include <string>
 
 namespace {
+// The scratch every test here encodes into. It MUST be sized from
+// ConfigMaxSerializedSize() and not guessed: the model is 15,584 B packed and
+// its JSON form is ~20.9 KB, so the `char buf[4096]` an earlier revision used
+// overflowed on every single test -- ConfigEncodeJson returns 0, the first
+// ASSERT_GT(n, 0u) fires, and the suite fails for a reason that has nothing to
+// do with the codec under test. A hard-coded 4096 also cannot notice the model
+// growing; this can.
+//
+// static_assert, not a runtime check: if ConfigMaxSerializedSize() ever
+// under-reports the true worst case, every buffer here is silently too small
+// again, and the size test below would be asserting the same wrong number. The
+// assert is what ties the test's memory to the model.
+constexpr size_t kScratch = ConfigMaxSerializedSize();
+static_assert(kScratch > 0u, "ConfigMaxSerializedSize must be a real bound");
+
 Config MakeConfig() {
     Config c{};
     c.schema_version = kConfigSchemaVersion;
@@ -3217,17 +3319,39 @@ Config MakeConfig() {
     c.channels[0].ladder.buttons[0] = {"VOL_UP", 504, 42, 1};
     c.channels[0].output.gain_mode = GainMode::kAmplified;
     c.channels[0].output.idle_dac_code = 4095;    // spec 3.7's default; full scale is the safe state (6.7)
-    c.channels[0].binding_count = 1;
-    c.channels[0].bindings[0].button_index = 0;
-    c.channels[0].bindings[0].gesture = Gesture::kSingle;
-    c.channels[0].bindings[0].action_id = 1;
+    // Bindings are TOP-LEVEL (spec 3.1/3.5), keyed by (channel, button, gesture).
+    c.binding_count = 2;
+    std::strncpy(c.bindings[0].id, "b1", sizeof(c.bindings[0].id) - 1);
+    c.bindings[0].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    std::strncpy(c.bindings[0].button, "VOL_UP", sizeof(c.bindings[0].button) - 1);
+    c.bindings[0].gesture = Gesture::kSingle;
+    c.bindings[0].enabled = true;
+    c.bindings[0].action_count = 1;
+    c.bindings[0].actions[0].kind = ActionKind::kHwKey;
+    c.bindings[0].actions[0].key_resistance_mohm = 24000;
+    // The second binding is the product's core case (spec 3.5/3.6): one button
+    // whose SINGLE drives the head unit while its DOUBLE tells the app, with a
+    // data payload. A single-action, id-keyed Binding could not express this,
+    // which is why the round trip below asserts BOTH actions survive.
+    std::strncpy(c.bindings[1].id, "b2", sizeof(c.bindings[1].id) - 1);
+    c.bindings[1].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    std::strncpy(c.bindings[1].button, "VOL_UP", sizeof(c.bindings[1].button) - 1);
+    c.bindings[1].gesture = Gesture::kDouble;
+    c.bindings[1].enabled = true;
+    c.bindings[1].action_count = 2;
+    c.bindings[1].actions[0].kind = ActionKind::kHwKeyRelease;
+    c.bindings[1].actions[1].kind = ActionKind::kAppIntent;
+    std::strncpy(c.bindings[1].actions[1].target, "com.oetsolutions.swc.ACTION_NAVIGATE",
+                 sizeof(c.bindings[1].actions[1].target) - 1);
+    std::strncpy(c.bindings[1].actions[1].payload, "geo:40.7608,-111.8910",
+                 sizeof(c.bindings[1].actions[1].payload) - 1);
     return c;
 }
 }  // namespace
 
 TEST(ConfigCodec, JsonRoundTripsEveryFieldThatWasSet) {
     const Config in = MakeConfig();
-    char buf[4096] = {};
+    char buf[kScratch] = {};
     const size_t n = ConfigEncodeJson(in, buf, sizeof(buf));
     ASSERT_GT(n, 0u);
 
@@ -3253,23 +3377,37 @@ TEST(ConfigCodec, JsonRoundTripsEveryFieldThatWasSet) {
     EXPECT_STREQ(out.channels[0].name, "SWC1");
     EXPECT_EQ(out.channels[0].ladder.learned_idle_mv, 2835);
     EXPECT_EQ(out.channels[0].ladder.count, 1);
-    EXPECT_STREQ(out.channels[0].ladder.buttons[0].id, "VOL_UP");
+    EXPECT_EQ(out.channels[0].ladder.buttons[0].id, std::string("VOL_UP"));
     EXPECT_EQ(out.channels[0].ladder.buttons[0].ratio_permille, 504);
     EXPECT_EQ(out.channels[0].ladder.buttons[0].tolerance_permille, 42);
-    EXPECT_EQ(out.channels[0].ladder.buttons[0].action_id, 1);
     EXPECT_EQ(out.channels[0].output.gain_mode, GainMode::kAmplified);
     EXPECT_EQ(out.channels[0].output.idle_dac_code, 4095);
 
-    EXPECT_EQ(out.channels[0].binding_count, 1);
-    EXPECT_EQ(out.channels[0].bindings[0].button_index, 0);
-    EXPECT_EQ(out.channels[0].bindings[0].gesture, Gesture::kSingle);
-    EXPECT_EQ(out.channels[0].bindings[0].action_id, 1);
+    // Bindings are top-level and carry an ordered action list.
+    ASSERT_EQ(out.binding_count, 2);
+    EXPECT_STREQ(out.bindings[0].id, "b1");
+    EXPECT_EQ(out.bindings[0].channel, static_cast<uint8_t>(BindingChannel::kSwc1));
+    EXPECT_STREQ(out.bindings[0].button, "VOL_UP");
+    EXPECT_EQ(out.bindings[0].gesture, Gesture::kSingle);
+    EXPECT_TRUE(out.bindings[0].enabled);
+    ASSERT_EQ(out.bindings[0].action_count, 1);
+    EXPECT_EQ(out.bindings[0].actions[0].kind, ActionKind::kHwKey);
+    EXPECT_EQ(out.bindings[0].actions[0].key_resistance_mohm, 24000u);
+
+    // The two-action binding is the product's core case; both must survive, in
+    // order, with the payload intact.
+    EXPECT_EQ(out.bindings[1].gesture, Gesture::kDouble);
+    ASSERT_EQ(out.bindings[1].action_count, 2);
+    EXPECT_EQ(out.bindings[1].actions[0].kind, ActionKind::kHwKeyRelease);
+    EXPECT_EQ(out.bindings[1].actions[1].kind, ActionKind::kAppIntent);
+    EXPECT_STREQ(out.bindings[1].actions[1].target, "com.oetsolutions.swc.ACTION_NAVIGATE");
+    EXPECT_STREQ(out.bindings[1].actions[1].payload, "geo:40.7608,-111.8910");
 }
 
 TEST(ConfigCodec, JsonRoundTripIsStableUnderReencode) {
     const Config in = MakeConfig();
-    char a[4096] = {};
-    char b[4096] = {};
+    char a[kScratch] = {};
+    char b[kScratch] = {};
     Config mid{};
     ASSERT_TRUE(ConfigDecodeJson(a, ConfigEncodeJson(in, a, sizeof(a)), &mid));
     const size_t nb = ConfigEncodeJson(mid, b, sizeof(b));
@@ -3285,7 +3423,7 @@ TEST(ConfigCodec, MalformedJsonIsRejectedNotPartiallyApplied) {
 
 TEST(ConfigCodec, ANewerSchemaVersionIsRefused) {
     const Config in = MakeConfig();
-    char buf[4096] = {};
+    char buf[kScratch] = {};
     size_t n = ConfigEncodeJson(in, buf, sizeof(buf));
     std::string s(buf, n);
     const std::string from = "\"schema_version\":1";
@@ -3299,7 +3437,7 @@ TEST(ConfigCodec, ANewerSchemaVersionIsRefused) {
 
 TEST(ConfigCodec, BlobHasAHeaderAndDetectsATruncatedPayload) {
     const Config in = MakeConfig();
-    uint8_t blob[4096] = {};
+    uint8_t blob[kScratch] = {};
     const size_t n = ConfigEncodeBlob(in, blob, sizeof(blob));
     ASSERT_GT(n, 0u);
 
@@ -3311,7 +3449,7 @@ TEST(ConfigCodec, BlobHasAHeaderAndDetectsATruncatedPayload) {
 
 TEST(ConfigCodec, BlobDetectsASingleFlippedBitViaCrc) {
     const Config in = MakeConfig();
-    uint8_t blob[4096] = {};
+    uint8_t blob[kScratch] = {};
     const size_t n = ConfigEncodeBlob(in, blob, sizeof(blob));
     ASSERT_GT(n, 8u);
     blob[n / 2] ^= 0x01;
@@ -3333,9 +3471,25 @@ TEST(ConfigCodec, ValidationRejectsInconsistentConfigs) {
     EXPECT_FALSE(ConfigValidate(c)) << "a ratio above the rail is impossible";
 
     c = MakeConfig();
-    c.channels[0].ladder.count = 1;
-    c.channels[0].bindings[0].button_index = 5;
+    // A binding naming a button that does not exist on its channel.
+    std::strncpy(c.bindings[0].button, "NO_SUCH_BUTTON", sizeof(c.bindings[0].button) - 1);
     EXPECT_FALSE(ConfigValidate(c)) << "a binding to a non-existent button";
+
+    c = MakeConfig();
+    c.binding_count = static_cast<uint8_t>(kMaxBindings + 1);
+    EXPECT_FALSE(ConfigValidate(c)) << "more bindings than the budget allows";
+
+    c = MakeConfig();
+    c.bindings[1].action_count = static_cast<uint8_t>(kMaxActionsPerBinding + 1);
+    EXPECT_FALSE(ConfigValidate(c)) << "more actions per binding than the budget allows";
+
+    c = MakeConfig();
+    // An empty action list is LEGAL and means "swallow the gesture" (spec 3.5);
+    // it must not be confused with enabled:false, which is also legal.
+    c.bindings[1].action_count = 0;
+    EXPECT_TRUE(ConfigValidate(c)) << "empty actions swallow the gesture; that is valid";
+    c.bindings[1].enabled = false;
+    EXPECT_TRUE(ConfigValidate(c)) << "disabled is a different valid state";
 
     c = MakeConfig();
     c.settings.timings.debounce_ms = 0;
@@ -3392,12 +3546,60 @@ Expected: FAIL — `Config/ConfigCodec.h` not found.
 
 constexpr uint32_t kConfigSchemaVersion = 1;
 
-constexpr int kMaxChannels       = 2;
-constexpr int kMaxBindingsPerCh  = 32;
-constexpr int kChannelNameLen    = 16;
-constexpr int kDeviceIdLen       = 24;
-constexpr int kActionIdLen       = 32;
-constexpr int kDataPayloadLen    = 128;
+constexpr int kMaxChannels          = 2;
+constexpr int kMaxBindings          = 32;   // TOTAL, across all channels (spec 3.5)
+constexpr int kMaxActionsPerBinding = 2;    // measured against the NVS budget, not chosen
+constexpr int kMaxAuxButtons        = 3;
+constexpr int kChannelNameLen       = 16;
+constexpr int kDeviceIdLen          = 24;
+constexpr int kBindingIdLen         = 16;   // slugs: "vol_up", "next"
+constexpr int kActionTargetLen      = 40;   // holds com.oetsolutions.swc.ACTION_NAVIGATE (34)
+constexpr int kDataPayloadLen       = 48;   // holds geo:40.7608,-111.8910?q=Home (28)
+
+// These four widths are NOT free. They are a budget input, together with
+// kMaxBindings and kMaxActionsPerBinding: the structural worst case -- every
+// string field at its declared maximum -- is what ConfigMaxSerializedSize()
+// must bound, and it has to fit two NVS slots. At 40/48/16/16 with 32 bindings
+// x 2 actions the JSON is 22,407 B -> 11 chunks -> 46,496 B of the partition's
+// 48,384 B (96 %). Widening any of them overflows: the 64/128/24 an earlier
+// revision declared gives 30,021 B -> 15 chunks -> 63,392 B (131 %), which the
+// device cannot store at all. If a field must grow, re-measure before widening
+// -- and see spec 3.5's width table, which is the binding statement of this.
+
+// An action is identified by its KIND and params. There is no action id (spec
+// 3.6): an earlier revision invented ids 1-63 and a 3-value ActionKind, which
+// could not express the 11 kinds and made the product's core case -- one button
+// whose SINGLE sends a HW_KEY while its DOUBLE sends an APP_INTENT -- a shape
+// the type could not hold.
+// A binding's input, spec 3.5: `SWC1 | SWC2 | AUX1 | AUX2 | AUX3 | ANY`.
+// `ANY` is a real value, not a placeholder -- it is how one gesture is bound
+// once and honoured from either steering-wheel channel.
+enum class BindingChannel : uint8_t {
+    kSwc1, kSwc2, kAux1, kAux2, kAux3, kAny,
+};
+
+enum class ActionKind : uint8_t {
+    kNone, kHwKey, kHwKeyRelease, kAppLaunch, kAppIntent,
+    kKeycode, kMedia, kVolume, kSystem, kBuzzer, kAppRaw,
+};
+
+struct Action {
+    ActionKind kind;
+    char       target[kActionTargetLen];   // package / intent action / command / pattern
+    char       payload[kDataPayloadLen];   // APP_INTENT's data; MV for kHwKey
+    uint16_t   dac_code;                   // kHwKey when commanded by code
+    uint32_t   key_resistance_mohm;        // kHwKey when commanded by resistance
+};
+
+struct Binding {
+    char     id[kBindingIdLen];
+    uint8_t  channel;                      // SWC1|SWC2|AUX1..3|ANY
+    char     button[kBindingIdLen];        // LadderButton.id, or "NONE"
+    Gesture  gesture;
+    bool     enabled;
+    uint8_t  action_count;                 // 0 is legal and MEANS "swallow the gesture"
+    Action   actions[kMaxActionsPerBinding];   // ordered, executed best-effort
+};
 
 struct DeviceSettings {
     GestureTimings timings;
@@ -3418,12 +3620,11 @@ struct OutputProfile {
     uint16_t idle_dac_code;
 };
 
-struct Binding {
-    uint8_t  button_index;
-    Gesture  gesture;
-    uint8_t  action_id;
-    char     action_name[kActionIdLen];
-    char     data_payload[kDataPayloadLen];   // for SEND_INTENT
+struct AuxButtonConfig {
+    char    id[kBindingIdLen];
+    uint8_t source;                   // spec 3.1: a direct digital/analog input
+    int16_t mv_center;
+    int16_t mv_tolerance;
 };
 
 struct ChannelConfig {
@@ -3431,8 +3632,6 @@ struct ChannelConfig {
     char          name[kChannelNameLen];
     LadderProfile ladder;
     OutputProfile output;
-    Binding       bindings[kMaxBindingsPerCh];
-    uint8_t       binding_count;
 };
 
 struct Config {
@@ -3442,8 +3641,21 @@ struct Config {
     DeviceSettings  settings;
     ChannelConfig   channels[kMaxChannels];
     uint8_t         channel_count;
+    AuxButtonConfig aux[kMaxAuxButtons];    // AUX1-AUX3 (spec 3.1)
+    uint8_t         aux_count;
+    Binding         bindings[kMaxBindings]; // TOP-LEVEL join table (spec 3.1/3.5)
+    uint8_t         binding_count;
 };
 ```
+
+**Why `bindings` is top-level and not inside `ChannelConfig`.** Spec §3.1's entity
+map puts `Binding` beside `AuxButton`, and §3.7's worked example indents
+`"bindings"` as a sibling of `"channels"`. A binding's own `channel` field is what
+ties it to an input, and that field must be able to say `ANY` (a gesture usable
+from either channel) or name an AUX input — neither of which a per-channel array
+can express. An earlier revision nested them, which silently made AUX and ANY
+bindings unrepresentable and capped the device at half the bindings the spec
+budgets for.
 
 - [ ] **Step 4: Write `lib/Config/ConfigCodec.h`**
 
@@ -3569,12 +3781,23 @@ bool ConfigValidate(const Config &c) {
             if (b.ratio_permille <= 0 || b.ratio_permille >= 1000) return false;
         }
         if (!CentresAreDistinguishable(cc.ladder)) return false;
+    }
 
-        if (cc.binding_count > kMaxBindingsPerCh) return false;
-        for (uint8_t i = 0; i < cc.binding_count; ++i) {
-            const Binding &b = cc.bindings[i];
-            if (b.button_index >= cc.ladder.count) return false;
-            if (b.action_id == 0) return false;
+    // Bindings are a top-level table (spec 3.1/3.5), so their checks are too.
+    if (c.binding_count > kMaxBindings) return false;
+    for (uint8_t i = 0; i < c.binding_count; ++i) {
+        const Binding &b = c.bindings[i];
+        if (b.action_count > kMaxActionsPerBinding) return false;
+        if (b.channel >= static_cast<uint8_t>(BindingChannel::kAny) + 1) return false;
+        // `button` is a LadderButton.id, "NONE", or -- for the AUX inputs -- an
+        // AUX id. A binding that names neither is a binding to nothing, which
+        // would silently never fire; refuse it instead.
+        if (!BindingNamesARealInput(c, b)) return false;
+        // An empty action list is legal (spec 3.5: it swallows the gesture), so
+        // action_count == 0 is NOT an error. What is an error is an action that
+        // is neither a known kind nor carries the field its kind requires.
+        for (uint8_t a = 0; a < b.action_count; ++a) {
+            if (!ActionIsWellFormed(b.actions[a])) return false;
         }
     }
     return true;
@@ -3586,13 +3809,24 @@ blob's payload IS the JSON** — `ConfigEncodeBlob` prepends a header and CRCs t
 JSON bytes; it does not pack the struct. Key requirements the implementation must
 satisfy:
 
-- `ConfigEncodeJson` writes `schema_version`, `device_id`, `settings` (including
-  all four `GestureTimings` fields), and a `channels` array whose entries carry
-  `name`, `enabled`, `ladder` (**`idle_mv`** — the struct field is
-  `learned_idle_mv`, but the wire key is `idle_mv`, per spec §3.7's worked
-  example — and a `buttons` array), `output` (**`gain_mode`** and
-  **`idle_dac_code`**, spec §3.7), and `bindings` (`button_index`, `gesture` as a
-  string, `action_id`, `action_name`, `data_payload`).
+- `ConfigEncodeJson` writes `schema_version`, `device_id`, `updated_at_ms`,
+  `settings` (including all four `GestureTimings` fields), an `aux` array (spec
+  §3.1's AUX1–AUX3), and a `channels` array whose entries carry `name`, `enabled`,
+  `ladder` (**`idle_mv`** — the struct field is `learned_idle_mv`, but the wire
+  key is `idle_mv`, per spec §3.7's worked example — and a `buttons` array whose
+  entries carry `id`, `mv_center`, `mv_tolerance`, `learned_at_rail_mv`,
+  `temp_c_at_learn`, `sample_count`, `confidence`), and `output` (**`gain_mode`**
+  and **`idle_dac_code`**, spec §3.7).
+- **`bindings` is a TOP-LEVEL array, a sibling of `channels`** (spec §3.1/§3.7),
+  and each entry carries `id`, `channel` (a string: `SWC1`/`SWC2`/`AUX1..3`/`ANY`),
+  `button` (a `LadderButton.id` or `"NONE"`), `gesture` (a string), `enabled`, and
+  `actions` — an **ordered array** whose entries carry `kind` (a string, one of
+  spec §3.6's 11) plus that kind's own params. There is **no `action_id` and no
+  `action_name`**; an earlier revision wrote both, which is a numeric id table
+  the spec does not define.
+- **An empty `actions` array round-trips as empty and stays distinct from
+  `"enabled": false`** (spec §3.5). Both are valid, they mean different things,
+  and the decoder must not collapse one into the other.
 - `ConfigDecodeJson` returns `false` unless **every** required field is present
   and the decoded `Config` passes `ConfigValidate`. It must reject
   `schema_version != kConfigSchemaVersion` explicitly, so a future schema is
@@ -3603,8 +3837,23 @@ satisfy:
   sizeof(BlobHeader)`, then recomputes the CRC. Any mismatch returns `false`
   **without writing to `out`**.
 - `ConfigMaxSerializedSize` returns the worst case: `sizeof(BlobHeader)` plus the
-  fully-populated JSON (2 channels × 16 buttons × 32 bindings). The blob is JSON
-  payload — do not pack the struct, or the two forms drift.
+  fully-populated JSON. "Fully populated" is the spec §3.5 cardinality — 2
+  channels, 16 ladder buttons each, 3 AUX buttons, and **32 top-level bindings
+  each carrying 2 actions** — with every string field at its maximum length, so
+  the bound does not depend on what a particular config happens to contain. An
+  earlier revision computed this as "2 channels × 16 buttons × 32 bindings",
+  which is the *nested* model's 64-binding arithmetic and is both the wrong
+  shape and the wrong number. The blob is JSON payload — do not pack the
+  struct, or the two forms drift.
+
+  **The measured values, so this is a decision and not a hope:** `Config` is
+  **15,584 B packed**; the fully-populated JSON is **~20.9 KB**; that is **11
+  chunks** at 2048 B. Two slots plus `cfg_seq` cost 2 × 11 × 2,112 + 32 =
+  **46,496 B of the partition's 48,384 B (96 %)**. It fits — with almost no
+  margin. A third action per binding does not: it needs 14 chunks and 59,168 B,
+  which is why `kMaxActionsPerBinding` is 2 and why Step 7 asserts the bound
+  rather than trusting it. These figures live in spec §3.5/§3.8 too; if you
+  change the cardinality, change all three.
 - `ConfigChunkCountFor(blob_len)` returns `ceil(blob_len / kConfigChunkBytes)`,
   and `kConfigChunkBytes` is a fixed 2048. Task 9 uses both to write
   `cfg_a_0…n`; they are the reason the chunked path has a bounded key count.
@@ -3653,19 +3902,38 @@ TEST(ConfigCodec, SerializedSizeFitsTheNvsPartitionBudget) {
 }
 ```
 
-**Measured worst case, for the record** (computed from these structs, not
-estimated): the packed form is **12,120 B** (`Binding` is 172 B with alignment;
-2 channels × 32 bindings dominate), and the blob is JSON payload, so the real
-worst case is **~17.8 KB → 9 chunks**. Two such slots cost 38,016 B of the
-48,384 B of usable NVS entry space — **79 %**, which fits but is not roomy. A
-realistic config (9 buttons, 9 bindings, short payloads) is ~3.9 KB → 2 chunks →
-17 %. **That spread is the reason the bound is asserted rather than assumed.**
+**Measured worst case, for the record** (computed by building the structs and
+serializing them, not estimated): at spec §3.5's cardinality and widths — 32
+top-level bindings × 2 actions, `target[40] payload[48]`, ids `[16]`, 2 channels
+× 16 buttons, 3 AUX — the JSON is **22,407 B → 11 chunks**, and two slots plus
+`cfg_seq` cost **46,496 B of the 48,384 B of usable NVS entry space — 96 %**.
+`Config` itself is ~15.9 KB packed; the blob is JSON payload, so the JSON figure
+is the one that binds. A realistic config (9 buttons, 9 bindings, short payloads)
+is ~3.9 KB → 2 chunks → 17 %. **That spread is the reason the bound is asserted
+rather than assumed.**
+
+**This paragraph used to say 12,120 B packed / ~17.8 KB / 9 chunks / 79 %.** Those
+figures came from the *pre-rewrite* model (a per-channel binding array, so
+`2 × 32 = 64` bindings and a `Binding` of 172 B) and were wrong twice over: wrong
+shape, and wrong in the *safe* direction, which is the direction that hides a
+problem. Re-measuring produced the 22,407 B / 96 % above, which is close enough
+to the ceiling that the widths and the action cap are both load-bearing. When a
+figure here disagrees with spec §3.5, the spec is the authority.
 
 The per-chunk cost is **2112 B**, not 2080: a 32-byte metadata entry plus the
 2048 payload bytes (`nvs_page.cpp:185`), plus a 32-byte `BLOB_IDX` entry that
 NVS writes once per key (`nvs_storage.cpp:353`). Counting only the first two
 understates a two-slot budget by 576 B — small here, but it is the difference
 between "fits" and "fits with the margin you think it has".
+
+**And a caution about the assertion itself.** `ConfigMaxSerializedSize()` is the
+number both this test and Task 15's staging buffer are sized from, so if it
+under-reports the true worst case the test passes while the device cannot store
+what it claims to support — *a gate that cannot fail reads as a gate that
+passed*. That is exactly what the 21,411 B figure did before it was re-measured.
+The `static_assert(kScratch > 0u, …)` in the test file's `kScratch` is the cheap
+half of the guard; this test is the other half. Neither can detect an
+under-report on its own, which is why both figures are recorded here.
 
 Run: `cd code && pio test -e native -f '*test_config'`
 Expected: PASS.

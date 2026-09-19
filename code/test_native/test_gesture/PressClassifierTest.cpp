@@ -7,7 +7,7 @@ LadderProfile Profile() {
     LadderProfile p{};
     p.learned_idle_mv = 2835;
     p.count = 1;
-    p.buttons[0] = {"VOL_UP", 504, 42, 1};
+    p.buttons[0] = {"VOL_UP", "Volume Up", 1430, 120, 3300, 235, 200, 98};
     return p;
 }
 }  // namespace
@@ -75,7 +75,7 @@ TEST(PressClassifier, UnlearnedLevelIsUnknownNotPressed) {
 TEST(PressClassifier, SwitchingButtonsMidPressReportsTheNewButtonAfterDebounce) {
     LadderProfile p = Profile();
     p.count = 2;
-    p.buttons[1] = {"VOL_DOWN", 630, 42, 2};
+    p.buttons[1] = {"VOL_DOWN", "Volume Down", 1785, 120, 3300, 235, 200, 97};
     PressClassifier c(p, GestureTimingsDefault());
     uint64_t t = 1000;
     for (int i = 0; i < 5; ++i) { c.Update(1430, 2835, t); t += 10; }

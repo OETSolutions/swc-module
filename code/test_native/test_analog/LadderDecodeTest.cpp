@@ -3,6 +3,8 @@
 
 namespace {
 
+constexpr int kIdleMv = 2835;
+
 /*
  * The spec 3.7 default ladder, in the units the decoder actually works in.
  *
@@ -13,18 +15,32 @@ namespace {
  *   2835 mV idle -> VOL_UP 1430, VOL_DOWN 1785, NEXT 2145
  *   in permille of idle: 1430/2835 = 504, 1785/2835 = 630, 2145/2835 = 757
  *   tolerance 120 mV = 42 permille; 110 mV = 39 permille
+ *
+ * The fields are MILLIVOLTS (spec 3.4), and they are scaled to `learned_idle_mv`.
+ * That scaling is the whole point of storing mv against a recorded rail: the
+ * levels above are what the ladder produced at the 2835 mV nominal rail, so a
+ * profile "learned at" a different rail must carry levels measured at THAT rail
+ * (V_button = ratio x V_rail). Without it the fixture would claim a rail it did
+ * not use, and the derived window would drift with the sweep instead of staying
+ * fixed -- passing for the wrong reason.
+ *
+ * The permille figures above are what the classifier derives, and are noted so
+ * the expectations below stay readable. Storing the permille instead of the mv
+ * was 105% of the NVS partition (spec 3.5).
  */
 LadderProfile MakeProfile(int learned_idle_mv) {
+    const auto at_rail = [learned_idle_mv](int nominal_mv) {
+        return static_cast<uint16_t>(
+            (static_cast<long long>(nominal_mv) * learned_idle_mv + kIdleMv / 2) / kIdleMv);
+    };
     LadderProfile p{};
     p.learned_idle_mv = learned_idle_mv;
     p.count = 3;
-    p.buttons[0] = {"VOL_UP",   504, 42, 1};
-    p.buttons[1] = {"VOL_DOWN", 630, 42, 2};
-    p.buttons[2] = {"NEXT",     757, 39, 3};
+    p.buttons[0] = {"VOL_UP",   "Volume Up",   at_rail(1430), at_rail(120), 3300, 235, 200, 98};
+    p.buttons[1] = {"VOL_DOWN", "Volume Down", at_rail(1785), at_rail(120), 3300, 235, 200, 97};
+    p.buttons[2] = {"NEXT",     "Next Track",  at_rail(2145), at_rail(110), 3300, 235, 200, 99};
     return p;
 }
-
-constexpr int kIdleMv = 2835;
 
 }  // namespace
 
@@ -86,6 +102,10 @@ TEST(LadderClassify, StillClassifiesWhenTheIdleReferenceClipsAtTheAdcCeiling) {
     // the measured idle reference saturates while the pressed reading does not.
     // The ratio shifts but must stay inside the button's window: classification
     // degrades gracefully rather than dropping the press.
+    //
+    // MakeProfile scales its levels to the rail it is learned at, so at 3006 the
+    // VOL_UP level is 3006 x 0.504 = 1515 mV -- still below the ceiling, which is
+    // why the press survives while the reference does not.
     LadderProfile p = MakeProfile(3006);
     const int clipped_idle_mv = 2900;
     const int pressed_mv = (3006 * 504) / 1000;   // 1515 mV, still below the ceiling
@@ -129,10 +149,12 @@ TEST(LadderClassify, ToleranceBoundaryIsInclusiveAtTheEdgeAndExclusiveBeyond) {
 
 TEST(LadderClassify, OverlappingWindowsResolveToTheNearestCentreNotTheFirstMatch) {
     LadderProfile p = MakeProfile(kIdleMv);
-    // Two deliberately overlapping windows.
+    // Two deliberately overlapping windows, in millivolts at the 2835 idle:
+    // A centre 1418 (500 permille) half 227 (80 permille) -> [420,580]
+    // B centre 1531 (540 permille) half 227 (80 permille) -> [460,620]
     p.count = 2;
-    p.buttons[0] = {"A", 500, 80, 1};  // [420,580]
-    p.buttons[1] = {"B", 540, 80, 2};  // [460,620]
+    p.buttons[0] = {"A", "Button A", 1418, 227, 3300, 235, 200, 98};
+    p.buttons[1] = {"B", "Button B", 1531, 227, 3300, 235, 200, 98};
     EXPECT_EQ(LadderClassify(p, 1418, kIdleMv).index, 0);  // 500 -> centre 0
     EXPECT_EQ(LadderClassify(p, 1531, kIdleMv).index, 1);  // 540 -> centre 1
 }

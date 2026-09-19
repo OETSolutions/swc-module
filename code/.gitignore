@@ -13,6 +13,8 @@
 .vscode/ipch
 sdkconfig
 sdkconfig.old
+# PlatformIO names the generated IDF config after the env ($PIOENV).
+sdkconfig.esp32s3
 *.swp
 build/
 android/.gradle/

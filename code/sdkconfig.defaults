@@ -1,3 +1,13 @@
+# --- Flash size ------------------------------------------------------------
+# CORRECTION to the brief (see bring-up-log.md): platformio.ini's
+# board_build.flash_size = 4MB is NOT honoured on pioarduino's ESP-IDF path --
+# the board->sdkconfig injection is Arduino-gated, so IDF fell back to its own
+# 2MB default and the build emitted "Flash memory size mismatch detected.
+# Expected 4MB, found 2MB!". ESPTOOLPY_FLASHSIZE is a Kconfig *choice*, so it
+# must be selected in choice form; the string form
+# CONFIG_ESPTOOLPY_FLASHSIZE="4MB" is silently ignored.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+
 # --- Console and USB -------------------------------------------------------
 # Console on the ROM USB-Serial-JTAG peripheral; the app link is TinyUSB CDC on
 # the same physical port but a separate USB interface (spec 4.1). Keeping them

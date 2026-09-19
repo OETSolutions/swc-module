@@ -1,7 +1,12 @@
 # name,     type, subtype,  offset,    size,      flags
+# NOTE: app1's offset must be 64 KB aligned (gen_esp32part.py: APP_TYPE offset
+# alignment = 0x10000). Spec 9.2's original 0x208000 is not, and IDF rejects the
+# table outright ("Partition app1 invalid: Offset 0x208000 is not aligned to
+# 0x10000"). app0/app1 are therefore both 0x1E0000 (1920 KB); 0x3E0000-0x3EFFFF
+# is left reserved so coredump stays at its specified 64 KB. See bring-up-log.md.
 nvs,        data, nvs,      0x9000,    0xC000,
 otadata,    data, ota,      0x15000,   0x2000,
 phy_init,   data, phy,      0x17000,   0x1000,
-app0,       app,  ota_0,    0x20000,   0x1E8000,
-app1,       app,  ota_1,    0x208000,  0x1E8000,
+app0,       app,  ota_0,    0x20000,   0x1E0000,
+app1,       app,  ota_1,    0x200000,  0x1E0000,
 coredump,   data, coredump, 0x3F0000,  0x10000,

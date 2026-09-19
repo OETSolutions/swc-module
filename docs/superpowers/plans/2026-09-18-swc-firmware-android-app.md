@@ -5173,6 +5173,17 @@ FR-20, FR-21, FR-22. The buzzer is an **active part at a fixed ~2.4 kHz**: the
 firmware can only gate it, so every pattern is rhythm, never pitch. Both LEDs
 are green, so every pattern is rate and rhythm, never hue.
 
+**This task was rewritten against spec 7.2/7.3.** An earlier revision specified
+its own pattern table that contradicted spec 7.2 on 12 of 15 rows
+(`KEY_ACCEPTED` 40 ms vs 25/0; `LEARN_REJECT` one 400 ms vs 300/80 x2;
+`BOOT_ERROR` 3x200 vs 500/200 x2), omitted `PROGRAM_SAVED`, `PROGRAM_CANCEL`,
+`FACTORY_RESET`, `FAULT_DAC` and `FAULT_CONFIG` entirely, declared
+`Play(BuzzerPattern)` and then called `Play(kProgramStep, n)` in its own tests,
+and gave both LEDs one flat 9-value `LedPattern` enum that cannot express spec
+7.3's two independent channel grammars. The spec is the authority; the tables in
+the Shared contract above are the single home for the pattern data, and this task
+implements them.
+
 **Files:**
 - Create: `code/lib/Feedback/BuzzerGrammar.h`
 - Create: `code/lib/Feedback/BuzzerGrammar.cpp`
@@ -5186,10 +5197,35 @@ are green, so every pattern is rate and rhythm, never hue.
 **Interfaces:**
 - Consumes: `IHAL` (Task 2), `DeviceSettings` (Task 8)
 - Produces:
-  - `enum class BuzzerPattern { kNone, kKeyAccepted, kKeyUnknown, kProgramEnter, kProgramStep, kProgramExit, kLearnPrompt, kLearnOk, kLearnReject, kBootOk, kBootDegraded, kBootError, kFault, kOtaStart, kOtaDone }`
-  - `class BuzzerGrammar` with `void Play(BuzzerPattern p)`, `void Update(uint64_t now_ms)`, `bool Busy() const`
-  - `enum class LedPattern { kOff, kIdle, kGesture, kDriving, kGainChanged, kAlternate, kSolid, kDoubleFlash, kMaintenance }`
-  - `class LedGrammar` with `void Set(LedPattern p)`, `void Update(uint64_t now_ms)`
+  - `enum class BuzzerPattern` — spec 7.2's complete table plus `kNone`. **Not**
+    a hand-written subset: the enumerators are `kBootOk, kBootDegraded,
+    kBootError, kKeyAccepted, kKeyUnknown, kProgramEnter, kProgramStep,
+    kProgramSaved, kProgramExit, kProgramCancel, kLearnPrompt, kLearnOk,
+    kLearnReject, kFaultDac, kFaultConfig, kFactoryReset, kOtaStart, kOtaOk,
+    kOtaFail`.
+  - `class BuzzerGrammar` with `BuzzerGrammar(IHAL*, uint8_t level)`,
+    `void Play(BuzzerPattern p)` — **arity 1**, `void Update(uint64_t now_ms)`,
+    `bool Busy() const`
+  - `enum class LedStatPattern { kOff, kSolid, kBreathe, kBlink, kDoubleFlash, kAlternate }`
+  - `enum class Led2Pattern { kOff, kFlick, kSolid, kLongPulse }`
+  - `class LedGrammar` with `LedGrammar(IHAL*, uint8_t level)`,
+    `void SetStat(LedStatPattern)`, `void Set2(Led2Pattern)`,
+    `void Update(uint64_t now_ms)`
+
+**Why `Play` has arity 1, and why `PROGRAM_STEP` is one pulse.** Spec 7.2's
+grammar is `pattern := pulse(on, off), repeat, gap` — `repeat` is a property of a
+*named pattern*, not an argument. Spec 7.4's fallback menu announces the *n*-th
+button as "*n* beeps", which reads as `reps = n`; it is not. The pattern is one
+40/40 pulse and the **caller** loops *n* times. Making the rep count an argument
+would put a runtime parameter into a compile-time table, and every pattern's
+timing would stop being checkable against spec 7.2.
+
+**Why two LED enums rather than one.** Spec 7.3 gives `LED_STAT` a *state*
+vocabulary (solid / breathe / blink / double-flash / alternate) and `LED2` an
+*activity* vocabulary (off / flick / solid / long pulse). The states are not the
+same set, and the normal connected-and-idle state is "LED_STAT breathes while
+LED2 is off" — unrepresentable in one flat enum without a channel argument on
+every setter anyway.
 
 - [ ] **Step 1: Write the failing buzzer test**
 
@@ -5222,34 +5258,48 @@ TEST(BuzzerGrammar, KeyAcceptedIsASingleShortBeep) {
     EXPECT_EQ(CountBeeps(hal, b, 400), 1);
 }
 
-TEST(BuzzerGrammar, ProgramEnterIsThreeShortAndOneLong) {
+// Spec 7.2's PROGRAM_ENTER is 40/40 x2 -- NOT the "3 short + 1 long"
+// shave-and-a-haircut an earlier revision specified, which is not in the table
+// and is not reproducible on a fixed-tone gated buzzer anyway.
+TEST(BuzzerGrammar, ProgramEnterIsTwoPulsesPerTheSpecTable) {
     MockHal hal;
     BuzzerGrammar b(&hal.InterfaceRef(), 3);
     b.Play(BuzzerPattern::kProgramEnter);
-    // "Shave and a haircut" minus the last two: 3 short + 1 long.
-    EXPECT_EQ(CountBeeps(hal, b, 2000), 4);
+    EXPECT_EQ(CountBeeps(hal, b, 2000), 2);
 }
 
-TEST(BuzzerGrammar, ProgramStepEmitsNBeepsForTheNthButton) {
-    for (int n = 1; n <= 4; ++n) {
-        MockHal hal;
-        BuzzerGrammar b(&hal.InterfaceRef(), 3);
-        b.Play(BuzzerPattern::kProgramStep, static_cast<uint8_t>(n));
-        EXPECT_EQ(CountBeeps(hal, b, 3000), n) << "n=" << n;
+// PROGRAM_STEP is ONE 40/40 pulse (spec 7.2); the caller repeats it n times.
+TEST(BuzzerGrammar, ProgramStepIsOnePulseAndTheCallerRepeatsIt) {
+    MockHal hal;
+    BuzzerGrammar b(&hal.InterfaceRef(), 3);
+    int beeps = 0;
+    for (int n = 0; n < 4; ++n) {
+        b.Play(BuzzerPattern::kProgramStep);
+        beeps += CountBeeps(hal, b, 200);   // one 40/40 cycle, plus margin
+        for (int i = 0; i < 20; ++i) b.Update(hal.NowMs()), hal.AdvanceMs(5);
     }
+    EXPECT_EQ(beeps, 4) << "four Play calls, one beep each";
 }
 
 TEST(BuzzerGrammar, LearnRejectIsDistinctFromLearnOk) {
+    // Spec 7.2 gives LEARN_OK 40/30 x2 and LEARN_REJECT 300/80 x2 -- the SAME
+    // count and very different rhythm, so counting alone cannot distinguish
+    // them. Assert on how long the line is actually on.
     MockHal hal_a, hal_b;
     BuzzerGrammar ok(&hal_a.InterfaceRef(), 3);
     BuzzerGrammar reject(&hal_b.InterfaceRef(), 3);
     ok.Play(BuzzerPattern::kLearnOk);
     reject.Play(BuzzerPattern::kLearnReject);
-    // A user doing this blind must be able to tell success from failure by
-    // rhythm alone; identical counts would make the distinction worthless.
-    const int a = CountBeeps(hal_a, ok, 2000);
-    const int b = CountBeeps(hal_b, reject, 2000);
-    EXPECT_NE(a, b) << "ok and reject must have different rhythms";
+    int on_a = 0, on_b = 0;
+    for (int i = 0; i < 400; ++i) {
+        ok.Update(hal_a.NowMs());
+        reject.Update(hal_b.NowMs());
+        if (hal_a.BuzzerIsOn()) ++on_a;
+        if (hal_b.BuzzerIsOn()) ++on_b;
+        hal_a.AdvanceMs(5);
+        hal_b.AdvanceMs(5);
+    }
+    EXPECT_GT(on_b, on_a * 2) << "reject must be audibly longer than ok";
 }
 
 TEST(BuzzerGrammar, LevelZeroSilencesEverythingExceptFatalPatterns) {
@@ -5260,20 +5310,24 @@ TEST(BuzzerGrammar, LevelZeroSilencesEverythingExceptFatalPatterns) {
     b.Play(BuzzerPattern::kBootOk);
     EXPECT_EQ(CountBeeps(hal, b, 600), 0);
 
-    // BOOT_ERROR and FAULT_* are the documented exceptions (spec 7.1): a device
+    // BOOT_ERROR and FAULT_* are the documented exceptions (spec 7.2): a device
     // that cannot serve output must still say so.
     b.Play(BuzzerPattern::kBootError);
     EXPECT_GT(CountBeeps(hal, b, 2000), 0);
+    b.Play(BuzzerPattern::kFaultConfig);
+    EXPECT_GT(CountBeeps(hal, b, 4000), 0);
 }
 
 TEST(BuzzerGrammar, PlayingWhileBusyReplacesRatherThanQueues) {
     MockHal hal;
     BuzzerGrammar b(&hal.InterfaceRef(), 3);
-    b.Play(BuzzerPattern::kProgramEnter);   // long pattern
+    b.Play(BuzzerPattern::kProgramEnter);   // 120 ms pattern
     b.Update(hal.NowMs());
     ASSERT_TRUE(b.Busy());
     b.Play(BuzzerPattern::kKeyAccepted);    // a key press during programming feedback
-    EXPECT_FALSE(b.Busy()) << "the newer, shorter pattern must take over immediately";
+    EXPECT_TRUE(b.Busy()) << "the new pattern is running, having replaced the old one";
+    for (int i = 0; i < 20; ++i) b.Update(hal.NowMs()), hal.AdvanceMs(5);
+    EXPECT_FALSE(b.Busy()) << "the newer, shorter pattern took over immediately";
 }
 
 TEST(BuzzerGrammar, NeverLeavesTheBuzzerStuckOnAfterAPatternCompletes) {
@@ -5282,6 +5336,33 @@ TEST(BuzzerGrammar, NeverLeavesTheBuzzerStuckOnAfterAPatternCompletes) {
     b.Play(BuzzerPattern::kProgramEnter);
     for (int i = 0; i < 2000; ++i) b.Update(hal.NowMs()), hal.AdvanceMs(5);
     EXPECT_FALSE(hal.BuzzerIsOn()) << "a stuck buzzer is a stuck-on hardware fault";
+}
+
+// Every pattern in spec 7.2 must be playable and must finish. A pattern that
+// never completes would hold the buzzer line forever, which the previous test
+// only checks for one pattern.
+TEST(BuzzerGrammar, EverySpecPatternCompletesAndReleasesTheLine) {
+    const BuzzerPattern all[] = {
+        BuzzerPattern::kBootOk, BuzzerPattern::kBootDegraded, BuzzerPattern::kBootError,
+        BuzzerPattern::kKeyAccepted, BuzzerPattern::kKeyUnknown,
+        BuzzerPattern::kProgramEnter, BuzzerPattern::kProgramStep,
+        BuzzerPattern::kProgramSaved, BuzzerPattern::kProgramExit,
+        BuzzerPattern::kProgramCancel,
+        BuzzerPattern::kLearnPrompt, BuzzerPattern::kLearnOk, BuzzerPattern::kLearnReject,
+        BuzzerPattern::kFaultDac, BuzzerPattern::kFaultConfig, BuzzerPattern::kFactoryReset,
+        BuzzerPattern::kOtaStart, BuzzerPattern::kOtaOk, BuzzerPattern::kOtaFail,
+    };
+    for (BuzzerPattern p : all) {
+        MockHal hal;
+        BuzzerGrammar b(&hal.InterfaceRef(), 3);
+        b.Play(p);
+        // Spec 7.2's bound: routine patterns finish inside ~2 s, the three fatal
+        // ones inside ~3 s. 3.5 s covers every row with margin, and is short
+        // enough that a pattern which never ends still fails here.
+        for (int i = 0; i < 700; ++i) b.Update(hal.NowMs()), hal.AdvanceMs(5);
+        EXPECT_FALSE(b.Busy()) << "pattern " << static_cast<int>(p) << " never finished";
+        EXPECT_FALSE(hal.BuzzerIsOn()) << "pattern " << static_cast<int>(p) << " left the line on";
+    }
 }
 ```
 
@@ -5292,22 +5373,29 @@ Expected: FAIL — `Feedback/BuzzerGrammar.h` not found.
 
 - [ ] **Step 3: Implement `BuzzerGrammar`**
 
-A pattern is a small array of `{on_ms, off_ms}` steps. `Update` is called from
-the main loop and drives `buzzer_on(...)` from the injected clock — **it never
-blocks**, which is FR-21. `Play` while busy discards the current pattern and
-starts the new one. At the end of every pattern the line is forced low.
+A pattern is a `{on_ms, off_ms, reps}` row from the Shared-contract table.
+`Update` is called from the main loop and drives `buzzer_on(...)` from the
+injected clock — **it never blocks**, which is FR-21. `Play` while busy discards
+the current pattern and starts the new one. At the end of every pattern the line
+is forced low, fatal or not.
 
-Patterns (from spec §7.1): `kKeyAccepted` = one 40 ms beep; `kKeyUnknown` = two
-60 ms beeps 60 ms apart; `kProgramEnter` = 3×80 ms + 160 ms; `kProgramStep` =
-n × 80 ms; `kProgramExit` = 2×120 ms; `kLearnPrompt` = 2×60 ms; `kLearnOk` =
-3×60 ms; `kLearnReject` = one 400 ms; `kBootOk` = 1×120 ms; `kBootDegraded` =
-2×120 ms; `kBootError` = 3×200 ms; `kFault` = 5×80 ms; `kOtaStart` = 2×40 ms;
-`kOtaDone` = 2×200 ms.
+Two implementation points the tests pin:
+
+- **The final pulse's `off_ms` is trimmed**, so a pattern's total is
+  `reps*(on+off) - off`. A pattern that ended with a full off would hold the line
+  silent for one extra interval, making "count the beeps in T ms" depend on T.
+- **`Update` writes the line only on change.** Re-driving it every tick would
+  make `BuzzerOnCount` meaningless as a signal, and it is what Task 13's
+  "idle ticks must be silent" assertion is built on.
+- **A suppressed pattern still runs its course.** At `level == 0` the line is
+  never driven, but `Busy()` reports honestly for the pattern's duration. Doing
+  it by refusing to start would make `Busy()` false during a pattern that is
+  notionally running.
 
 - [ ] **Step 4: Run the buzzer tests**
 
 Run: `cd code && pio test -e native -f '*test_feedback'`
-Expected: PASS — 7 buzzer tests green.
+Expected: PASS — 8 buzzer tests green.
 
 - [ ] **Step 5: Write the failing LED test**
 
@@ -5333,7 +5421,8 @@ int CountFlashes(MockHal &hal, LedGrammar &g, GpioPin pin, uint32_t total_ms) {
 TEST(LedGrammar, OffMeansOffOnBothChannels) {
     MockHal hal;
     LedGrammar g(&hal.InterfaceRef(), 3);
-    g.Set(LedPattern::kOff);
+    g.SetStat(LedStatPattern::kOff);
+    g.Set2(Led2Pattern::kOff);
     for (int i = 0; i < 200; ++i) g.Update(hal.NowMs()), hal.AdvanceMs(5);
     EXPECT_FALSE(hal.GpioRead(GPIO_LED_STAT));
     EXPECT_FALSE(hal.GpioRead(GPIO_LED2));
@@ -5342,7 +5431,7 @@ TEST(LedGrammar, OffMeansOffOnBothChannels) {
 TEST(LedGrammar, DrivingIsContinuousOnLed2NotBlinking) {
     MockHal hal;
     LedGrammar g(&hal.InterfaceRef(), 3);
-    g.Set(LedPattern::kDriving);
+    g.Set2(Led2Pattern::kSolid);
     for (int i = 0; i < 100; ++i) g.Update(hal.NowMs()), hal.AdvanceMs(5);
     // "Solid while driving" is the diagnostic (spec 7.3): the user can see the
     // adapter is holding a key, which separates adapter-wrong from radio-ignoring.
@@ -5353,14 +5442,45 @@ TEST(LedGrammar, DrivingIsContinuousOnLed2NotBlinking) {
 TEST(LedGrammar, MaintenanceIsADistinctDoubleFlash) {
     MockHal hal;
     LedGrammar g(&hal.InterfaceRef(), 3);
-    g.Set(LedPattern::kMaintenance);
+    g.SetStat(LedStatPattern::kDoubleFlash);
     EXPECT_GE(CountFlashes(hal, g, GPIO_LED_STAT, 3000), 4) << "repeating double flashes";
+}
+
+// The burst must be a BURST: a plain 100/100 blink would satisfy the count above
+// while being indistinguishable from kBlink, which is the one thing this pattern
+// exists not to be. The signature is two rising edges close together followed by
+// a long silence, so the window must be one burst period (900 ms) and no longer
+// -- a longer window catches the start of the next burst, a shorter one sees two
+// flashes from either pattern.
+TEST(LedGrammar, DoubleFlashIsABurstNotABlink) {
+    const uint32_t kWindowMs = 880;   // just inside one 900 ms burst period
+
+    auto count_rises = [](LedStatPattern p) {
+        MockHal hal;
+        LedGrammar g(&hal.InterfaceRef(), 3);
+        g.SetStat(p);
+        int rises = 0;
+        bool prev = false;
+        for (uint32_t t = 0; t < kWindowMs; t += 5) {
+            g.Update(hal.NowMs());
+            const bool now = hal.GpioRead(GPIO_LED_STAT);
+            if (now && !prev) ++rises;
+            prev = now;
+            hal.AdvanceMs(5);
+        }
+        return rises;
+    };
+
+    EXPECT_EQ(count_rises(LedStatPattern::kDoubleFlash), 2)
+        << "two flashes, then a gap -- not an even blink";
+    EXPECT_GT(count_rises(LedStatPattern::kBlink), 2)
+        << "the blink keeps firing inside the same window";
 }
 
 TEST(LedGrammar, TheTwoChannelsHaveIndependentPatterns) {
     MockHal hal;
     LedGrammar g(&hal.InterfaceRef(), 3);
-    g.Set(LedPattern::kAlternate);
+    g.SetStat(LedStatPattern::kAlternate);
     const int a = CountFlashes(hal, g, GPIO_LED_STAT, 2000);
     const int b = CountFlashes(hal, g, GPIO_LED2, 2000);
     EXPECT_GT(a, 0);
@@ -5377,16 +5497,45 @@ TEST(LedGrammar, TheTwoChannelsHaveIndependentPatterns) {
 TEST(LedGrammar, LevelZeroSilencesBothChannels) {
     MockHal hal;
     LedGrammar g(&hal.InterfaceRef(), 0);
-    g.Set(LedPattern::kMaintenance);
+    g.SetStat(LedStatPattern::kDoubleFlash);
     EXPECT_EQ(CountFlashes(hal, g, GPIO_LED_STAT, 3000), 0);
+    g.Set2(Led2Pattern::kSolid);
     EXPECT_EQ(CountFlashes(hal, g, GPIO_LED2, 3000), 0);
+}
+
+// Spec 7.3's two channels are separate grammars, so setting one must not
+// disturb the other. An earlier single flat enum could not express this at all.
+TEST(LedGrammar, SettingOneChannelLeavesTheOtherAlone) {
+    MockHal hal;
+    LedGrammar g(&hal.InterfaceRef(), 3);
+    g.Set2(Led2Pattern::kSolid);
+    for (int i = 0; i < 20; ++i) g.Update(hal.NowMs()), hal.AdvanceMs(5);
+    ASSERT_TRUE(hal.GpioRead(GPIO_LED2));
+
+    g.SetStat(LedStatPattern::kBlink);
+    for (int i = 0; i < 40; ++i) g.Update(hal.NowMs()), hal.AdvanceMs(5);
+    EXPECT_TRUE(hal.GpioRead(GPIO_LED2)) << "LED2 is still solid while LED_STAT blinks";
 }
 ```
 
 - [ ] **Step 6: Implement `LedGrammar` and run**
 
 Run: `cd code && pio test -e native -f '*test_feedback'`
-Expected: PASS — 7 + 5 tests green.
+Expected: PASS — 8 + 7 tests green.
+
+Three implementation points the tests pin:
+
+- **A pattern is a short repeating `{on, off}` sequence, not a single cycle.**
+  `kDoubleFlash` is `(100 on, 100 off), (100 on, 600 off)` — a *pair* followed by
+  a long gap. A single 100/100 cycle is indistinguishable from `kBlink`, which is
+  the one thing this pattern exists not to be.
+- **`kAlternate` owns LED2 while it is set.** Spec 7.3's "alternating with LED2"
+  is a property of the *pair*: exactly one of the two is lit. That is why the two
+  channels share one phase clock — two independent blinks could overlap, and
+  overlap is precisely not an alternation.
+- **`level == 0` silences both channels**, with no fatal exception. Unlike the
+  buzzer there is no pattern that must be heard when feedback is off; the
+  buzzer's `FAULT_*` is how a fault is reported.
 
 - [ ] **Step 7: Commit**
 
@@ -5399,12 +5548,13 @@ git add code/lib/Feedback/BuzzerGrammar.h code/lib/Feedback/BuzzerGrammar.cpp \
 git commit -m "Add the buzzer and LED feedback grammars
 
 The buzzer is active at a fixed frequency, so every pattern is rhythm and no
-pattern attempts pitch. Learn OK and learn reject are asserted to differ, since
-a user doing this blind must be able to tell them apart. Both grammars are
-clock-driven and never block, so feedback cannot delay a key press."
+pattern attempts pitch. The pattern table is spec 7.2's, implemented as written:
+the previous revision of this task had its own table that disagreed with the spec
+on twelve of fifteen rows and omitted five patterns. Learn OK and learn reject
+have the same beep count and different pulse lengths, so the test asserts on
+duration rather than count. Both grammars are clock-driven and never block, so
+feedback cannot delay a key press."
 ```
-
----
 
 ### Task 13: `SystemOrchestrator` — the main loop that ties it together
 

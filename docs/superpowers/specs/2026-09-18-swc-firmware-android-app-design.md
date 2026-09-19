@@ -1284,7 +1284,14 @@ pattern   := pulse("on_ms", "off_ms") , repeat , gap_ms
 | `FAULT_DAC` | 500/300 | 3 | I²C/DAC fault |
 | `FAULT_CONFIG` | 500/300 | 4 | Config corrupt; defaults loaded |
 | `FACTORY_RESET` | 800/200 | 3 | Everything erased |
-| `OTA_START` / `OTA_OK` / `OTA_FAIL` | — | — | Long single / rising double / harsh triple |
+| `OTA_START` / `OTA_OK` / `OTA_FAIL` | 400/0 · 150/100 · 80/40 | 1 · 2 · 3 | Long single / double / harsh triple |
+
+The OTA row is the only one with no numbers in the 2022 table, and its prose says
+"rising double" — **which this hardware cannot produce.** §7.1 fixes the buzzer's
+tone at ~2.4 kHz with on/off gating only, so a *rising* interval is not
+representable. `OTA_OK` is therefore a plain double with a longer second pulse
+(150/100 ×2), which is what "rising" can mean once pitch is unavailable: the
+pulses grow in *length*, not in frequency.
 
 **Design rules:**
 
@@ -1301,8 +1308,17 @@ pattern   := pulse("on_ms", "off_ms") , repeat , gap_ms
   hundreds of times a drive; the diagnostic patterns are long and loud so they
   are unmistakable and rare. If feedback were uniform, a fault would be
   indistinguishable from normal operation.
-- **No pattern may exceed ~2 s**, because the buzzer is non-blocking (FR-21) and
-  a long pattern would still be playing over a subsequent event.
+- **No routine pattern may exceed ~2 s**, because the buzzer is non-blocking
+  (FR-21) and a long pattern would still be playing over a subsequent event.
+  **The fatal patterns are the stated exception, bounded at ~3 s instead**:
+  `FAULT_DAC` (2.1 s), `FAULT_CONFIG` (2.9 s) and `FACTORY_RESET` (2.8 s) exceed
+  2 s as the table above defines them. That is deliberate and it is the same
+  argument as `KEY_ACCEPTED`'s, read the other way: these three must be
+  *unmistakable*, and they are rare enough that nothing follows them to be
+  delayed. A 2 s rule applied to them would shorten the one pattern the user
+  most needs to hear. The bound is stated as ~3 s so the table has a check it
+  actually passes.
+
 - `buzzer_level` (`OFF` / `QUIET` / `NORMAL` / `LOUD`) scales duty or suppresses
   entire classes: `OFF` silences everything except `BOOT_ERROR` and `FAULT_*`.
 
@@ -1386,8 +1402,8 @@ obvious choice of the BOOT button:
 
 ```
 PROGRAMMING MODE   (trigger: AUX1 held ≥ 1.5 s, or the app requests it)
-  1. Enter:      BEEP PROGRAM_ENTER ("shave-and-a-haircut": 3 short + 1 long)
-                 LED_STAT does the same 3-1 cadence
+  1. Enter:      BEEP PROGRAM_ENTER — §7.2's 40/40 ×2, NOT a shave-and-a-haircut
+                 LED_STAT does the same 2-pulse cadence
   2. Target:     the user presses the physical button to program
                    SWC1's buttons → 1 beep slot, SWC2's → 2, AUX1–3 → 3/4/5
                    (beep COUNT identifies the slot — there is no pitch)
@@ -1397,10 +1413,24 @@ PROGRAMMING MODE   (trigger: AUX1 held ≥ 1.5 s, or the app requests it)
                    double press  → DOUBLE   (2 beeps)
                    hold ≥ long   → LONG     (3 beeps)
                  ← this escalating count IS the "buzzer sounds that escalate"
-  4. Confirm:    2 equal beeps = BEEP_SAVED
+  4. Confirm:    BEEP PROGRAM_SAVED — §7.2's 40/20 ×4
   5. More?       return to 2; exit with AUX1 held ≥ 1.5 s again
                  BEEP PROGRAM_EXIT
 ```
+
+**The 2022 "shave-and-a-haircut" cadence is gone, and the reason is the same one
+that removed pitch.** This block previously specified a 3-short-plus-1-long
+`PROGRAM_ENTER` and a "2 equal beeps" save confirmation. Neither is in §7.2's
+table: `PROGRAM_ENTER` is 40/40 ×2 there, and the save confirmation is
+`PROGRAM_SAVED` (40/20 ×4). Two homes for one pattern is how a firmware
+implementation and a test come to disagree about what the device plays, so the
+table wins — it is the section that exists to define the patterns, and §7.5 is a
+description of a *flow* that consumes them.
+
+**Every pattern named in this flow is now a §7.2 row.** That is the check worth
+applying to any future edit here: if a step names a pattern, the pattern must
+exist in the table above with the timings this step implies.
+
 
 **The beep count is the menu depth**, which is how a fixed-pitch buzzer conveys
 "how deep am I" — the old design used rising pitch for this, and pitch is not

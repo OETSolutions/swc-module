@@ -6570,6 +6570,29 @@ image rolls back rather than being confirmed by a boot it happened to survive."
 The single mechanism that keeps the two sides from drifting. A change to a field
 name surfaces as a failing build, not a runtime parse failure in a car.
 
+**What the contract contains, and what it must never contain.** It generates the
+**frame vocabulary** and the **action-kind enum**. It does **not** generate an
+action-id table: spec §3.6 states there are no numeric action ids, and that "a
+generated contract must not synthesize them".
+
+**The action kind is a STRING on the wire and an ordinal in memory.** Spec §3.7's
+worked example writes `{ "kind": "HW_KEY", "key_resistance_mohm": 24000 }` — the
+JSON and the NDJSON both carry the name, because a config written by one firmware
+version must be readable by another and an ordinal silently rebinds when a kind is
+inserted. The ordinal exists only inside each side's own enum.
+
+That makes the generator's order and `ConfigModel.h`'s `ActionKind` declaration
+order **one fact**, so the generator does not own the numbering —
+`ConfigModel.h` does, and a test below parses the firmware enum to assert they
+still agree. A drift there means the generated C enum's values no longer match the
+firmware's, which is a defect in the *generated header*, not in a stored config.
+
+**Neither form may become an action id.** An earlier revision of this task emitted
+`#define SWC_ACTION_<NAME> <id>` for a `1–63` table and a Kotlin
+`object ActionIds { const val VOL_UP = 1 ... }` — synthesizing exactly what spec
+§3.6 forbids, and encoding `VOL_UP` (a `LadderButton.id`) as an action id, which is
+the conflation §3.6 names as a defect.
+
 **Files:**
 - Create: `code/tools/gen_contract.py`
 - Create: `code/tools/gen_contract_kotlin.py`
@@ -6579,9 +6602,10 @@ name surfaces as a failing build, not a runtime parse failure in a car.
 - Create: `code/tools/test_gen_contract.py`
 
 **Interfaces:**
-- Consumes: nothing
-- Produces: `swc_contract.h` (C enums and structs for the frame types and action
-  ids) and `Contract.kt` (Kotlin equivalents)
+- Consumes: `ActionKind`'s declaration order from `lib/Config/ConfigModel.h`
+  (Task 8) — read, not redefined
+- Produces: `swc_contract.h` (the action-kind enum and the frame type strings) and
+  `Contract.kt` (the Kotlin equivalents)
 
 - [ ] **Step 1: Write the failing test**
 
@@ -6590,9 +6614,31 @@ name surfaces as a failing build, not a runtime parse failure in a car.
 import subprocess, sys, pathlib
 import contract_schema
 
-def test_action_ids_are_contiguous_from_one():
-    ids = sorted(a.id for a in contract_schema.ACTIONS)
-    assert ids == list(range(1, len(ids) + 1)), "action ids must have no gaps"
+def test_action_kinds_are_contiguous_from_zero():
+    # A kind's ordinal is its in-memory value on each side, so a gap would be a
+    # value nothing defines. (Action ids 1-63 are a different thing and do not
+    # exist at all; the wire carries the kind NAME, per spec 3.7.)
+    ordinals = sorted(k.ordinal for k in contract_schema.ACTION_KINDS)
+    assert ordinals == list(range(len(ordinals))), "kind ordinals must have no gaps"
+
+def test_there_are_exactly_the_eleven_spec_kinds():
+    # Spec 3.6's table. A kind added here without a spec entry is a name the app
+    # can send and the firmware has no behavior for.
+    assert len(contract_schema.ACTION_KINDS) == 11
+    assert contract_schema.ACTION_KINDS[0].name == "NONE"
+
+def test_generated_kinds_match_the_firmware_enum_order():
+    # The generator's order and ConfigModel.h's ActionKind declaration order are
+    # ONE fact with two spellings. Both sides use their own enum's ordinal
+    # internally; the wire carries the NAME (spec 3.7), so a drift here is a
+    # defect in the generated header, not a misread config. Asserted anyway,
+    # because two spellings of one list is how this plan's defects start.
+    text = pathlib.Path("../lib/Config/ConfigModel.h").read_text()
+    body = text.split("enum class ActionKind : uint8_t {", 1)[1].split("};", 1)[0]
+    firmware = [w.strip() for w in body.replace("\n", " ").split(",") if w.strip()]
+    generated = [k.c_enum for k in contract_schema.ACTION_KINDS]
+    assert generated == firmware, \
+        "regenerate the contract after changing ActionKind's declaration order"
 
 def test_frame_types_are_unique():
     types = [f.name for f in contract_schema.FRAMES]
@@ -6623,15 +6669,29 @@ Expected: FAIL — `contract_schema` not found.
 
 - [ ] **Step 3: Write `contract_schema.py` and the two generators**
 
-`contract_schema.py` holds `PROTOCOL_VERSION = 1`, an `ACTIONS` list of
-`Action(name, id, kind, takes_payload, payload_label)` matching spec §3.6 **with
-contiguous ids from 1**, and a `FRAMES` list of `Frame(name, direction, fields)`.
+`contract_schema.py` holds:
+
+- `PROTOCOL_VERSION = 1`;
+- `ACTION_KINDS` — a list of `ActionKind(name, ordinal, c_enum, needs_target)`,
+  spec §3.6's eleven kinds **in `ConfigModel.h`'s declaration order**, so
+  `ordinal` is redundant with the list position and the test above asserts that;
+- `FRAMES` — a list of `Frame(name, direction, fields)`.
+
+`needs_target` is the same fact as `ConfigModel.h`'s `ActionIsWellFormed`, stated
+once here for the app's benefit so the app can grey out an empty field. It is
+**not** a stored flag — spec §3.6 makes it a property of the kind, and an earlier
+revision's per-action `takes_payload` bool is deleted for exactly that reason.
+
 The generators emit:
 
-- `swc_contract.h` — `#define SWC_PROTOCOL_VERSION`, `#define SWC_ACTION_<NAME> <id>`
-  for every action, and the frame type strings as `#define`s.
-- `Contract.kt` — a Kotlin `object ActionIds { const val VOL_UP = 1 ... }` and
-  the frame names, so the app references symbols rather than string literals.
+- `swc_contract.h` — `#define SWC_PROTOCOL_VERSION`, an `SwcActionKind` C enum
+  whose **enumerator order is `ActionKind`'s**, a `SWC_ACTION_KIND_<NAME>` string
+  `#define` per kind (the wire form — spec §3.7), and the frame type strings as
+  `#define`s. There is no `SWC_ACTION_<NAME>` numeric macro, because there is no
+  action id.
+- `Contract.kt` — `enum class ActionKind { NONE, HW_KEY, HW_KEY_RELEASE, … }`
+  with a `wireName` property per entry, and the frame names, so the app references
+  symbols rather than string literals. There is no `ActionIds` object.
 
 Both generators are deterministic (sorted iteration, no timestamps) so the
 checked-in-vs-generated comparison is meaningful.
@@ -6639,7 +6699,7 @@ checked-in-vs-generated comparison is meaningful.
 - [ ] **Step 4: Run the tests**
 
 Run: `cd code/tools && python3 -m pytest test_gen_contract.py -v`
-Expected: PASS — 5 tests green.
+Expected: PASS — 7 tests green.
 
 - [ ] **Step 5: Commit**
 
@@ -6650,10 +6710,11 @@ git add code/tools/gen_contract.py code/tools/gen_contract_kotlin.py \
         code/android/app/src/main/java/com/oetsolutions/swc/contract/Contract.kt
 git commit -m "Generate the wire contract for firmware and app from one schema
 
-Action ids and frame types are defined once and emitted as a C header and a
-Kotlin object. The tests assert the committed copies match what the generators
-produce, so a spec change surfaces as a failing build rather than as a runtime
-parse failure in a car."
+The contract carries the frame vocabulary and the action-kind enum. It carries no
+action-id table, because spec 3.6 defines none and forbids the generator from
+synthesizing one. The wire carries the kind NAME (spec 3.7); the ordinal is
+internal to each side, so the firmware header owns the numbering and a test
+parses that header to assert the generated order still matches."
 ```
 
 ---
@@ -6743,8 +6804,12 @@ class SwcClientTest {
 ```
 
 Plus `ConfigCodecTest.kt`, asserting the Kotlin model round-trips `ConfigJson`
-including every field, and that an unknown action name decodes to a sentinel
-rather than throwing (so an older app can open a config from a newer firmware).
+including every field, and that an unknown action **kind** decodes to a sentinel
+rather than throwing (so an older app can open a config from a newer firmware —
+and, symmetrically, so a newer app does not crash on an older one). A kind is a
+string on the wire (`"APP_INTENT"`), not a number, so this is a name-to-enum
+lookup with a fallback; an unknown *action id* cannot occur, because spec §3.6
+defines no action ids at all.
 
 - [ ] **Step 2: Run and watch them fail**
 
@@ -6832,16 +6897,27 @@ fun liveLadderView_showsEachLearnedButtonAtItsMeasuredLevel() {
         LadderScreen(state = LadderUiState(
             idleMv = 2835,
             buttons = listOf(
-                LearnedButton("VOL_UP", ratioPermille = 504, tolerancePermille = 42),
-                LearnedButton("VOL_DOWN", ratioPermille = 630, tolerancePermille = 120)),
-            liveRatioPermille = 504))
+                LearnedButton("vol_up", mvCenter = 1430, mvTolerance = 120),
+                LearnedButton("vol_dn", mvCenter = 1785, mvTolerance = 120)),
+            liveMv = 1430))
     }
     // The point of the live view is that the user can see *which* button the
     // device currently thinks is pressed, so the matched one must be marked.
-    composeRule.onNodeWithContentDescription("VOL_UP, matched").assertExists()
-    composeRule.onNodeWithContentDescription("VOL_DOWN, not matched").assertExists()
+    composeRule.onNodeWithContentDescription("vol_up, matched").assertExists()
+    composeRule.onNodeWithContentDescription("vol_dn, not matched").assertExists()
 }
 ```
+
+**The UI's state is millivolts, and the ratio is derived for display.** Spec §3.4
+stores `mv_center`/`mv_tolerance` and the ratio is computed at classify time — so
+the app must not carry a second, storable copy of the ratio. An earlier revision
+of this test had `LearnedButton(ratioPermille = 504, tolerancePermille = 42)`,
+which is the pre-rewrite model: those fields do not exist on `LadderButton`, and
+the app showing a ratio it stored rather than derived is how the app and the
+firmware come to disagree about where a window is. `LadderScreen` places each
+marker and band by the derived ratio against `idleMv` (which is what makes the
+view rail-invariant, per spec §6.3) and labels it with the measured millivolts,
+because that is the number a user can compare against a multimeter.
 
 - [ ] **Step 2: Run and watch it fail**
 
@@ -6857,14 +6933,17 @@ Each screen's job, stated as what the user must be able to tell:
   cable present but no device, version mismatch (with both versions shown), and
   device in maintenance. A generic "connection error" is not acceptable here.
 - **`LadderScreen`** — the live ladder: the rail voltage, every learned button as
-  a marker at its ratio with its tolerance as a band, and the current reading
-  moving in real time. **The user must be able to see which button the device
-  thinks is pressed** — that is the whole diagnostic value, and it is what the
-  instrumented test asserts via content descriptions.
+  a marker at its derived ratio with its tolerance as a band, and the current
+  reading moving in real time. **The user must be able to see which button the
+  device thinks is pressed** — that is the whole diagnostic value, and it is what
+  the instrumented test asserts via content descriptions.
 - **`BindingScreen`** — a grid of buttons × gestures, each cell showing its bound
-  action; tapping opens an action picker driven by the generated `ActionIds`, so
-  the app can never offer an action the firmware does not have. A cell with a
-  payload action shows the payload and refuses to save an empty one.
+  action; tapping opens an action picker driven by the generated **`ActionKind`**
+  enum, so the app can never offer a kind the firmware does not have. A cell whose
+  kind takes a target (`ActionTakesPayload`'s set, emitted into the contract)
+  shows that field and refuses to save an empty one. **There is no action-id
+  picker**: spec §3.6 defines no numeric ids, and the generated contract carries
+  none to offer.
 - **`UpdateScreen`** — current version, a "check for updates" that reports
   up-to-date/newer/wrong-board plainly, and two explicit paths: push a file over
   USB, or update over WiFi. **The screen must state that the device keeps working
@@ -6889,8 +6968,10 @@ git commit -m "Add the Android UI: link status, live ladder, bindings and update
 
 The live ladder view marks which button the device currently classifies, which
 is the diagnostic that distinguishes an adapter fault from a head-unit fault.
-The binding screen is driven by the generated action ids, so it cannot offer an
-action the firmware lacks. Link failures are four distinct actionable messages,
+It places each marker by the ratio derived from the stored millivolts rather than
+a stored ratio, so the view and the firmware cannot disagree about a window. The
+binding screen is driven by the generated action-kind enum, so it cannot offer a
+kind the firmware lacks. Link failures are four distinct actionable messages,
 not one generic error."
 ```
 

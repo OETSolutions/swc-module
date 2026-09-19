@@ -48,9 +48,10 @@
   ≤ 48,384 B** at **2,112 B per 2048-byte chunk** (payload + NVS's metadata and
   `BLOB_IDX` entries). Note this is *not* "a slot ≤ 24 KB": two 24 KB slots need
   49,152 B and do not fit.
-  The worst-case config is ~17.8 KB and even a realistic one is ~3.9 KB, so a
-  slot is **chunked** (`cfg_a_0…n`, 2048 B per chunk, 9 chunks worst case); see
-  "NVS layout" in the Shared contract.
+  The worst-case config is **22,407 B** and even a realistic one is ~3.9 KB, so a
+  slot is **chunked** (`cfg_a_0…n`, 2048 B per chunk, **11 chunks worst case**);
+  see "NVS layout" in the Shared contract. Two such slots are 46,496 B of the
+  48,384 B — **96 %**, so the widths and caps in spec §3.5 are load-bearing.
 - **TinyUSB is NOT part of IDF.** IDF 5.5.5 ships no `components/tinyusb` and
   defines no `CONFIG_TINYUSB_*`; the app USB link needs the managed component
   `espressif/esp_tinyusb` added via `idf_component.yml`. **Verified in Task 1.**
@@ -510,16 +511,18 @@ now done and is in the IDF source rather than in a datasheet:
 - A single NVS value is capped at `ENTRY_SIZE × (ENTRY_COUNT − 1)` = 32 × 125 =
   **4000 bytes**. `nvs_page.cpp` returns `ESP_ERR_NVS_VALUE_TOO_LONG` above it.
   This is a hard limit, not a budget.
-- The worst-case `Config` is **~17.8 KB** as JSON (~12.1 KB packed; `Binding` is
-  172 B and 2 channels × 32 bindings dominate). **Even a realistic config
-  (~3.9 KB) sits on the 4000-byte line, and a moderate one (~7.9 KB) exceeds it**
-  — so the single-value form fails on the common case, not a hypothetical one.
+- The worst-case `Config` is **22,407 B** as JSON (~15.9 KB packed; 32 top-level
+  bindings × 2 actions dominate). **Even a realistic config (~3.9 KB) sits on the
+  4000-byte line, and a moderate one (~7.9 KB) exceeds it** — so the single-value
+  form fails on the common case, not a hypothetical one.
 
 Hence `ConfigChunkCountFor()` (Task 8) and the fixed `kConfigChunkBytes = 2048`:
-worst case **9 chunks per slot**, bounded key count. Measured slot cost is
-**79 % of usable NVS entry space** for two worst-case slots (38,016 B of
+worst case **11 chunks per slot**, bounded key count. Measured slot cost is
+**96 % of usable NVS entry space** for two worst-case slots (46,496 B of
 48,384 B — the partition is 12 × 4096 B pages, each with 126 × 32 B entries), so
-it fits with less slack than "48 KB" suggests. Each chunk key costs **2112 B**,
+it fits with much less slack than "48 KB" suggests — and the 48 KB is shared with
+WiFi provisioning credentials (spec §9.2), so this is an upper bound, not a
+private budget. Each chunk key costs **2112 B**,
 not 2080: NVS writes a 32-byte metadata entry and the 2048 payload bytes
 (`nvs_page.cpp:185`) and *then* a separate 32-byte `BLOB_IDX` entry for the key
 (`nvs_storage.cpp:353`). An earlier revision counted 2080 and understated the
@@ -1878,11 +1881,20 @@ ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int i
 
     // Nearest-centre match, so two overlapping windows resolve deterministically
     // to whichever button the user actually pressed rather than to array order.
+    //
+    // The centre and half-width are DERIVED from millivolts against the LEARNED
+    // idle, not read from stored ratio fields (spec 3.4/3.5: storing both forms
+    // does not fit the NVS budget). Deriving is also the more correct of the two:
+    // the learned idle is the rail the mv_center values were measured at, so the
+    // ratio is the same number either way, but a stored copy could drift from it.
     int best = -1;
     int best_distance = 0;
     for (uint8_t i = 0; i < profile.count && i < kLadderMaxButtons; ++i) {
-        const int centre = profile.buttons[i].ratio_permille;
-        const int half   = profile.buttons[i].tolerance_permille;
+        const int centre = LadderRatioPermille(profile.buttons[i].mv_center,
+                                               profile.learned_idle_mv);
+        const int half   = LadderRatioPermille(profile.buttons[i].mv_tolerance,
+                                               profile.learned_idle_mv);
+        if (centre < 0 || half < 0) continue;
         const int distance = abs(ratio - centre);
         if (distance > half) continue;
         if (best < 0 || distance < best_distance) {
@@ -3283,12 +3295,13 @@ persists or transmits it.
 
 namespace {
 // The scratch every test here encodes into. It MUST be sized from
-// ConfigMaxSerializedSize() and not guessed: the model is 15,584 B packed and
-// its JSON form is ~20.9 KB, so the `char buf[4096]` an earlier revision used
-// overflowed on every single test -- ConfigEncodeJson returns 0, the first
-// ASSERT_GT(n, 0u) fires, and the suite fails for a reason that has nothing to
-// do with the codec under test. A hard-coded 4096 also cannot notice the model
-// growing; this can.
+// ConfigMaxSerializedSize() and not guessed: the model's JSON form is 22,407 B
+// at the worst case, so the `char buf[4096]` an earlier revision used overflowed
+// on every single test -- ConfigEncodeJson returns 0, the first ASSERT_GT(n, 0u)
+// fires, and the suite fails for a reason that has nothing to do with the codec
+// under test. A hard-coded literal also cannot notice the model growing; this
+// can, and ConfigMaxSerializedSize() is constexpr precisely so it can be used
+// here.
 //
 // static_assert, not a runtime check: if ConfigMaxSerializedSize() ever
 // under-reports the true worst case, every buffer here is silently too small
@@ -3296,6 +3309,10 @@ namespace {
 // assert is what ties the test's memory to the model.
 constexpr size_t kScratch = ConfigMaxSerializedSize();
 static_assert(kScratch > 0u, "ConfigMaxSerializedSize must be a real bound");
+// The size test asserts this same number fits two NVS slots; if it stops doing
+// so, that test fails -- but only after this one has already allocated. Keeping
+// the two together is what makes the failure legible.
+static_assert(kScratch < 100000u, "a bound this large is a bug, not a config");
 
 Config MakeConfig() {
     Config c{};
@@ -3315,8 +3332,10 @@ Config MakeConfig() {
     c.channels[0].ladder.learned_idle_mv = 2835;
     c.channels[0].ladder.count = 1;
     // The initializer sets the whole struct including id; a separate strncpy
-    // before it would be overwritten and is not there.
-    c.channels[0].ladder.buttons[0] = {"VOL_UP", 504, 42, 1};
+    // before it would be overwritten and is not there. Fields are spec 3.4's
+    // millivolts: 1430 mV at the 2835 idle is the 504 permille the classifier
+    // derives (1430 x 1000 / 2835 = 504).
+    c.channels[0].ladder.buttons[0] = {"VOL_UP", "Volume Up", 1430, 120, 3300, 235, 200, 98};
     c.channels[0].output.gain_mode = GainMode::kAmplified;
     c.channels[0].output.idle_dac_code = 4095;    // spec 3.7's default; full scale is the safe state (6.7)
     // Bindings are TOP-LEVEL (spec 3.1/3.5), keyed by (channel, button, gesture).
@@ -3378,8 +3397,8 @@ TEST(ConfigCodec, JsonRoundTripsEveryFieldThatWasSet) {
     EXPECT_EQ(out.channels[0].ladder.learned_idle_mv, 2835);
     EXPECT_EQ(out.channels[0].ladder.count, 1);
     EXPECT_EQ(out.channels[0].ladder.buttons[0].id, std::string("VOL_UP"));
-    EXPECT_EQ(out.channels[0].ladder.buttons[0].ratio_permille, 504);
-    EXPECT_EQ(out.channels[0].ladder.buttons[0].tolerance_permille, 42);
+    EXPECT_EQ(out.channels[0].ladder.buttons[0].mv_center, 1430);
+    EXPECT_EQ(out.channels[0].ladder.buttons[0].mv_tolerance, 120);
     EXPECT_EQ(out.channels[0].output.gain_mode, GainMode::kAmplified);
     EXPECT_EQ(out.channels[0].output.idle_dac_code, 4095);
 
@@ -3467,8 +3486,10 @@ TEST(ConfigCodec, ValidationRejectsInconsistentConfigs) {
 
     c = MakeConfig();
     c.channels[0].ladder.count = 1;
-    c.channels[0].ladder.buttons[0].ratio_permille = 1200;
-    EXPECT_FALSE(ConfigValidate(c)) << "a ratio above the rail is impossible";
+    // Above the ADC ceiling: spec 3.2 caps a pin reading at 2900 mV, so a
+    // mv_center above it is not a value the hardware can produce.
+    c.channels[0].ladder.buttons[0].mv_center = 3300;
+    EXPECT_FALSE(ConfigValidate(c)) << "a pin voltage above the ADC ceiling is impossible";
 
     c = MakeConfig();
     // A binding naming a button that does not exist on its channel.
@@ -3501,17 +3522,18 @@ TEST(ConfigCodec, ValidationRejectsInconsistentConfigs) {
     EXPECT_FALSE(ConfigValidate(c)) << "long press must exceed the double window";
 
     c = MakeConfig();
-    c.channels[0].ladder.buttons[0].tolerance_permille = 0;
+    c.channels[0].ladder.buttons[0].mv_tolerance = 0;
     EXPECT_FALSE(ConfigValidate(c)) << "a zero-width window can never match";
 }
 
 TEST(ConfigCodec, ValidationRejectsButtonsTooCloseToTellApart) {
     Config c = MakeConfig();
     c.channels[0].ladder.count = 2;
-    c.channels[0].ladder.buttons[0] = {"VOL_UP", 505, 42, 1};
-    // 10 permille apart, but each window is 42 wide: every reading in the
-    // overlap is equally close to both, so classification would be a coin toss.
-    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", 515, 42, 2};
+    // 1418 and 1445 mV are 27 mV apart at a 120 mV half-width: every reading in
+    // the overlap is equally close to both, so classification would be a coin
+    // toss. (In permille of the 2835 idle: 500 and 510, each window 42 wide.)
+    c.channels[0].ladder.buttons[0] = {"VOL_UP",   "Volume Up",   1418, 120, 3300, 235, 200, 98};
+    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", "Volume Down", 1445, 120, 3300, 235, 200, 97};
     EXPECT_FALSE(ConfigValidate(c))
         << "centres closer together than the wider tolerance can never be told apart";
 }
@@ -3519,12 +3541,15 @@ TEST(ConfigCodec, ValidationRejectsButtonsTooCloseToTellApart) {
 TEST(ConfigCodec, ValidationAcceptsButtonsExactlyTolerancePlusOneApart) {
     Config c = MakeConfig();
     c.channels[0].ladder.count = 2;
-    c.channels[0].ladder.buttons[0] = {"VOL_UP", 505, 42, 1};
-    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", 548, 42, 2};  // 43 = max(42,42) + 1
+    // The check is on the DERIVED permille window, so the boundary is expressed
+    // in millivolts that land on it: 1430 mV (504 permille) and 1551 mV
+    // (547 permille) are 43 permille apart = max(42,42) + 1.
+    c.channels[0].ladder.buttons[0] = {"VOL_UP",   "Volume Up",   1430, 120, 3300, 235, 200, 98};
+    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", "Volume Down", 1551, 120, 3300, 235, 200, 97};
     EXPECT_TRUE(ConfigValidate(c));
 
-    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", 547, 42, 2};  // exactly tolerance apart
-    EXPECT_FALSE(ConfigValidate(c));
+    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", "Volume Down", 1548, 120, 3300, 235, 200, 97};
+    EXPECT_FALSE(ConfigValidate(c)) << "exactly tolerance apart still overlaps";
 }
 ```
 
@@ -3683,13 +3708,20 @@ size_t ConfigEncodeBlob(const Config &c, uint8_t *out, size_t out_len);
 bool   ConfigDecodeBlob(const uint8_t *in, size_t len, Config *out);
 
 // Worst-case serialized size, asserted against the NVS budget (spec 10.5).
-size_t ConfigMaxSerializedSize();
+//
+// constexpr, and that is load-bearing rather than stylistic: the tests size
+// their encode buffers from it (`constexpr size_t kScratch =
+// ConfigMaxSerializedSize();`), which is only legal if it is a constant
+// expression. A plain function would force those buffers back to a hard-coded
+// literal -- which is exactly how they went stale at 4096 B for a 22 KB model.
+// It is a pure function of the constants in ConfigModel.h, so it can be one.
+constexpr size_t ConfigMaxSerializedSize();
 
 // How many NVS keys a blob of this size needs, at a fixed chunk size well under
 // the 4000-byte single-value cap. A slot is written as `cfg_a_0..n` with the
 // count and a per-slot CRC in the header chunk (spec 3.8), because a real config
 // is 10-15 KB and CANNOT be one NVS value.
-int ConfigChunkCountFor(size_t blob_len);
+constexpr int ConfigChunkCountFor(size_t blob_len);
 
 // The fixed chunk size the store writes. Must be < 4000 to leave entry
 // overhead, and is a compile-time constant so the key count is bounded.
@@ -3738,13 +3770,22 @@ constexpr uint32_t kBlobMagic = 0x53435743u;  // "SWCC"
 // ambiguous is when the *centres* are closer together than the wider of the two
 // tolerances: every reading in the overlap is then equally close to both, so
 // classification is a coin toss rather than a measurement.
+//
+// Compared in the DERIVED permille the classifier actually uses, not in raw
+// millivolts. Two buttons 10 mV apart at a high rail are a much narrower window
+// than 10 mV apart at a low one, so the raw-mv distance is not the quantity the
+// ambiguity depends on.
 bool CentresAreDistinguishable(const LadderProfile &p) {
+    if (p.learned_idle_mv == 0) return false;   // no reference, nothing to derive
     for (uint8_t i = 0; i < p.count; ++i) {
         for (uint8_t j = static_cast<uint8_t>(i + 1); j < p.count; ++j) {
-            const int distance = abs(p.buttons[i].ratio_permille - p.buttons[j].ratio_permille);
-            const int tolerance = p.buttons[i].tolerance_permille > p.buttons[j].tolerance_permille
-                                      ? p.buttons[i].tolerance_permille
-                                      : p.buttons[j].tolerance_permille;
+            const int ci = LadderRatioPermille(p.buttons[i].mv_center, p.learned_idle_mv);
+            const int cj = LadderRatioPermille(p.buttons[j].mv_center, p.learned_idle_mv);
+            const int ti = LadderRatioPermille(p.buttons[i].mv_tolerance, p.learned_idle_mv);
+            const int tj = LadderRatioPermille(p.buttons[j].mv_tolerance, p.learned_idle_mv);
+            if (ci < 0 || cj < 0 || ti < 0 || tj < 0) return false;
+            const int distance  = abs(ci - cj);
+            const int tolerance = ti > tj ? ti : tj;
             if (distance <= tolerance) return false;
         }
     }
@@ -3774,11 +3815,16 @@ bool ConfigValidate(const Config &c) {
         for (uint8_t i = 0; i < cc.ladder.count; ++i) {
             const LadderButton &b = cc.ladder.buttons[i];
             if (b.id[0] == '\0') return false;
-            if (b.tolerance_permille <= 0) return false;
-            // A ratio above the idle reference is physically impossible: a
-            // press pulls the input DOWN (spec 6.3), so every button sits
-            // below 1000 permille.
-            if (b.ratio_permille <= 0 || b.ratio_permille >= 1000) return false;
+            // A button at or above the idle reference is physically impossible:
+            // a press pulls the input DOWN (spec 6.3), so every button sits
+            // below the idle. Both bounds are checked against the 2900 mV ADC
+            // ceiling (spec 3.2) rather than a 3300 mV rail -- no pin reading
+            // can exceed the ceiling, so a value above it is not a measurement.
+            if (b.mv_center == 0 || b.mv_center > 2900) return false;
+            if (b.mv_tolerance == 0) return false;
+            // And the DERIVED window must be a real one: a tolerance that
+            // rounds to zero permille can never match anything.
+            if (LadderRatioPermille(b.mv_tolerance, cc.ladder.learned_idle_mv) <= 0) return false;
         }
         if (!CentresAreDistinguishable(cc.ladder)) return false;
     }
@@ -3836,27 +3882,35 @@ satisfy:
 - `ConfigDecodeBlob` checks magic, `schema_version`, `payload_len <= len -
   sizeof(BlobHeader)`, then recomputes the CRC. Any mismatch returns `false`
   **without writing to `out`**.
-- `ConfigMaxSerializedSize` returns the worst case: `sizeof(BlobHeader)` plus the
-  fully-populated JSON. "Fully populated" is the spec §3.5 cardinality — 2
-  channels, 16 ladder buttons each, 3 AUX buttons, and **32 top-level bindings
-  each carrying 2 actions** — with every string field at its maximum length, so
-  the bound does not depend on what a particular config happens to contain. An
-  earlier revision computed this as "2 channels × 16 buttons × 32 bindings",
-  which is the *nested* model's 64-binding arithmetic and is both the wrong
-  shape and the wrong number. The blob is JSON payload — do not pack the
-  struct, or the two forms drift.
+- `ConfigMaxSerializedSize` is **`constexpr`** and returns the worst case:
+  `sizeof(BlobHeader)` plus the fully-populated JSON. "Fully populated" is the
+  spec §3.5 cardinality — 2 channels, 16 ladder buttons each, 3 AUX buttons, and
+  **32 top-level bindings each carrying 2 actions** — with every string field at
+  its maximum length, so the bound does not depend on what a particular config
+  happens to contain. An earlier revision computed this as "2 channels × 16
+  buttons × 32 bindings", which is the *nested* model's 64-binding arithmetic and
+  is both the wrong shape and the wrong number. The blob is JSON payload — do not
+  pack the struct, or the two forms drift.
+
+  Being `constexpr` is required, not decorative: the test's `kScratch` and
+  Task 15's staging buffer are both sized from it at compile time. Implement it
+  as a sum of `sizeof` and the `kMax*`/`k*Len` constants in `ConfigModel.h`, so
+  it stays a constant expression — do not call `snprintf`, `strlen` on runtime
+  data, or anything else that only exists at run time.
 
   **The measured values, so this is a decision and not a hope:** `Config` is
-  **15,584 B packed**; the fully-populated JSON is **~20.9 KB**; that is **11
+  **~15.9 KB packed**; the fully-populated JSON is **22,407 B**; that is **11
   chunks** at 2048 B. Two slots plus `cfg_seq` cost 2 × 11 × 2,112 + 32 =
   **46,496 B of the partition's 48,384 B (96 %)**. It fits — with almost no
   margin. A third action per binding does not: it needs 14 chunks and 59,168 B,
   which is why `kMaxActionsPerBinding` is 2 and why Step 7 asserts the bound
   rather than trusting it. These figures live in spec §3.5/§3.8 too; if you
-  change the cardinality, change all three.
-- `ConfigChunkCountFor(blob_len)` returns `ceil(blob_len / kConfigChunkBytes)`,
-  and `kConfigChunkBytes` is a fixed 2048. Task 9 uses both to write
-  `cfg_a_0…n`; they are the reason the chunked path has a bounded key count.
+  change the cardinality **or any string width**, change all three and re-measure.
+- `ConfigChunkCountFor(blob_len)` is also **`constexpr`** — it returns
+  `ceil(blob_len / kConfigChunkBytes)`, a pure function of its argument and a
+  constant. Task 9 uses it to write `cfg_a_0…n`; being constexpr is what lets
+  Step 7's test compute the chunk count in a constant expression rather than
+  asserting against a hard-coded number that could go stale.
 
 - [ ] **Step 6: Run the tests**
 

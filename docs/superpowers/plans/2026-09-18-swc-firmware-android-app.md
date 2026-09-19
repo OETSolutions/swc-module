@@ -53,7 +53,7 @@
 - **`lib/HAL/IHAL.h` is a C header, and its enumerators are prefixed constants.**
   It is the one header both the C host and the C++ application include, so it is
   `extern "C"` with C enums: `ADC_CH_SWC1`, `DAC_CH_KEY1`, `DAC_POWER_GND_1K`,
-  `GPIO_BUZZ`. Never `AdcChannel::kSwc1`. Every task names channels this way.
+  `GPIO_LED_STAT`. Never `AdcChannel::kSwc1`. Every task names channels this way.
 - **The interface is frozen** (spec §10.2). Its members are exactly:
   `adc_read_mv`, `dac_set_code`, `dac_power_mode`, `dac_ldac`, `gpio_write`,
   `gpio_read`, `buzzer_on`, `now_ms`, `now_us`, `nvs_get`, `nvs_set`, `reboot`,
@@ -202,9 +202,19 @@ typedef enum { DAC_CH_KEY1, DAC_CH_ADJ1, DAC_CH_KEY2, DAC_CH_ADJ2,
                DAC_CH_COUNT } DacChannel;
 typedef enum { DAC_POWER_NORMAL, DAC_POWER_GND_1K, DAC_POWER_GND_100K,
                DAC_POWER_GND_500K } DacPowerMode;
-typedef enum { GPIO_BUZZ, GPIO_LED_STAT, GPIO_LED2, GPIO_DAC_LDAC_B,
+typedef enum { GPIO_LED_STAT, GPIO_LED2,
                GPIO_BOOT, GPIO_VBUS_VALID, GPIO_COUNT } GpioPin;
 ```
+
+**`GpioPin` holds only raw pins — the buzzer and LDAC are NOT in it.** Spec §10.2
+gives them their own frozen members, `buzzer_on` and `dac_ldac`, because they are
+*semantic* lines: the buzzer is a rhythm grammar (§7.2) and LDAC is DAC
+sequencing (§2.3), so both have a right way to be driven that a bare pin write
+cannot express. An earlier revision of this enum listed `GPIO_BUZZ` and
+`GPIO_DAC_LDAC_B` alongside those members — **two routes to one physical line**,
+which `MockHal` would then have to store twice. The test for that trap is
+`BuzzerIsOn()` vs `GpioRead(GPIO_BUZZ)`: follow the frozen spec and the second one
+never moves. LEDs and the two digital inputs are genuinely raw pins and stay.
 
 **Eight ADC channels, per spec §2.2's pin map** — `IO1`/`IO2` (SWC1/2 ladder),
 `IO7` (NTC temp), `IO4`/`IO5`/`IO6` (AUX1–3, "fully usable analog inputs"), and
@@ -464,15 +474,20 @@ what the ~100 call sites across Tasks 3–24 use.
 ```cpp
 class MockHal {
  public:
-  IHal &InterfaceRef();                       // passed to every unit under test
+  IHAL &InterfaceRef();                       // passed to every unit under test
   void  AdvanceMs(uint64_t ms);               // synthetic clock
   void  SetAdcMilliVolts(AdcChannel ch, int mv);
   void  SetGpioInput(GpioPin pin, bool level);
-  void  DacSetCode(DacChannel ch, uint16_t code, DacPowerMode mode);
+  void  DacSetCode(DacChannel ch, uint16_t code);
+  void  DacPowerMode(DacChannel ch, DacPowerMode mode);
   uint16_t    LastDacCode(DacChannel ch) const;
   DacPowerMode LastDacPowerMode(DacChannel ch) const;
   int   DacWriteCount(DacChannel ch) const;
+  void  DacLdac(bool assert);
   bool  LastLdac() const;
+  void  BuzzerOn(bool on);                    // the semantic line, not a GpioPin
+  bool  BuzzerIsOn() const;
+  int   BuzzerOnCount() const;
   void  GpioWrite(GpioPin pin, bool level);
   bool  GpioRead(GpioPin pin) const;
   int   GpioWriteCount(GpioPin pin) const;
@@ -869,9 +884,14 @@ windows, §8's 5-minute timeout) testable in microseconds of wall time.
     `VOUTD`→`/V_ADJ2`)
   - `DacPowerMode` — C enum `{ DAC_POWER_NORMAL, DAC_POWER_GND_1K,
     DAC_POWER_GND_100K, DAC_POWER_GND_500K }`
-  - `GpioPin` — C enum `{ GPIO_BUZZ, GPIO_LED_STAT, GPIO_LED2, GPIO_DAC_LDAC_B,
-    GPIO_BOOT, GPIO_VBUS_VALID, GPIO_COUNT }`
-  - `struct IHal { ... }` — **13 members**, verbatim from spec §10.2:
+  - `GpioPin` — C enum `{ GPIO_LED_STAT, GPIO_LED2, GPIO_BOOT, GPIO_VBUS_VALID,
+    GPIO_COUNT }`. **Raw pins only.** The buzzer (`/BUZZ`, IO13) and the MCP4728
+    `~LDAC` (IO48) are deliberately absent: each already has its own frozen member
+    (`buzzer_on`, `dac_ldac`), and they are semantic lines — a rhythm grammar
+    (§7.2) and DAC sequencing (§2.3) — that a bare pin write cannot express.
+    Listing them here as well would give two routes to one physical line and make
+    the mock store the same state twice.
+  - `struct IHAL { ... }` — **13 members**, verbatim from spec §10.2:
     `adc_read_mv`, `dac_set_code`, `dac_power_mode`, `dac_ldac`, `gpio_write`,
     `gpio_read`, `buzzer_on`, `now_ms`, `now_us`, `nvs_get`, `nvs_set`, `reboot`,
     `ctx`. `dac_set_code` takes `(ctx, ch, code)` only — **the power mode is its
@@ -938,14 +958,22 @@ TEST(MockHalBuzzer, IsAnOnOffLineNotAGpioPin) {
     hal.BuzzerOn(true);
     EXPECT_TRUE(hal.BuzzerIsOn());
     EXPECT_EQ(hal.BuzzerOnCount(), 1);
+
+    // The buzzer has its own frozen member (spec 10.2) and is NOT a GpioPin, so
+    // driving it must not move any pin counter. If GPIO_BUZZ is ever added back
+    // to the enum there are then two routes to one physical line, and this is
+    // the assertion that catches it.
+    EXPECT_EQ(hal.GpioWriteCount(GPIO_LED_STAT), 0)
+        << "the buzzer must not be driven through gpio_write";
+    EXPECT_FALSE(hal.LastLdac()) << "nothing here touched ~LDAC";
 }
 
 TEST(MockHalGpio, ReadsBackWhatWasWrittenAndTracksWriteCount) {
     MockHal hal;
-    EXPECT_EQ(hal.GpioWriteCount(GPIO_BUZZ), 0);
-    hal.GpioWrite(GPIO_BUZZ, true);
-    EXPECT_TRUE(hal.GpioRead(GPIO_BUZZ));
-    EXPECT_EQ(hal.GpioWriteCount(GPIO_BUZZ), 1);
+    EXPECT_EQ(hal.GpioWriteCount(GPIO_LED_STAT), 0);
+    hal.GpioWrite(GPIO_LED_STAT, true);
+    EXPECT_TRUE(hal.GpioRead(GPIO_LED_STAT));
+    EXPECT_EQ(hal.GpioWriteCount(GPIO_LED_STAT), 1);
 }
 
 TEST(MockHalNvs, PersistsBytesAcrossCallsAndCanBeMadeToFail) {
@@ -1045,15 +1073,18 @@ typedef enum {
 } DacPowerMode;
 
 typedef enum {
-    GPIO_BUZZ = 0, GPIO_LED_STAT, GPIO_LED2, GPIO_DAC_LDAC_B,
-    /* The only two GPIO inputs. SENSE1/SENSE2 are ADC channels above. */
+    GPIO_LED_STAT = 0, GPIO_LED2,
+    /* The only two GPIO inputs. SENSE1/SENSE2 are ADC channels above. The
+     * buzzer and ~LDAC are NOT here -- they are the semantic members
+     * buzzer_on and dac_ldac, which is where the rhythm grammar and the DAC
+     * sequencing contract live. */
     GPIO_BOOT, GPIO_VBUS_VALID,
     GPIO_COUNT
 } GpioPin;
 
 /*
  * The only interface between logic and silicon. Every module above lib/HAL
- * takes an IHal* so it can be exercised on the host with MockHal.
+ * takes an IHAL* so it can be exercised on the host with MockHal.
  *
  * now_ms/now_us are part of the HAL on purpose: every timing rule in the spec
  * (500ms double-press window, 750ms long-press threshold, 200ms key send,
@@ -1068,7 +1099,7 @@ typedef enum {
  * backoff internally and latches a fault on persistent failure; it never
  * drives a guessed code. There is no useful failure for a caller to branch on.
  */
-typedef struct IHal {
+typedef struct IHAL {
     int      (*adc_read_mv)(void *ctx, AdcChannel ch);
     void     (*dac_set_code)(void *ctx, DacChannel ch, uint16_t code);
     void     (*dac_power_mode)(void *ctx, DacChannel ch, DacPowerMode mode);
@@ -1082,7 +1113,7 @@ typedef struct IHal {
     int      (*nvs_set)(void *ctx, const char *key, const void *in, size_t len);
     void     (*reboot)(void *ctx);
     void      *ctx;
-} IHal;
+} IHAL;
 
 #ifdef __cplusplus
 }
@@ -1103,14 +1134,14 @@ typedef struct IHal {
 #include "HAL/IHAL.h"
 
 /*
- * Host implementation of IHal. All state is observable, so tests assert on
+ * Host implementation of IHAL. All state is observable, so tests assert on
  * what the code *did to the hardware*, not on internal variables.
  */
 class MockHal {
 public:
     MockHal();
 
-    IHal &InterfaceRef() { return iface_; }   // every later task's tests take &hal.InterfaceRef()
+    IHAL &InterfaceRef() { return iface_; }   // every later task's tests take &hal.InterfaceRef()
 
     // --- clock -------------------------------------------------------------
     uint64_t NowMs() { return now_ms_; }
@@ -1138,10 +1169,11 @@ public:
     // --- buzzer ------------------------------------------------------------
     // The buzzer is active at a fixed ~2.4 kHz with no pitch control (spec
     // 5.5), so it is a plain on/off line, not a GPIO. Level is what tests
-    // assert on; BuzzerOnCount counts edges.
-    void BuzzerOn(bool on) { buzzer_on_ = on; ++buzzer_edges_; }
+    // assert on; BuzzerOnCount counts drive calls, which is what makes
+    // "idle ticks must be silent" checkable.
+    void BuzzerOn(bool on) { buzzer_on_ = on; ++buzzer_calls_; }
     bool BuzzerIsOn() const { return buzzer_on_; }
-    int BuzzerOnCount() const { return buzzer_edges_; }
+    int BuzzerOnCount() const { return buzzer_calls_; }
 
     // --- nvs ---------------------------------------------------------------
     int NvsSet(const char *key, const void *in, size_t len);
@@ -1176,7 +1208,7 @@ private:
     static int  NvsSetThunk(void *ctx, const char *key, const void *in, size_t len);
     static void RebootThunk(void *ctx);
 
-    IHal iface_{};
+    IHAL iface_{};
     uint64_t now_ms_ = 0;
     int adc_mv_[ADC_CH_COUNT] = {};
     uint16_t dac_code_[DAC_CH_COUNT] = {};
@@ -1187,7 +1219,7 @@ private:
     bool gpio_in_[GPIO_COUNT] = {};
     int gpio_writes_[GPIO_COUNT] = {};
     bool buzzer_on_ = false;
-    int buzzer_edges_ = 0;
+    int buzzer_calls_ = 0;
     std::map<std::string, std::vector<uint8_t>> nvs_;
     bool fail_next_nvs_write_ = false;
     bool truncate_set_ = false;
@@ -1245,9 +1277,10 @@ void MockHal::GpioWrite(GpioPin pin, bool level) {
 
 bool MockHal::GpioRead(GpioPin pin) const {
     const int i = static_cast<int>(pin);
-    // Outputs read back what was written (BUZZ, LEDs, LDAC); the two digital
-    // inputs read their programmed input state. Nothing else is a GpioPin --
-    // SENSE1/SENSE2 are ADC channels and are read with AdcReadMv.
+    // Outputs read back what was written (the LEDs); the two digital inputs read
+    // their programmed input state. Nothing else is a GpioPin -- SENSE1/SENSE2
+    // are ADC channels (AdcReadMv), and the buzzer and ~LDAC are the semantic
+    // members BuzzerIsOn() and LastLdac().
     switch (pin) {
         case GPIO_BOOT: case GPIO_VBUS_VALID:
             return gpio_in_[i];
@@ -1318,14 +1351,14 @@ void MockHal::RebootThunk(void *ctx) { ++static_cast<MockHal *>(ctx)->reboot_cou
 - [ ] **Step 6: Run the tests**
 
 Run: `cd code && pio test -e native -f test_hal`
-Expected: PASS — 5 tests green.
+Expected: PASS — 9 tests green.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add code/lib/HAL/IHAL.h code/test_native/MockHAL.h code/test_native/MockHAL.cpp \
         code/test_native/test_hal/MockHalTest.cpp
-git commit -m "Add the IHal seam and a MockHal with an injectable clock
+git commit -m "Add the IHAL seam and a MockHal with an injectable clock
 
 The clock is part of the HAL so every timing rule in the spec (500ms double
 press, 750ms long press, 200ms key send, 5-minute maintenance timeout) is
@@ -3313,7 +3346,7 @@ the older copy is always intact while the newer one is being written.
 - Create: `code/test_native/test_config/ConfigStoreTest.cpp`
 
 **Interfaces:**
-- Consumes: `ConfigCodec` (Task 8), `IHal::nvs_get`/`nvs_set` (Task 2), `MockHal` (Task 2)
+- Consumes: `ConfigCodec` (Task 8), `IHAL::nvs_get`/`nvs_set` (Task 2), `MockHal` (Task 2)
 - Produces:
   - `enum class ConfigLoadResult { kLoaded, kNoConfig, kRecoveredFromBackup, kFellBackToDefaults, kCorrupt }`
   - `class ConfigStore` with `ConfigLoadResult Load(Config *out)`, `bool Save(const Config &c)`, `uint32_t LoadedSequence() const`
@@ -3427,7 +3460,7 @@ first consumer:
 
 ```cpp
 // In MockHAL.h, public:
-    IHal &InterfaceRef() { return iface_; }
+    IHAL &InterfaceRef() { return iface_; }
     void CorruptNvsValue(const char *key, size_t offset);   // flips one bit
     void ClearNvs();
 
@@ -3473,7 +3506,7 @@ enum class ConfigLoadResult {
  */
 class ConfigStore {
 public:
-    explicit ConfigStore(IHal *hal);
+    explicit ConfigStore(IHAL *hal);
 
     ConfigLoadResult Load(Config *out);
 
@@ -3486,7 +3519,7 @@ public:
     static size_t MaxStoredBytes();
 
 private:
-    IHal *hal_;
+    IHAL *hal_;
     uint32_t loaded_seq_ = 0;
     int next_slot_ = 0;
 };
@@ -3888,7 +3921,7 @@ are green, so every pattern is rate and rhythm, never hue.
 - Create: `code/test_native/test_feedback/LedGrammarTest.cpp`
 
 **Interfaces:**
-- Consumes: `IHal` (Task 2), `DeviceSettings` (Task 8)
+- Consumes: `IHAL` (Task 2), `DeviceSettings` (Task 8)
 - Produces:
   - `enum class BuzzerPattern { kNone, kKeyAccepted, kKeyUnknown, kProgramEnter, kProgramStep, kProgramExit, kLearnPrompt, kLearnOk, kLearnReject, kBootOk, kBootDegraded, kBootError, kFault, kOtaStart, kOtaDone }`
   - `class BuzzerGrammar` with `void Play(BuzzerPattern p)`, `void Update(uint64_t now_ms)`, `bool Busy() const`
@@ -3902,14 +3935,15 @@ are green, so every pattern is rate and rhythm, never hue.
 #include "MockHAL.h"
 #include <gtest/gtest.h>
 
-// Counts on-transitions of the buzzer pin over a pattern's duration.
+// Counts on-transitions of the buzzer line over a pattern's duration. The
+// buzzer is the semantic member buzzer_on (spec 10.2), not a GpioPin.
 namespace {
 int CountBeeps(MockHal &hal, BuzzerGrammar &b, uint32_t total_ms) {
     int on = 0;
     bool prev = false;
     for (uint32_t t = 0; t < total_ms; t += 5) {
         b.Update(hal.NowMs());
-        const bool now = hal.GpioRead(GPIO_BUZZ);
+        const bool now = hal.BuzzerIsOn();
         if (now && !prev) ++on;
         prev = now;
         hal.AdvanceMs(5);
@@ -3984,7 +4018,7 @@ TEST(BuzzerGrammar, NeverLeavesTheBuzzerStuckOnAfterAPatternCompletes) {
     BuzzerGrammar b(&hal.InterfaceRef(), 3);
     b.Play(BuzzerPattern::kProgramEnter);
     for (int i = 0; i < 2000; ++i) b.Update(hal.NowMs()), hal.AdvanceMs(5);
-    EXPECT_FALSE(hal.GpioRead(GPIO_BUZZ)) << "a stuck buzzer is a stuck-on hardware fault";
+    EXPECT_FALSE(hal.BuzzerIsOn()) << "a stuck buzzer is a stuck-on hardware fault";
 }
 ```
 
@@ -3996,10 +4030,9 @@ Expected: FAIL — `Feedback/BuzzerGrammar.h` not found.
 - [ ] **Step 3: Implement `BuzzerGrammar`**
 
 A pattern is a small array of `{on_ms, off_ms}` steps. `Update` is called from
-the main loop and drives `gpio_write(GPIO_BUZZ, ...)` from the injected clock —
-**it never blocks**, which is FR-21. `Play` while busy discards the current
-pattern and starts the new one. At the end of every pattern the pin is forced
-low.
+the main loop and drives `buzzer_on(...)` from the injected clock — **it never
+blocks**, which is FR-21. `Play` while busy discards the current pattern and
+starts the new one. At the end of every pattern the line is forced low.
 
 Patterns (from spec §7.1): `kKeyAccepted` = one 40 ms beep; `kKeyUnknown` = two
 60 ms beeps 60 ms apart; `kProgramEnter` = 3×80 ms + 160 ms; `kProgramStep` =
@@ -4110,7 +4143,7 @@ clock-driven and never block, so feedback cannot delay a key press."
 
 This is where FR-13 (safe idle before anything else), FR-39/FR-40 (safety on
 every reset path) and FR-42 (works with no USB, no app, no WiFi) become real.
-It is still host-testable, because it holds only `IHal*` and the modules above.
+It is still host-testable, because it holds only `IHAL*` and the modules above.
 
 **Files:**
 - Create: `code/lib/System/SystemOrchestrator.h`
@@ -4248,10 +4281,10 @@ TEST(SystemOrchestrator, TickIsCheapEnoughToRunAtThePollCadence) {
     o.Boot();
     // No assertion on wall time (that is meaningless on the host); the point is
     // that Tick does no I/O beyond the HAL calls already counted, and allocates
-    // nothing. Repeated ticking must not grow any write counter without cause.
-    const int before = hal.GpioWriteCount(GPIO_BUZZ);
+    // nothing. Repeated ticking must not grow any counter without cause.
+    const int before = hal.BuzzerOnCount();
     for (uint64_t t = 0; t < 100; t += 10) { o.Tick(hal.NowMs()); hal.AdvanceMs(10); }
-    EXPECT_EQ(hal.GpioWriteCount(GPIO_BUZZ), before) << "idle ticks must be silent";
+    EXPECT_EQ(hal.BuzzerOnCount(), before) << "idle ticks must be silent";
 }
 ```
 
@@ -4328,8 +4361,8 @@ it is the only part that cannot be tested on the host.
 - Create: `code/test/test_hw/TestEspHal.c` (Unity, on device)
 
 **Interfaces:**
-- Consumes: `IHal` (Task 2)
-- Produces: `IHal *EspHalInit(void)`; `PinMap.h` constants
+- Consumes: `IHAL` (Task 2)
+- Produces: `IHAL *EspHalInit(void)`; `PinMap.h` constants
 
 - [ ] **Step 1: Write `lib/HAL/PinMap.h`**
 
@@ -4367,7 +4400,7 @@ it is the only part that cannot be tested on the host.
 #include "freertos/task.h"
 
 TEST_CASE("esp_hal_adc_is_monotonic_with_a_known_input", "[hw]") {
-    IHal *hal = EspHalInit();
+    IHAL *hal = EspHalInit();
     /* With nothing connected, both ladder channels sit at their pull-up level;
        the assertion is only that the value is stable and inside the ADC range,
        so a wiring fault shows up as an implausible reading rather than as a
@@ -4381,7 +4414,7 @@ TEST_CASE("esp_hal_adc_is_monotonic_with_a_known_input", "[hw]") {
 }
 
 TEST_CASE("esp_hal_dac_reaches_both_rails", "[hw]") {
-    IHal *hal = EspHalInit();
+    IHAL *hal = EspHalInit();
     hal->dac_power_mode(hal->ctx, DAC_CH_ADJ1, DAC_POWER_GND_1K);
     hal->dac_set_code(hal->ctx, DAC_CH_KEY1, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
@@ -4393,14 +4426,14 @@ TEST_CASE("esp_hal_dac_reaches_both_rails", "[hw]") {
 }
 
 TEST_CASE("esp_hal_clock_advances", "[hw]") {
-    IHal *hal = EspHalInit();
+    IHAL *hal = EspHalInit();
     const uint64_t t0 = hal->now_ms(hal->ctx);
     vTaskDelay(pdMS_TO_TICKS(50));
     TEST_ASSERT_GREATER_OR_EQUAL_UINT64(t0 + 40, hal->now_ms(hal->ctx));
 }
 
 TEST_CASE("esp_hal_nvs_round_trips", "[hw]") {
-    IHal *hal = EspHalInit();
+    IHAL *hal = EspHalInit();
     const char payload[] = "swc-nvs-probe";
     TEST_ASSERT_EQUAL_INT(0, hal->nvs_set(hal->ctx, "probe", payload, sizeof(payload)));
     char out[sizeof(payload)] = {0};
@@ -4434,6 +4467,12 @@ Key requirements, each a specific ESP-IDF choice:
   read through `adc_read_mv` as `ADC_CH_KEY_SENSE1`/`ADC_CH_KEY_SENSE2`, because
   the servo trim loop samples them every tick. **No pin is configured as an
   output that the netlist shows as an input** — check each against `PinMap.h`.
+- **`buzzer_on` and `dac_ldac` are implemented here, on `SWC_PIN_BUZZ` and
+  `SWC_PIN_DAC_LDAC_B`.** They are not `GpioPin`s (spec §10.2): the buzzer is a
+  rhythm grammar and `~LDAC` is DAC sequencing, so each gets a named function
+  that says what it does rather than a raw pin write at the call site. Both still
+  use `gpio_set_level` underneath — the pin map constants stay, the enum entries
+  do not.
 
 - [ ] **Step 4: Wire it into `main.c`**
 
@@ -4445,7 +4484,7 @@ Key requirements, each a specific ESP-IDF choice:
 
 void app_main(void)
 {
-    IHal *hal = EspHalInit();
+    IHAL *hal = EspHalInit();
     SystemOrchestrator *sys = SystemOrchestratorCreate(hal);   /* loads config */
     SystemOrchestratorBoot(sys);                               /* safe idle FIRST */
 
@@ -4873,7 +4912,7 @@ Expected: PASS — 8 tests green.
 - [ ] **Step 5: Add the headless AUX1-driven wizard (FR-31)**
 
 Create `code/lib/Learning/LearnWizard.cpp` with the state machine from spec §7.4,
-taking `IHal*`, `BuzzerGrammar*`, `LedGrammar*`, and `AUX1` as the select button.
+taking `IHAL*`, `BuzzerGrammar*`, `LedGrammar*`, and `AUX1` as the select button.
 The AUX1 press counting uses the **same** `PressClassifier` (Task 6) with a
 ladder profile of one button at the AUX threshold, so there is one debounce
 implementation, not two.
@@ -4916,7 +4955,7 @@ gate a path that can brick the device.
 - Create: `code/test_native/test_update/ReleaseCheckTest.cpp`
 
 **Interfaces:**
-- Consumes: `IHal` (Task 2)
+- Consumes: `IHAL` (Task 2)
 - Produces:
   - `enum class VerifyResult { kOk, kSizeMismatch, kChecksumMismatch, kTooLarge, kEmpty }`
   - `class Sha256Stream` with `void Update(const uint8_t *data, size_t len)`, `void Final(uint8_t out[32])`
@@ -5143,7 +5182,7 @@ button presses is unacceptable.
 - Create: `code/test_native/test_maintenance/MaintenanceModeTest.cpp`
 
 **Interfaces:**
-- Consumes: `Config` (Task 8), `ReleaseCheck` (Task 17), `IHal` (Task 2)
+- Consumes: `Config` (Task 8), `ReleaseCheck` (Task 17), `IHAL` (Task 2)
 - Produces:
   - `enum class MaintenanceTrigger { kNone, kUsbCommand, kConfigFlag, kAux1Hold, kNoConfigAtBoot }`
   - `class MaintenanceMode` with `bool Enter(MaintenanceTrigger t, uint64_t now_ms)`, `void Exit()`, `bool Active() const`, `void Update(uint64_t now_ms)`, `bool ShouldTimeout(uint64_t now_ms) const`
@@ -5836,7 +5875,7 @@ code on host and device*.
 **3. Type consistency.** Checked across tasks: `LadderProfile`/`LadderButton`
 (Task 3) are used unchanged in 6, 8, 16. `GestureTimings`/`Gesture` (Task 6) are
 used unchanged in 8, 11. `GainMode`/`GainPolicy` (Task 5) are used unchanged in
-7, 8. `Config` (Task 8) is used unchanged in 9, 11, 15, 16. `IHal` (Task 2) is
+7, 8. `Config` (Task 8) is used unchanged in 9, 11, 15, 16. `IHAL` (Task 2) is
 used unchanged everywhere. `ConfigLoadResult::kNoConfig` means *pass-through* in
 both Task 9 and Task 13. `MockHalDefaultsConfig()` is defined once (Task 15) and
 reused by Task 13's `MockHal::Defaults`.

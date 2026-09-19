@@ -1786,17 +1786,52 @@ typedef struct {
 } IHAL;
 ```
 
+The four channel/pin enums are part of the same frozen interface, and they are
+enumerated here so the seam has one authority rather than a header that gets
+invented per task. `IO4`/`IO5`/`IO6` and `IO8`/`IO9` are `A-in` in §2.2, so the
+AUX inputs and the KEY senses are **ADC channels, not GPIOs**.
+
+```c
+typedef enum { ADC_CH_SWC1, ADC_CH_SWC2, ADC_CH_TEMP,
+               ADC_CH_AUX1, ADC_CH_AUX2, ADC_CH_AUX3,
+               ADC_CH_KEY_SENSE1, ADC_CH_KEY_SENSE2,
+               ADC_CH_COUNT } AdcChannel;          // eight, §2.2
+typedef enum { DAC_CH_KEY1, DAC_CH_ADJ1, DAC_CH_KEY2, DAC_CH_ADJ2,
+               DAC_CH_COUNT } DacChannel;          // four, no spare, §2.3
+typedef enum { DAC_POWER_NORMAL, DAC_POWER_GND_1K, DAC_POWER_GND_100K,
+               DAC_POWER_GND_500K } DacPowerMode;  // the MCP4728 has no Hi-Z
+typedef enum { GPIO_LED_STAT, GPIO_LED2,
+               GPIO_BOOT, GPIO_VBUS_VALID, GPIO_COUNT } GpioPin;
+```
+
+**`GpioPin` carries raw pins only.** The buzzer (`/BUZZ`, IO13) and the MCP4728
+`~LDAC` (IO48) are deliberately **absent**, because each already has its own
+member above — `buzzer_on` and `dac_ldac`. They are *semantic* lines: the buzzer
+is a rhythm grammar (§7.2) and `~LDAC` is DAC sequencing (§2.3), so a bare pin
+write cannot express the contract. Listing them here as well would give two
+routes to one physical line, and a mock would have to store the same state twice
+— which is exactly how a driver ends up driving the line one way while the tests
+observe the other.
+
 **This interface is frozen as of this revision.** An earlier revision labelled it
 "shape, not final", which made every module above `lib/HAL/` a moving target and
-let the plan and the spec drift on names — `Interface()` vs `InterfaceRef()`, C
-enums vs `enum class`, `SENSE1`/`SENSE2` as GPIOs when §2.2 defines them as ADC
-inputs. Those were all symptoms of the interface not being authoritative.
+let the plan and the spec drift on names — `IHal` in the code block against `IHAL`
+in the prose, C enums vs `enum class`, `SENSE1`/`SENSE2` as GPIOs when §2.2
+defines them as ADC inputs. Those were all symptoms of the interface not being
+authoritative.
 
 **The freeze is what makes the seam real:** the enums (`AdcChannel`, `DacChannel`,
 `DacPowerMode`, `GpioPin`) are **C enums with explicit `ADC_CH_*` / `DAC_*` /
 `GPIO_*` constant names**, not C++ `enum class`, because `IHAL` is a C struct and
-the ESP-IDF side of the seam is C. Every module takes `IHAL&`; there is no
-`Interface()`/`InterfaceRef()` accessor pair — the reference is passed in.
+the ESP-IDF side of the seam is C. Every module takes `IHAL&`; the reference is
+passed in rather than fetched from a singleton, so there is no `Interface()`
+accessor on the interface itself.
+
+The **mock** does expose `InterfaceRef()`, and that is not a contradiction: a
+test owns a `MockHal` object and must hand *its* `IHAL&` to the unit under test,
+so the accessor belongs to the harness, not to the seam. The earlier revision
+labelled both names drift symptoms, which left the plan with ~51 call sites and
+no sanctioned way to obtain the reference from a mock.
 
 Changing this interface is now a **spec change**, not an implementation detail: it
 requires a spec edit, a regeneration of `contract/` (§10.2 above), and a plan

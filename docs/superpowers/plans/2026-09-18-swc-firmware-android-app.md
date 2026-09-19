@@ -5128,12 +5128,24 @@ ResolvedAction BindingResolve(const Config &cfg, uint8_t channel_index,
 - [ ] **Step 4: Run the tests**
 
 Run: `cd code && pio test -e native -f '*test_bindings'`
-Expected: PASS — 5 + 10 tests green.
+Expected: PASS — 5 + 10 from Step 1, plus 3 added while implementing, for 18 green.
+
+The 3 added tests cover the other three counts the resolver indexes.
+`BindingResolverTest` refuses `action_count > kMaxActionsPerBinding` as "a corrupt
+config, not a shorter action list" — but `binding_count`, `ladder.count` and
+`ev.button_index` are read the same way, from the same untrusted source, and the
+plan's ten tests exercise none of them out of range. A count past its array is an
+out-of-bounds read in all four cases; checking one and not the others is the rule
+with a single home and three stale copies.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add code/lib/Bindings code/test_native/test_bindings
+git add code/lib/Bindings/ActionLibrary.h code/lib/Bindings/ActionLibrary.cpp \
+        code/lib/Bindings/BindingResolver.h code/lib/Bindings/BindingResolver.cpp \
+        code/test_native/test_bindings/ActionLibraryTest.cpp \
+        code/test_native/test_bindings/BindingResolverTest.cpp \
+        code/test_native/test_bindings/test_main.cpp
 git commit -m "Add the action library and binding resolution
 
 An action is its kind plus params, per spec 3.6 -- there is no numeric action-id
@@ -5143,6 +5155,11 @@ field, ANY, and the AUX inputs are all representable. An action that cannot be
 executed is refused rather than silently dropped, and an empty action list is
 found-and-inert because that is what spec 3.5 says it means."
 ```
+
+Note: explicit file paths rather than the `code/lib/Bindings` /
+`code/test_native/test_bindings` directories. The repo root holds untracked,
+non-project paths (`code/.kilo/`), and a directory-form add is how one of those
+gets committed by accident.
 
 ---
 

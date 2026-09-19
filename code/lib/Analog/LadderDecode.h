@@ -4,13 +4,10 @@
 
 #include "HAL/IHAL.h"
 
-// Spec 3.2's value type: a pin voltage in millivolts, 0-2900 (the ADC's
-// calibrated ceiling). The Shared contract puts this in IHAL.h; it is declared
-// here instead because Task 2's IHAL.h block never actually defines it, and
-// widening a frozen C header that Task 2's committed tests depend on is a
-// larger change than this task needs. When IHAL.h gains the typedef, delete
-// this one -- a duplicate typedef of the same type is not an error in C++.
-using MilliVolt = uint16_t;
+// MilliVolt comes from IHAL.h -- spec 3.2's value type, a pin voltage in
+// millivolts, 0-2900 (the ADC's calibrated ceiling). It was declared locally
+// here while Task 2's IHAL.h block omitted it; the typedef is now in the frozen
+// header, so the workaround is gone.
 
 // Ratios are permille (thousandths of the idle reference) so the whole
 // comparison path is integer arithmetic. Floating point on this target is

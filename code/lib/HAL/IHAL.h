@@ -8,6 +8,17 @@
 extern "C" {
 #endif
 
+/*
+ * Spec 3.2's value types, declared here because this header is the frozen C
+ * contract every later task consumes. An earlier revision omitted all three --
+ * they were declared in the Shared contract but not here, so LadderDecode.h had
+ * to carry a local `using MilliVolt = uint16_t;` to compile. One declaration,
+ * in the frozen header, is the fix.
+ */
+typedef uint16_t MilliVolt;    /* 0-2900 at the pin, after calibration (spec 3.2) */
+typedef uint16_t AdcRaw;       /* 0-4095, 12-bit at 12 dB atten (spec 3.2) */
+typedef uint32_t TimestampMs;  /* monotonic ms since boot (spec 3.2) */
+
 typedef enum {
     ADC_CH_SWC1 = 0, ADC_CH_SWC2, ADC_CH_TEMP,
     ADC_CH_AUX1, ADC_CH_AUX2, ADC_CH_AUX3,

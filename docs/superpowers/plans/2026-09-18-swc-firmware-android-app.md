@@ -458,18 +458,27 @@ green — **nothing relies on hue**. The two channels have separate grammars
 ### Frame vocabulary (spec §4.3) — exact names
 
 `hello`, `event`, `status`, `ladder_sample`, `ack`, `nack`, `log`,
-`config_get`, `config_set`, `config_patch`, `config_begin`, `config_chunk`,
+`config_get`, `config_patch`, `config_begin`, `config_chunk`,
 `config_end`, `learn_start`, `learn_stop`, `learn_commit`, `test_key`,
 `identify`, `reboot`, `ping`, `time_sync`, `ota_begin`, `ota_chunk`, `ota_end`.
 
-Four corrections an earlier revision needs, all spec §4.3:
+**`config_set` is NOT in that list and is not a frame.** It names the *logical*
+operation "replace the whole config", and spec §4.2 carries it entirely as a
+`config_begin`/`config_chunk`/`config_end` run. Spec §4.3's table lists no
+`config_set` and no `config` type. A frame that can only ever be rejected is a
+trap for the app author, and an earlier revision both implemented it and asserted
+it in tests.
+
+Five corrections an earlier revision needs, all spec §4.3:
 
 - **`ping` → `status`**, not `pong`.
 - **`nack` carries `err` and `detail`**, not `reason`.
 - **The learn frames are `learn_start`/`learn_stop`/`learn_commit`**, not
   `ladder_learn_start`/`_sample`/`_commit`.
-- **`reset_config` and `link_gap` are not frames.** Reset is a `config_set` with
-  defaults, or a `reboot` with a boot target.
+- **`config_set` is not a frame** — it is the chunked run above.
+- **`reset_config` and `link_gap` are not frames.** Reset is a chunked
+  `config_set` carrying defaults, or a `reboot` with a boot target; `link_gap` is
+  a firmware-emitted `event`, not a peer command.
 
 **The protocol version has exactly one definition** — the generated
 `SWC_PROTOCOL_VERSION` in `contract/swc_contract.h` (spec §10.2). A hand-written
@@ -2466,7 +2475,11 @@ LadderProfile Profile() {
     LadderProfile p{};
     p.learned_idle_mv = 2835;
     p.count = 1;
-    p.buttons[0] = {"VOL_UP", 504, 42, 1};
+    // The mv model, spec 3.4: mv_center/mv_tolerance are PIN MILLIVOLTS, not
+    // permille. 1430 mV against a 2835 mV idle is the same 504 permille the
+    // comments below refer to -- the classifier DERIVES the ratio, the profile
+    // never stores it.
+    p.buttons[0] = {"VOL_UP", "Volume Up", 1430, 120, 3300, 235, 200, 98};
     return p;
 }
 }  // namespace
@@ -2534,7 +2547,9 @@ TEST(PressClassifier, UnlearnedLevelIsUnknownNotPressed) {
 TEST(PressClassifier, SwitchingButtonsMidPressReportsTheNewButtonAfterDebounce) {
     LadderProfile p = Profile();
     p.count = 2;
-    p.buttons[1] = {"VOL_DOWN", 630, 42, 2};
+    // 1785 mV against the 2835 mV idle -- the 630 permille the test below
+    // presses at. Millivolts, per spec 3.4.
+    p.buttons[1] = {"VOL_DOWN", "Volume Down", 1785, 120, 3300, 235, 200, 97};
     PressClassifier c(p, GestureTimingsDefault());
     uint64_t t = 1000;
     for (int i = 0; i < 5; ++i) { c.Update(1430, 2835, t); t += 10; }
@@ -6268,7 +6283,11 @@ Expected: FAIL — `Link/CommandRouter.h` not found.
 | `learn_start` / `learn_stop` / `learn_commit` | Learn flow (Task 16). **These three names, per spec §4.3** — not `ladder_learn_start`/`_sample`/`_commit` |
 | `maintenance_enter` / `maintenance_exit` | Task 18 |
 | `ota_begin` / `ota_chunk` / `ota_end` | Task 17 |
-| `reset_config` | Wipe NVS config after an `ack` |
+
+**`reset_config` is not a frame** and has no row. Resetting the config is a
+chunked `config_set` carrying the defaults (spec §4.2), or a `reboot` with a boot
+target — both of which are already above. An earlier revision listed it as its
+own command, which is a third route to one operation.
 
 **There is no single-frame `config_set`.** Spec §4.2 makes `config_set` a logical
 operation carried by the `config_begin`/`config_chunk`/`config_end` run, and spec

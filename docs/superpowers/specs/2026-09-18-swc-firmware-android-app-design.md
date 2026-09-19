@@ -378,6 +378,20 @@ params. An earlier revision of the plan invented a numeric action-id table
 defines neither, and a generated contract must not synthesize them. `VOL_UP` is
 a `LadderButton.id`, used in a binding's `button` field — never an action name.
 
+**The `HW_KEY` level lives in the action, and there is no per-button key table.**
+An earlier revision of §3.7's worked example carried an
+`output.key_values: { vol_up: { dac_code: 1240 }, … }` map alongside the
+bindings. That is a second home for the level: §3.6's `HW_KEY` row already says
+an action carries `dac_code` or `key_resistance_mohm`, and §3.5's whole design is
+that a binding's own `actions` list is what decides what happens — including the
+core case where `vol_up`'s `SINGLE` sends a `HW_KEY` while its `LONG` sends
+something else entirely. A per-button default map cannot express that, and two
+places to look for one level is how they drift. The map is removed; a binding's
+`HW_KEY` action names its own level. This is also a budget fact rather than a
+taste one: 32 buttons × a `{dac_code}` entry is 576 B, which takes the measured
+worst case from 22,407 B to 22,983 B → **12 chunks → 50,720 B = 105 % of the
+partition** — the map does not fit.
+
 **Cardinality (v1), fixed by the NVS budget rather than by preference:**
 
 | Limit | Value | Why |
@@ -468,12 +482,7 @@ out:
       },
       "output": {
         "gain_mode": "AUTO",
-        "idle_dac_code": 4095,
-        "key_values": {
-          "vol_up": { "dac_code": 1240 },
-          "vol_dn": { "dac_code": 1680 },
-          "next":   { "dac_code": 2050 }
-        }
+        "idle_dac_code": 4095
       }
     }
   ],
@@ -2009,9 +2018,12 @@ RTOS, milliseconds. This is where the correctness of the *rules* lives:
 - **`ReleaseCheck`** — the manifest parse and version comparison of §9.5,
   including a downgrade attempt, a `min_from_version` refusal, and a manifest
   pointing at a URL for a different board.
-- **`ActionLibrary` / `BindingResolver`** — every action in §3.6 resolves; an
-  action with a data payload round-trips it; an unknown action id is rejected
-  with an error rather than silently dropped.
+- **`ActionLibrary` / `BindingResolver`** — every action kind in §3.6 resolves;
+  an action with a data payload round-trips it; an action whose kind is not in
+  the table is rejected with an error rather than silently dropped. (There is no
+  numeric action id to be unknown — §3.6 defines an action as its `kind` plus
+  params, so the rejection is on the kind and on a `HW_KEY` that carries neither
+  a `dac_code` nor a `key_resistance_mohm`.)
 
 **Level 2 — on-device tests (`test/`, Unity).** Runs on the real board, asserts
 what only silicon can answer. Deliberately small and mostly *measurement*, not

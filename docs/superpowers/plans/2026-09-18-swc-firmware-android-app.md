@@ -285,16 +285,29 @@ value, not a placeholder.
 them. `VOL_UP` is a `LadderButton.id`, **never** an action name — an earlier
 revision conflated the two, which made bindings unrepresentable.
 
+The kind values below are **pinned and append-only**, because they are what the
+generated Android contract and the firmware's `ActionKind` both encode. They
+match `ConfigModel.h`'s declaration order exactly; the two lists are one fact
+with two spellings, so a reorder in either is a defect, not a refactor.
+
+```c
+typedef enum { ACTION_NONE, ACTION_HW_KEY, ACTION_HW_KEY_RELEASE,
+               ACTION_APP_LAUNCH, ACTION_APP_INTENT, ACTION_KEYCODE,
+               ACTION_MEDIA, ACTION_VOLUME, ACTION_SYSTEM, ACTION_BUZZ,
+               ACTION_APP_RAW, ACTION_KIND_COUNT } ActionKind;
+```
+
 **`Binding` is a top-level join table** (spec §3.5), not nested per channel:
 
 ```c
 enum { kMaxBindings = 32, kMaxActionsPerBinding = 2 };
 
 typedef struct {
-    uint8_t  kind;                 // spec 3.6's 11 kinds; NOT a numeric id
-    bool     takes_payload;        // whether `payload` is meaningful
-    char     target[40];           // package / action / command / pattern
-    char     payload[kDataPayloadLen];  // the kind's data (APP_INTENT's `data`, ...)
+    uint8_t  kind;                 // ActionKind above; NOT a numeric action id
+    char     target[40];           // package / intent action / command / pattern
+    char     payload[48];          // APP_INTENT's `data`; MV for HW_KEY
+    uint16_t dac_code;             // HW_KEY when commanded by code
+    uint32_t key_resistance_mohm;  // HW_KEY when commanded by resistance
 } Action;
 
 typedef struct {
@@ -307,6 +320,20 @@ typedef struct {
     Action   actions[kMaxActionsPerBinding];  // ordered, executed best-effort
 } Binding;
 ```
+
+**An `Action` has no `takes_payload` flag**, though an earlier revision of this
+contract carried one. Whether a payload is meaningful is a property of the
+*kind*, which spec §3.6's table already states, so a per-action bool was a second
+home for a fact the kind owns — and it let a stored config assert something the
+kind denied. Task 11 exposes it as `ActionTakesPayload(ActionKind)` instead, and
+`ConfigValidate` refuses an `APP_INTENT` with an empty `target` rather than
+trusting a flag.
+
+**`HW_KEY` carries its level two ways and needs exactly one of them**: a
+`dac_code` (already an output command) or a `key_resistance_mohm` (the head
+unit's own ladder value, which the firmware converts through the gain policy).
+An `HW_KEY` with neither is refused by `ConfigValidate` — it would drive the
+output to a level nothing defined.
 
 **The string widths are part of the budget, not free choices** (spec §3.5's
 width table): `target[40]`, `payload[48]`, ids and names `[16]`. A provable
@@ -3616,6 +3643,18 @@ struct Action {
     uint32_t   key_resistance_mohm;        // kHwKey when commanded by resistance
 };
 
+// Whether the kind gives `payload` a meaning (spec 3.6's table is the authority).
+// Declared here rather than in ConfigCodec.h because Task 11's BindingResolver and
+// Task 8's ConfigValidate both need it, and it is a fact about the KIND -- not
+// about a particular action. An earlier revision stored it as a per-action bool,
+// which let a config claim a payload for a kind that has none.
+inline bool ActionTakesPayload(ActionKind k) {
+    return k == ActionKind::kAppLaunch || k == ActionKind::kAppIntent ||
+           k == ActionKind::kKeycode   || k == ActionKind::kMedia     ||
+           k == ActionKind::kVolume    || k == ActionKind::kSystem    ||
+           k == ActionKind::kBuzzer    || k == ActionKind::kAppRaw;
+}
+
 struct Binding {
     char     id[kBindingIdLen];
     uint8_t  channel;                      // SWC1|SWC2|AUX1..3|ANY
@@ -3696,6 +3735,13 @@ budgets for.
 // classification ambiguous or the device unable to serve input (FR-26).
 bool ConfigValidate(const Config &c);
 
+// Is this single action runnable: a known kind, carrying the field its kind
+// requires? Declared (not file-local) because Task 11's BindingResolver refuses
+// an un-executable action, and two copies of this predicate is exactly the
+// two-homes defect this plan keeps re-discovering. Task 11's ActionIsExecutable
+// is a thin alias for this, not a re-derivation.
+bool ActionIsWellFormed(const Action &a);
+
 // JSON form: the Android-facing and backup form (FR-27). Returns bytes written
 // excluding the terminator, or 0 on overflow.
 size_t ConfigEncodeJson(const Config &c, char *out, size_t out_len);
@@ -3709,23 +3755,55 @@ bool   ConfigDecodeBlob(const uint8_t *in, size_t len, Config *out);
 
 // Worst-case serialized size, asserted against the NVS budget (spec 10.5).
 //
-// constexpr, and that is load-bearing rather than stylistic: the tests size
-// their encode buffers from it (`constexpr size_t kScratch =
-// ConfigMaxSerializedSize();`), which is only legal if it is a constant
-// expression. A plain function would force those buffers back to a hard-coded
-// literal -- which is exactly how they went stale at 4096 B for a 22 KB model.
-// It is a pure function of the constants in ConfigModel.h, so it can be one.
-constexpr size_t ConfigMaxSerializedSize();
+// DEFINED HERE, INLINE, and that is load-bearing rather than stylistic. The tests
+// size their encode buffers from it (`constexpr size_t kScratch =
+// ConfigMaxSerializedSize();`), which is only legal if the definition is visible
+// in that translation unit: a `constexpr` function DECLARED in this header and
+// DEFINED in ConfigCodec.cpp does not compile there -- "undefined function cannot
+// be used in a constant expression". An earlier revision of this header declared
+// both functions and defined them in the .cpp, which would have failed the moment
+// Task 8's own tests were written. Inline in the header is the fix.
+//
+// It is a MEASURED NUMBER, not a cJSON call, for two reasons: cJSON cannot report
+// a size without building and printing the tree (neither constexpr nor cheap), and
+// this must be usable in a constant expression. The number is spec 3.5's
+// measurement -- every string field at its declared width, 2 channels x 16
+// buttons, 3 AUX, 32 bindings x 2 actions = 22,407 B of JSON -> 11 chunks.
+//
+// A number can go stale, so it is gated twice, and both gates are real:
+//   * the static_asserts below are compile-time and catch a value that no longer
+//     fits two slots, or one small enough to make Task 9's chunked path dead code;
+//   * Task 8's SerializedSizeFitsTheNvsPartitionBudget encodes the same two limits
+//     and additionally proves the constant is a real bound on the encoder's output.
+// **If any width in ConfigModel.h changes, re-measure this and spec 3.5 together.**
+// They are one fact with two homes, which is this plan's most common defect.
+inline constexpr size_t ConfigMaxSerializedSize() { return 22407; }
+
+// The fixed chunk size the store writes. Must be < 4000 to leave entry
+// overhead, and is a compile-time constant so the key count is bounded.
+// Declared BEFORE ConfigChunkCountFor, which uses it -- order matters here.
+constexpr size_t kConfigChunkBytes = 2048;
 
 // How many NVS keys a blob of this size needs, at a fixed chunk size well under
 // the 4000-byte single-value cap. A slot is written as `cfg_a_0..n` with the
 // count and a per-slot CRC in the header chunk (spec 3.8), because a real config
-// is 10-15 KB and CANNOT be one NVS value.
-constexpr int ConfigChunkCountFor(size_t blob_len);
+// is 10-15 KB and CANNOT be one NVS value. Inline for the same reason as above.
+inline constexpr int ConfigChunkCountFor(size_t blob_len) {
+    return static_cast<int>((blob_len + kConfigChunkBytes - 1) / kConfigChunkBytes);
+}
 
-// The fixed chunk size the store writes. Must be < 4000 to leave entry
-// overhead, and is a compile-time constant so the key count is bounded.
-constexpr size_t kConfigChunkBytes = 2048;
+// NVS's usable entry space: 12 pages x 126 entries x 32 B (spec 3.8), and each
+// chunk key costs 32 B of metadata + the payload + a 32 B BLOB_IDX entry -- so
+// 2,112 B per chunk, NOT 2,048. Counting only the payload understates the budget.
+constexpr size_t kUsableEntryBytes   = 32u * 126u * 12u;              // 48,384
+constexpr size_t kEntryBytesPerChunk = 32u + kConfigChunkBytes + 32u; // 2,112
+constexpr size_t kSequenceKeyBytes   = 32u;
+
+static_assert(ConfigMaxSerializedSize() > 4000u,
+              "the worst case must force chunking, or Task 9's chunked path is dead code");
+static_assert(2u * static_cast<size_t>(ConfigChunkCountFor(ConfigMaxSerializedSize())) *
+                      kEntryBytesPerChunk + kSequenceKeyBytes <= kUsableEntryBytes,
+              "two slots + cfg_seq no longer fit the nvs partition: re-measure spec 3.5");
 ```
 
 - [ ] **Step 5: Implement `ConfigCodec.cpp`**
@@ -3792,7 +3870,43 @@ bool CentresAreDistinguishable(const LadderProfile &p) {
     return true;
 }
 
+bool BindingNamesARealInput(const Config &c, const Binding &b) {
+    if (strcmp(b.button, "NONE") == 0) return true;   // gestures on the prog button
+    for (uint8_t ch = 0; ch < c.channel_count; ++ch) {
+        const LadderProfile &p = c.channels[ch].ladder;
+        for (uint8_t i = 0; i < p.count; ++i) {
+            if (strcmp(p.buttons[i].id, b.button) == 0) return true;
+        }
+    }
+    for (uint8_t i = 0; i < c.aux_count; ++i) {
+        if (strcmp(c.aux[i].id, b.button) == 0) return true;
+    }
+    return false;
+}
+
 }  // namespace
+
+// Declared in ConfigCodec.h, so it is defined OUTSIDE the anonymous namespace --
+// Task 11 calls it. A file-local definition would link only for this file, which
+// is how the earlier revision's cross-check silently became a re-derivation.
+bool ActionIsWellFormed(const Action &a) {
+    if (a.kind > ActionKind::kAppRaw) return false;   // the enum is contiguous
+    // Every kind needs its non-payload parameter, because that parameter is what
+    // the action DOES. An empty one is an action with no effect, which would be
+    // stored and reported as a binding that fires.
+    const bool needs_target =
+        a.kind == ActionKind::kAppLaunch || a.kind == ActionKind::kAppIntent ||
+        a.kind == ActionKind::kKeycode   || a.kind == ActionKind::kMedia     ||
+        a.kind == ActionKind::kVolume    || a.kind == ActionKind::kSystem    ||
+        a.kind == ActionKind::kBuzzer    || a.kind == ActionKind::kAppRaw;
+    if (needs_target && a.target[0] == '\0') return false;
+    // HW_KEY carries its level exactly one way -- an already-resolved `dac_code`,
+    // or the head unit's own `key_resistance_mohm` for the gain policy to convert.
+    // Neither means the action would drive the output to a level nothing defined.
+    if (a.kind == ActionKind::kHwKey &&
+        a.dac_code == 0 && a.key_resistance_mohm == 0) return false;
+    return true;
+}
 
 bool ConfigValidate(const Config &c) {
     if (c.schema_version != kConfigSchemaVersion) return false;
@@ -4484,8 +4598,18 @@ desynchronizing the link."
 ### Task 11: `ActionLibrary` and `BindingResolver`
 
 The action library is the vocabulary the app offers and the firmware executes.
-Two rules matter: an action with a payload must round-trip it, and an unknown
-action id must be **rejected with an error**, never silently dropped.
+Two rules matter: an action with a payload must round-trip it, and an action
+whose kind is not executable must be **rejected**, never silently dropped.
+
+**There is no numeric action-id table** (spec §3.6). An earlier revision of this
+task invented `enum class ActionId : uint8_t`, a `1–63` contiguous table, and a
+three-value `ActionKind { kLadderKey, kAndroidCommand, kNoOp }`; it also treated
+ladder-button slugs (`VOL_UP`) as action *names*. The spec defines none of that.
+`VOL_UP` is a `LadderButton.id` — the `button` field of a `Binding` — and an
+action is its `kind` plus its params, which is what `ConfigModel.h` already
+stores. The three-value enum could not even express spec §3.6's eleven kinds, and
+it made the product's core case (one button whose `SINGLE` sends a `HW_KEY` while
+its `DOUBLE` sends an `APP_INTENT`) a shape the type could not hold.
 
 **Files:**
 - Create: `code/lib/Bindings/ActionLibrary.h`
@@ -4498,15 +4622,24 @@ action id must be **rejected with an error**, never silently dropped.
   four-line `main()`.
 
 **Interfaces:**
-- Consumes: `Config` (Task 8), `Gesture`, `GestureEvent` (Task 6)
+- Consumes: `Config`, `Action`, `ActionKind`, `Binding` (Task 8), `Gesture`,
+  `GestureEvent` (Task 6)
 - Produces:
-  - `enum class ActionId : uint8_t` — the numeric ids from spec §3.6
-  - `enum class ActionKind { kLadderKey, kAndroidCommand, kNoOp }`
-  - `struct ActionDef { ActionId id; const char *name; ActionKind kind; bool takes_payload; const char *payload_label; }`
-  - `const ActionDef *ActionFindByName(const char *name)`
-  - `const ActionDef *ActionFindById(uint8_t id)`
-  - `struct ResolvedAction { bool found; ActionDef def; uint8_t ladder_button; char payload[kDataPayloadLen]; }`
-  - `ResolvedAction BindingResolve(const ChannelConfig &ch, const GestureEvent &ev)`
+  - `bool ActionIsExecutable(const Action &a)` — the kind is known *and* carries
+    the field its kind requires; this is `ActionIsWellFormed`'s contract, exposed
+    so the resolver and the codec cannot drift apart
+  - `struct ResolvedAction { bool found; Action action; }`
+  - `ResolvedAction BindingResolve(const Config &cfg, uint8_t channel_index,
+    const GestureEvent &ev)`
+
+**Why `BindingResolve` takes the whole `Config` and a channel index.** Spec §3.5
+makes `bindings` a top-level table whose entries carry their own `channel`
+(`SWC1|SWC2|AUX1..3|ANY`) — an earlier revision of this task resolved against a
+`ChannelConfig` and so could not see a binding's channel at all, could not honour
+`ANY`, and could not see the AUX inputs. It also could not resolve the
+`LadderButton.id` in `b.button`, because the ladder lives on the channel while
+the binding lives at the top level. Passing the `Config` is what makes the two
+addressable at once.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4515,36 +4648,94 @@ action id must be **rejected with an error**, never silently dropped.
 ```cpp
 #include "Bindings/ActionLibrary.h"
 #include <gtest/gtest.h>
+#include <cstring>
 
-TEST(ActionLibrary, IdsAreStableAndNamesAreUnique) {
-    // Ids are persisted in configs shipped to users; renumbering them silently
-    // rebinds every existing device's buttons.
-    for (int id = 1; id < 64; ++id) {
-        const ActionDef *d = ActionFindById(static_cast<uint8_t>(id));
-        ASSERT_NE(d, nullptr) << "id " << id << " must exist (no gaps in the table)";
-        ASSERT_STREQ(ActionFindByName(d->name)->name, d->name) << "name lookup must be exact";
-    }
+namespace {
+Action HwKey(uint16_t code) {
+    Action a{};
+    a.kind = ActionKind::kHwKey;
+    a.dac_code = code;
+    return a;
+}
+Action Intent(const char *action, const char *data) {
+    Action a{};
+    a.kind = ActionKind::kAppIntent;
+    std::strncpy(a.target, action, sizeof(a.target) - 1);
+    std::strncpy(a.payload, data, sizeof(a.payload) - 1);
+    return a;
+}
+}  // namespace
+
+TEST(ActionLibrary, EverySpecKindIsExecutable) {
+    // Spec 3.6's eleven kinds, each given the field its own row requires. A kind
+    // that cannot be made executable is a kind the firmware cannot run.
+    Action none{};            none.kind = ActionKind::kNone;
+    Action release{};         release.kind = ActionKind::kHwKeyRelease;
+    Action launch{};          launch.kind = ActionKind::kAppLaunch;
+    std::strncpy(launch.target, "com.spotify.music", sizeof(launch.target) - 1);
+    Action keycode{};         keycode.kind = ActionKind::kKeycode;
+    std::strncpy(keycode.target, "KEYCODE_MEDIA_NEXT", sizeof(keycode.target) - 1);
+    Action media{};           media.kind = ActionKind::kMedia;
+    std::strncpy(media.target, "next", sizeof(media.target) - 1);
+    Action volume{};          volume.kind = ActionKind::kVolume;
+    std::strncpy(volume.target, "media", sizeof(volume.target) - 1);
+    Action system{};          system.kind = ActionKind::kSystem;
+    std::strncpy(system.target, "screen_off", sizeof(system.target) - 1);
+    Action buzz{};            buzz.kind = ActionKind::kBuzzer;
+    std::strncpy(buzz.target, "kBootOk", sizeof(buzz.target) - 1);
+    Action raw{};             raw.kind = ActionKind::kAppRaw;
+    std::strncpy(raw.target, "ping", sizeof(raw.target) - 1);
+
+    EXPECT_TRUE(ActionIsExecutable(none));
+    EXPECT_TRUE(ActionIsExecutable(release));
+    EXPECT_TRUE(ActionIsExecutable(launch));
+    EXPECT_TRUE(ActionIsExecutable(HwKey(1240)));
+    EXPECT_TRUE(ActionIsExecutable(Intent("com.oetsolutions.swc.ACTION_NAVIGATE", "geo:1,2")));
+    EXPECT_TRUE(ActionIsExecutable(keycode));
+    EXPECT_TRUE(ActionIsExecutable(media));
+    EXPECT_TRUE(ActionIsExecutable(volume));
+    EXPECT_TRUE(ActionIsExecutable(system));
+    EXPECT_TRUE(ActionIsExecutable(buzz));
+    EXPECT_TRUE(ActionIsExecutable(raw));
 }
 
-TEST(ActionLibrary, LadderKeyActionsCarryNoPayload) {
-    const ActionDef *d = ActionFindByName("VOL_UP");
-    ASSERT_NE(d, nullptr);
-    EXPECT_EQ(d->kind, ActionKind::kLadderKey);
-    EXPECT_FALSE(d->takes_payload);
+TEST(ActionLibrary, HwKeyMustCarryALevelOneWayOrTheOther) {
+    // Spec 3.6: HW_KEY takes `key_resistance_mohm`, OR `dac_code`. Neither means
+    // the output would be driven to a level nothing defined -- the exact fault
+    // spec 6.7 exists to prevent, so it is refused rather than guessed.
+    Action neither{};
+    neither.kind = ActionKind::kHwKey;
+    EXPECT_FALSE(ActionIsExecutable(neither));
+
+    Action by_code = HwKey(1240);
+    EXPECT_TRUE(ActionIsExecutable(by_code));
+
+    Action by_resistance{};
+    by_resistance.kind = ActionKind::kHwKey;
+    by_resistance.key_resistance_mohm = 24000;   // spec 3.7's b1
+    EXPECT_TRUE(ActionIsExecutable(by_resistance));
 }
 
-TEST(ActionLibrary, IntentActionsRequireAPayloadAndSayWhatItIs) {
-    const ActionDef *d = ActionFindByName("ANDROID_SEND_INTENT");
-    ASSERT_NE(d, nullptr);
-    EXPECT_EQ(d->kind, ActionKind::kAndroidCommand);
-    EXPECT_TRUE(d->takes_payload);
-    EXPECT_STRNE(d->payload_label, "");
+TEST(ActionLibrary, AnIntentWithNoActionIsNotAnIntent) {
+    Action a{};
+    a.kind = ActionKind::kAppIntent;
+    std::strncpy(a.payload, "geo:1,2", sizeof(a.payload) - 1);   // data, but no action
+    EXPECT_FALSE(ActionIsExecutable(a)) << "the action is what the intent DOES";
 }
 
-TEST(ActionLibrary, AnUnknownNameIsNotFoundNotGuessed) {
-    EXPECT_EQ(ActionFindByName("NOT_A_REAL_ACTION"), nullptr);
-    EXPECT_EQ(ActionFindByName(""), nullptr);
-    EXPECT_EQ(ActionFindByName("vol_up"), nullptr) << "names are case-sensitive";
+TEST(ActionLibrary, APayloadIsMeaningfulOnlyForTheKindsThatUseOne) {
+    // The flag is a property of the kind, not of a stored action (spec 3.6).
+    EXPECT_TRUE(ActionTakesPayload(ActionKind::kAppIntent));
+    EXPECT_TRUE(ActionTakesPayload(ActionKind::kAppRaw));
+    EXPECT_FALSE(ActionTakesPayload(ActionKind::kHwKey));
+    EXPECT_FALSE(ActionTakesPayload(ActionKind::kNone));
+    EXPECT_FALSE(ActionTakesPayload(ActionKind::kHwKeyRelease));
+}
+
+TEST(ActionLibrary, AKindOutsideTheSpecIsRefusedNotGuessed) {
+    Action a{};
+    a.kind = static_cast<ActionKind>(200);   // no such kind
+    EXPECT_FALSE(ActionIsExecutable(a));
 }
 ```
 
@@ -4556,63 +4747,144 @@ TEST(ActionLibrary, AnUnknownNameIsNotFoundNotGuessed) {
 #include <cstring>
 
 namespace {
-ChannelConfig MakeChannel() {
-    ChannelConfig ch{};
-    ch.enabled = true;
-    std::strncpy(ch.name, "SWC1", sizeof(ch.name) - 1);
-    ch.ladder.count = 2;
-    ch.ladder.learned_idle_mv = 2835;
-    ch.ladder.buttons[0] = {"VOL_UP", 504, 42, 0};
-    ch.ladder.buttons[1] = {"VOL_DOWN", 630, 42, 0};
-    ch.binding_count = 3;
-    ch.bindings[0] = {0, Gesture::kSingle, 1, "VOL_UP", ""};
-    ch.bindings[1] = {0, Gesture::kDouble, 20, "ANDROID_SEND_INTENT", "com.app/.Main"};
-    ch.bindings[2] = {1, Gesture::kLong, 3, "MUTE", ""};
-    return ch;
+// Spec 3.7's worked example: one channel, three buttons, idle 2835 mV, and the
+// bindings that make the product's core case real -- vol_up SINGLE drives a
+// HW_KEY (works with no app) while next DOUBLE launches an app (the app's extra).
+Config MakeConfig() {
+    Config c{};
+    c.schema_version = kConfigSchemaVersion;
+    c.channel_count = 1;
+    std::strncpy(c.channels[0].name, "SWC1", sizeof(c.channels[0].name) - 1);
+    c.channels[0].enabled = true;
+    c.channels[0].ladder.learned_idle_mv = 2835;
+    c.channels[0].ladder.count = 3;
+    c.channels[0].ladder.buttons[0] = {"vol_up", "Volume Up",   1430, 120, 3300, 235, 200, 98};
+    c.channels[0].ladder.buttons[1] = {"vol_dn", "Volume Down", 1785, 120, 3300, 235, 200, 97};
+    c.channels[0].ladder.buttons[2] = {"next",   "Next Track",  2145, 110, 3300, 235, 200, 99};
+
+    c.binding_count = 4;
+    std::strncpy(c.bindings[0].id, "b1", sizeof(c.bindings[0].id) - 1);
+    c.bindings[0].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    std::strncpy(c.bindings[0].button, "vol_up", sizeof(c.bindings[0].button) - 1);
+    c.bindings[0].gesture = Gesture::kSingle;
+    c.bindings[0].enabled = true;
+    c.bindings[0].action_count = 1;
+    c.bindings[0].actions[0].kind = ActionKind::kHwKey;
+    c.bindings[0].actions[0].key_resistance_mohm = 24000;
+
+    std::strncpy(c.bindings[1].id, "b3", sizeof(c.bindings[1].id) - 1);
+    c.bindings[1].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    std::strncpy(c.bindings[1].button, "next", sizeof(c.bindings[1].button) - 1);
+    c.bindings[1].gesture = Gesture::kDouble;
+    c.bindings[1].enabled = true;
+    c.bindings[1].action_count = 1;
+    c.bindings[1].actions[0].kind = ActionKind::kAppLaunch;
+    std::strncpy(c.bindings[1].actions[0].target, "com.spotify.music",
+                 sizeof(c.bindings[1].actions[0].target) - 1);
+
+    // b4 is spec 3.7's APP_INTENT: the kind that actually carries a data payload.
+    // (b3 is APP_LAUNCH, which takes a `package` and no data -- pairing a payload
+    // with APP_LAUNCH is the kind of shape this model exists to make impossible.)
+    std::strncpy(c.bindings[3].id, "b4", sizeof(c.bindings[3].id) - 1);
+    c.bindings[3].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    std::strncpy(c.bindings[3].button, "next", sizeof(c.bindings[3].button) - 1);
+    c.bindings[3].gesture = Gesture::kLong;
+    c.bindings[3].enabled = true;
+    c.bindings[3].action_count = 1;
+    c.bindings[3].actions[0].kind = ActionKind::kAppIntent;
+    std::strncpy(c.bindings[3].actions[0].target, "com.oetsolutions.swc.ACTION_NAVIGATE",
+                 sizeof(c.bindings[3].actions[0].target) - 1);
+    std::strncpy(c.bindings[3].actions[0].payload, "geo:40.7608,-111.8910?q=Home",
+                 sizeof(c.bindings[3].actions[0].payload) - 1);
+
+    // b2 is on channel 2, which this config does not even enable: resolving a
+    // SWC1 gesture must never find it.
+    std::strncpy(c.bindings[2].id, "b2", sizeof(c.bindings[2].id) - 1);
+    c.bindings[2].channel = static_cast<uint8_t>(BindingChannel::kSwc2);
+    std::strncpy(c.bindings[2].button, "vol_up", sizeof(c.bindings[2].button) - 1);
+    c.bindings[2].gesture = Gesture::kSingle;
+    c.bindings[2].enabled = true;
+    c.bindings[2].action_count = 1;
+    c.bindings[2].actions[0].kind = ActionKind::kHwKeyRelease;
+    return c;
 }
 GestureEvent Ev(Gesture g, uint8_t b) { return GestureEvent{g, b, 0}; }
 }  // namespace
 
 TEST(BindingResolver, ResolvesAButtonsSinglePressToItsAction) {
-    const ResolvedAction r = BindingResolve(MakeChannel(), Ev(Gesture::kSingle, 0));
+    const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kSingle, 0));
     ASSERT_TRUE(r.found);
-    EXPECT_STREQ(r.def.name, "VOL_UP");
-    EXPECT_EQ(r.def.kind, ActionKind::kLadderKey);
+    EXPECT_EQ(r.action.kind, ActionKind::kHwKey);
+    EXPECT_EQ(r.action.key_resistance_mohm, 24000u);
 }
 
 TEST(BindingResolver, CarriesTheDataPayloadThroughUntouched) {
-    const ResolvedAction r = BindingResolve(MakeChannel(), Ev(Gesture::kDouble, 0));
+    // b4, spec 3.7's APP_INTENT. A binding's payload is stored in the ACTION, and
+    // this asserts it arrives byte for byte rather than being re-derived.
+    const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kLong, 2));
     ASSERT_TRUE(r.found);
-    EXPECT_STREQ(r.def.name, "ANDROID_SEND_INTENT");
-    EXPECT_STREQ(r.payload, "com.app/.Main");
+    EXPECT_EQ(r.action.kind, ActionKind::kAppIntent);
+    EXPECT_STREQ(r.action.target, "com.oetsolutions.swc.ACTION_NAVIGATE");
+    EXPECT_STREQ(r.action.payload, "geo:40.7608,-111.8910?q=Home");
+}
+
+TEST(BindingResolver, ABindingOnAnotherChannelIsNotResolved) {
+    // b2 binds vol_up SINGLE on SWC2. Resolving a SWC1 event must not find it --
+    // this is the check the earlier per-channel revision could not express.
+    const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kSingle, 0));
+    ASSERT_TRUE(r.found);
+    EXPECT_NE(r.action.kind, ActionKind::kHwKeyRelease) << "that binding is SWC2's";
+}
+
+TEST(BindingResolver, AnyChannelIsHonouredFromEitherChannel) {
+    Config c = MakeConfig();
+    c.bindings[0].channel = static_cast<uint8_t>(BindingChannel::kAny);
+    c.channel_count = 2;
+    c.channels[1] = c.channels[0];
+    EXPECT_TRUE(BindingResolve(c, 0, Ev(Gesture::kSingle, 0)).found);
+    EXPECT_TRUE(BindingResolve(c, 1, Ev(Gesture::kSingle, 0)).found)
+        << "ANY means one binding honoured from either steering-wheel channel";
 }
 
 TEST(BindingResolver, UnboundGestureIsNotFoundRatherThanDefaultingToSomething) {
-    const ResolvedAction r = BindingResolve(MakeChannel(), Ev(Gesture::kLong, 0));
+    const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kLong, 0));
     EXPECT_FALSE(r.found) << "an unbound gesture must do nothing, not act by accident";
 }
 
 TEST(BindingResolver, ResolvesTheSameGestureDifferentlyPerButton) {
-    const ChannelConfig ch = MakeChannel();
-    EXPECT_STREQ(BindingResolve(ch, Ev(Gesture::kLong, 1)).def.name, "MUTE");
-    EXPECT_FALSE(BindingResolve(ch, Ev(Gesture::kLong, 0)).found);
+    const Config c = MakeConfig();
+    EXPECT_TRUE(BindingResolve(c, 0, Ev(Gesture::kSingle, 0)).found);   // vol_up SINGLE
+    EXPECT_FALSE(BindingResolve(c, 0, Ev(Gesture::kSingle, 2)).found);  // next SINGLE
 }
 
-TEST(BindingResolver, AnActionIdWithNoDefinitionIsRejectedNotDroppedSilently) {
-    ChannelConfig ch = MakeChannel();
-    ch.bindings[0].action_id = 200;               // not in the table
-    std::strncpy(ch.bindings[0].action_name, "GHOST", sizeof(ch.bindings[0].action_name) - 1);
-    const ResolvedAction r = BindingResolve(ch, Ev(Gesture::kSingle, 0));
-    EXPECT_FALSE(r.found);
+TEST(BindingResolver, AnEmptyActionListSwallowsTheGestureWithoutActing) {
+    // Spec 3.5: empty actions is NOT the same as enabled:false -- the gesture is
+    // recognised and does nothing, so no lower-priority binding may take it.
+    Config c = MakeConfig();
+    c.bindings[0].action_count = 0;
+    const ResolvedAction r = BindingResolve(c, 0, Ev(Gesture::kSingle, 0));
+    EXPECT_TRUE(r.found);
+    EXPECT_EQ(r.action.kind, ActionKind::kNone) << "recognised, and deliberately inert";
 }
 
-TEST(BindingResolver, TheStoredNameMustAgreeWithTheStoredId) {
-    // If a firmware update renumbers an action, an old config would silently
-    // fire the wrong thing. The name is the cross-check that catches it.
-    ChannelConfig ch = MakeChannel();
-    std::strncpy(ch.bindings[0].action_name, "MUTE", sizeof(ch.bindings[0].action_name) - 1);
-    EXPECT_FALSE(BindingResolve(ch, Ev(Gesture::kSingle, 0)).found)
-        << "id says VOL_UP, name says MUTE: refuse rather than pick one";
+TEST(BindingResolver, ADisabledBindingIsSkippedNotSwallowed) {
+    Config c = MakeConfig();
+    c.bindings[0].enabled = false;
+    EXPECT_FALSE(BindingResolve(c, 0, Ev(Gesture::kSingle, 0)).found)
+        << "disabled means do not match at all, so a later binding may";
+}
+
+TEST(BindingResolver, AnUnExecutableActionIsRefusedRatherThanDropped) {
+    Config c = MakeConfig();
+    c.bindings[0].actions[0].key_resistance_mohm = 0;   // HW_KEY with no level
+    EXPECT_FALSE(BindingResolve(c, 0, Ev(Gesture::kSingle, 0)).found);
+}
+
+TEST(BindingResolver, AnActionListTooLongIsRefusedRatherThanTruncated) {
+    Config c = MakeConfig();
+    c.bindings[0].action_count = kMaxActionsPerBinding + 1;
+    EXPECT_FALSE(BindingResolve(c, 0, Ev(Gesture::kSingle, 0)).found)
+        << "a count past the array is a corrupt config, not a shorter action list";
 }
 ```
 
@@ -4623,30 +4895,60 @@ Expected: FAIL — headers not found.
 
 - [ ] **Step 3: Implement**
 
-`ActionLibrary.cpp` defines a single `constexpr ActionDef kActions[]` table
-covering every action in spec §3.6, **numbered contiguously from 1 with no
-gaps** (the test walks the whole range). `ActionFindById` is a linear scan;
-`ActionFindByName` is an exact, case-sensitive `strcmp`.
+`ActionLibrary.h` declares `ActionIsExecutable`, which **delegates to
+`ActionIsWellFormed`** from `ConfigCodec.h` rather than re-deriving the rule. The
+codec and the resolver must agree on what a runnable action is; two copies of that
+predicate is exactly the two-homes defect this plan keeps re-discovering.
 
 `BindingResolver.cpp`:
 
 ```cpp
-ResolvedAction BindingResolve(const ChannelConfig &ch, const GestureEvent &ev) {
+#include "Bindings/BindingResolver.h"
+
+#include <string.h>
+
+#include "Bindings/ActionLibrary.h"
+
+ResolvedAction BindingResolve(const Config &cfg, uint8_t channel_index,
+                              const GestureEvent &ev) {
     ResolvedAction out{};
     out.found = false;
-    if (!ch.enabled) return out;
-    for (uint8_t i = 0; i < ch.binding_count; ++i) {
-        const Binding &b = ch.bindings[i];
-        if (b.button_index != ev.button_index || b.gesture != ev.gesture) continue;
-        const ActionDef *d = ActionFindById(b.action_id);
-        if (d == nullptr) return out;                  // unknown id: refuse, do not act
-        // The stored name is a cross-check against a renumbering firmware
-        // update silently rebinding an old config to a different action.
-        if (std::strcmp(d->name, b.action_name) != 0) return out;
-        if (d->takes_payload) {
-            std::strncpy(out.payload, b.data_payload, sizeof(out.payload) - 1);
-        }
-        out.def = *d;
+    out.action = Action{};
+    out.action.kind = ActionKind::kNone;   // inert by default, never uninitialised
+    if (channel_index >= cfg.channel_count) return out;
+    if (!cfg.channels[channel_index].enabled) return out;
+
+    // The button the gesture fired on, by id. The event carries an index into
+    // that channel's ladder (Task 6), and the binding names the id, so this is
+    // the join between the two.
+    const LadderProfile &ladder = cfg.channels[channel_index].ladder;
+    if (ev.button_index >= ladder.count) return out;
+    const char *button_id = ladder.buttons[ev.button_index].id;
+
+    const uint8_t as_swc = channel_index == 0
+        ? static_cast<uint8_t>(BindingChannel::kSwc1)
+        : static_cast<uint8_t>(BindingChannel::kSwc2);
+
+    for (uint8_t i = 0; i < cfg.binding_count; ++i) {
+        const Binding &b = cfg.bindings[i];
+        if (!b.enabled) continue;                    // disabled: do not match at all
+        if (b.gesture != ev.gesture) continue;
+        if (b.channel != as_swc &&
+            b.channel != static_cast<uint8_t>(BindingChannel::kAny)) continue;
+        if (strcmp(b.button, button_id) != 0) continue;
+        // A count past the array is a corrupt config. Refuse rather than
+        // truncate: a shortened action list is a binding that fires differently
+        // from the one that was stored.
+        if (b.action_count > kMaxActionsPerBinding) return out;
+        // An empty list is legal and MEANS "swallow the gesture" (spec 3.5), so
+        // it is found-and-inert, not not-found.
+        if (b.action_count == 0) { out.found = true; return out; }
+        // v1 executes the FIRST action; the list is ordered and best-effort
+        // (spec 3.5), and the multi-action runner is Task 13's job. An action
+        // that cannot be executed is refused, not skipped -- silently dropping
+        // it would fire a different binding than the one stored.
+        if (!ActionIsExecutable(b.actions[0])) return out;
+        out.action = b.actions[0];
         out.found = true;
         return out;
     }
@@ -4657,7 +4959,7 @@ ResolvedAction BindingResolve(const ChannelConfig &ch, const GestureEvent &ev) {
 - [ ] **Step 4: Run the tests**
 
 Run: `cd code && pio test -e native -f '*test_bindings'`
-Expected: PASS — 4 + 6 tests green.
+Expected: PASS — 5 + 10 tests green.
 
 - [ ] **Step 5: Commit**
 
@@ -4665,10 +4967,12 @@ Expected: PASS — 4 + 6 tests green.
 git add code/lib/Bindings code/test_native/test_bindings
 git commit -m "Add the action library and binding resolution
 
-Action ids are contiguous and stable because they are persisted in shipped
-configs. Resolution cross-checks the stored name against the stored id, so a
-firmware update that renumbers an action refuses an old config rather than
-silently firing the wrong key. Payloads round-trip untouched."
+An action is its kind plus params, per spec 3.6 -- there is no numeric action-id
+table, and a ladder-button slug is a LadderButton.id rather than an action name.
+Resolution works against the top-level bindings table so a binding's own channel
+field, ANY, and the AUX inputs are all representable. An action that cannot be
+executed is refused rather than silently dropped, and an empty action list is
+found-and-inert because that is what spec 3.5 says it means."
 ```
 
 ---
@@ -5082,11 +5386,28 @@ requirement, not an implementation detail):
 
 `Tick(now)` per channel: read `adc_read_mv(SWCn)` and `adc_read_mv(TEMP)`;
 `PressClassifier::Update`; feed the result to `GestureStateMachine::Update`; on a
-gesture, `BindingResolve`; if found and `kLadderKey`, compute the target KEY
-voltage for that ladder button and `ServoLoop::Target`; on release (or fault, or
+gesture, `BindingResolve(config_, ch, event)`. **A found `kHwKey` action names a
+level, not a button**, so the target KEY voltage comes from the action:
+
+- `dac_code` → `GainPolicyKeyMvForCode(mode, code)`, the already-resolved form;
+- `key_resistance_mohm` → the level that resistance presents to the head unit,
+  computed from that action's own resistance and the head unit's pull-up.
+
+**There is no per-button key table** (`output.key_values` in an earlier revision
+of spec §3.7). The level is the action's, because that is what lets `vol_up`'s
+`SINGLE` drive a `HW_KEY` while its `LONG` does something else — the core case of
+spec §3.5. The map also did not fit: 32 buttons × a `{dac_code}` entry is 576 B,
+which takes the measured worst case to 12 chunks = 105 % of the partition.
+
+Then `ServoLoop::Target(mode, target_key_mv)`; on release (or fault, or
 `kUnknown`) retarget to the idle code. Then `ServoLoop::Update(sense_mv)` and
 write the DAC only when the code changed. Finally `BuzzerGrammar::Update` and
 `LedGrammar::Update`.
+
+**An action that is not executable releases rather than acting** — the resolver
+refuses it, and a refused action must retarget to idle in the same tick for the
+same reason `kFault` does: a stale key driven with no action behind it is the
+phantom-key hazard of spec §6.7.
 
 The fault path is the one to get right: **any** `kFault` on a channel must
 retarget that channel to idle in the same tick, which is what
@@ -5094,10 +5415,20 @@ retarget that channel to idle in the same tick, which is what
 
 Add `MockHal::Defaults` to `MockHAL.h` — a helper struct holding a valid
 `Config` and `GestureTimingsDefault()`, so these tests are readable. The single
-channel's ladder is **`idle_mv` 2835** with **`VOL_UP` at `mv_center` 1430,
-`mv_tolerance` 120**, and a single-press binding to `VOL_UP`. These are the
+channel's ladder is **`learned_idle_mv` 2835** with **`vol_up` at `mv_center`
+1430, `mv_tolerance` 120**, and a single-press binding to `vol_up`. These are the
 spec §3.7 defaults; **they are not arbitrary** — a press pulls the input *down*
-from idle (§6.3), so every button's `mv_center` is *below* `idle_mv`.
+from idle (§6.3), so every button's `mv_center` is *below* `learned_idle_mv`.
+
+**A button id is an opaque string compared exactly** — the `button` field of a
+binding must equal a `LadderButton.id` character for character, and there is no
+case folding. Task 13's default config uses spec §3.7's spelling (`vol_up`,
+`vol_dn`, `next`); Tasks 3 and 6's committed tests use `VOL_UP`. Both work,
+because the id is opaque and never parsed — but an earlier revision of *this*
+task went further and used `VOL_UP` as an **action name** with a `ActionFindByName`
+lookup behind it. That is the defect worth naming: `VOL_UP` is not an action and
+there is no action-name lookup at all, so a config that spelled a ladder id in the
+action field would have resolved to nothing.
 
 - [ ] **Step 4: Run the tests**
 

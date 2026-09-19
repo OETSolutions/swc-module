@@ -4084,6 +4084,28 @@ satisfy:
   spec §3.6's 11) plus that kind's own params. There is **no `action_id` and no
   `action_name`**; an earlier revision wrote both, which is a numeric id table
   the spec does not define.
+- **Each kind names its own two string slots on the wire; the struct's fields are
+  generic.** `Action.target` is the "what to do" string and `Action.payload` the
+  data URI, but the wire key is the kind's own name for it — spec §3.7 is written
+  in those names and the Android app parses them, so the encoder must emit them:
+
+  | kind | `target` is written as | `payload` is written as |
+  | --- | --- | --- |
+  | `APP_LAUNCH` | `package` | — |
+  | `APP_INTENT` | `action` | `data` |
+  | `KEYCODE` | `keycode` | — |
+  | `MEDIA` / `SYSTEM` / `APP_RAW` | `command` | — |
+  | `VOLUME` | `target` | — |
+  | `BUZZ` | `pattern` | — |
+  | `NONE` / `HW_KEY` / `HW_KEY_RELEASE` | — (HW_KEY uses the numeric fields) | — |
+
+  A field the kind does not use is **omitted, not written empty**, so a `NONE`
+  action is exactly `{"kind":"NONE"}`. One table in the .cpp serves both the
+  encoder and the decoder: a kind renamed on one side and not the other would
+  produce a config that cannot be read back, which is the round-trip failure
+  FR-27 exists to prevent. Spec §3.6's table is the authority for which params
+  exist, and it is **capped at two string params per action** — a budget fact
+  (see §3.6's note), not a taste one.
 - **An empty `actions` array round-trips as empty and stays distinct from
   `"enabled": false`** (spec §3.5). Both are valid, they mean different things,
   and the decoder must not collapse one into the other.
@@ -4228,7 +4250,9 @@ Expected: PASS.
 
 ```bash
 git add code/lib/Config/ConfigModel.h code/lib/Config/ConfigCodec.h \
-        code/lib/Config/ConfigCodec.cpp code/test_native/test_config \
+        code/lib/Config/ConfigCodec.cpp \
+        code/test_native/test_config/ConfigCodecTest.cpp \
+        code/test_native/test_config/test_main.cpp \
         code/platformio.ini
 git commit -m "Add the config model with validated JSON and CRC'd blob codecs
 

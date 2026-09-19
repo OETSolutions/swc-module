@@ -330,6 +330,59 @@ bool ReadConfidence(const cJSON *obj, uint8_t *out) {
     return true;
 }
 
+// The wire key each kind uses for the struct's two generic string fields (spec
+// 3.6). `target` is the "what to do" string and `payload` the data URI; the kind
+// decides what to call them. Returning nullptr means the kind has no such
+// parameter, and the field is then neither written nor required.
+//
+// One table rather than two switch statements, because the encoder and the decoder
+// must agree exactly -- a kind renamed in one and not the other would encode a
+// config the decoder cannot read back, which is precisely the round-trip failure
+// FR-27 exists to prevent.
+struct ParamKeys { ActionKind kind; const char *target; const char *payload; };
+
+constexpr ParamKeys kParamKeys[] = {
+    {ActionKind::kNone,         nullptr,        nullptr},
+    {ActionKind::kHwKey,        nullptr,        nullptr},   // uses the numeric fields
+    {ActionKind::kHwKeyRelease, nullptr,        nullptr},
+    {ActionKind::kAppLaunch,    "package",      nullptr},
+    {ActionKind::kAppIntent,    "action",       "data"},
+    {ActionKind::kKeycode,      "keycode",      nullptr},
+    {ActionKind::kMedia,        "command",      nullptr},
+    {ActionKind::kVolume,       "target",       nullptr},
+    {ActionKind::kSystem,       "command",      nullptr},
+    {ActionKind::kBuzzer,       "pattern",      nullptr},
+    {ActionKind::kAppRaw,       "command",      nullptr},
+};
+
+const ParamKeys *KeysFor(ActionKind kind) {
+    for (size_t i = 0; i < sizeof(kParamKeys) / sizeof(kParamKeys[0]); ++i) {
+        if (kParamKeys[i].kind == kind) return &kParamKeys[i];
+    }
+    return nullptr;
+}
+
+const char *TargetKeyFor(ActionKind kind) {
+    const ParamKeys *k = KeysFor(kind);
+    return k == nullptr ? nullptr : k->target;
+}
+
+const char *PayloadKeyFor(ActionKind kind) {
+    const ParamKeys *k = KeysFor(kind);
+    return k == nullptr ? nullptr : k->payload;
+}
+
+// The inverse: which struct field a wire key fills. Returns 0 for no match, 1 for
+// `target`, 2 for `payload` -- an enum would be tidier but this keeps the lookup
+// in one place with the table above.
+int FieldForWireKey(ActionKind kind, const char *key) {
+    const ParamKeys *k = KeysFor(kind);
+    if (k == nullptr) return 0;
+    if (k->target != nullptr && strcmp(k->target, key) == 0) return 1;
+    if (k->payload != nullptr && strcmp(k->payload, key) == 0) return 2;
+    return 0;
+}
+
 cJSON *EncodeActions(const Binding &b) {
     cJSON *arr = cJSON_CreateArray();
     if (arr == nullptr) return nullptr;
@@ -339,12 +392,24 @@ cJSON *EncodeActions(const Binding &b) {
         if (o == nullptr) { cJSON_Delete(arr); return nullptr; }
         cJSON_AddStringToObject(o, "kind",
                                 NAME_OF(kActionKindNames, act.kind, "NONE"));
-        // `target` and `payload` are written for every kind that has them and
-        // omitted otherwise, so a NONE action encodes as `{"kind":"NONE"}`.
-        // Writing them unconditionally would put a `target` on a HW_KEY_RELEASE
-        // and make the wire form claim a parameter the kind does not have.
-        if (act.target[0] != '\0') cJSON_AddStringToObject(o, "target", act.target);
-        if (act.payload[0] != '\0') cJSON_AddStringToObject(o, "payload", act.payload);
+        // Each kind NAMES its own string slots on the wire (spec 3.6): APP_INTENT
+        // carries `action` and `data`, APP_LAUNCH `package`, KEYCODE `keycode`,
+        // MEDIA/SYSTEM/APP_RAW `command`, VOLUME `target`, BUZZ `pattern`. The
+        // struct keeps the two generic fields because the executor only needs to
+        // know "the string and the payload"; the wire keeps the kind's own names
+        // because spec 3.7 is written in them and the Android app parses them.
+        //
+        // A field the kind does not use is OMITTED rather than written empty, so
+        // a NONE action is exactly `{"kind":"NONE"}` and the wire form never
+        // claims a parameter its kind does not have.
+        const char *target_key = TargetKeyFor(act.kind);
+        const char *payload_key = PayloadKeyFor(act.kind);
+        if (target_key != nullptr && act.target[0] != '\0') {
+            cJSON_AddStringToObject(o, target_key, act.target);
+        }
+        if (payload_key != nullptr && act.payload[0] != '\0') {
+            cJSON_AddStringToObject(o, payload_key, act.payload);
+        }
         if (act.dac_code != 0) AddU32(o, "dac_code", act.dac_code);
         if (act.key_resistance_mohm != 0) AddU32(o, "key_resistance_mohm", act.key_resistance_mohm);
         cJSON_AddItemToArray(arr, o);
@@ -482,13 +547,22 @@ bool DecodeActions(const cJSON *arr, Binding *b) {
         act.payload[0] = '\0';
         act.dac_code = 0;
         act.key_resistance_mohm = 0;
-        const cJSON *target = Member(o, "target");
-        if (target != nullptr) {
-            if (!ReadStr(o, "target", act.target, sizeof(act.target))) return false;
-        }
-        const cJSON *payload = Member(o, "payload");
-        if (payload != nullptr) {
-            if (!ReadStr(o, "payload", act.payload, sizeof(act.payload))) return false;
+        // The kind's own parameter names (spec 3.6), read through the same table
+        // the encoder writes from. An unknown key is ignored rather than
+        // rejected -- forward compatibility for a v2 field is the schema
+        // version's job, not the key loop's.
+        for (const cJSON *f = o->child; f != nullptr; f = f->next) {
+            if (f->string == nullptr) continue;
+            switch (FieldForWireKey(act.kind, f->string)) {
+                case 1:
+                    if (!ReadStr(o, f->string, act.target, sizeof(act.target))) return false;
+                    break;
+                case 2:
+                    if (!ReadStr(o, f->string, act.payload, sizeof(act.payload))) return false;
+                    break;
+                default:
+                    break;
+            }
         }
         if (Member(o, "dac_code") != nullptr &&
             !ReadU16(o, "dac_code", &act.dac_code)) return false;

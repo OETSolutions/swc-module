@@ -354,14 +354,37 @@ which is precisely the split the user described.
 | `NONE` | — | — | Explicit no-op; useful as a placeholder |
 | `HW_KEY` | `key_resistance_mohm`, or `dac_code` | Firmware | **The core function.** Present a key value to the head unit |
 | `HW_KEY_RELEASE` | — | Firmware | Force the KEY line to idle/high-Z |
-| `APP_LAUNCH` | `package`, optional `activity` | Android | Launch an app by package name |
-| `APP_INTENT` | `action`, `data`, `mime`, `extras{}`, `flags[]` | Android | Send an arbitrary intent, **including a data payload** — the user's stated example |
-| `KEYCODE` | `keycode`, `meta` | Android | Inject a key event (`KEYCODE_MEDIA_NEXT`, …) |
-| `MEDIA` | `command` (`play`/`pause`/`next`/`prev`/`stop`) | Android | Media transport via `MediaSession`-style dispatch |
-| `VOLUME` | `target` (`media`/`call`/`ring`/`alarm`), `delta` or `absolute` | Android | Volume, including absolute set which stock SWC cannot do |
+| `APP_LAUNCH` | `package` | Android | Launch an app by package name |
+| `APP_INTENT` | `action`, `data` | Android | Send an arbitrary intent, **including a data payload** — the user's stated example |
+| `KEYCODE` | `keycode` | Android | Inject a key event (`KEYCODE_MEDIA_NEXT`, …) |
+| `MEDIA` | `command` (`play`/`pause`/`next`/`prev`/`stop`) | Android | Media transport via `MediaSession<｜｜begin▁of▁sentence｜｜>`-style dispatch |
+| `VOLUME` | `target` (`media`/`call`/`ring`/`alarm`) | Android | Volume, including absolute set which stock SWC cannot do |
 | `SYSTEM` | `command` (`screen_off`/`night_mode`/`screenshot`/`open_settings`) | Android | Head-unit housekeeping |
 | `BUZZ` | `pattern` (named) | Firmware | Local audible confirmation, independent of the buzzer grammar |
-| `APP_RAW` | `command`, `args[]` | Android | Escape hatch: an app-defined command not yet promoted to a kind |
+| `APP_RAW` | `command` | Android | Escape hatch: an app-defined command not yet promoted to a kind |
+
+**Every action carries at most two string params, and that is a budget
+constraint rather than a design preference.** An earlier revision of this table
+gave `APP_INTENT` five (`action`, `data`, `mime`, `extras{}`, `flags[]`),
+`KEYCODE` two, `VOLUME` two and `APP_RAW` two. None of those extra params had a
+field in the shared `Action` entity, so a config carrying one could not be
+stored or transmitted — `ConfigValidate` refuses it, which is the safe direction
+but leaves the table describing actions the product cannot express. Closing that
+gap from the other side does not work either: the worst-case `Config` already
+occupies **96 % of the `nvs` partition** (the measurement below), and a per-action
+params field costs a 12th NVS chunk at *any* width, because chunking is coarse —
+even `params[32]` pushes two slots past the partition, and clawing it back means
+cutting `kMaxBindings` from 32 to about 18. Two string params per action is what
+the partition buys at this cardinality.
+
+So the rule is: **`target` and `payload` are the action's two string slots, and
+each kind names them on the wire** — `APP_INTENT`'s `action`/`data`,
+`APP_LAUNCH`'s `package`, `KEYCODE`'s `keycode`, `MEDIA`/`SYSTEM`/`APP_RAW`'s
+`command`, `VOLUME`'s `target`, `BUZZ`'s `pattern`. The wire key is the kind's own
+name for the parameter (§3.7 is written in those names); the struct field is the
+generic one. `HW_KEY` is the exception that uses the two numeric fields instead.
+A kind needing more than two strings is a v2 item with its own `schema_version`,
+not a v1 action.
 
 `MACRO` is **not** an action kind — it is a binding with an ordered `actions`
 list, which is the same thing with one fewer concept to learn.

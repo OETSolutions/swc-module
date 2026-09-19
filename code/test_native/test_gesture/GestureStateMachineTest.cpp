@@ -80,8 +80,11 @@ TEST(Gesture, LongPressFiresAtTheThresholdBeforeRelease) {
     EXPECT_EQ(ev.gesture, Gesture::kLong);
     // The `u` suffixes are load-bearing: ev.at_ms is uint64_t, so the
     // subtraction yields unsigned long long and comparing it against a signed
-    // literal trips -Wsign-compare, which -Werror promotes. Device GCC accepts
-    // the plan's signed form; the host clang build does not.
+    // literal trips -Wsign-compare, which -Werror promotes. The host build is
+    // where this bites, because it is the one that compiles the tests; the
+    // device build never does (test_native is in test_ignore). Both compilers
+    // reject the signed form -- verified against device GCC 14.2.0 as well --
+    // so this is a correctness fix, not a host-only workaround.
     EXPECT_GE(ev.at_ms - 1000, 750u);
     EXPECT_LT(ev.at_ms - 1000, 800u) << "must fire at the threshold, not on release";
 }
@@ -100,7 +103,9 @@ TEST(Gesture, LongPressBoundaryIsSilentAt749InclusiveAt750AndAt751) {
         sm.Update(ChannelLevel::kPressed, 0, 1000, &ev);          // press begins
         const bool fired = sm.Update(ChannelLevel::kPressed, 0, 1000 + offsets[i], &ev);
         EXPECT_EQ(fired, expect_long[i]) << "offset=" << offsets[i] << "ms";
-        if (expect_long[i]) EXPECT_EQ(ev.gesture, Gesture::kLong) << "offset=" << offsets[i];
+        if (expect_long[i]) {
+            EXPECT_EQ(ev.gesture, Gesture::kLong) << "offset=" << offsets[i];
+        }
     }
 }
 

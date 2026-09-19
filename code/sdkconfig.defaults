@@ -14,7 +14,11 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 # distinct is deliberate: the console must not corrupt app frames.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_UART_DEFAULT=n
-CONFIG_TINYUSB_CDC_ENABLED=y
+# NOTE: there is deliberately NO CONFIG_TINYUSB_CDC_ENABLED here. IDF 5.5.5
+# ships no components/tinyusb and defines no CONFIG_TINYUSB_* symbol, so such a
+# key is silently inert -- it would look like configuration while doing nothing.
+# TinyUSB is the managed component `espressif/esp_tinyusb`; the app USB link
+# does not exist until a task adds it via idf_component.yml (spec 4.1).
 
 # --- Bluetooth: NimBLE, not Bluedroid --------------------------------------
 # Bluedroid does not fit 4MB/no-PSRAM alongside WiFi + OTA (spec 9.2).
@@ -30,10 +34,19 @@ CONFIG_MBEDTLS_HARDWARE_AES=n
 CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
 
 # --- ADC -------------------------------------------------------------------
-# Curve-fit calibration for per-chip accuracy (spec 2.3). Without this the
-# raw-ADC linear-scale assumption is off by more than the classification windows.
-CONFIG_ESP_ADC_CAL_USE_EFUSE_CALIBRATION=y
-CONFIG_ESP_ADC_CAL_DEFAULT_ATTENUATION_12=y
+# NOTE: there is deliberately NO ADC calibration key here, because on this
+# target there is no such Kconfig symbol to set.
+#
+# The brief specified CONFIG_ESP_ADC_CAL_USE_EFUSE_CALIBRATION and
+# CONFIG_ESP_ADC_CAL_DEFAULT_ATTENUATION_12. Neither is defined anywhere in IDF
+# 5.5.5. The real ADC calibration keys (ADC_CALI_EFUSE_TP_ENABLE,
+# ADC_CALI_EFUSE_VREF_ENABLE, ADC_CALI_LUT_ENABLE, esp_adc/Kconfig:22,30,38) are
+# `depends on IDF_TARGET_ESP32`, so they are inert on the ESP32-S3 too.
+#
+# On the S3, per-chip calibration is a RUNTIME API, not a build knob:
+# `adc_cali_create_scheme_curve_fitting()` (SOC_ADC_CALIBRATION_V1_SUPPORTED).
+# Task 4 (`CalibrationCurve`) owns that call and spec 2.3's 25 mV error budget.
+# Setting a key here would have looked like calibration while doing nothing.
 
 # --- Crash handling --------------------------------------------------------
 # Coredump partition exists (partitions.csv). Reset in release; gdbstub in dev.

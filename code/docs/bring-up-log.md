@@ -136,8 +136,16 @@ Per the brief these encode real decisions, so they are **reported, not dropped**
 | Key in brief | Status in IDF 5.5.5 | Effect |
 | --- | --- | --- |
 | `CONFIG_TINYUSB_CDC_ENABLED` | **not defined** — IDF 5.5.5 has no `components/tinyusb`; TinyUSB is a managed component (`espressif/esp_tinyusb`) | inert. The console *is* correctly on USB-Serial-JTAG (`ESP_CONSOLE_USB_SERIAL_JTAG = True`), but **no TinyUSB CDC app interface is configured at all** — spec §4.1's separate app USB interface is not yet real. Belongs to the task that adds `esp_tinyusb`. |
-| `CONFIG_ESP_ADC_CAL_USE_EFUSE_CALIBRATION` | **not defined** | inert. No such symbol; the real IDF 5.5.5 ADC-cal keys are `ADC_CALI_EFUSE_TP_ENABLE` / `ADC_CALI_EFUSE_VREF_ENABLE` / `ADC_CALI_LUT_ENABLE` (esp_adc Kconfig), and they are `default y` on the relevant targets. **Spec §2.3's per-chip accuracy intent is likely already satisfied by defaults, but this must be confirmed, not assumed, before Task 13's ADC work.** |
+| `CONFIG_ESP_ADC_CAL_USE_EFUSE_CALIBRATION` | **not defined** | inert. No such symbol. The real IDF 5.5.5 ADC-cal keys are `ADC_CALI_EFUSE_TP_ENABLE` / `ADC_CALI_EFUSE_VREF_ENABLE` / `ADC_CALI_LUT_ENABLE` (`esp_adc/Kconfig:22,30,38`) — **but they sit under `depends on IDF_TARGET_ESP32`, so they are inert on the ESP32-S3 as well.** On the S3, per-chip calibration is a **runtime API**, not a build knob: `adc_cali_create_scheme_curve_fitting()` (`SOC_ADC_CALIBRATION_V1_SUPPORTED`, `soc_caps.h:127`). **Spec §2.3's 25 mV error budget therefore rests on Task 4 calling that API, not on any default.** |
 | `CONFIG_ESP_ADC_CAL_DEFAULT_ATTENUATION_12` | **not defined** | inert. No such symbol; attenuation is a runtime `adc_oneshot` argument in IDF 5.x, not a Kconfig key. The 12 dB choice belongs in the HAL. |
+
+**Both ADC keys and the TinyUSB key have been removed from
+`sdkconfig.defaults`** rather than left in place as inert entries: a key that
+looks like configuration but does nothing is worse than an absent one, because
+it makes the file read as if calibration and the USB app interface were
+configured. Each removal site carries a comment saying what to do instead.
+The build was re-run after the removals and is unchanged (215,085 bytes, 10.9 %
+of 1,966,080) — confirming they were inert.
 
 Keys that **did** apply correctly (verified in generated `sdkconfig.json`):
 `ESP_CONSOLE_USB_SERIAL_JTAG=True`, `ESP_CONSOLE_UART_DEFAULT=False`,

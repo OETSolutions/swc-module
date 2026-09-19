@@ -3044,7 +3044,11 @@ Expected: PASS — 7 classifier + 9 state-machine tests green. In particular
 - [ ] **Step 10: Commit**
 
 ```bash
-git add code/lib/Gesture code/test_native/test_gesture
+git add code/lib/Gesture/PressClassifier.h code/lib/Gesture/PressClassifier.cpp \
+        code/lib/Gesture/GestureStateMachine.h code/lib/Gesture/GestureStateMachine.cpp \
+        code/test_native/test_gesture/PressClassifierTest.cpp \
+        code/test_native/test_gesture/GestureStateMachineTest.cpp \
+        code/test_native/test_gesture/test_main.cpp
 git commit -m "Add debounced press classification and the gesture state machine
 
 Clock-injected throughout, so the 500ms double-press window and 750ms long-press
@@ -5387,7 +5391,11 @@ Expected: PASS — 7 + 5 tests green.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add code/lib/Feedback code/test_native/test_feedback
+git add code/lib/Feedback/BuzzerGrammar.h code/lib/Feedback/BuzzerGrammar.cpp \
+        code/lib/Feedback/LedGrammar.h code/lib/Feedback/LedGrammar.cpp \
+        code/test_native/test_feedback/BuzzerGrammarTest.cpp \
+        code/test_native/test_feedback/LedGrammarTest.cpp \
+        code/test_native/test_feedback/test_main.cpp
 git commit -m "Add the buzzer and LED feedback grammars
 
 The buzzer is active at a fixed frequency, so every pattern is rhythm and no
@@ -5624,7 +5632,9 @@ Expected: PASS — 8 tests green.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add code/lib/System code/test_native/test_system \
+git add code/lib/System/SystemOrchestrator.h code/lib/System/SystemOrchestrator.cpp \
+        code/test_native/test_system/SystemOrchestratorTest.cpp \
+        code/test_native/test_system/test_main.cpp \
         code/test_native/MockHAL.h code/test_native/MockHAL.cpp
 git commit -m "Add the system orchestrator with safe idle ahead of everything
 
@@ -5816,7 +5826,8 @@ Expected: app ≤ **1920 KB**. Record the new number next to Task 1's baseline.
 
 ```bash
 git add code/lib/HAL/EspHal.h code/lib/HAL/EspHal.c code/lib/HAL/PinMap.h \
-        code/src/main.c code/test/test_hw code/lib/System/SystemOrchestrator.h
+        code/src/main.c code/src/CMakeLists.txt code/test/test_hw/TestEspHal.c \
+        code/lib/System/SystemOrchestrator.h
 git commit -m "Add the ESP32-S3 HAL implementation and wire up main
 
 ADC uses the curve-fit calibration scheme at 12dB attenuation (the 2.9V ceiling
@@ -6036,7 +6047,11 @@ Expected: PASS — 11 tests green (6 SHA-256 + 5 base64).
 - [ ] **Step 5: Commit**
 
 ```bash
-git add code/lib/Util code/test_native/test_util
+git add code/lib/Util/Sha256.h code/lib/Util/Sha256.cpp \
+        code/lib/Util/Base64.h code/lib/Util/Base64.cpp \
+        code/test_native/test_util/Sha256Test.cpp \
+        code/test_native/test_util/Base64Test.cpp \
+        code/test_native/test_util/test_main.cpp
 git commit -m "Add streaming SHA-256 and base64 as shared primitives
 
 Both the config run and the OTA path need the same digest, and the previous
@@ -6770,7 +6785,9 @@ Expected: PASS.
 - [ ] **Step 6: Commit**
 
 ```bash
-git add code/lib/Learning code/test_native/test_learning
+git add code/lib/Learning/LearnSession.h code/lib/Learning/LearnSession.cpp \
+        code/test_native/test_learning/LearnSessionTest.cpp \
+        code/test_native/test_learning/test_main.cpp
 git commit -m "Add learn mode with distinct rejection reasons and a headless wizard
 
 Commit checks too-few, out-of-range, at-idle, too-noisy and too-close in that
@@ -7001,8 +7018,11 @@ Expected: PASS — 7 + 6 tests green.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add code/lib/Update/ImageVerify.* code/lib/Update/ReleaseCheck.* \
-        code/test_native/test_update
+git add code/lib/Update/ImageVerify.h code/lib/Update/ImageVerify.c \
+        code/lib/Update/ReleaseCheck.h code/lib/Update/ReleaseCheck.c \
+        code/test_native/test_update/ImageVerifyTest.cpp \
+        code/test_native/test_update/ReleaseCheckTest.cpp \
+        code/test_native/test_update/test_main.cpp
 git commit -m "Add image verification and release-manifest checks
 
 An unparseable hash is refused rather than becoming a no-op check, an oversized
@@ -7188,8 +7208,13 @@ must be tested with a genuinely broken image**, not a mocked failure.
 - [ ] **Step 8: Commit**
 
 ```bash
-git add code/lib/Maintenance code/lib/Update/OtaWifi.* code/lib/Update/OtaUsb.* \
-        code/assets code/test_native/test_maintenance code/src/main.c
+git add code/lib/Maintenance/MaintenanceMode.h code/lib/Maintenance/MaintenanceMode.c \
+        code/lib/Maintenance/WebPage.h code/lib/Update/OtaWifi.h code/lib/Update/OtaWifi.c \
+        code/lib/Update/OtaUsb.h code/lib/Update/OtaUsb.c \
+        code/assets/index.html \
+        code/test_native/test_maintenance/MaintenanceModeTest.cpp \
+        code/test_native/test_maintenance/test_main.cpp \
+        code/src/main.c
 git commit -m "Add maintenance mode with BLE provisioning, the web page and both OTA paths
 
 The radio is never initialized in normal operation. The web page is embedded in
@@ -7496,7 +7521,15 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add code/android
+git add code/android/settings.gradle.kts code/android/build.gradle.kts \
+        code/android/app/build.gradle.kts code/android/gradle.properties \
+        code/android/app/src/main/AndroidManifest.xml \
+        code/android/app/src/main/java/com/oetsolutions/swc/model/Config.kt \
+        code/android/app/src/main/java/com/oetsolutions/swc/link/SwcTransport.kt \
+        code/android/app/src/main/java/com/oetsolutions/swc/link/SwcClient.kt \
+        code/android/app/src/main/java/com/oetsolutions/swc/link/UsbSerialTransport.kt \
+        code/android/app/src/test/java/com/oetsolutions/swc/link/SwcClientTest.kt \
+        code/android/app/src/test/java/com/oetsolutions/swc/model/ConfigCodecTest.kt
 git commit -m "Add the Android app model, codec and protocol client
 
 The USB transport sits behind an interface, so frame reassembly, nack handling
@@ -7598,7 +7631,14 @@ Expected: PASS.
 - [ ] **Step 5: Commit**
 
 ```bash
-git add code/android
+git add code/android/app/src/main/java/com/oetsolutions/swc/ui/MainActivity.kt \
+        code/android/app/src/main/java/com/oetsolutions/swc/ui/LinkScreen.kt \
+        code/android/app/src/main/java/com/oetsolutions/swc/ui/LadderScreen.kt \
+        code/android/app/src/main/java/com/oetsolutions/swc/ui/BindingScreen.kt \
+        code/android/app/src/main/java/com/oetsolutions/swc/ui/UpdateScreen.kt \
+        code/android/app/src/main/java/com/oetsolutions/swc/action/ActionRunner.kt \
+        code/android/app/src/main/res/ \
+        code/android/app/src/androidTest/java/com/oetsolutions/swc/ui/
 git commit -m "Add the Android UI: link status, live ladder, bindings and updates
 
 The live ladder view marks which button the device currently classifies, which
@@ -7693,7 +7733,8 @@ than raising the threshold.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add code/.github code/tools/check_size.py
+git add code/.github/workflows/firmware.yml code/.github/workflows/android.yml \
+        code/tools/check_size.py
 git commit -m "Add CI gates for host tests, contract sync, and the app size budget
 
 The 1920KB size gate runs on every push so a BLE+WiFi+OTA build that outgrows

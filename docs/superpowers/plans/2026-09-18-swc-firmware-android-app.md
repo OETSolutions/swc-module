@@ -3438,8 +3438,15 @@ TEST(ConfigCodec, JsonRoundTripsEveryFieldThatWasSet) {
     EXPECT_EQ(out.schema_version, in.schema_version);
     EXPECT_STREQ(out.device_id, in.device_id);
     EXPECT_EQ(out.settings.timings.debounce_ms, in.settings.timings.debounce_ms);
-    EXPECT_EQ(out.settings.timings.double_press_off_ms, 500);
-    EXPECT_EQ(out.settings.timings.long_press_ms, 750);
+    // The `u` suffixes are not cosmetic. `GestureTimings`'s fields are uint32_t
+    // and these are the only two assertions in the file with a bare literal on
+    // the right, so they are the only two that instantiate gtest's
+    // CmpHelperEQ<uint32_t, int> -- which is `-Wsign-compare` inside
+    // gtest.h:1394, and the native env builds with -Wall -Wextra -Werror. Without
+    // the suffix this file does not compile on the host, and the error points
+    // into gtest rather than at these lines.
+    EXPECT_EQ(out.settings.timings.double_press_off_ms, 500u);
+    EXPECT_EQ(out.settings.timings.long_press_ms, 750u);
     EXPECT_EQ(out.settings.timings.send_duration_ms, in.settings.timings.send_duration_ms);
     EXPECT_EQ(out.settings.gain_policy, GainPolicy::kAuto);
     EXPECT_EQ(out.settings.buzzer_level, 2);
@@ -4010,6 +4017,20 @@ Both encoders are mechanical; the tests above are what pin the behavior. **The
 blob's payload IS the JSON** — `ConfigEncodeBlob` prepends a header and CRCs the
 JSON bytes; it does not pack the struct. Key requirements the implementation must
 satisfy:
+
+- **`ConfigEncodeJson` must print with `cJSON_PrintUnformatted`, not
+  `cJSON_Print`.** This is a wire-format decision, not a style one, and nothing
+  else in this section pins it. `cJSON_Print` emits `"schema_version": 1` — with
+  a space after the colon — and inserts newlines and indentation; `PrintUnformatted`
+  emits `"schema_version":1`. `ANewerSchemaVersionIsRefused` searches the encoded
+  text for the exact substring `"schema_version":1` and `ASSERT_NE(pos, npos)`
+  fails on the formatted output, so the test does pin it — but the failure it
+  produces (`ASSERT_NE` on a substring search) names neither cJSON nor the
+  spacing, and the natural "fix" is to loosen the test rather than the encoder.
+  The unformatted form is also the right one on the merits: the blob CRCs these
+  exact bytes, they cross USB and NVS, and pretty-printing them spends flash on
+  whitespace the device never reads. `ConfigDecodeJson` is indifferent to both,
+  so this only ever bites the encoder.
 
 - `ConfigEncodeJson` writes `schema_version`, `device_id`, `updated_at_ms`,
   `settings` (including all four `GestureTimings` fields), an `aux` array (spec

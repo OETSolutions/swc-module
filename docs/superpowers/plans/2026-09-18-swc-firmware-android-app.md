@@ -4709,24 +4709,47 @@ Implementation notes the tests pin:
 - The reader accumulates into a fixed `char buf_[kNdjsonMaxFrame + 1]`. On
   overflow it latches `kTooLong` and **stops consuming**, so `Consume()` can
   resynchronize (drop until the next `\n`).
+- The reader also resynchronizes **without** an explicit `Consume()`: while
+  latched it discards bytes until the next `\n`, then is ready for a fresh line.
+  Without this, a caller that never calls `Consume()` would hand the tail of the
+  overrun line upward as a frame. `Consume()` remains for a caller that knows the
+  line is already over.
 - `\r` immediately before `\n` is stripped, so a host that sends CRLF works.
 - `NdjsonParseEnvelope` requires all three of `v`, `seq`, `type`; a missing or
-  wrong-typed field is a failure, not a default.
-- `NdjsonWriter::Write` builds `{"v":1,"seq":N,"type":"T",<fields>}\n`. If the
-  result would exceed `kNdjsonMaxFrame`, it instead emits
+  wrong-typed field is a failure, not a default. Out-of-range numbers (`v` > 255,
+  `seq` > 4294967295, or either negative) are refused rather than cast, because
+  the cast is a silent corruption.
+- `NdjsonWriter::Write` builds `{"v":1,"seq":N,"type":"T",<fields>}\n`. A null,
+  empty, `"{}"` or `"null"` body contributes no fields and no trailing comma.
+  If the result would exceed `kNdjsonMaxFrame`, it instead emits
   `{"v":1,"seq":N,"type":"error","error":"frame_too_long"}\n`. **The writer
   never emits a partial or oversized line** — that is the property the test
   asserts, and it is what keeps a big config from desynchronizing the link.
+  Detection is via `snprintf`'s return value (the length it *would* have
+  written), so the oversized body is caught before it becomes a truncated line.
+- The writer's buffer is `kNdjsonMaxFrame + 2`: the cap bounds the JSON text, so
+  a maximal frame still has room for its `\n` and terminator.
 
 - [ ] **Step 4: Run the tests**
 
 Run: `cd code && pio test -e native -f '*test_link'`
-Expected: PASS — 8 tests green.
+Expected: PASS — 8 tests from Step 1, plus 2 added while implementing (see below),
+for 10 green.
+
+Two tests were added beyond Step 1's eight, each covering a path those eight
+leave untested:
+
+- `EmitsAValidLineWhenThereAreNoBodyFields` — the naive writer emits
+  `...,"type":"ack",}`, which passes a substring check and is not JSON.
+- `RecoversFromAnOverrunWithoutAnExplicitConsume` — Step 1's oversized-frame test
+  calls `Consume()` immediately, so it cannot tell a reader that resynchronizes
+  from one that merely resets its counter.
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add code/lib/Link/Ndjson.h code/lib/Link/Ndjson.cpp code/test_native/test_link
+git add code/lib/Link/Ndjson.h code/lib/Link/Ndjson.cpp \
+        code/test_native/test_link/NdjsonTest.cpp code/test_native/test_link/test_main.cpp
 git commit -m "Add NDJSON framing with a hard maximum frame length
 
 A reader that latches TooLong and resynchronizes on the next newline, and a
@@ -4734,6 +4757,10 @@ writer that degrades an oversized body to an error frame rather than emitting a
 line the peer cannot parse. Both directions are what keep a large config from
 desynchronizing the link."
 ```
+
+Note: the `git add` above lists explicit files rather than the `test_link/`
+directory. The repo root holds untracked, non-project paths (`code/.kilo/`), and
+a directory-form add is how one of those gets committed by accident.
 
 ---
 

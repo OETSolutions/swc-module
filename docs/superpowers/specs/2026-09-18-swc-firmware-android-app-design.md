@@ -660,14 +660,35 @@ of chunks**, each comfortably under the cap:
 
 ```
 config_get   →  fw replies  config_begin {total_len, crc32}
-                            config_chunk {offset, data}   × N
+                            config_chunk {offset, data_b64}   × N
                             config_end   {sha256}         (or nack on failure)
 
 config_set   →  app sends   config_begin {total_len, crc32}
-                            config_chunk {offset, data}   × N
+                            config_chunk {offset, data_b64}   × N
                             config_end   {sha256}
                 fw replies  ack | nack {err, detail}
 ```
+
+`data_b64` is **base64**, spelled the same way §9.3's `ota_chunk` spells it. A
+chunk is JSON, so it cannot carry raw bytes, and the config's payload is the
+*UTF-8 JSON text* of §3.7 — base64 rather than a JSON string literal because the
+transport must be byte-exact and must not depend on the peer's escaping rules.
+`offset` is the byte offset of this chunk's first *decoded* byte, so a gap or an
+overlap is detectable rather than silently concatenated.
+
+Each chunk is sized so the **encoded frame** — envelope, offset, and the base64
+expansion of the payload — stays under the 1024-byte line cap. Base64 costs 4
+bytes per 3, so the decoded chunk payload is **512 bytes**, giving a frame of
+roughly 750 bytes. Sizing the chunk by the *decoded* length and then discovering
+the encoded frame is too long is how a chunked transport ends up unable to send
+its own chunks.
+
+`config_get` is a real frame. **`config_set` is a logical operation, not a frame
+type** — it names "replace the whole config", and it is carried entirely by the
+`config_begin`/`config_chunk`/`config_end` run above. There is deliberately no
+single-frame `config_set`: a real config is ~22 KB and the line cap is 1024 B, so
+such a frame could never carry a legal config, and a type that exists only to be
+always-rejected is a trap for the app author.
 
 The receiving side **accumulates into a fixed-size staging buffer sized to the
 maximum legal config** (a compile-time constant, so the bound is provable, not
@@ -689,8 +710,7 @@ An interrupted run is discarded wholesale — a partial config is never applied.
 | FW → App | `nack` | `for_seq`, `err`, `detail` | Explicit failure, with a machine-readable code |
 | FW → App | `log` | `level`, `msg` | Optional, gated by a settings flag |
 | App → FW | `config_get` | — | Request the whole config (replied as a chunked run, §4.2) |
-| App → FW | `config_set` | `config` | Replace the whole config; validated before commit (chunked, §4.2) |
-| App → FW | `config_begin` / `config_chunk` / `config_end` | total_len+crc32; offset+data; sha256 | The chunked transport for `config_get`/`config_set` (§4.2) |
+| App → FW | `config_begin` / `config_chunk` / `config_end` | total_len+crc32; offset+data; sha256 | The chunked transport that carries **both** `config_get` and `config_set` (§4.2) |
 | App → FW | `config_patch` | `path`, `value` | Single-field change, cheaper and less racy — fits one line |
 | App → FW | `learn_start` / `learn_stop` | `channel`, `button_id` | Drive the learn wizard (§6.4) |
 | App → FW | `learn_commit` | `channel`, `button_id`, `name` | Accept the streamed samples as this button |

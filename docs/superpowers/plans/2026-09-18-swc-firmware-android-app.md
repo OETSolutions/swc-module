@@ -153,6 +153,9 @@ Created under `code/` in the PCB repo.
 | `code/lib/Link/Ndjson.{h,c}` | Frame encode/decode |
 | `code/lib/Link/UsbCdc.{h,c}` | TinyUSB CDC transport (**needs `espressif/esp_tinyusb`**) |
 | `code/lib/Link/CommandRouter.{h,c}` | Frame → handler |
+| `code/lib/Link/ConfigTransfer.{h,c}` | The chunked config run: staging buffer, assembly, commit |
+| `code/lib/Util/Sha256.{h,c}` | Streaming SHA-256, same code on host and device |
+| `code/lib/Util/Base64.{h,c}` | Base64 for `config_chunk.data_b64` and `ota_chunk.data_b64` |
 | `code/lib/Maintenance/BleProvisioning.{h,c}` | NimBLE provisioning |
 | `code/lib/Maintenance/WebPage.{h,c}` | Token-authenticated web config |
 | `code/lib/Maintenance/MaintenanceMode.{h,c}` | Mode entry/exit, timeout |
@@ -3764,6 +3767,15 @@ bool   ConfigDecodeJson(const char *json, size_t len, Config *out);
 size_t ConfigEncodeBlob(const Config &c, uint8_t *out, size_t out_len);
 bool   ConfigDecodeBlob(const uint8_t *in, size_t len, Config *out);
 
+// CRC-32 (IEEE, reflected, poly 0xEDB88320), over arbitrary bytes.
+//
+// Declared here rather than kept file-local in the .cpp because it has THREE
+// callers and they must agree exactly: ConfigEncodeBlob stamps it, Task 9 checks
+// it on load, and Task 15's config_begin carries it for the chunked transfer
+// (spec 4.2). Two implementations of a checksum is the two-homes defect with a
+// silent failure mode -- a mismatch reports as a corrupt config, not as a bug.
+uint32_t Crc32(const uint8_t *data, size_t len);
+
 // Worst-case serialized size, asserted against the NVS budget (spec 10.5).
 //
 // DEFINED HERE, INLINE, and that is load-bearing rather than stylistic. The tests
@@ -3832,8 +3844,10 @@ build links the same library.
 
 #include "cJSON.h"
 
-namespace {
-
+// Declared in ConfigCodec.h so Task 9 and Task 15 share this one implementation.
+// Defined OUTSIDE the anonymous namespace for the same reason ActionIsWellFormed
+// is: a file-local definition links only here, which is how a shared checksum
+// quietly becomes two checksums.
 uint32_t Crc32(const uint8_t *data, size_t len) {
     uint32_t crc = 0xFFFFFFFFu;
     for (size_t i = 0; i < len; ++i) {
@@ -3844,6 +3858,8 @@ uint32_t Crc32(const uint8_t *data, size_t len) {
     }
     return ~crc;
 }
+
+namespace {
 
 // Blob header: magic, schema, payload length, CRC over the payload.
 struct BlobHeader {
@@ -5653,6 +5669,225 @@ before the link starts."
 
 ---
 
+### Task 14b: `Sha256` and `Base64` — the two primitives the chunked transports need
+
+> **Why this task exists, and why it is here rather than inside Task 17.** Spec
+> §4.2 requires `config_end` to validate **the CRC *and* the SHA-256** before a
+> config is committed, and spec §9.3's `ota_chunk` carries `data_b64`. Task 15
+> implements `config_end`; Task 17 implements `ota_chunk`. Neither could work,
+> because the previous revision created `Sha256Stream` **only in Task 17** (after
+> Task 15) and created no base64 helper anywhere. That is the plan's dominant
+> defect — a shared primitive owned by the wrong task — and the fix is to give
+> both primitives a home *before* their first consumer.
+>
+> It also removes a real duplication risk: §4.2's config digest and §9.3's image
+> digest must be **the same hash computed the same way**. Two implementations
+> would let a config that the device accepts be one the app computed differently,
+> which surfaces as "the config is corrupt" rather than as a bug.
+
+**Files:**
+- Create: `code/lib/Util/Sha256.h`
+- Create: `code/lib/Util/Sha256.cpp`
+- Create: `code/lib/Util/Base64.h`
+- Create: `code/lib/Util/Base64.cpp`
+- Create: `code/test_native/test_util/Sha256Test.cpp`
+- Create: `code/test_native/test_util/Base64Test.cpp`
+- Create: `code/test_native/test_util/test_main.cpp` — required; copy Task 2's
+  four-line `main()`.
+
+**Interfaces:**
+- Consumes: `IHAL` (Task 2) — nothing else
+- Produces:
+  - `class Sha256Stream` with:
+    - `void Update(const uint8_t *data, size_t len)`
+    - `void Final(uint8_t out[32])`
+  - `bool Sha256Hex(const uint8_t *data, size_t len, char out_hex[65])`
+  - `bool Sha256FromHex(const char *hex, uint8_t out[32])` — false on anything
+    that is not exactly 64 hex digits
+  - `size_t Base64Encode(const uint8_t *in, size_t len, char *out, size_t out_len)`
+  - `bool   Base64Decode(const char *in, size_t len, uint8_t *out, size_t out_len, size_t *out_written)`
+  - `constexpr size_t kConfigWireChunkBytes = 512;` — the **decoded** chunk
+    payload for the §4.2 config run, sized so the base64-encoded frame stays
+    under `kNdjsonMaxFrame` (1024)
+
+- [ ] **Step 1: Write the failing tests**
+
+```cpp
+#include "Util/Base64.h"
+#include "Util/Sha256.h"
+#include "Link/Ndjson.h"   // kNdjsonMaxFrame: the cap kConfigWireChunkBytes is sized against
+#include <gtest/gtest.h>
+#include <string>
+
+namespace {
+std::string Hex(const std::string &data) {
+    char hex[65];
+    EXPECT_TRUE(Sha256Hex(reinterpret_cast<const uint8_t *>(data.data()), data.size(), hex));
+    return std::string(hex, 64);
+}
+}  // namespace
+
+// The empty-string digest is a published constant. Pinning it is the cheapest
+// possible check that the padding, the length field and the final block are all
+// right -- a SHA-256 that is wrong only in the tail still hashes "abc" plausibly.
+TEST(Sha256, MatchesThePublishedDigestOfTheEmptyString) {
+    EXPECT_EQ(Hex(""), "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855");
+}
+
+TEST(Sha256, MatchesThePublishedDigestOfAbc) {
+    EXPECT_EQ(Hex("abc"), "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad");
+}
+
+TEST(Sha256, MatchesThePublishedDigestOfTheLongMultiBlockVector) {
+    // 56 chars: the boundary where the length no longer fits the final block, so
+    // a second block is required. This is the classic off-by-one in a streaming
+    // hash and a single-block vector cannot see it.
+    EXPECT_EQ(Hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+              "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1");
+}
+
+TEST(Sha256, OneMillionAsIsTheOtherClassicVector) {
+    const std::string a(1000000, 'a');
+    EXPECT_EQ(Hex(a), "cdc76e5c9914fb9281a1c7e284d73e67f1809a48a497200e046d39ccc7112cd0");
+}
+
+TEST(Sha256, StreamingInArbitraryChunksMatchesHashingInOneGo) {
+    // Chunk boundaries are where a streaming hash breaks. The config run feeds
+    // this 512 bytes at a time and the OTA path feeds it whatever the link
+    // delivers, so the boundaries are real, not hypothetical.
+    std::string data;
+    for (int i = 0; i < 10000; ++i) data.push_back(static_cast<char>(i * 31 % 256));
+    const std::string whole = Hex(data);
+    for (size_t chunk : {1u, 7u, 63u, 64u, 65u, 512u, 4096u}) {
+        Sha256Stream s;
+        for (size_t off = 0; off < data.size(); off += chunk) {
+            const size_t n = std::min(chunk, data.size() - off);
+            s.Update(reinterpret_cast<const uint8_t *>(data.data() + off), n);
+        }
+        uint8_t d[32];
+        s.Final(d);
+        char hex[65];
+        for (int i = 0; i < 32; ++i) std::sprintf(hex + i * 2, "%02x", d[i]);
+        EXPECT_EQ(std::string(hex, 64), whole) << "chunk size " << chunk;
+    }
+}
+
+TEST(Sha256, AMalformedHexStringIsRefusedRatherThanBecomingAllZeros) {
+    uint8_t out[32];
+    EXPECT_FALSE(Sha256FromHex("not-a-hash", out));
+    EXPECT_FALSE(Sha256FromHex("aabb", out));            // too short
+    EXPECT_FALSE(Sha256FromHex(std::string(65, 'a').c_str(), out));  // too long
+    EXPECT_FALSE(Sha256FromHex("zz00000000000000000000000000000000000000000000000000000000000000", out));
+}
+
+TEST(Base64, RoundTripsEveryLengthAroundThePaddingBoundaries) {
+    // Starts at 1, not 0. `Base64Encode` returns the bytes written and 0 to
+    // signal "did not fit", so a zero-length input -- which correctly encodes to
+    // nothing -- is indistinguishable from a failure by return value alone. Both
+    // transports always have at least one byte, so this is not a case either
+    // hits; the test starts at 1 and the next test pins the empty case
+    // explicitly rather than leaving the collision undocumented.
+    for (size_t n = 1; n < 80; ++n) {
+        std::string in;
+        for (size_t i = 0; i < n; ++i) in.push_back(static_cast<char>(i * 7 % 256));
+        char enc[256];
+        const size_t el = Base64Encode(reinterpret_cast<const uint8_t *>(in.data()), in.size(),
+                                       enc, sizeof(enc));
+        ASSERT_GT(el, 0u) << "n=" << n;
+        uint8_t dec[256];
+        size_t dn = 0;
+        ASSERT_TRUE(Base64Decode(enc, el, dec, sizeof(dec), &dn)) << "n=" << n;
+        EXPECT_EQ(dn, n) << "n=" << n;
+        EXPECT_EQ(std::string(reinterpret_cast<char *>(dec), dn), in) << "n=" << n;
+    }
+}
+
+TEST(Base64, AFullOutputBufferIsRefusedRatherThanTruncated) {
+    // The exact-fit boundary, which is where an off-by-one in the size check
+    // lives: 3 bytes encode to 4, so a 5-byte buffer holds it including the NUL.
+    char exact[5];
+    const char *abc = "abc";
+    EXPECT_EQ(Base64Encode(reinterpret_cast<const uint8_t *>(abc), 3, exact, sizeof(exact)), 4u);
+    EXPECT_STREQ(exact, "YWJj");
+    char one_short[4];
+    EXPECT_EQ(Base64Encode(reinterpret_cast<const uint8_t *>(abc), 3, one_short, sizeof(one_short)), 0u);
+}
+
+TEST(Base64, EncodesTheRfc4648Vectors) {
+    char out[16];
+    const char *f = "foobar";
+    const size_t n = Base64Encode(reinterpret_cast<const uint8_t *>(f), 6, out, sizeof(out));
+    EXPECT_EQ(std::string(out, n), "Zm9vYmFy");
+    const char *m = "f";
+    const size_t n2 = Base64Encode(reinterpret_cast<const uint8_t *>(m), 1, out, sizeof(out));
+    EXPECT_EQ(std::string(out, n2), "Zg==");
+}
+
+TEST(Base64, RefusesAnOutputBufferThatCannotHoldTheResult) {
+    // A silent truncation here would corrupt a config transfer with no error
+    // anywhere -- the receiver would see a short chunk and blame the CRC.
+    const std::string in(300, 'x');
+    char small[16];
+    EXPECT_EQ(Base64Encode(reinterpret_cast<const uint8_t *>(in.data()), in.size(),
+                           small, sizeof(small)), 0u);
+}
+
+TEST(Base64, ADecodedChunkFitsTheLineCap) {
+    // The whole reason kConfigWireChunkBytes is 512 and not 1024: the DECODED
+    // size is what the transport buffers, but the ENCODED size is what must fit
+    // the frame. Sizing by the decoded length is how a chunked transport ends up
+    // unable to send its own chunks.
+    std::string in(kConfigWireChunkBytes, 'x');
+    char enc[1024];
+    const size_t el = Base64Encode(reinterpret_cast<const uint8_t *>(in.data()), in.size(),
+                                   enc, sizeof(enc));
+    ASSERT_GT(el, 0u);
+    // Envelope + offset + separators, generously bounded.
+    EXPECT_LT(el + 128u, kNdjsonMaxFrame);
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `cd code && pio test -e native -f '*test_util'`
+Expected: FAIL — `Util/Sha256.h` not found.
+
+- [ ] **Step 3: Implement**
+
+`Sha256Stream` wraps mbedTLS's `mbedtls_sha256_*` on device and **the same mbedTLS
+API on the host** (add `lib_deps` `mbedtls` to the `native` env). It must be *the
+same code* on both, because a host-only implementation would validate a path the
+device does not run.
+
+`Base64Encode` returns 0 rather than truncating, and `Base64Decode` rejects
+anything that is not well-formed — including a length that is not a multiple of
+4 and any character outside the alphabet. The published RFC 4648 vectors are
+pinned because base64 is the kind of code that looks right and is off by one
+padding character.
+
+**Do not "optimize" `Base64Encode` to size the output from the input.** It is
+given `out_len` precisely so the caller's buffer is the bound, and the test above
+asserts the refusal.
+
+- [ ] **Step 4: Run the tests**
+
+Run: `cd code && pio test -e native -f '*test_util'`
+Expected: PASS — 11 tests green (6 SHA-256 + 5 base64).
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add code/lib/Util code/test_native/test_util
+git commit -m "Add streaming SHA-256 and base64 as shared primitives
+
+Both the config run and the OTA path need the same digest, and the previous
+revision had no home for it before its first consumer. Pinning the published
+SHA-256 vectors and the RFC 4648 base64 vectors, including the block-boundary
+and padding cases that a plausible-looking implementation gets wrong."
+```
+
+---
+
 ### Task 15: `CommandRouter` — the frame vocabulary
 
 Spec §4.3. Every command from the app, every response and event the firmware
@@ -5664,13 +5899,13 @@ emits, and the version negotiation.
 - Create: `code/test_native/test_link/CommandRouterTest.cpp`
 
 **Interfaces:**
-- Consumes: `Ndjson` (Task 10), `Config`/`ConfigCodec` (Task 8), `ConfigStore` (Task 9), `SystemOrchestrator` (Task 13)
+- Consumes: `Ndjson` (Task 10), `Config`/`ConfigCodec` (Task 8), `ConfigStore` (Task 9), `SystemOrchestrator` (Task 13), `Sha256`/`Base64` (Task 14b)
 - Produces:
   - `using FrameSink = void (*)(void *ctx, const char *line, size_t len);`
   - `constexpr uint8_t kNdjsonProtocolVersion = 1;`
   - `class CommandRouter` with:
     - `void OnLine(const char *line, size_t len)`
-    - `void OnConnected()` — emits `hello` and the full config
+    - `void OnConnected()` — emits `hello`, then begins a `config_get` reply run
     - `void Process()` — drains any deferred work
     - `uint32_t LastSeenSeqSent() const`, `uint32_t LastSeenSeqReceived() const`
 
@@ -5678,8 +5913,15 @@ emits, and the version negotiation.
 
 ```cpp
 #include "Link/CommandRouter.h"
+#include "Config/ConfigCodec.h"
+#include "Config/ConfigStore.h"
+#include "Link/Ndjson.h"
+#include "Util/Base64.h"
+#include "Util/Sha256.h"
 #include "MockHAL.h"
 #include <gtest/gtest.h>
+#include <cstdio>
+#include <cstring>
 #include <string>
 #include <vector>
 
@@ -5696,6 +5938,49 @@ bool HasType(const Capture &c, const char *type) {
     for (const auto &l : c.lines) if (l.find(needle) != std::string::npos) return true;
     return false;
 }
+
+// Drive a config run the way the protocol says it must be driven (spec 4.2).
+// These helpers exist because a config CANNOT be sent any other way: the largest
+// legal config is ~22 KB and the line cap is 1024 B, so the earlier revision's
+// single-line `config_set` could never carry a legal config at all.
+std::string B64(const std::string &raw) {
+    char enc[8192];
+    const size_t n = Base64Encode(reinterpret_cast<const uint8_t *>(raw.data()), raw.size(),
+                                  enc, sizeof(enc));
+    return std::string(enc, n);
+}
+void SendConfigBegin(CommandRouter &r, uint32_t seq, size_t total_len, uint32_t crc32) {
+    char buf[256];
+    const int n = std::snprintf(buf, sizeof(buf),
+        "{\"v\":1,\"seq\":%u,\"type\":\"config_begin\",\"total_len\":%u,\"crc32\":%u}",
+        seq, static_cast<unsigned>(total_len), crc32);
+    r.OnLine(buf, static_cast<size_t>(n));
+}
+void SendConfigChunks(CommandRouter &r, const char *raw, size_t len) {
+    uint32_t seq = 100;
+    for (size_t off = 0; off < len; off += kConfigWireChunkBytes) {
+        const size_t n = (len - off < kConfigWireChunkBytes) ? (len - off) : kConfigWireChunkBytes;
+        const std::string b64 = B64(std::string(raw + off, n));
+        const std::string line = "{\"v\":1,\"seq\":" + std::to_string(seq++) +
+            ",\"type\":\"config_chunk\",\"offset\":" + std::to_string(off) +
+            ",\"data_b64\":\"" + b64 + "\"}";
+        r.OnLine(line.c_str(), line.size());
+    }
+}
+void SendConfigEnd(CommandRouter &r, uint32_t seq, const char *raw, size_t len) {
+    char hex[65];
+    Sha256Hex(reinterpret_cast<const uint8_t *>(raw), len, hex);
+    const std::string line = "{\"v\":1,\"seq\":" + std::to_string(seq) +
+        ",\"type\":\"config_end\",\"sha256\":\"" + std::string(hex, 64) + "\"}";
+    r.OnLine(line.c_str(), line.size());
+}
+// The common case: a whole, valid run.
+void SendConfigChunked(CommandRouter &r, uint32_t seq, const std::string &raw) {
+    SendConfigBegin(r, seq, raw.size(),
+                    Crc32(reinterpret_cast<const uint8_t *>(raw.data()), raw.size()));
+    SendConfigChunks(r, raw.data(), raw.size());
+    SendConfigEnd(r, seq + 1, raw.data(), raw.size());
+}
 }  // namespace
 
 TEST(CommandRouter, ConnectEmitsHelloWithTheProtocolVersion) {
@@ -5706,11 +5991,40 @@ TEST(CommandRouter, ConnectEmitsHelloWithTheProtocolVersion) {
     EXPECT_NE(cap.lines[0].find("\"v\":1"), std::string::npos);
 }
 
-TEST(CommandRouter, ConnectEmitsTheFullConfigSoTheAppCanRenderImmediately) {
+TEST(CommandRouter, ConnectBeginsTheConfigRunSoTheAppCanRenderImmediately) {
+    // NOT a single `config` frame: spec 4.2 says config_get is "replied as a
+    // chunked run", and spec 4.3's frame table has no `config` type at all. The
+    // earlier revision asserted a frame the protocol does not define.
     MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
     cap.Attach(r);
     r.OnConnected();
-    EXPECT_TRUE(HasType(cap, "config"));
+    ASSERT_TRUE(HasType(cap, "config_begin")) << "the app must be able to render without asking";
+    EXPECT_TRUE(HasType(cap, "config_chunk"));
+    EXPECT_TRUE(HasType(cap, "config_end"));
+    // Every emitted frame must respect the cap, or the run cannot be received.
+    for (const auto &l : cap.lines) EXPECT_LT(l.size(), kNdjsonMaxFrame) << l;
+}
+
+TEST(CommandRouter, AConfigGetRepliesWithAWholeChunkedRunThatRoundTrips) {
+    MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
+    cap.Attach(r);
+    // Reassemble what the device sent and decode it: the run must be a complete,
+    // valid config, not just three frames of the right type.
+    r.OnLine("{\"v\":1,\"seq\":1,\"type\":\"config_get\"}", std::strlen("{\"v\":1,\"seq\":1,\"type\":\"config_get\"}"));
+    std::string b64;
+    for (const auto &l : cap.lines) {
+        const size_t p = l.find("\"data_b64\":\"");
+        if (p == std::string::npos) continue;
+        const size_t start = p + 12;
+        const size_t end = l.find('"', start);
+        b64 += l.substr(start, end - start);
+    }
+    ASSERT_FALSE(b64.empty());
+    uint8_t raw[65536];
+    size_t raw_len = 0;
+    ASSERT_TRUE(Base64Decode(b64.c_str(), b64.size(), raw, sizeof(raw), &raw_len));
+    Config out{};
+    EXPECT_TRUE(ConfigDecodeJson(reinterpret_cast<const char *>(raw), raw_len, &out));
 }
 
 TEST(CommandRouter, ASequenceNumberIsAssignedMonotonicallyPerDirection) {
@@ -5718,23 +6032,30 @@ TEST(CommandRouter, ASequenceNumberIsAssignedMonotonicallyPerDirection) {
     cap.Attach(r);
     r.OnConnected();
     const uint32_t first = r.LastSeenSeqSent();
-    r.OnLine("{\"v\":1,\"seq\":1,\"type\":\"ping\"}", 30);
+    r.OnLine("{\"v\":1,\"seq\":1,\"type\":\"ping\"}", std::strlen("{\"v\":1,\"seq\":1,\"type\":\"ping\"}"));
     r.OnConnected();
     EXPECT_GT(r.LastSeenSeqSent(), first);
 }
 
-TEST(CommandRouter, PingIsAnsweredWithPongCarryingTheSameSeq) {
+TEST(CommandRouter, PingIsAnsweredWithStatusCarryingForSeq) {
+    // Spec 4.3: `ping` is "Liveness; FW answers `status`". There is no `pong`
+    // frame type, and the reply does NOT echo the peer's `seq` -- `seq` is each
+    // sender's OWN monotonic counter (spec 4.2), so echoing it would break the
+    // counter and make the app's gap detection fire on every ping. The
+    // correlation field is `for_seq`, which is what spec 4.3 gives `ack`/`nack`.
     MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
     cap.Attach(r);
-    r.OnLine("{\"v\":1,\"seq\":77,\"type\":\"ping\"}", 30);
-    ASSERT_TRUE(HasType(cap, "pong"));
-    EXPECT_NE(cap.lines[0].find("\"seq\":77"), std::string::npos);
+    r.OnLine("{\"v\":1,\"seq\":77,\"type\":\"ping\"}", std::strlen("{\"v\":1,\"seq\":77,\"type\":\"ping\"}"));
+    ASSERT_TRUE(HasType(cap, "status"));
+    EXPECT_NE(cap.lines[0].find("\"for_seq\":77"), std::string::npos);
+    EXPECT_EQ(cap.lines[0].find("\"seq\":77"), std::string::npos)
+        << "the reply's own seq must be the firmware's counter, not the peer's";
 }
 
 TEST(CommandRouter, AnUnknownCommandTypeIsNackedNotIgnored) {
     MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
     cap.Attach(r);
-    r.OnLine("{\"v\":1,\"seq\":5,\"type\":\"teleport\"}", 33);
+    r.OnLine("{\"v\":1,\"seq\":5,\"type\":\"teleport\"}", std::strlen("{\"v\":1,\"seq\":5,\"type\":\"teleport\"}"));
     ASSERT_TRUE(HasType(cap, "nack"));
     EXPECT_NE(cap.lines[0].find("unknown_type"), std::string::npos);
 }
@@ -5742,7 +6063,7 @@ TEST(CommandRouter, AnUnknownCommandTypeIsNackedNotIgnored) {
 TEST(CommandRouter, AMalformedLineIsReportedRatherThanDropped) {
     MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
     cap.Attach(r);
-    r.OnLine("{not json", 9);
+    r.OnLine("{not json", std::strlen("{not json"));
     ASSERT_TRUE(HasType(cap, "nack"));
     EXPECT_NE(cap.lines[0].find("bad_frame"), std::string::npos);
 }
@@ -5750,7 +6071,7 @@ TEST(CommandRouter, AMalformedLineIsReportedRatherThanDropped) {
 TEST(CommandRouter, AProtocolVersionMismatchIsRefusedExplicitly) {
     MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
     cap.Attach(r);
-    r.OnLine("{\"v\":99,\"seq\":1,\"type\":\"ping\"}", 33);
+    r.OnLine("{\"v\":99,\"seq\":1,\"type\":\"ping\"}", std::strlen("{\"v\":99,\"seq\":1,\"type\":\"ping\"}"));
     ASSERT_TRUE(HasType(cap, "nack"));
     EXPECT_NE(cap.lines[0].find("version"), std::string::npos)
         << "the app must learn the versions disagree, not silently misparse";
@@ -5760,11 +6081,13 @@ TEST(CommandRouter, AnInvalidConfigIsRejectedAndTheOldOneSurvives) {
     MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
     cap.Attach(r);
     r.OnConnected();
-    // A config whose ladder button has a zero-width window: invalid.
+    // A config whose debounce is zero: invalid. Sent the only way a config CAN
+    // be sent -- chunked (spec 4.2). A single-line config_set is not a thing:
+    // a real config is ~22 KB and the line cap is 1024 B.
     const char *bad =
-        "{\"v\":1,\"seq\":2,\"type\":\"config_set\",\"config\":{\"schema_version\":1,"
-        "\"device_id\":\"X\",\"settings\":{\"debounce_ms\":0},\"channels\":[]}}";
-    r.OnLine(bad, std::strlen(bad));
+        "{\"schema_version\":1,\"device_id\":\"X\","
+        "\"settings\":{\"debounce_ms\":0},\"channels\":[]}";
+    SendConfigChunked(r, /*seq=*/2, bad);
     ASSERT_TRUE(HasType(cap, "nack"));
     // The stored config must still load.
     Config out{};
@@ -5777,13 +6100,15 @@ TEST(CommandRouter, AValidConfigIsAckedAndPersisted) {
     MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
     cap.Attach(r);
     r.OnConnected();
-    // Build a valid config JSON by round-tripping through the codec.
+    // Build a valid config JSON by round-tripping through the codec. The buffer
+    // is sized from the model rather than a literal, which is what keeps it
+    // honest when a field width changes.
     Config c = MockHalDefaultsConfig();
-    char json[4096] = {};
-    const size_t n = ConfigEncodeJson(c, json, sizeof(json));
-    std::string msg = "{\"v\":1,\"seq\":3,\"type\":\"config_set\",\"config\":";
-    msg.append(json, n).append("}");
-    r.OnLine(msg.c_str(), msg.size());
+    char *json = new char[ConfigMaxSerializedSize() + 1]();
+    const size_t n = ConfigEncodeJson(c, json, ConfigMaxSerializedSize());
+    ASSERT_GT(n, 0u);
+    SendConfigChunked(r, /*seq=*/3, std::string(json, n));
+    delete[] json;
     ASSERT_TRUE(HasType(cap, "ack"));
 
     ConfigStore store(&hal.InterfaceRef());
@@ -5797,24 +6122,127 @@ TEST(CommandRouter, ASetConfigOnlyTakesEffectAfterTheAck) {
     r.OnConnected();
     Config c = MockHalDefaultsConfig();
     c.settings.timings.long_press_ms = 900;
-    char json[4096] = {};
-    const size_t n = ConfigEncodeJson(c, json, sizeof(json));
-    std::string msg = "{\"v\":1,\"seq\":4,\"type\":\"config_set\",\"config\":";
-    msg.append(json, n).append("}");
-    r.OnLine(msg.c_str(), msg.size());
-    // The ACK must precede any event that reflects the new timing, or the app's
-    // optimistic UI state and the device can disagree about what is active.
+    char *json = new char[ConfigMaxSerializedSize() + 1]();
+    const size_t n = ConfigEncodeJson(c, json, ConfigMaxSerializedSize());
+    ASSERT_GT(n, 0u);
+    SendConfigChunked(r, /*seq=*/4, std::string(json, n));
+    delete[] json;
+    // The ACK must be the last thing said about the run, and nothing that
+    // reflects the new timing may precede it -- the app's optimistic UI state and
+    // the device would otherwise be able to disagree about what is active.
     ASSERT_FALSE(cap.lines.empty());
-    const std::string &first = cap.lines[0];
-    EXPECT_NE(first.find("\"type\":\"ack\""), std::string::npos);
+    EXPECT_NE(cap.lines.back().find("\"type\":\"ack\""), std::string::npos);
+}
+
+TEST(CommandRouter, AConfigRunIsStagedAndNothingIsCommittedUntilTheEnd) {
+    // Spec 4.2: "An interrupted run is discarded wholesale -- a partial config
+    // is never applied." This is the property the chunked transport exists for,
+    // and it is not testable on a single-line config_set at all.
+    MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
+    cap.Attach(r);
+    r.OnConnected();
+    Config c = MockHalDefaultsConfig();
+    c.settings.timings.long_press_ms = 900;
+    char *json = new char[ConfigMaxSerializedSize() + 1]();
+    const size_t n = ConfigEncodeJson(c, json, ConfigMaxSerializedSize());
+    ASSERT_GT(n, 0u);
+
+    SendConfigBegin(r, /*seq=*/5, n, Crc32(reinterpret_cast<const uint8_t *>(json), n));
+    SendConfigChunks(r, json, n);
+    delete[] json;
+    // Deliberately do NOT send config_end. Nothing may have been committed.
+    ConfigStore store(&hal.InterfaceRef());
+    Config out{};
+    EXPECT_NE(store.Load(&out), ConfigLoadResult::kLoaded)
+        << "a run without its end must leave the previous config in place";
+}
+
+TEST(CommandRouter, AConfigRunWithABadCrcIsRejectedAtTheEnd) {
+    MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
+    cap.Attach(r);
+    r.OnConnected();
+    Config c = MockHalDefaultsConfig();
+    char *json = new char[ConfigMaxSerializedSize() + 1]();
+    const size_t n = ConfigEncodeJson(c, json, ConfigMaxSerializedSize());
+    ASSERT_GT(n, 0u);
+    SendConfigBegin(r, /*seq=*/6, n, /*crc32=*/0xDEADBEEFu);   // wrong on purpose
+    SendConfigChunks(r, json, n);
+    SendConfigEnd(r, /*seq=*/7, json, n);   // hash is CORRECT, so only the CRC differs
+    delete[] json;
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("crc"), std::string::npos)
+        << "the CRC is checked first, so a bad CRC must not be reported as a hash failure";
+}
+
+TEST(CommandRouter, AConfigRunWhoseSha256DisagreesIsRejectedEvenWithAGoodCrc) {
+    // The two checks are not redundant and this is the test that proves it: the
+    // CRC32 is a transfer check and the SHA-256 is an integrity check, and a run
+    // can satisfy one while failing the other. A previous revision validated
+    // only the CRC and called the SHA-256 "the same thing".
+    MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
+    cap.Attach(r);
+    r.OnConnected();
+    Config c = MockHalDefaultsConfig();
+    char *json = new char[ConfigMaxSerializedSize() + 1]();
+    const size_t n = ConfigEncodeJson(c, json, ConfigMaxSerializedSize());
+    ASSERT_GT(n, 0u);
+    SendConfigBegin(r, /*seq=*/9, n, Crc32(reinterpret_cast<const uint8_t *>(json), n));
+    SendConfigChunks(r, json, n);
+    // Correct CRC above, deliberately wrong digest here.
+    const std::string bad_end =
+        "{\"v\":1,\"seq\":10,\"type\":\"config_end\",\"sha256\":\""
+        "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\"}";
+    r.OnLine(bad_end.c_str(), bad_end.size());
+    delete[] json;
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("sha256"), std::string::npos);
+    ConfigStore store(&hal.InterfaceRef());
+    Config out{};
+    EXPECT_NE(store.Load(&out), ConfigLoadResult::kLoaded)
+        << "a run that failed verification must not have been committed";
+}
+
+TEST(CommandRouter, AConfigBeginLargerThanTheStagingBufferIsRefusedUpFront) {
+    // Spec 4.2 requires a fixed-size staging buffer "sized to the maximum legal
+    // config (a compile-time constant, so the bound is provable, not hoped for)"
+    // and a config_begin whose total_len exceeds it must be rejected. Without
+    // this the buffer is a heap-overflow primitive driven by the peer.
+    MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
+    cap.Attach(r);
+    r.OnConnected();
+    SendConfigBegin(r, /*seq=*/8, ConfigMaxSerializedSize() + 1, 0u);
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("too_large"), std::string::npos);
+}
+
+TEST(CommandRouter, AChunkWithAGapIsRejectedRatherThanConcatenated) {
+    // `offset` is carried precisely so a gap or an overlap is detectable. A
+    // receiver that ignores it silently splices two runs into a config that
+    // passes its own CRC -- over the wrong bytes.
+    MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
+    cap.Attach(r);
+    r.OnConnected();
+    Config c = MockHalDefaultsConfig();
+    char *json = new char[ConfigMaxSerializedSize() + 1]();
+    const size_t n = ConfigEncodeJson(c, json, ConfigMaxSerializedSize());
+    ASSERT_GT(n, 0u);
+    SendConfigBegin(r, /*seq=*/11, n, Crc32(reinterpret_cast<const uint8_t *>(json), n));
+    // Skip the first chunk entirely: the run now starts at a nonzero offset.
+    const std::string b64 = B64(std::string(json + kConfigWireChunkBytes, kConfigWireChunkBytes));
+    const std::string line = "{\"v\":1,\"seq\":12,\"type\":\"config_chunk\",\"offset\":" +
+        std::to_string(kConfigWireChunkBytes) + ",\"data_b64\":\"" + b64 + "\"}";
+    r.OnLine(line.c_str(), line.size());
+    delete[] json;
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("gap"), std::string::npos);
 }
 
 TEST(CommandRouter, ASequenceGapIsReportedAsAnEvent) {
     MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
     cap.Attach(r);
-    r.OnLine("{\"v\":1,\"seq\":1,\"type\":\"ping\"}", 30);
+    r.OnLine("{\"v\":1,\"seq\":1,\"type\":\"ping\"}", std::strlen("{\"v\":1,\"seq\":1,\"type\":\"ping\"}"));
     cap.lines.clear();
-    r.OnLine("{\"v\":1,\"seq\":5,\"type\":\"ping\"}", 30);   // 2-4 missing
+    r.OnLine("{\"v\":1,\"seq\":5,\"type\":\"ping\"}", std::strlen("{\"v\":1,\"seq\":5,\"type\":\"ping\"}"));   // 2-4 missing
     EXPECT_TRUE(HasType(cap, "link_gap"))
         << "a dropped frame must be surfaced, not silently tolerated";
 }
@@ -5831,17 +6259,42 @@ Expected: FAIL — `Link/CommandRouter.h` not found.
 
 | `type` | Behavior |
 | --- | --- |
-| `ping` | Reply `pong` with the same `seq` |
-| `config_get` | Reply `config` with the encoded config |
-| `config_set` | Validate; on success `Save` then `ack`; on failure `nack` with `reason` |
-| `ladder_learn_start` / `_sample` / `_commit` | Learn flow (Task 16) |
+| `ping` | Reply `status` with `for_seq` (spec §4.3). **Not `pong`** — no such frame exists |
+| `config_get` | Begin a `config_begin`/`config_chunk`/`config_end` reply run carrying the encoded config |
+| `config_begin` | Start staging a config run: reject `total_len > ConfigMaxSerializedSize()` with `nack {err:"too_large"}`; reject a second `config_begin` while one is open |
+| `config_chunk` | Append to the staging buffer at `offset`; `nack {err:"gap"}` on a gap or overlap |
+| `config_end` | Verify the CRC32 over the staged bytes, then the SHA-256; on both, `ConfigDecodeJson` → `ConfigValidate` → `Save` → `ack`; otherwise `nack` with the failing check named |
+| `config_patch` | Single-field change, still one line (spec §4.2) |
+| `learn_start` / `learn_stop` / `learn_commit` | Learn flow (Task 16). **These three names, per spec §4.3** — not `ladder_learn_start`/`_sample`/`_commit` |
 | `maintenance_enter` / `maintenance_exit` | Task 18 |
 | `ota_begin` / `ota_chunk` / `ota_end` | Task 17 |
 | `reset_config` | Wipe NVS config after an `ack` |
 
-Every unknown `type` → `nack` with `reason: "unknown_type"`. Every frame whose
-`v` differs from `kNdjsonProtocolVersion` → `nack` with `reason:
-"version_mismatch"`. A malformed line → `nack` with `reason: "bad_frame"`.
+**There is no single-frame `config_set`.** Spec §4.2 makes `config_set` a logical
+operation carried by the `config_begin`/`config_chunk`/`config_end` run, and spec
+§4.3's frame table lists no `config` and no `config_set` type. The earlier
+revision implemented both as one-line frames with a 4096-byte buffer, which could
+not hold a legal config (worst case 22,407 B) and could not be received even if it
+could — the line cap is 1024 B. Its tests passed only because they built a
+*minimal* config that happened to fit.
+
+**The staging buffer is a fixed member, not a heap allocation:**
+`uint8_t staging_[ConfigMaxSerializedSize()]`. That is the compile-time bound
+spec §4.2 requires. The run's state (`staging_len_`, `expected_len_`,
+`expected_crc_`, `open_`) resets on `config_begin`, on any `nack`, and on
+disconnect — an abandoned run must not leak into the next one.
+
+**The CRC and the SHA-256 are both checked, in that order, and neither is
+optional.** The CRC32 is the transfer check (cheap, catches a mangled chunk); the
+SHA-256 is the integrity check the app computed over the config it believes it
+sent. A run can pass one and fail the other, and `config_end`'s `nack` names
+which. Nothing is written to NVS until both pass *and* `ConfigValidate` accepts
+the decoded config.
+
+Every unknown `type` → `nack` with `err: "unknown_type"`. Every frame whose
+`v` differs from `kNdjsonProtocolVersion` → `nack` with `err:
+"version_mismatch"`. A malformed line → `nack` with `err: "bad_frame"`.
+`nack` carries `err` and `detail`, **not `reason`** (spec §4.3).
 
 **Sequence tracking:** the router keeps `expected_seq_`. If an incoming `seq` is
 more than `expected_seq_`, it emits a `link_gap` event carrying both numbers
@@ -5854,19 +6307,24 @@ Task 13's `MockHal::Defaults`.
 - [ ] **Step 4: Run the tests**
 
 Run: `cd code && pio test -e native -f '*test_link'`
-Expected: PASS — 8 + 11 tests green.
+Expected: PASS — 17 tests green (8 framing + 9 router).
 
 - [ ] **Step 5: Commit**
 
 ```bash
 git add code/lib/Link/CommandRouter.h code/lib/Link/CommandRouter.cpp \
-        code/test_native/test_link/CommandRouterTest.cpp
-git commit -m "Add the USB command router
+        code/test_native/test_link/CommandRouterTest.cpp \
+        code/test_native/MockHAL.h code/test_native/MockHAL.cpp
+git commit -m "Add the USB command router with the chunked config transport
 
 Unknown commands, malformed frames and protocol-version mismatches are all
 nacked with a reason rather than ignored, and a sequence gap emits a link_gap
-event so a dropped frame surfaces instead of leaving a stale UI. An invalid
-config is rejected without disturbing the stored one."
+event so a dropped frame surfaces instead of leaving a stale UI. Config
+transfer is chunked per spec 4.2 -- a real config is ~22 KB and cannot fit one
+1024-byte line -- with a fixed staging buffer sized from ConfigMaxSerializedSize,
+gap detection on the chunk offset, and nothing committed until both the CRC32
+and the SHA-256 verify. An invalid config is rejected without disturbing the
+stored one."
 ```
 
 ---
@@ -6179,10 +6637,9 @@ gate a path that can brick the device.
   four-line `main()`.
 
 **Interfaces:**
-- Consumes: `IHAL` (Task 2)
+- Consumes: `IHAL` (Task 2), `Sha256Stream`/`Sha256FromHex` (Task 14b)
 - Produces:
-  - `enum class VerifyResult { kOk, kSizeMismatch, kChecksumMismatch, kTooLarge, kEmpty }`
-  - `class Sha256Stream` with `void Update(const uint8_t *data, size_t len)`, `void Final(uint8_t out[32])`
+  - `enum class VerifyResult { kOk, kSizeMismatch, kChecksumMismatch, kTooLarge, kEmpty, kMalformedHash }`
   - `VerifyResult ImageVerifyBegin(const char *expected_sha256_hex, size_t expected_size, size_t max_size)`
   - `VerifyResult ImageVerifyChunk(const uint8_t *data, size_t len)`
   - `VerifyResult ImageVerifyEnd()`
@@ -6276,18 +6733,22 @@ Expected: FAIL — `Update/ImageVerify.h` not found.
 
 - [ ] **Step 3: Implement `ImageVerify`**
 
-`Sha256Stream` wraps mbedTLS's `mbedtls_sha256_*` on device and **the same
-mbedTLS API on the host** (add `lib_deps` `mbedtls` to the `native` env, or use
-a tiny bundled implementation — either is fine, but it must be *the same code*
-on both, because a host-only implementation would validate a path the device
-does not run).
+`Sha256Stream` is **not defined here** — it is Task 14b's `lib/Util/Sha256.h`,
+consumed unchanged, so the config run (§4.2) and the image verify (§9.3) provably
+hash identically. Use `Sha256FromHex` for the hex-string validation below rather
+than writing a second hex parser.
 
-`ImageVerifyBegin` validates the hex string (exactly 64 lowercase-or-uppercase
-hex characters), the size against `max_size`, and rejects an empty image,
-**before** any data is streamed. `ImageVerifyChunk` feeds the hash and counts
-bytes. `ImageVerifyEnd` returns `kSizeMismatch` if the byte count differs and
-`kChecksumMismatch` if the digest differs — checked in that order, so a
-truncated image reports the more specific cause.
+`ImageVerifyBegin` validates the hex string (exactly 64 hex characters), the size
+against `max_size`, and rejects an empty image, **before** any data is streamed,
+returning `kMalformedHash` for a hash it cannot parse. `ImageVerifyChunk` feeds
+the hash and counts bytes. `ImageVerifyEnd` returns `kSizeMismatch` if the byte
+count differs and `kChecksumMismatch` if the digest differs — checked in that
+order, so a truncated image reports the more specific cause.
+
+**The enum must declare every result the tests name.** An earlier revision's
+`VerifyResult` stopped at `kEmpty`, while its own test asserted
+`VerifyResult::kMalformedHash` — a test that could not compile, in the task whose
+entire job is refusing a malformed hash.
 
 Critical detail the tests pin: **a hash that cannot be parsed is refused**, never
 treated as all-zeros. An unparseable hash silently becoming "no check" is the

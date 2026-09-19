@@ -5874,11 +5874,44 @@ have the head unit out of the dash.
   four-line `main()`.
 
 **Interfaces:**
-- Consumes: `LadderProfile` (Task 3), `LadderDecode` (Task 3), `BuzzerGrammar` (Task 12), `Config` (Task 8)
+- Consumes: `LadderProfile`, `LadderButton` (Task 3), `LadderDecode` (Task 3),
+  `BuzzerGrammar` (Task 12), `Config` (Task 8)
 - Produces:
   - `enum class LearnReject { kNone, kTooNoisy, kTooCloseToExisting, kAtIdle, kOutOfRange, kTooFewSamples }`
   - `const char *LearnRejectReason(LearnReject r)` — the wire string
-  - `class LearnSession` with `void Start(int channel, const LadderProfile &existing)`, `void AddSample(int level_mv, int idle_mv, uint64_t now_ms)`, `LearnReject Commit(LadderButton *out)`, `int SampleCount() const`
+  - `class LearnSession` with:
+    - `void Start(int channel, const LadderProfile &existing)`
+    - `void AddSample(int level_mv, int idle_mv, MilliVolt rail_mv, int16_t temp_tenths_c, uint64_t now_ms)`
+    - `LearnReject Commit(LadderButton *out)`
+    - `int SampleCount() const`
+    - `MilliVolt LearnedIdleMv() const`
+
+**The session fills six of `LadderButton`'s eight fields, not two.** Spec §3.4
+defines eight, and `Commit` must produce all the ones learn is the only source
+of: `mv_center`, `mv_tolerance`, `learned_at_rail_mv`, `temp_c_at_learn`,
+`sample_count`, `confidence`. **`id` and `name` are the caller's** — they are a
+slug and a display label, which learn cannot invent; the app supplies them (or
+the wizard in Step 5 generates a slug). An earlier revision of this task stored
+`ratio_permille`/`tolerance_permille` and left `learned_at_rail_mv` and
+`temp_c_at_learn` unset, which made FR-17 (temp compensation) and FR-30 (rail
+renormalization) unimplementable from a learned profile.
+
+**Why the rail is a parameter and not an ADC read.** `learned_at_rail_mv` is
+spec §3.4's "+3V3 rail measured during learn", but this board has **no +3V3 sense
+channel** — `AdcChannel` is `SWC1`, `SWC2`, `TEMP`, `AUX1–3`, `KEY_SENSE1/2`, and
+none of them is the rail. So the rail arrives from the caller: the app supplies
+it, or a bring-up measurement sets it, or it defaults to nominal 3300. Inventing
+an `ADC_CH_3V3` here would have compiled and read a channel that does not exist.
+
+**The temperature is `ADC_CH_TEMP`** — the NTC `RT1` on the ladder (spec §6.4).
+It is read and recorded regardless of whether compensation is enabled, because
+spec §6.4 makes the *coefficient* a bring-up deliverable that has to be measured
+from recorded data, and v1 defaults it to zero.
+
+**Why `temp_tenths_c` and not a float.** Spec §3.4's wire form is `23.5`. The
+struct stores `int16_t` tenths (235) and the JSON encoder divides by ten — the
+same choice `ConfigModel.h` already makes, and it keeps a float off a device that
+has no FPU and out of a `memcmp`-compared blob.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5886,32 +5919,59 @@ have the head unit out of the dash.
 #include "Learning/LearnSession.h"
 #include <gtest/gtest.h>
 
+#include <cstring>
+#include <set>
+#include <string>
+
 namespace {
-LadderProfile ExistingWith(const char *id, int ratio, int tol) {
+// Spec 3.4's worked-example rail and the ~23.5 C the ladder was learned at.
+constexpr MilliVolt kRailMv     = 3300;
+constexpr int16_t   kTempTenths = 235;
+
+LadderProfile ExistingWith(const char *id, int mv_center, int mv_tolerance) {
     LadderProfile p{};
     p.learned_idle_mv = 2835;
     p.count = 1;
     std::strncpy(p.buttons[0].id, id, sizeof(p.buttons[0].id) - 1);
-    p.buttons[0].ratio_permille = ratio;
-    p.buttons[0].tolerance_permille = tol;
+    p.buttons[0].mv_center    = static_cast<MilliVolt>(mv_center);
+    p.buttons[0].mv_tolerance = static_cast<MilliVolt>(mv_tolerance);
     return p;
 }
 void Feed(LearnSession &s, int mv, int idle, int n, uint64_t &t) {
-    for (int i = 0; i < n; ++i) { s.AddSample(mv, idle, t); t += 10; }
+    for (int i = 0; i < n; ++i) { s.AddSample(mv, idle, kRailMv, kTempTenths, t); t += 10; }
 }
 }  // namespace
 
-TEST(LearnSession, ASteadyLevelCommitsAndRecordsTheIdleItWasLearnedAt) {
+TEST(LearnSession, ASteadyLevelCommitsAndRecordsEverythingLearnIsTheSourceOf) {
     LearnSession s;
     s.Start(0, LadderProfile{});
     uint64_t t = 1000;
     Feed(s, 1430, 2835, 30, t);
     LadderButton out{};
     ASSERT_EQ(s.Commit(&out), LearnReject::kNone);
-    ASSERT_EQ(out.ratio_permille, 504);
+    // Spec 3.4's eight fields. Learn is the only source of six of them, so all
+    // six are asserted here -- a profile that commits without its rail or its
+    // temperature is one FR-17 and FR-30 cannot use.
+    EXPECT_EQ(out.mv_center, 1430);
+    EXPECT_GT(out.mv_tolerance, 0);
+    EXPECT_EQ(out.learned_at_rail_mv, kRailMv);
+    EXPECT_EQ(out.temp_c_at_learn, kTempTenths);
+    EXPECT_EQ(out.sample_count, 30);
+    EXPECT_GT(out.confidence, 0);
     // FR-30: the idle reference is recorded so runtime classification can
     // detect a rail fault and the app can display absolute millivolts.
     EXPECT_EQ(s.LearnedIdleMv(), 2835);
+}
+
+TEST(LearnSession, TheIdAndNameAreLeftToTheCallerNotInvented) {
+    LearnSession s;
+    s.Start(0, LadderProfile{});
+    uint64_t t = 1000;
+    Feed(s, 1430, 2835, 30, t);
+    LadderButton out{};
+    out.id[0] = '\0';
+    ASSERT_EQ(s.Commit(&out), LearnReject::kNone);
+    EXPECT_EQ(out.id[0], '\0') << "learn cannot invent a slug; the caller supplies it";
 }
 
 TEST(LearnSession, TooFewSamplesIsRejectedNotAcceptedFromOneReading) {
@@ -5930,7 +5990,7 @@ TEST(LearnSession, ANoisyLevelIsRejectedWithTheNoiseReason) {
     // A 550 mV swing at a 2835 mV idle is ~195 permille of wobble: far wider
     // than the classification tolerance.
     for (int i = 0; i < 30; ++i) {
-        s.AddSample((i % 2) ? 1430 : 1980, 2835, t);
+        s.AddSample((i % 2) ? 1430 : 1980, 2835, kRailMv, kTempTenths, t);
         t += 10;
     }
     LadderButton out{};
@@ -5948,9 +6008,9 @@ TEST(LearnSession, ALevelAtIdleIsRejectedBecauseTheButtonWasNotPressed) {
 
 TEST(LearnSession, ALevelWithinAnExistingButtonsToleranceIsRejectedAsAmbiguous) {
     LearnSession s;
-    s.Start(0, ExistingWith("VOL_UP", 504, 42));
+    s.Start(0, ExistingWith("vol_up", 1430, 120));
     uint64_t t = 1000;
-    Feed(s, 1450, 2835, 30, t);   // 511 permille, inside VOL_UP's window
+    Feed(s, 1450, 2835, 30, t);   // 511 permille, inside vol_up's window
     LadderButton out{};
     EXPECT_EQ(s.Commit(&out), LearnReject::kTooCloseToExisting);
 }
@@ -5980,18 +6040,28 @@ TEST(LearnSession, EachRejectionHasADistinctWireReason) {
     for (const auto &r : reasons) EXPECT_FALSE(r.empty());
 }
 
-TEST(LearnSession, ToleranceIsDerivedFromTheMeasuredSpreadNotAConstant) {
+TEST(LearnSession, ToleranceIsTheMidpointOfTheGapNotADoubleOfTheSpread) {
+    // Spec 3.4: mv_tolerance is the midpoint of the gap to the nearest
+    // neighbouring button, capped. Deriving it from the observed spread instead
+    // is the classic cause of two buttons both triggering the same action --
+    // exactly what this rule exists to prevent.
     LearnSession s;
-    s.Start(0, LadderProfile{});
+    // A neighbour 200 mV below the level being learned, with a narrow window so
+    // the gap (not the neighbour's tolerance) is what determines the answer.
+    s.Start(0, ExistingWith("other", 1230, 20));
     uint64_t t = 1000;
-    for (int i = 0; i < 30; ++i) {          // a small, realistic spread
-        s.AddSample((i % 2) ? 1445 : 1415, 2835, t);
+    // A 30 mV spread. A spread-derived tolerance would give 60 mV; the gap
+    // midpoint is 100 mV. The two are far enough apart to tell apart.
+    for (int i = 0; i < 30; ++i) {
+        s.AddSample((i % 2) ? 1445 : 1415, 2835, kRailMv, kTempTenths, t);
         t += 10;
     }
     LadderButton out{};
     ASSERT_EQ(s.Commit(&out), LearnReject::kNone);
-    EXPECT_GE(out.tolerance_permille, 8) << "tolerance must cover the observed spread";
-    EXPECT_LE(out.tolerance_permille, 120) << "and must not swallow neighbouring buttons";
+    EXPECT_NEAR(out.mv_center, 1430, 2);
+    EXPECT_NEAR(out.mv_tolerance, 100, 3)
+        << "half the 200 mV gap to the neighbour, not the 120 mV cap and not 60 mV";
+    EXPECT_GE(out.mv_tolerance, 20) << "and it must still cover the measured spread";
 }
 ```
 
@@ -6009,20 +6079,46 @@ returning the **first** failure so the user gets the most actionable reason:
 2. `kOutOfRange` — any sample above the **2900 mV** calibrated ADC ceiling
    (spec §3.2) or below 0. This is the *input* ladder's ceiling; the 2490 mV
    figure is the *output* sense divider (spec §2.3) and is a different net.
-3. `kAtIdle` — the mean ratio is within the idle margin, so the button was not
-   pressed.
-4. `kTooNoisy` — the spread exceeds `noise_limit_permille` (default 60).
-5. `kTooCloseToExisting` — the mean is within an existing button's tolerance.
+3. `kAtIdle` — the mean is within the idle margin, so the button was not pressed.
+4. `kTooNoisy` — the spread exceeds `noise_limit_mv` (default 170 mV, which is
+   ~60 permille at a 2835 mV idle).
+5. `kTooCloseToExisting` — the mean is within an existing button's window.
 
-On success, `out.tolerance_permille` is the midpoint of the gap to the nearest
-neighbouring button capped by a configurable maximum (spec §3.4) — **not**
-`max(spread * 2, 8)`. `out.ratio_permille` is the rounded mean ratio, and
-`LearnedIdleMv()` records the idle reference (FR-30).
+**An out-of-range reading is still a reading, and this is load-bearing for the
+gate order.** The sample gate counts every `AddSample` call; the statistics
+(mean, spread) use only the in-range ones. Two counters, not one. With a single
+counter that dropped out-of-range samples, a learn of 30 implausible readings
+fails the *first* gate and reports `kTooFewSamples` — telling the user to hold
+the button longer when the real problem is that nothing they can do will help.
+The order above is only meaningful if gate 1 can be passed by the same samples
+gate 2 is about to reject. Verified: with one counter the test fails; with two it
+passes.
+
+**On success, `Commit` fills six fields and leaves two alone:**
+
+| Field | Source |
+| --- | --- |
+| `mv_center` | rounded mean of the accepted samples |
+| `mv_tolerance` | **half the gap** to the nearest neighbouring button's centre, capped by a configurable maximum (spec §3.4) — and floored so it still covers the measured spread |
+| `learned_at_rail_mv` | the `rail_mv` passed to `AddSample` |
+| `temp_c_at_learn` | the `temp_tenths_c` passed to `AddSample`, from `ADC_CH_TEMP` |
+| `sample_count` | the number of samples accepted |
+| `confidence` | 0–100, from the spread relative to the tolerance |
+| `id`, `name` | **untouched** — the caller's; learn cannot invent a slug |
+
+`LearnedIdleMv()` returns the idle reference recorded at `Start` (FR-30).
+
+**The tolerance is the gap midpoint, not a multiple of the spread.** An earlier
+revision said `max(spread * 2, 8)` in permille, which is the opposite of spec
+§3.4 and is the classic cause of two buttons both triggering the same action: a
+wide spread would *widen* the window toward its neighbour instead of the window
+being bounded by how far away that neighbour actually is. The spread's only role
+is as a **floor**, so a window always covers the noise it was measured through.
 
 - [ ] **Step 4: Run the tests**
 
 Run: `cd code && pio test -e native -f '*test_learning'`
-Expected: PASS — 8 tests green.
+Expected: PASS — 9 tests green.
 
 - [ ] **Step 5: Add the headless AUX1-driven wizard (FR-31)**
 

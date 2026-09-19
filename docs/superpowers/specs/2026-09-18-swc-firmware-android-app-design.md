@@ -171,19 +171,39 @@ saturate.** No clamp logic is needed in firmware.
 ### 2.4 The ladder input (per channel)
 
 ```
-factory ladder (to +12 V when idle)
+steering-pad ladder (series chain, common tied to GND)
    └─ J2 ─ R1/R2 10 kΩ ─┬─ /SWC1_ADC / /SWC2_ADC ─► ESP32-S3 ADC1
                         ├─ R15/R16 10 kΩ pull-up to +3V3
                         ├─ D4/D5 BAT54S clamp to +3V3 / GND
                         └─ C3/C4 100 nF
 ```
 
-The **10 kΩ pull-up is what makes a bare switch-to-ground button work as well as
-a resistor ladder.** The clamp protects the 3.3 V pin from the 12 V idle level.
-The 10 kΩ series resistor plus the pull-up forms a divider, so the pin voltage
-is a function of *both* the ladder resistance *and* the 12 V rail — which drifts
-with the vehicle's charging system. §6.3 derives the transfer function and
-explains why the firmware must learn rather than assume.
+**The ladder is a resistor chain with its common tied to ground, and a button
+shorts the node it sits at to the chain's common — so pressing a button pulls the
+input *down*, not up.** (Reference: `Tundra_SWC_steeringpadswitch.bmp` in the
+Android_Stereo_Apps working notes; verified with the board's owner, 2026-09-18.)
+This is the single most important correction in this section:
+
+- **Idle (no button) is the *high* state:** the ladder's full series resistance
+  sits between the pin node and GND, so the node is pulled up toward **+3V3**
+  through `R15`/`R16`. It is **not** driven to +12 V, and the pin is therefore
+  **never saturated** — the node sits inside the ADC's 2.9 V range.
+- **Pressing a button lowers the node voltage** by shunting part of the ladder to
+  GND. Different buttons short at different points in the chain, giving different
+  resistances to GND and therefore different pin voltages.
+- The **10 kΩ pull-up is what makes a bare switch-to-ground button work as well as
+  a resistor ladder**, and it is what sets the idle level.
+- The BAT54S clamp is **protection only** — against a miswire or a ladder that is
+  externally pulled high. It is not the operating point.
+- The node voltage is a function of the ladder resistance **and** of the +3V3
+  rail, not the vehicle's 12 V rail. `R15`/`R16` and the ladder's own values form
+  the divider, so **the pull-up value may need to be adjusted to suit the measured
+  ladder resistances** — a bring-up measurement (§10.6), not an assumption.
+
+> **This supersedes `DESIGN.md` §4.1's "pulled to 12 V when idle" prose, which is
+> wrong.** An earlier revision of this section repeated that claim and derived a
+> saturated-node transfer function from it; that derivation was retracted on
+> 2026-09-18. §6.3 is written against the topology above.
 
 `AUX1`–`AUX3` on `J5` are electrically identical but use a **1 kΩ** series
 resistor (`R23`–`R25`) and the same pull-up/clamp/filter, on IO4/IO5/IO6.
@@ -239,7 +259,7 @@ count is mistaken for a millivolt or a resistance.
 
 | Type | Range | Meaning |
 | --- | --- | --- |
-| `AdcRaw` | u16, 0–8191 | Raw 13-bit ADC count as read from the S3 at 12 dB atten |
+| `AdcRaw` | u16, 0–4095 | Raw **12-bit** ADC count as read from the S3 at 12 dB atten |
 | `MilliVolt` | u16, 0–2900 | Pin voltage in mV, after calibration, **at the pin** |
 | `MilliOhm` | u32 | Ladder resistance in mΩ. Not inferred unless learned — see §3.4 |
 | `DacCode` | u16, 0–4095 | MCP4728 code. `mV ≈ code × 3300 / 4095` (1 LSB = 806 µV) |
@@ -247,10 +267,10 @@ count is mistaken for a millivolt or a resistance.
 
 **Rule:** the firmware stores ladder calibration as `MilliVolt` at the pin, and
 **never** as a resistance, because the board does not measure resistance — it
-measures a divided voltage that depends on the vehicle's 12 V rail (§6.3).
-`MilliOhm` is display-only, computed for the app's benefit when the user supplies
-the known rail voltage. Storing a resistance as if it were measured would be a
-lie that drifts with the charging system.
+measures a divided voltage (§6.3), and the ladder's own values are vehicle-
+specific and unknown until learned. `MilliOhm` is display-only, computed for the
+app's benefit **if and when** the user supplies the ladder's reference voltage.
+Storing a resistance as if it were measured would be a lie.
 
 ### 3.3 Gestures
 
@@ -270,10 +290,15 @@ not be in the first cut.
 
 ### 3.4 Learned ladder
 
-The critical insight: **the ladder is a voltage divider against the vehicle's
-12 V rail, so the same car can read differently at 12.0 V and 14.4 V.** Values
-therefore carry the rail voltage measured at learn time, so the firmware can
-renormalize at runtime.
+The critical insight: **the ladder is a series chain whose common is tied to GND,
+and each button shunts a different point in that chain to common, so each button
+produces a distinct divider ratio against the +3V3 pull-up.** The absolute pin
+voltage therefore depends on the ladder's own resistance values — which are
+vehicle-specific and **not known in advance** — and secondarily on the +3V3 rail
+(§6.3). Values are stored both as measured millivolts and as a **normalized
+ratio**, so runtime classification does not depend on the rail or on absolute
+level. See §6.3 for the topology and why an earlier revision's "divider against
+the vehicle's 12 V rail" reading was wrong.
 
 ```
 LadderButton {
@@ -281,7 +306,7 @@ LadderButton {
   name         : "Volume Up"        // display only
   mv_center    : 1240               // MilliVolt at the pin when this button is held
   mv_tolerance : 120                // half-width of the accept window
-  learned_at_rail_mv : 12100        // rail voltage measured during learn
+  learned_at_rail_mv : 3300         // +3V3 rail measured during learn (§6.3)
   temp_c_at_learn    : 23.5         // for the NTC compensation model
   sample_count : 200                // how many samples were averaged
   confidence   : 0.98               // learn-quality score, 0–1
@@ -362,8 +387,8 @@ out:
     "hostname": "swc-adapter",
     "settings": {
       "single_press_ms": 0,
-      "double_press_gap_ms": 400,
-      "long_press_ms": 700,
+      "double_press_gap_ms": 500,
+      "long_press_ms": 750,
       "long_repeat_ms": 250,
       "debounce_ms": 25,
       "release_margin_mv": 900,
@@ -379,15 +404,15 @@ out:
       "id": "SWC1",
       "enabled": true,
       "ladder": {
-        "source": "LADDER_12V",
-        "idle_mv": 2900,
+        "source": "LADDER_3V3",
+        "idle_mv": 2835,
         "buttons": [
-          { "id": "vol_up",   "name": "Volume Up",   "mv_center": 1240, "mv_tolerance": 120,
-            "learned_at_rail_mv": 12100, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.98 },
-          { "id": "vol_dn",   "name": "Volume Down", "mv_center": 1680, "mv_tolerance": 120,
-            "learned_at_rail_mv": 12100, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.97 },
-          { "id": "next",     "name": "Next Track",  "mv_center": 2050, "mv_tolerance": 110,
-            "learned_at_rail_mv": 12100, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.99 }
+          { "id": "vol_up",   "name": "Volume Up",   "mv_center": 1430, "mv_tolerance": 120,
+            "learned_at_rail_mv": 3300, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.98 },
+          { "id": "vol_dn",   "name": "Volume Down", "mv_center": 1785, "mv_tolerance": 120,
+            "learned_at_rail_mv": 3300, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.97 },
+          { "id": "next",     "name": "Next Track",  "mv_center": 2145, "mv_tolerance": 110,
+            "learned_at_rail_mv": 3300, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.99 }
         ]
       },
       "output": {
@@ -427,11 +452,24 @@ out:
 
 ### 3.8 Persistence, versioning and migration
 
-- **Storage:** NVS, namespace `swc_cfg`. The whole `Config` is stored as a single
-  JSON blob under one key, for atomicity — a partial config is worse than no
-  config. The blob is well under the NVS partition's per-entry limit (currently
-  ~4 KB per value); §10 verifies the real ceiling and picks a blob vs chunked
-  strategy against a **measured** size, not a guess.
+- **Storage:** NVS, namespace `swc_cfg`. The `Config` is stored as a single JSON
+  blob **per slot**, with **two slot keys** (`cfg_a`, `cfg_b`) plus a small
+  sequence key (`cfg_seq`) — see the A/B rule below. A partial config is worse
+  than no config, which is why each slot is written and verified whole rather
+  than field-by-field.
+- **Blob size is a measured quantity, not an assumption.** An NVS value has a
+  per-entry ceiling (historically ~4 KB, and **§10 requires measuring the real
+  ceiling on the actual IDF version**, not trusting that figure). The full
+  `Config` is expected to be several KB and **may exceed one NVS value.** The
+  measured serialized size therefore selects the strategy, and the firmware must
+  not assume either way:
+  - if a slot fits one value → one blob per slot, as above;
+  - if it does not → the slot's blob is **chunked across a small fixed number of
+    NVS keys** (`cfg_a_0`, `cfg_a_1`, …) with the chunk count and a per-slot CRC
+    in a header chunk, so a slot is still read and validated as a unit.
+
+  This is the one place where "measure, then decide" is mandatory rather than
+  preferred, because the answer changes the persistence code.
 - **Dual-slot writes with a monotonic sequence number.** NVS is written **A/B**:
   write the inactive slot, verify it by read-back, bump the sequence, *then* flip
   the active marker. **A power loss mid-write must never destroy a working
@@ -486,6 +524,17 @@ Android app for a protocol frame — the classic failure when both share one CDC
 **This is a hard requirement:** the console must never be configured onto the
 TinyUSB CDC port in a production build. §10 tests it.
 
+> **Build consequence, verified 2026-09-18 (Task 1, against IDF 5.5.5): TinyUSB
+> is not part of IDF — it is the managed component `espressif/esp_tinyusb`.**
+> IDF 5.5.5 ships no `components/tinyusb` and defines **no** `CONFIG_TINYUSB_*`
+> symbols, so any such key in `sdkconfig.defaults` is silently inert (accepted
+> with no warning, and doing nothing). The app link above is therefore **not
+> real until a task adds the component** — via `idf_component.yml` or
+> `lib_deps` — and configures it. Until then the console on USB-Serial-JTAG
+> works and there is no app interface at all. The task that owns `UsbCdc`
+> (§10.1) must add it; this note exists so that task cannot be written without
+> noticing.
+
 ### 4.2 Framing
 
 Line-oriented **NDJSON** (newline-delimited JSON) in both directions, with an
@@ -516,6 +565,30 @@ line is discarded with an error frame rather than buffered — an unbounded line
 buffer on a 4 MB/no-PSRAM part is a heap-exhaustion bug that a hostile or buggy
 peer can trigger.
 
+**The cap applies to every frame, including config transfer, and that is why
+config transfer is chunked.** A full `Config` is several KB (§3.8) and cannot
+fit one line, so `config_get`/`config_set` carry the config as an **ordered run
+of chunks**, each comfortably under the cap:
+
+```
+config_get   →  fw replies  config_begin {total_len, crc32}
+                            config_chunk {offset, data}   × N
+                            config_end   {sha256}         (or nack on failure)
+
+config_set   →  app sends   config_begin {total_len, crc32}
+                            config_chunk {offset, data}   × N
+                            config_end   {sha256}
+                fw replies  ack | nack {err, detail}
+```
+
+The receiving side **accumulates into a fixed-size staging buffer sized to the
+maximum legal config** (a compile-time constant, so the bound is provable, not
+hoped for) and rejects a `config_begin` whose `total_len` exceeds it. Nothing is
+committed until `config_end` validates the CRC **and** the SHA-256, which keeps
+§3.8's "staged, then committed" rule intact across the wire as well as in NVS.
+An interrupted run is discarded wholesale — a partial config is never applied.
+`config_patch` (single field) stays on one line, which is most of why it exists.
+
 ### 4.3 Frame types
 
 | Direction | `type` | Payload | Notes |
@@ -527,9 +600,10 @@ peer can trigger.
 | FW → App | `ack` | `for_seq`, `ok`, `err` | Every command is acked |
 | FW → App | `nack` | `for_seq`, `err`, `detail` | Explicit failure, with a machine-readable code |
 | FW → App | `log` | `level`, `msg` | Optional, gated by a settings flag |
-| App → FW | `config_get` | — | Request the whole config |
-| App → FW | `config_set` | `config` | Replace the whole config; validated before commit |
-| App → FW | `config_patch` | `path`, `value` | Single-field change, cheaper and less racy |
+| App → FW | `config_get` | — | Request the whole config (replied as a chunked run, §4.2) |
+| App → FW | `config_set` | `config` | Replace the whole config; validated before commit (chunked, §4.2) |
+| App → FW | `config_begin` / `config_chunk` / `config_end` | total_len+crc32; offset+data; sha256 | The chunked transport for `config_get`/`config_set` (§4.2) |
+| App → FW | `config_patch` | `path`, `value` | Single-field change, cheaper and less racy — fits one line |
 | App → FW | `learn_start` / `learn_stop` | `channel`, `button_id` | Drive the learn wizard (§6.4) |
 | App → FW | `learn_commit` | `channel`, `button_id`, `name` | Accept the streamed samples as this button |
 | App → FW | `test_key` | `channel`, `dac_code` or `key_resistance_mohm`, `hold_ms` | Bench/production test of the output stage |
@@ -641,7 +715,7 @@ used in the RFC 2119 sense. Each requirement is stated so that it is
 | --- | --- |
 | FR-28 | The firmware MUST provide a learn mode that measures and records a ladder button's level, tolerance and rail voltage, driven over USB and optionally locally via the AUX inputs (§2.2). |
 | FR-29 | Learn MUST reject a sample set that is too noisy, or that lands within the tolerance of an existing button, and say why. |
-| FR-30 | Learn MUST record `learned_at_rail_mv` so runtime classification can renormalize for a different rail voltage. |
+| FR-30 | Learn MUST record `learned_at_rail_mv` — the **+3V3** rail measured during learn (§6.3) — so runtime classification can renormalize if that rail moves. Classification itself runs on the normalized ratio `n` (§6.3), which is already rail-invariant; this field exists so the app can display absolute millivolts and so a genuine 3V3 fault (a sagging regulator, not an alternator) is detectable. |
 | FR-31 | The firmware MUST be able to learn with **no app connected**, using AUX1 as the select button plus buzzer/LED prompts (§7.4), because a user may not have the head unit out of the dash. |
 
 ### 5.7 Maintenance
@@ -716,8 +790,7 @@ DAC code       = round(V_DAC_setpoint · 4096 / 3.300)
 3. **Guard band.** If `V_KEY_idle` falls in **2.6–3.4 V**, **do not guess** — the
    two ranges are indistinguishable there. Stay on the current mode and re-measure
    after the head unit has settled.
-4. `V_KEY_idle ≥ 3.4 V` → **3 V range is unnecessary and 5 V range is correct**;
-   actually invert: **≥ 3.4 V ⇒ 5 V range**, gain 1.82.
+4. `V_KEY_idle ≥ 3.4 V` → **5 V range**, gain 1.82.
 5. `V_KEY_idle < 2.6 V` → **3 V range**, gain 1.00, `V_ADJ` tracking the signal
    channel's code.
 
@@ -744,46 +817,93 @@ command.
 
 ### 6.3 The ladder transfer function
 
-This derivation is what justifies "learn, do not assume". Per channel:
+This derivation is what justifies "learn, do not assume". Per channel — and note
+the topology, which §2.4 establishes and which an earlier revision of this section
+got backwards:
 
 ```
-   +12V ──┬── ladder resistance R_ladder ──┬── R_series 10k ──┬── ADC pin
-          │  (vehicle-specific)            │                  │
-          │                            (to head unit)     R_pullup 10k
-          │                                                to +3V3
-          │                                                C 100nF
-                                                        BAT54S clamp
+   +3V3 ── R15/R16 10k (pull-up) ──┬── J2 connector node ── R1/R2 10k ── ADC pin
+                                   │          │                            │
+                                   │   ladder (vehicle-specific)      C3/C4 100nF
+                                   │          │                      D4/D5 clamp
+                                   │     common → GND                  (protection)
 ```
 
-With the switch closed, the pin node sees `R_series` in series with the parallel
-combination of `R_ladder` (to 12 V) and `R_pullup` (to 3V3):
+**The ladder's common is tied to GND, and a button shunts the node it sits at to
+that common.** So the **connector node** is a divider between **+3V3 (through
+`R_pullup`)** and **GND (through the ladder's resistance to common)**:
 
 ```
-V_pin = ( (V_rail / R_ladder) + (3.3 / R_pullup) ) / ( 1/R_ladder + 1/R_pullup + 1/R_series )
+V_pin = 3.3 · R_ladder / (R_ladder + R_pullup)
 ```
+
+**`R1`/`R2` do not appear in this expression, and that is not an oversight.**
+Verified against the netlist: `R1` runs from the connector node to the ADC pin,
+and the ADC input is high-impedance, so `R1` carries no DC current and drops no
+DC voltage. `V_pin` = `V_connector`. `R1` and `C3` form the **RC anti-alias
+filter**; `R1`'s job is to bound the current into the clamp and give `C3`
+something to work against, not to divide. (An earlier revision of this section
+included `R_series` in the divider, which double-counted it.)
+
+Idle — no button — is the **maximum** `R_ladder` (the whole chain), so **idle is
+the high level**, and the pin never approaches the +12 V rail or the ADC's 2.9 V
+ceiling.
 
 Three consequences that shape the firmware:
 
-1. **`V_pin` depends on `V_rail`.** The same button reads ~20 % higher at 14.4 V
-   (alternator charging) than at 12.0 V. **Fixed thresholds cannot work across a
-   real vehicle.** This alone kills the "hard-coded voltage table" approach.
-2. **The mapping is monotonic but strongly non-linear**, compressing high
-   resistance values into a small voltage band. Two ladder buttons that differ by
-   a large resistance difference may differ by only a few tens of millivolts —
-   which is why `mv_tolerance` is derived from the *measured gap* (§3.4) and why
-   the ADC's accuracy ceiling (§6.5) matters.
-3. **The pull-up to 3V3 means an open input reads near 3.3 V, clamped**, which is
-   why `idle` is a high level and why an unclamped input would have destroyed the
-   pin.
+1. **`V_pin` depends on the +3V3 rail, not on the vehicle's 12 V rail.** The 12 V
+   system still matters indirectly — it is what the steering-pad ladder is
+   referenced to in some vehicles, and it sets the head unit's own KEY-line idle
+   — but it is **not** the divider's high side here. The rail that matters for
+   classification is the regulated 3V3, which is far more stable than an
+   alternator. This is a *weaker* rail-dependence than an earlier revision of this
+   section claimed, and it is why §2.4's "measure the ladder, do not assume its
+   values" is the load-bearing rule.
+2. **The mapping is monotonic and compresses toward the *top*.** As `R_ladder`
+   falls toward 0 (a button shorting straight to common), `V_pin` falls toward 0.
+   Sensitivity `dV/dR = 3.3·R_pullup / (R_ladder + R_pullup)²` is *highest* at low
+   `R_ladder` and falls as `R_ladder` grows — so buttons whose ladder resistances
+   are large (i.e. near the idle end) produce pin voltages only a few tens of
+   millivolts apart, while buttons near common are well separated. This is why
+   `mv_tolerance` is derived from the *measured gap* (§3.4), why the ADC's
+   accuracy ceiling (§6.5) matters, and why the bring-up measurement (§10.6) must
+   check that the **idle-adjacent** buttons are still resolvable.
+3. **The pull-up and the ladder values must be chosen together.** `R_pullup` is
+   10 kΩ as built, but **whether that spreads the buttons adequately across the
+   ADC's range depends on the ladder's actual resistances**, which are vehicle-
+   specific and are *measured* at bring-up (§10.6), not assumed. If the measured
+   spread is too small — most likely among the idle-adjacent buttons, per
+   consequence 2 — the fix is to change `R15`/`R16`. This is a rework item, and
+   the reason this measurement is early in the bring-up order.
+4. **There is also a *ceiling* constraint on `R_ladder`, and it is the one that
+   bites first.** Idle is the high end of the divider, so it is the *worst case*
+   for the ADC's 2.9 V calibrated limit:
 
-> **Correction to `DESIGN.md` §4.1.** That prose says the 10 kΩ is a pull-up *to
-> 12 V*. **The netlist shows `R15`/`R16` go to +3V3**; the ladder's 12 V is only
-> on the far side of `R1`/`R2` (the `J2` pin). This changes the divider math, so
-> the decode below is written as a **normalized ratio**, which is correct under
-> either reading and does not depend on resolving the discrepancy in prose.
+   ```
+   V_idle = 3.3 · R_ladder_idle / (R_ladder_idle + R_pullup)  ≤  2.9 V
+   ⇒  R_ladder_idle  ≤  R_pullup · 7.25
+   ```
 
-**The decode therefore uses a rail-immune normalized ratio**, not absolute
-millivolts:
+   With `R_pullup` = 10 kΩ that means **the idle ladder resistance must be
+   ≤ ~72.5 kΩ**, or idle reads *at* the 2.9 V ceiling and the whole range is
+   clipped from the top — silently, since a clamped idle looks like a valid
+   reading. A steering-pad ladder built from 10 kΩ steps (say 8 buttons → ~80 kΩ
+   idle) **would sit right on that edge.** So the bring-up measurement (§10.6)
+   must record the idle resistance and confirm it is comfortably under the bound;
+   if it is not, `R15`/`R16` get **smaller**, not larger. This is the opposite of
+   the naive "raise the pull-up for more separation" instinct and is exactly why
+   the measurement gates the decision.
+   `MilliVolt`'s declared range (§3.2, 0–2900) is the ceiling this expresses.
+
+> **Two corrections to `DESIGN.md` §4.1, both load-bearing.** That prose says the
+> 10 kΩ is a pull-up *to 12 V* (the netlist shows `R15`/`R16` go to **+3V3**), and
+> it says the ladder is *pulled to 12 V when idle* (it is a series chain whose
+> **common is tied to GND**, so idle is simply the high end of the divider). The
+> first was already noted here; the second is the more serious, because it inverts
+> which end of the range a press moves toward.
+
+**The decode still uses a normalized ratio**, which is what makes it robust to the
+3V3 rail's own tolerance and to any residual series-resistance variation:
 
 ```
 n = V_ADC / V_ADC_idle          measured now
@@ -791,10 +911,10 @@ n_learned = V_learned / V_learned_at_idle   recorded at learn time
 match button k  ⟺  |n − n_learned[k]| < tolerance_n[k]
 ```
 
-Because both the numerator and denominator scale with the rail, **`n` is
-invariant to the vehicle's 12 V rail.** This removes the whole class of "works at
-idle, drifts when the alternator spins up" bugs, and it means runtime
-classification needs no separate rail renormalization step.
+Because both the numerator and denominator scale with the 3V3 rail, **`n` is
+invariant to that rail.** This removes the class of "works at idle, drifts as the
+rail moves" bugs and means runtime classification needs no separate renormalization
+step.
 
 Absolute millivolts are still stored and displayed (§3.2) because they are what a
 human compares against a datasheet — but **classification runs on `n`.**
@@ -1023,7 +1143,7 @@ pattern   := pulse("on_ms", "off_ms") , repeat , gap_ms
 | `KEY_ACCEPTED` | 25/0 | 1 | A gesture was recognised and an action taken |
 | `KEY_UNKNOWN` | 120/80 | 1 | A press was seen but not recognised (unlearned) |
 | `PROGRAM_ENTER` | 40/40 | 2 | Entering programming mode |
-| `PROGRAM_STEP` | 40/40 | 1 | One step deeper into a menu |
+| `PROGRAM_STEP` | 40/40 | 1 | **One** step deeper into a menu — see below |
 | `PROGRAM_SAVED` | 40/20 | 4 | Setting stored |
 | `PROGRAM_EXIT` | 200/0 | 1 | Programming finished |
 | `PROGRAM_CANCEL` | 300/100 | 1 | Programming abandoned, nothing saved |
@@ -1037,6 +1157,15 @@ pattern   := pulse("on_ms", "off_ms") , repeat , gap_ms
 
 **Design rules:**
 
+- **`PROGRAM_STEP` is one rep, and callers repeat it.** §7.4's fallback menu
+  announces the *n*-th button as "*n* beeps", which reads as a conflict with this
+  table's `Reps = 1`. It is not: the pattern is defined as a single 40/40 pulse,
+  and the caller emits it *n* times with the pattern's own `gap_ms` between
+  repeats. Defining the pattern with `Reps = n` would make the rep count a
+  runtime parameter of a pattern, which the grammar
+  (`pattern := pulse(on, off), repeat, gap`) does not express — `repeat` is a
+  property of the named pattern, not an argument. The same rule covers
+  `PROGRAM_ENTER`'s 2 reps, which are baked in and not caller-varied.
 - **`KEY_ACCEPTED` is deliberately the quietest and shortest.** The user hears it
   hundreds of times a drive; the diagnostic patterns are long and loud so they
   are unmistakable and rare. If feedback were uniform, a fault would be
@@ -1361,19 +1490,38 @@ that.
 nvs,         data, nvs,      0x9000,   0xC000,   48 KB — config + provisioning creds (§3.8)
 otadata,     data, ota,      0x15000,  0x2000,   A/B boot selector + rollback state
 phy_init,    data, phy,      0x17000,  0x1000,   RF calibration
-#            0x18000–0x1FFFF reserved (32 KB): keeps app0 128 KB-aligned
-app0,        app,  ota_0,    0x20000,  0x1E8000, 1,998,848 B = 1952 KB — the running image
-app1,        app,  ota_1,    0x208000, 0x1E8000, 1952 KB — the update target
+#            0x18000–0x1FFFF reserved (32 KB): keeps app0 64 KB-aligned
+app0,        app,  ota_0,    0x20000,  0x1E0000, 1,966,080 B = 1920 KB — the running image
+app1,        app,  ota_1,    0x200000, 0x1E0000, 1920 KB — the update target
 coredump,    data, coredump, 0x3F0000, 0x10000,  64 KB — crash forensics
 ```
 
-**Arithmetic, checked exactly:** `0x20000 + 2 × 0x1E8000 + 0x10000 = 0x400000` =
-exactly 4 MiB. Both app slots are **1,998,848 bytes ≈ 1.95 MiB.**
+**App partitions must be 64 KiB-aligned.** IDF's `gen_esp32part.py` sets
+`ALIGNMENT[APP_TYPE] = 0x10000`, and it **rejects the whole table** otherwise:
+
+```
+Partition app1 invalid: Offset 0x208000 is not aligned to 0x10000
+```
+
+An earlier revision of this table put `app1` at `0x208000` (app0 + 0x1E8000).
+`0x208000 % 0x10000 = 0x8000`, so **the firmware did not build at all** — the
+error was found by actually running `pio run -e esp32s3` (plan Task 1), not by
+inspection, because the sum checked out. Both slots are now `0x1E0000` = **1920
+KB**, and `0x3E0000–0x3EFFFF` is left reserved so `coredump` keeps its specified
+64 KB at `0x3F0000`.
+
+**Arithmetic, checked exactly:** `0x20000 + 2 × 0x1E0000 = 0x3E0000`; `+ 0x10000`
+(coredump) = `0x3F0000`; `+ 0x10000` (coredump size) = **`0x400000` = exactly
+4 MiB.** Both app slots are **1,966,080 bytes = 1920 KB.**
+
+**The app budget is therefore 1920 KB, not 1952 KB.** That is 32 KB less than the
+first revision assumed, and it tightens §9.6's fallback trigger — the size gate in
+§10.5 and in CI is **1920 KB**.
 
 This is **generously above** the reference layouts: IDF's own
 `partitions_two_ota_large.csv` — the table Espressif's `advanced_https_ota`
 example uses for 4 MB parts — gives **1700 KB** per slot, and the IDF
-`wifi_prov_mgr` provisioning example's app partition is only ~1.4 MB. **1952 KB
+`wifi_prov_mgr` provisioning example's app partition is only ~1.4 MB. **1920 KB
 is larger than both**, and that gap is affordable precisely because §9.1 removed
 the filesystem.
 
@@ -1383,7 +1531,7 @@ a few dozen bindings is realistically 10–15 KB of JSON, and an NVS blob must f
 with headroom. **§10 requires the real serialized size to be measured, not
 estimated.**
 
-**Is 1952 KB enough for the app?** This is the load-bearing question and §10
+**Is 1920 KB enough for the app?** This is the load-bearing question and §10
 requires a **measured** answer. Reference points:
 
 - coop_controller builds an ESP32 WiFi + web + JSON + TLS app to ~1.47 MB
@@ -1577,14 +1725,36 @@ code/
 ├── tools/                         # host-side scripts (release, contract gen)
 ├── contract/                      # the single source of truth for the wire types
 │   └── swc_contract.h             # GENERATED, checked in, CI-diffed
-├── android/
-│   ├── app/src/main/java/...      # Compose UI + usb-serial + provisioning
-│   ├── app/src/test/              # JVM unit tests
-│   └── app/src/androidTest/       # instrumented tests
+└── android/
+    ├── app/src/main/java/...      # Compose UI + usb-serial + provisioning
+    ├── app/src/test/              # JVM unit tests
+    └── app/src/androidTest/       # instrumented tests
+```
+
+**This tree is the binding target structure.** The module names above are the
+contract: `AdcReader`, `DacMcp4728`, `BleProvisioning`, `UsbCdc`, `LadderDecode`,
+`CalibrationCurve`, `GainPolicy`, `ServoLoop`, `PressClassifier`,
+`GestureStateMachine`, `ActionLibrary`, `BindingResolver`, `BuzzerGrammar`,
+`LedGrammar`, `ConfigStore`, `ConfigCodec`, `Ndjson`, `CommandRouter`, `WebPage`,
+`MaintenanceMode`, `OtaUsb`, `OtaWifi`, `ReleaseCheck`, `ImageVerify`. An earlier
+plan revision named several of these inconsistently and created no task for
+`UsbCdc`, `DacMcp4728`, `BleProvisioning` or `AdcReader`; the plan is rewritten
+against this list, not the other way round. `src/` stays thin — wiring only.
+
+**CI workflows live at the repository root, not under `code/`.** GitHub Actions
+reads `.github/workflows/` from the repo root only, so a workflow placed at
+`code/.github/workflows/` is never executed. In this repo the firmware and
+Android workflows therefore belong at the PCB repo's own root:
+
+```
+<repo root>/
 └── .github/workflows/
     ├── firmware.yml               # test → build → size gate → artifacts
     └── android.yml                # test → assembleDebug → APK artifact
 ```
+
+Each workflow must `working-directory: code` (or `code/android`) for its steps,
+since the projects live one level down.
 
 **Why the split between `src/` and `lib/`:** PlatformIO runs `lib/` tests from
 `test_native/` against the host compiler with no ESP32 toolchain involved, so the
@@ -1598,7 +1768,7 @@ and the RTOS plumbing require the device.
 `lib/HAL/` takes an `IHAL&` and is therefore host-testable.
 
 ```c
-// lib/HAL/IHAL.h  (shape, not final)
+// lib/HAL/IHAL.h  (frozen — this is the binding interface, not a sketch)
 typedef struct {
     int  (*adc_read_mv)(void *ctx, AdcChannel ch);      // calibrated millivolts, §2.3
     void (*dac_set_code)(void *ctx, DacChannel ch, uint16_t code);
@@ -1615,6 +1785,23 @@ typedef struct {
     void *ctx;
 } IHAL;
 ```
+
+**This interface is frozen as of this revision.** An earlier revision labelled it
+"shape, not final", which made every module above `lib/HAL/` a moving target and
+let the plan and the spec drift on names — `Interface()` vs `InterfaceRef()`, C
+enums vs `enum class`, `SENSE1`/`SENSE2` as GPIOs when §2.2 defines them as ADC
+inputs. Those were all symptoms of the interface not being authoritative.
+
+**The freeze is what makes the seam real:** the enums (`AdcChannel`, `DacChannel`,
+`DacPowerMode`, `GpioPin`) are **C enums with explicit `ADC_CH_*` / `DAC_*` /
+`GPIO_*` constant names**, not C++ `enum class`, because `IHAL` is a C struct and
+the ESP-IDF side of the seam is C. Every module takes `IHAL&`; there is no
+`Interface()`/`InterfaceRef()` accessor pair — the reference is passed in.
+
+Changing this interface is now a **spec change**, not an implementation detail: it
+requires a spec edit, a regeneration of `contract/` (§10.2 above), and a plan
+revision. That is the intended cost — the seam is the one place where a mistake
+propagates to every task at once.
 
 **`now_ms`/`now_us` are in the HAL on purpose.** Every timing rule in §7 — the
 500 ms double-press window, the 750 ms long-press threshold, the 200 ms send
@@ -1673,10 +1860,12 @@ produce a build that lies about the target.
 RTOS, milliseconds. This is where the correctness of the *rules* lives:
 
 - **`LadderDecode`** — the ratio-normalized transfer function of §6.3, against
-  synthesized ADC traces: exact resistors, ±1 % resistors, 11.0–14.8 V rail
-  sweep, ±temperature skew. **The assertion is behavioural:** the same physical
-  button classifies identically at 11.0 V and at 14.8 V. That single test is the
-  entire justification for the ratio-normalization design choice.
+  synthesized ADC traces: exact resistors, ±1 % resistors, a **+3V3 rail sweep
+  (3.14–3.47 V)**, ±temperature skew. **The assertion is behavioural:** the same
+  physical button classifies identically at 3.14 V and at 3.47 V. That single
+  test is the entire justification for the ratio-normalization design choice.
+  *(Not an 11–14.8 V vehicle-rail sweep: no vehicle-rail term exists in the
+  transfer function, and no reading above 2.9 V is producible at all — §6.3.)*
 - **`CalibrationCurve`** — the curve-fit polynomial and the attenuation
   conversion; a table of (raw, expected_mv) pairs at the 2.9 V ceiling (§2.3).
 - **`GainPolicy`** — the 1.82/1.00 selection, the 2.6–3.4 V guard band, the
@@ -1741,9 +1930,10 @@ supply, a resistor ladder in place of the steering wheel, and a head-unit
 emulator (a resistor load plus a scope on the output). These are the tests that
 answer the questions the user actually cares about:
 
-- Every learned button, pressed 100 times each, at three rail voltages (11.0,
-  12.6, 14.8 V) — **zero misclassifications**, and every press produces exactly
-  the expected output level.
+- Every learned button, pressed 100 times each, at three **+3V3 rail** voltages
+  (3.14, 3.30, 3.47 V) — **zero misclassifications**, and every press produces
+  exactly the expected output level. *(The rail that feeds the ladder is +3V3,
+  not the vehicle's 12 V — §6.3.)*
 - The output level for each button, measured, versus the head unit's own
   documented ladder windows — the end-to-end pass/fail that matters.
 - Simultaneous-press and rapid-alternation behaviour per §6.
@@ -1756,13 +1946,13 @@ answer the questions the user actually cares about:
 | --- | --- | --- |
 | Native tests | `pio test -e native` | 100 % pass, no skips |
 | Device tests | `pio test -e esp32s3` | 100 % pass on the bench board |
-| App fits the slot | `pio run -e esp32s3 && pio run -t size` | ≤ 1952 KB (§9.2) — **the highest-risk gate** |
+| App fits the slot | `pio run -e esp32s3 && pio run -t size` | ≤ 1920 KB (§9.2) — **the highest-risk gate** |
 | Free-heap headroom | runtime assertion in the device test | ≥ 20 % free at worst-case steady state |
 | Config fits NVS | `ConfigCodec` round-trip size assertion | ≤ 24 KB serialized vs the 48 KB partition |
 | Contract in sync | `tools/gen_contract*.py` then `git diff --exit-code` | No diff |
 | Android builds | `./gradlew assembleDebug test` | Clean, tests pass |
 
-**If the app does not fit 1952 KB**, the documented fallback is §9.6's separate
+**If the app does not fit 1920 KB**, the documented fallback is §9.6's separate
 maintenance image — decided now, so a size blowout is a known trade, not a
 mid-project emergency. The gate exists so that is discovered in CI, on day one,
 rather than the week the boards land.
@@ -1781,10 +1971,18 @@ eyeballed. Nothing later is trusted until the step before it passed.
 2. **I²C and the DAC.** Scan the bus, find the MCP4728 at its strap address,
    write a mid-code, measure with a meter. Confirms §2.5's wiring and that
    `LDAC` behaves.
-3. **The ADC ladder.** With a resistor ladder in place, sweep the bench supply
-   11.0 → 14.8 V and record the idle and per-button readings. **Fit the real
-   calibration here** — this is where the §2.3 numbers become true for the
-   actual board.
+3. **The ADC ladder — and the `R15`/`R16` decision.** With a resistor ladder in
+   place, sweep the **+3V3 rail 3.14 → 3.47 V** and record the idle and
+   per-button readings. **Fit the real calibration here** — this is where the
+   §2.3 numbers become true for the actual board.
+   Two gates ride on this measurement, and both must be recorded before the
+   PCB is considered final:
+   - **The ladder ceiling.** Confirm `R_ladder_idle ≤ R_pullup · 7.25`
+     (≈72.5 kΩ at the 10 kΩ `R15`/`R16`; §6.3 consequence 4). If it is over,
+     `R15`/`R16` go **smaller**, not larger.
+   - **The ceiling headroom.** The nominal 2835 mV idle reaches the 2900 mV ADC
+     ceiling at only **+2.3 %** of rail, so confirm the real idle is not already
+     clipping at nominal 3.3 V.
 4. **The output stage and gain.** Measure the output envelope in both gain
    modes, verify 1.82 and 1.00, verify the guard-band switch, verify the 1.80 V
    floor and 5.20 V ceiling. Update §6.2 if reality disagrees — and it may, on
@@ -1833,7 +2031,7 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-3 | Filter settling test | N | Step response settles in < `debounce_ms`, and a 20 ms press is not attenuated below the detection threshold |
 | FR-4 | Fault-injection tests | N + D | Open input, short-to-rail and rail collapse each yield `FAULT_*`, never a button classification |
 | FR-5 | Live-sample stream test | N + D | During learn, ≥ 20 samples/s reach the link with bounded latency |
-| FR-6 | Classification + hysteresis test | N | A level inside the window's outer edge twice in a row does not re-trigger; each learned button classifies at 11.0/12.6/14.8 V |
+| FR-6 | Classification + hysteresis test | N | A level inside the window's outer edge twice in a row does not re-trigger; each learned button classifies across the **+3V3** tolerance band (3.14–3.47 V, §6.3), and an idle-adjacent button — the worst case for separation, per §6.3 consequence 2 — still resolves |
 | FR-7 | Gesture tests | N | Each of SINGLE/DOUBLE/LONG fires exactly once for its stimulus |
 | FR-8 | Injected-clock suite | N | The entire §3.4 gesture set runs with zero wall-clock sleeps |
 | FR-9 | Dual-channel concurrency test | N + B | Two simultaneous presses produce two independent, correct events |
@@ -1857,7 +2055,7 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-27 | Export/import test | N + A | Full config JSON round-trips byte-identically through export → import |
 | FR-28 | Learn-mode tests | N + D + B | Measured level, tolerance and rail are stored and match the bench instrument |
 | FR-29 | Learn-rejection tests | N | Noisy and too-close-to-existing samples are each rejected **with the correct distinct reason** |
-| FR-30 | Rail-renormalization test | N | A button learned at 12.6 V classifies correctly at 11.0 V and 14.8 V |
+| FR-30 | Rail-renormalization test | N | A button learned at 3.3 V classifies correctly at 3.14 V and 3.47 V (±5 % regulator tolerance); the ratio `n` is unchanged across that sweep. A **separate** fault test asserts that a 3V3 sag to ≤20 % of the learned value is reported as a rail fault, not as idle. **Note:** this is a *+3V3* sweep, not the 11–14.8 V vehicle-rail sweep an earlier revision specified — no vehicle-rail term exists in the transfer function (§6.3). |
 | FR-31 | Headless-learn test | D + B | A full learn completes with no USB host attached, driven by AUX1 + buzzes |
 | FR-32 | Radio-absent test | D + B | In normal mode, current draw and heap show WiFi/BLE never initialized |
 | FR-33 | Maintenance-entry tests | N + D | Each of the three triggers enters maintenance; each exits correctly |
@@ -1886,8 +2084,8 @@ ordered board and are called out in §12 as the critical path.
 | # | Item | Needed by | Blocking? |
 | --- | --- | --- | --- |
 | N-1 | **The exact DOIT ESPS3-32-N4 flash/RAM configuration** — confirm 4 MB flash, no PSRAM, and the USB-Serial-JTAG pin map, then fix the board JSON | Immediately | **Yes** — every build depends on it |
-| N-2 | **The head unit's actual ladder resistor values and windows.** The spec's envelope assumes a 5 V-referenced ladder; if the real radio differs, §6.2's guard band and §2's divider assumptions change | Before bench tests | Yes, for output calibration |
-| N-3 | **App-fits-in-1952 KB** — unresolved until the first full BLE build with NimBLE. The §9.6 fallback is the answer if it does not | First CI run | No (fallback exists) |
+| N-2 | **The head unit's actual ladder resistor values.** The *input* side is now settled (§2.4/§6.3: series chain, common to GND, pulled up to +3V3 by `R15`/`R16`, no 12 V term), but the **actual resistance values are vehicle-specific and unmeasured**, so how well the buttons spread across the ADC range is unknown. If the spread is poor — most likely for the idle-adjacent buttons (§6.3 consequence 2) — the fix is to change `R15`/`R16` | Before bench tests | Yes, for **input** calibration; also gates §6.2's output envelope indirectly |
+| N-3 | **App-fits-in-1920 KB** — unresolved until the first full BLE build with NimBLE. The §9.6 fallback is the answer if it does not | First CI run | No (fallback exists) |
 | N-4 | **The real MCP4728 I²C address strap** on this board — read from the schematic/silkscreen, not assumed | Before step 2 of bring-up | Yes, for bring-up |
 | N-5 | **Whether the integrator's measured plant matches the modelled one.** §6.5's servo constants are a model until step 5 of bring-up | Bring-up | No, but constants change |
 | N-6 | **Android: the head unit's Android version and whether it is rooted/a system app.** Determines if launching apps from background needs the launcher role or the overlay permission (§3.6, Android BAL) | Before Android work | Yes, for the app's action library |
@@ -1898,8 +2096,9 @@ ordered board and are called out in §12 as the critical path.
 
 | # | Risk | Impact | Mitigation |
 | --- | --- | --- | --- |
-| R-1 | **The app does not fit 1952 KB with BLE + WiFi + OTA + web UI** | High — forces the §9.6 split image | Gate it in CI on day one (§10.5); the fallback is designed, not improvised |
+| R-1 | **The app does not fit 1920 KB with BLE + WiFi + OTA + web UI** | High — forces the §9.6 split image | Gate it in CI on day one (§10.5); the fallback is designed, not improvised |
 | R-2 | **A wrong config drives a wrong key in a moving car** | High — could be genuinely dangerous | Ratio-normalized decode, hysteresis, never guessing `UNKNOWN`, safe idle on every fault path, and §10.4's 100-press × 3-voltage misclassification test |
+| R-2b | **The steering-pad ladder's button spread is too tight to classify** once the real resistances are measured — the failure mode §6.3 consequence 2 predicts, and worst at the idle-adjacent end | Medium–High — degrades the headline feature, not safety | Measure the ladder early in bring-up (§10.6, N-2) **before** trusting `R15`/`R16`; the fix is a pull-up value change (rework), and `mv_tolerance` derives from the measured gap (§3.4) so a tight-but-usable spread still works |
 | R-3 | **The output stage misbehaves on the real head unit** (impedance, bias, the 1.80 V floor) | High | Real-load bench test with a head-unit emulator; the envelope is asserted, and the spec gets corrected by measurement |
 | R-4 | **First firmware meets silicon only at bring-up** | Medium–High | The bring-up plan of §10.6 is ordered so each step gates the next; nothing is trusted on the strength of a compile |
 | R-5 | **Android BAL: cannot launch apps from background** | Medium — could kill a headline feature | targetSdk 34 to avoid BAL hardening; default-launcher role is the real fix, overlay permission the fallback; **needs N-6 to resolve** |

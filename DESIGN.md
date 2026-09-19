@@ -86,11 +86,23 @@ quad op-amp.
 
 ### 4.1 Inputs
 
-**SWC1 / SWC2.** The factory ladder is pulled to 12 V when idle, so each input
+**SWC1 / SWC2.** The steering-pad ladder is a **series resistor chain whose
+common is tied to GND**; each button shunts a different point in the chain to
+that common, so a press pulls the input **down**. Idle (no button) is therefore
+the *high* state, set by the **10 kΩ pull-up** (`R15`/`R16`) to +3V3. Each input
 takes a **10 kΩ series resistor** (`R1`/`R2`) into a **BAT54S** clamp
-(`D4`/`D5`) to +3V3/GND, a 100 nF filter (`C3`/`C4`), and a **10 kΩ pull-up**
-(`R15`/`R16`) to +3V3. The pull-up is what lets a bare switch-to-ground button
-work as well as a ladder. Both SWC lines land on the ESP32-S3's ADC inputs.
+(`D4`/`D5`) to +3V3/GND (protection only, not the operating point), a 100 nF
+filter (`C3`/`C4`), and that pull-up. The pull-up is what lets a bare
+switch-to-ground button work as well as a ladder. Both SWC lines land on the
+ESP32-S3's ADC inputs.
+
+> **Correction (2026-09-18).** This paragraph previously said the ladder is
+> "pulled to 12 V when idle", which is wrong and inverts the direction a press
+> moves the input. Verified against `Tundra_SWC_steeringpadswitch.bmp` in the
+> Android_Stereo_Apps working notes and with the board's owner. The ladder
+> resistances are vehicle-specific, so **`R15`/`R16` may need adjusting to spread
+> the buttons adequately across the ADC range** — measure before assuming.
+> The firmware spec's §2.4/§6.3 carry the corrected derivation.
 
 **AUX1–AUX3.** On the 4-pin `J5` terminal, intended for extra buttons or
 programming functions. Identical conditioning but with a **1 kΩ series

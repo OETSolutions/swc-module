@@ -12,31 +12,104 @@
 
 ## Global Constraints
 
+> **Rewritten 2026-09-18 against the repaired spec.** The previous revision of this
+> section was itself defective (it said `platform = espressif32`, quoted a 1952 KB
+> budget, and carried a 12 V ladder assumption). Every value below is now taken
+> from the spec, and the spec is the authority where they differ.
+
+### Platform and build
+
 - **Framework:** `framework = espidf`. **Never** Arduino. The reported WiFi/SSL/webserver crash class is an Arduino-core defect (spec §1).
-- **Platform:** `platform = espressif32` pinned to an exact version. A floating platform silently re-resolves the IDF version.
+- **Platform:** **pioarduino's fork pinned to an exact release tag** —
+  `https://github.com/pioarduino/platform-espressif32/releases/download/55.03.311/platform-espressif32.zip`.
+  **Not** `platform = espressif32`: stock PlatformIO's `framework-espidf` tops out
+  at 4.60100.0 (IDF 4.6.1), which predates the mbedTLS fix this project needs.
+  Pin the *tag*, never the rolling `stable` zip, which crashes the installer under
+  Python 3.14 (`exists(None)` in `safe_framework_cleanup`). **Verified in Task 1:
+  resolves IDF 5.5.5 and builds green.**
 - **Target:** ESP32-S3, **4 MB flash, no PSRAM**. No allocation may assume PSRAM.
-- **ADC ceiling:** 2.9 V at 12 dB attenuation. `V_SENSE ≤ 2.49 V` by the divider. Never configure a range that exceeds 2.9 V input.
-- **Gain:** `V_KEY = (1 + R58/R61)·V_DAC − (R58/R61)·V_ADJ` with `R58=82k`, `R61=100k` → gain exactly **1.82**, **not** 1.812. Tracking mode gain **1.00**.
-- **Output envelope:** 1.80 V – 5.20 V. Guard band 2.6 V – 3.4 V. AUTO default is **1.82**.
-- **No DAC Hi-Z.** Release = command above idle + sink FET off.
-- **App size gate:** ≤ **1952 KB** per OTA slot (`pio run -t size`). Fallback if exceeded: spec §9.6.
+- **`CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y` is required.** The string form is silently
+  ignored (it is a Kconfig *choice*) and `board_build.flash_size` is **not**
+  honoured on pioarduino's IDF path. **Verified in Task 1:** without it the image
+  silently builds for 2 MB.
+- **`CONFIG_MBEDTLS_HARDWARE_AES` = n** in `sdkconfig.defaults`. **Verified in
+  Task 1:** live, not inert (IDF 5.5.5 defaults it to `y`).
+- **App size gate:** ≤ **1920 KB** per OTA slot (`pio run -t size`). Fallback if exceeded: spec §9.6.
+- **Partitions:** exactly as spec §9.2 —
+  `nvs 0x9000/0xC000`, `otadata 0x15000/0x2000`, `phy_init 0x17000/0x1000`,
+  `app0 0x20000/0x1E0000`, `app1 0x200000/0x1E0000`, `coredump 0x3F0000/0x10000`.
+  **App partitions must be 64 KiB-aligned** — IDF's `gen_esp32part.py` sets
+  `ALIGNMENT[APP_TYPE] = 0x10000` and rejects the whole table otherwise. An
+  earlier revision's `app1 @ 0x208000` **did not build**; that is why the slots
+  are 1920 KB and not 1952 KB. `0x3E0000–0x3EFFFF` is reserved slack.
 - **NVS partition:** 48 KB; serialized config ≤ 24 KB.
-- **Partitions:** exactly as spec §9.2.
-- **`CONFIG_MBEDTLS_HARDWARE_AES` = n** in `sdkconfig.defaults`.
-- **Buzzer is active at a fixed ~2.4 kHz.** No pitch control. All feedback is rhythm/count/duration.
-- **Both LEDs are green.** No colour grammar.
-- **Never guess an unlearned button.** `UNKNOWN` → `event{button: null}`, always.
-- **Safe idle is established before USB/BLE/WiFi init** (spec §6.1, step 8 before step 9).
-- **Android `targetSdk = 34`, `minSdk = 26`.** Do not raise targetSdk without re-reading spec §3.6 on Android BAL.
-- **Reporter locale:** user-facing strings in `en-US`; no units other than mV/V/mm/ms in the protocol.
-- **`lib/HAL/IHAL.h` is C, and its enumerators are prefixed constants.** It is
-  the one header both the C host and the C++ application include, so it is
+- **TinyUSB is NOT part of IDF.** IDF 5.5.5 ships no `components/tinyusb` and
+  defines no `CONFIG_TINYUSB_*`; the app USB link needs the managed component
+  `espressif/esp_tinyusb` added via `idf_component.yml`. **Verified in Task 1.**
+  Until a task adds it, spec §4.1's app interface does not exist.
+
+### The HAL seam — the single naming authority (spec §10.2, frozen)
+
+- **`lib/HAL/IHAL.h` is a C header, and its enumerators are prefixed constants.**
+  It is the one header both the C host and the C++ application include, so it is
   `extern "C"` with C enums: `ADC_CH_SWC1`, `DAC_CH_KEY1`, `DAC_POWER_GND_1K`,
   `GPIO_BUZZ`. Never `AdcChannel::kSwc1`. Every task names channels this way.
+- **The interface is frozen** (spec §10.2). Its members are exactly:
+  `adc_read_mv`, `dac_set_code`, `dac_power_mode`, `dac_ldac`, `gpio_write`,
+  `gpio_read`, `buzzer_on`, `now_ms`, `now_us`, `nvs_get`, `nvs_set`, `reboot`,
+  `ctx`. There is **no** `Interface()` accessor — the `IHAL *` is passed in, and
+  the mock exposes it as `InterfaceRef()`. Changing this interface is a **spec
+  change**.
 - **`/SENSE1` and `/SENSE2` are ADC channels (`ADC_CH_KEY_SENSE1`,
   `ADC_CH_KEY_SENSE2`), not `GpioPin`s.** Spec §2.2 marks them `A-in` — they are
   the KEY-line ÷2 sense divider that the servo trim loop reads. The only
   `GpioPin` inputs are `GPIO_BOOT` and `GPIO_VBUS_VALID`.
+
+### Analog facts
+
+- **ADC:** 12-bit, `0–4095`. The S3 has **no DAC** and the calibrated ceiling is
+  **2.9 V** at 12 dB attenuation. `V_SENSE ≤ 2.49 V` by the exact ÷2 divider.
+- **Gain:** `V_KEY = (1 + R58/R61)·V_DAC − (R58/R61)·V_ADJ` with `R58=82k`,
+  `R61=100k` → gain exactly **1.82**, **not** 1.812. Tracking mode gain **1.00**.
+- **Output envelope:** 1.80 V – 5.20 V. Guard band 2.6 V – 3.4 V. AUTO default is **1.82**.
+- **No DAC Hi-Z.** Release = command above idle + sink FET off.
+- **The ladder input is the OTHER side of the board and must not be conflated with
+  the output.** Spec §6.3: the steering-pad ladder is a **series chain whose common
+  is tied to GND**, so a press pulls the input **down** and **idle is the HIGH
+  state**; `V_pin = 3.3 · R_ladder / (R_ladder + R_pullup)` with `R_pullup` =
+  `R15`/`R16` 10 kΩ to **+3V3**. **`R1`/`R2` are not in that divider** — they feed
+  a high-Z ADC pin and are the RC anti-alias filter. **There is no 12 V term
+  anywhere in the transfer function.** Classification is
+  `n = V_ADC / V_ADC_idle`, invariant to the +3V3 rail.
+- **Never guess an unlearned button.** `UNKNOWN` → `event{button: null}`, always.
+
+### Feedback and UX
+
+- **Buzzer is active at a fixed ~2.4 kHz.** No pitch control. All feedback is rhythm/count/duration.
+- **Both LEDs are green.** No colour grammar.
+- **Safe idle is established before USB/BLE/WiFi init** (spec §6.1, step 8 before step 9).
+
+### Protocol
+
+- **NDJSON** line protocol with a `{v, seq, type}` envelope, 1024-byte line cap.
+- **Config transfer is chunked** (`config_begin`/`config_chunk`/`config_end`,
+  spec §4.2) because a whole config is several KB and cannot fit one line.
+  Frame names are exactly those in spec §4.3 — notably `ping` → `status` (not
+  `pong`), `nack` carries `err`/`detail` (not `reason`), and the learn frames are
+  `learn_start`/`learn_stop`/`learn_commit`.
+- **Reporter locale:** user-facing strings in `en-US`; no units other than mV/V/mm/ms in the protocol.
+- **Android `targetSdk = 34`, `minSdk = 26`.** Do not raise targetSdk without re-reading spec §3.6 on Android BAL.
+
+### Test discipline
+
+- Host tests are **GoogleTest** under `test_native/` and run with the `native`
+  env; on-device tests are **Unity** under `test/`.
+- Test output must be pristine — no stray warnings or noise (warnings are findings).
+- A test that asserts nothing, or that asserts against a mock's own bookkeeping
+  rather than the behavior under test, is a defect regardless of who wrote it.
+- **Every FR in spec §11's matrix must have its test in this plan.** An earlier
+  revision claimed "no gaps" while FR-3, FR-5, FR-9, FR-16, FR-17, FR-25 and FR-40
+  had no test at all; §11 is the checklist.
 
 ---
 
@@ -46,14 +119,15 @@ Created under `code/` in the PCB repo.
 
 | Path | Responsibility |
 | --- | --- |
-| `code/platformio.ini` | Envs: `native`, `esp32s3`, `esp32s3-ota` |
-| `code/partitions.csv` | Spec §9.2, verbatim |
-| `code/sdkconfig.defaults` | Non-default IDF knobs |
+| `code/platformio.ini` | Envs: `native`, `esp32s3` (no `esp32s3-ota` — OTA is a runtime path, not a separate env) |
+| `code/partitions.csv` | Spec §9.2 — **1920 KB slots**, 64 KiB-aligned |
+| `code/sdkconfig.defaults` | Non-default IDF knobs, incl. `CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y` |
 | `code/boards/swc-s3.json` | Board definition: 4 MB, no PSRAM |
 | `code/src/main.c` | Wiring only: create HAL, start tasks |
-| `code/lib/HAL/IHAL.h` | The seam (spec §10.2) |
+| `code/lib/HAL/IHAL.h` | The seam (spec §10.2, **frozen**) |
 | `code/lib/HAL/EspHal.{h,c}` | Real implementation |
 | `code/test_native/MockHAL.h` | Host implementation, injectable clock |
+| `code/lib/Analog/AdcReader.{h,c}` | ADC sampling, filter, calibrated mV |
 | `code/lib/Analog/CalibrationCurve.{h,c}` | ADC raw→mV |
 | `code/lib/Analog/LadderDecode.{h,c}` | Ratio-normalized classification |
 | `code/lib/Gesture/PressClassifier.{h,c}` | Level → press events |
@@ -61,20 +135,372 @@ Created under `code/` in the PCB repo.
 | `code/lib/Output/DacMcp4728.{h,c}` | I²C DAC driver |
 | `code/lib/Output/GainPolicy.{h,c}` | Gain-mode selection |
 | `code/lib/Output/ServoLoop.{h,c}` | Bounded trim loop |
-| `code/lib/Bindings/ActionLibrary.{h,c}` | Action ids → semantics |
+| `code/lib/Bindings/ActionLibrary.{h,c}` | Action kinds → semantics |
 | `code/lib/Bindings/BindingResolver.{h,c}` | Gesture → action |
 | `code/lib/Feedback/BuzzerGrammar.{h,c}` | Buzzer patterns |
 | `code/lib/Feedback/LedGrammar.{h,c}` | LED patterns |
 | `code/lib/Config/ConfigCodec.{h,c}` | Config ↔ JSON |
 | `code/lib/Config/ConfigStore.{h,c}` | A/B NVS persistence |
 | `code/lib/Link/Ndjson.{h,c}` | Frame encode/decode |
+| `code/lib/Link/UsbCdc.{h,c}` | TinyUSB CDC transport (**needs `espressif/esp_tinyusb`**) |
 | `code/lib/Link/CommandRouter.{h,c}` | Frame → handler |
+| `code/lib/Maintenance/BleProvisioning.{h,c}` | NimBLE provisioning |
+| `code/lib/Maintenance/WebPage.{h,c}` | Token-authenticated web config |
+| `code/lib/Maintenance/MaintenanceMode.{h,c}` | Mode entry/exit, timeout |
 | `code/lib/Update/ImageVerify.{h,c}` | SHA-256 streaming verify |
 | `code/lib/Update/ReleaseCheck.{h,c}` | Manifest fetch/compare |
+| `code/lib/Update/OtaUsb.{h,c}` | USB OTA path |
+| `code/lib/Update/OtaWifi.{h,c}` | `esp_https_ota` path, pinned CA |
 | `code/contract/swc_contract.h` | Generated, checked in |
 | `code/tools/gen_contract.py` | Generates the above |
 | `code/tools/gen_contract_kotlin.py` | Generates Kotlin types |
 | `code/android/...` | Gradle project |
+
+**Four modules the previous revision declared but no task created —
+`AdcReader`, `DacMcp4728`, `UsbCdc`, `BleProvisioning` — now each have an owning
+task below.** That was the single largest structural gap in the plan: the File
+Structure table promised them and the task list never built them.
+
+**CI workflows live at the repository root**, not under `code/` — GitHub Actions
+reads `.github/workflows/` from the repo root only. Each workflow needs
+`working-directory: code` (or `code/android`). Spec §10.1.
+
+---
+
+## Shared contract — the single source of every cross-task name
+
+> **This section is new, and it is the fix for the plan's dominant failure mode.**
+> A preflight scan of the previous revision found **34 cross-task interface
+> conflicts** — one task defining `ADC_CH_SENSE1`, another `ADC_CH_KEY_SENSE1`;
+> one task's `GainPolicySelect` returning the opposite gain from the spec; two
+> definitions of the action table; two of the protocol version; a `Config` that
+> could not represent spec §3.5's bindings. Every one of those was a name or a
+> value invented independently in a task that could not see the others.
+>
+> **The rule: a task never invents a shared name or a shared constant.** If a task
+> needs a type, an enumerator, a frame name, a timing, a pattern or a struct
+> shape that another task also touches, it is defined **here**, once, and the task
+> *uses* it. A task may add a private `static` helper freely; it may not add a
+> second definition of anything below.
+>
+> The spec is still the authority. Where this section and the spec disagree, the
+> spec wins and this section is a bug — but they are written to agree, and each
+> entry cites its spec section so the check is mechanical.
+
+### C types and enums (`lib/HAL/IHAL.h` — frozen, spec §10.2)
+
+```c
+typedef uint16_t MilliVolt;    // 0–2900 at the pin (spec §3.2)
+typedef uint16_t AdcRaw;       // 0–4095, 12-bit (spec §3.2)
+typedef uint32_t TimestampMs;  // u32 monotonic (spec §3.2)
+
+typedef enum { ADC_CH_SWC1, ADC_CH_SWC2, ADC_CH_TEMP,
+               ADC_CH_AUX1, ADC_CH_AUX2, ADC_CH_AUX3,
+               ADC_CH_KEY_SENSE1, ADC_CH_KEY_SENSE2,
+               ADC_CH_COUNT } AdcChannel;
+typedef enum { DAC_CH_KEY1, DAC_CH_ADJ1, DAC_CH_KEY2, DAC_CH_ADJ2,
+               DAC_CH_COUNT } DacChannel;
+typedef enum { DAC_POWER_NORMAL, DAC_POWER_GND_1K, DAC_POWER_GND_100K,
+               DAC_POWER_GND_500K } DacPowerMode;
+typedef enum { GPIO_BUZZ, GPIO_LED_STAT, GPIO_LED2, GPIO_DAC_LDAC_B,
+               GPIO_BOOT, GPIO_VBUS_VALID, GPIO_COUNT } GpioPin;
+```
+
+**Eight ADC channels, per spec §2.2's pin map** — `IO1`/`IO2` (SWC1/2 ladder),
+`IO7` (NTC temp), `IO4`/`IO5`/`IO6` (AUX1–3, "fully usable analog inputs"), and
+`IO8`/`IO9` (the KEY-line ÷2 senses). **`ADC_CH_AUX1–3` are real and must not be
+dropped** — they are the local programming/test buttons, and the whole headless
+learn fallback (spec §7.4) presses them.
+
+**Four DAC channels, not five — and no spare.** Verified against the netlist:
+`U4.VOUTA` → ch1 signal, `VOUTB` → `/V_ADJ1`, `VOUTC` → ch2 signal, `VOUTD` →
+`/V_ADJ2`. An earlier revision had `DAC_CH_ADJ` (one shared adjust) plus a
+`DAC_CH_SPARE` that does not exist; the adjust channel is **per channel**,
+because each channel's gain mode is selected independently (spec §2.3).
+
+**`ADC_CH_KEY_SENSE1/2` — not `ADC_CH_SENSE1/2`.** The sense channels are the
+KEY-line ÷2 divider (spec §2.2 marks them `A-in`). **There is no
+`GPIO_SENSE1`/`GPIO_SENSE2`** — a `MockHal::GpioRead` switch casing those is the
+exact defect this section exists to prevent. The only `GpioPin` inputs are
+`GPIO_BOOT` and `GPIO_VBUS_VALID`.
+
+The `IHAL` struct itself is **verbatim from spec §10.2** and is reproduced there;
+do not restate it here. Its 13 members are exactly: `adc_read_mv`, `dac_set_code`,
+`dac_power_mode`, `dac_ldac`, `gpio_write`, `gpio_read`, `buzzer_on`, `now_ms`,
+`now_us`, `nvs_get`, `nvs_set`, `reboot`, `ctx`. **No `Interface()` accessor** —
+the reference is passed in; the test-side accessor is `InterfaceRef()`.
+
+**`dac_set_code` takes only `(ctx, ch, code)` — it does NOT take a power mode.**
+Power mode is a separate call, `dac_power_mode(ctx, ch, mode)`, and `dac_ldac` is
+its own member too. An earlier revision folded the power mode into
+`dac_set_code` and renamed the LDAC member `dac_ldac_assert`, which does not
+match the frozen interface — and the fold is wrong on the merits, because the
+gain-mode selection *is* a power-mode change (spec §2.3: `PD1:PD0 = 01` → gain
+1.82) made independently of any code write.
+
+**`dac_set_code` returns `void`, and that is deliberate** (spec §6.8): the DAC
+driver retries with backoff internally and, on persistent failure, releases the
+line and latches a fault — it never drives a guessed code. A `bool` return was
+considered and rejected because the retry policy lives *inside* the driver, so
+there is no useful failure for a caller to branch on. Fault visibility is via
+`AdcReader`/orchestrator state and the `FAULT_DAC` pattern, not a return code.
+
+### Gestures, channels, actions (spec §3.3, §3.5, §3.6)
+
+```c
+typedef enum { GESTURE_NONE, GESTURE_SINGLE, GESTURE_DOUBLE, GESTURE_TRIPLE,
+               GESTURE_LONG, GESTURE_LONG_REPEAT, GESTURE_COUNT } Gesture;
+```
+
+`TRIPLE` and `LONG_REPEAT` are in the enum **from day one** (spec §3.3) so the
+schema needs no migration; they are gated behind a capability flag and the first
+cut implements `SINGLE`/`DOUBLE`/`LONG`. `COMBO` is deferred to v2.
+
+**Binding channel** is `SWC1 | SWC2 | AUX1 | AUX2 | AUX3 | ANY`. `ANY` is a real
+value, not a placeholder.
+
+**The 11 action kinds** (spec §3.6) — `NONE`, `HW_KEY`, `HW_KEY_RELEASE`,
+`APP_LAUNCH`, `APP_INTENT`, `KEYCODE`, `MEDIA`, `VOLUME`, `SYSTEM`, `BUZZ`,
+`APP_RAW`. **There are no numeric action ids.** An earlier revision invented ids
+`1–63`; the spec defines none, and the contract generator must not synthesize
+them. `VOL_UP` is a `LadderButton.id`, **never** an action name — an earlier
+revision conflated the two, which made bindings unrepresentable.
+
+**`Binding` is a top-level join table** (spec §3.5), not nested per channel:
+
+```c
+typedef struct {
+    char     id[24];
+    uint8_t  channel;              // SWC1|SWC2|AUX1..3|ANY
+    char     button[24];           // LadderButton.id, or "NONE"
+    uint8_t  gesture;
+    bool     enabled;
+    uint8_t  action_count;         // 0 is legal and MEANS "swallow the gesture"
+    Action   actions[4];           // ordered, executed best-effort
+} Binding;
+```
+
+**An empty `actions` list is not `enabled: false`** (spec §3.5): empty swallows
+the gesture, disabled lets a lower-priority binding match. Both states must be
+representable and tested.
+
+**`OutputProfile` must carry `idle_dac_code`** (spec §3.7, value `4095`) — spec
+§6.7's whole hardware-default argument depends on it. An earlier revision's
+`OutputProfile{gain_mode, idle_key_mv}` omitted it, and every orchestrator test
+compared against a code the config could not supply.
+
+### Gain policy (spec §6.2)
+
+```c
+typedef enum { GAIN_POLICY_AUTO, GAIN_POLICY_FORCE_5V, GAIN_POLICY_FORCE_3V } GainPolicy;
+typedef enum { GAIN_MODE_AMPLIFIED, GAIN_MODE_TRACKING } GainMode;
+```
+
+**Wire names are `AUTO`/`FORCE_5V`/`FORCE_3V`** — an earlier revision used
+`kForceTracking`/`kForceAmplified`, which are undefined on the wire.
+
+**The selection rule, which an earlier revision had exactly backwards:**
+
+| `V_KEY_idle` | Mode | Gain |
+| --- | --- | --- |
+| `≥ 3.4 V` | `AMPLIFIED` | **1.82** |
+| `2.6–3.4 V` (guard band) | **hold current mode, re-measure** | — |
+| `< 2.6 V` | `TRACKING` | **1.00** |
+
+**Default to 1.82 whenever the measurement is absent or ambiguous.** The only
+dangerous error is over-ranging a 3 V head unit; under-ranging a 5 V unit merely
+wastes range (spec §6.2's asymmetry argument). Gain is **re-evaluated**, not
+latched — on `/VBUS_VALID` transitions and periodically while idle.
+
+**Command targets must stay within `[min_ladder, V_KEY_idle − 0.20 V]`.**
+
+### Timing defaults (spec §3.7, §6.x)
+
+| Setting | Value |
+| --- | --- |
+| `debounce_ms` | 25 |
+| `double_press_gap_ms` | **500** |
+| `long_press_ms` | **750** |
+| `long_repeat_ms` | 250 |
+| `send_duration_ms` | 200 |
+| `release_margin_mv` | 900 |
+
+**500/750, not 400/700.** The spec's worked example said 400/700 and Appendix A
+plus §6.x plus the plan's own defaults said 500/750; the spec has been corrected
+to 500/750 and this table is the single definition.
+
+### Buzzer patterns (spec §7.2) — the complete table
+
+```c
+typedef enum {
+    BUZZ_BOOT_OK, BUZZ_BOOT_DEGRADED, BUZZ_BOOT_ERROR,
+    BUZZ_KEY_ACCEPTED, BUZZ_KEY_UNKNOWN,
+    BUZZ_PROGRAM_ENTER, BUZZ_PROGRAM_STEP, BUZZ_PROGRAM_SAVED,
+    BUZZ_PROGRAM_EXIT, BUZZ_PROGRAM_CANCEL,
+    BUZZ_LEARN_PROMPT, BUZZ_LEARN_OK, BUZZ_LEARN_REJECT,
+    BUZZ_FAULT_DAC, BUZZ_FAULT_CONFIG, BUZZ_FACTORY_RESET,
+    BUZZ_OTA_START, BUZZ_OTA_OK, BUZZ_OTA_FAIL,
+    BUZZ_PATTERN_COUNT
+} BuzzerPattern;
+```
+
+| Pattern | on/off ms | reps | | Pattern | on/off ms | reps |
+| --- | --- | --- | --- | --- | --- | --- |
+| `BOOT_OK` | 60/60 | 1 | | `LEARN_PROMPT` | 100/100 | 1 |
+| `BOOT_DEGRADED` | 60/60 | 3 | | `LEARN_OK` | 40/30 | 2 |
+| `BOOT_ERROR` | 500/200 | 2 | | `LEARN_REJECT` | 300/80 | 2 |
+| `KEY_ACCEPTED` | 25/0 | 1 | | `FAULT_DAC` | 500/300 | 3 |
+| `KEY_UNKNOWN` | 120/80 | 1 | | `FAULT_CONFIG` | 500/300 | 4 |
+| `PROGRAM_ENTER` | 40/40 | 2 | | `FACTORY_RESET` | 800/200 | 3 |
+| `PROGRAM_STEP` | 40/40 | **1** | | `OTA_START` | long single | — |
+| `PROGRAM_SAVED` | 40/20 | 4 | | `OTA_OK` | rising double | — |
+| `PROGRAM_EXIT` | 200/0 | 1 | | `OTA_FAIL` | harsh triple | — |
+| `PROGRAM_CANCEL` | 300/100 | 1 | | | | |
+
+**`PROGRAM_STEP` is one 40/40 pulse; the *caller* repeats it *n* times** for the
+*n*-th button (spec §7.4). It is **not** a runtime `reps` argument — the grammar
+(`pattern := pulse(on, off), repeat, gap`) makes `repeat` a property of the named
+pattern. So the API is `Play(BuzzerPattern p)` with **arity 1**, and a caller
+needing *n* beeps loops. An earlier revision declared arity 1 and then called
+arity 2 in its own tests, and omitted `PROGRAM_SAVED`, `PROGRAM_CANCEL`,
+`FACTORY_RESET` entirely.
+
+**No pattern may exceed ~2 s** (spec §7.2), because the buzzer is non-blocking.
+
+### LED grammars (spec §7.3)
+
+`LED_STAT` is the **state** channel; `LED2` is the **activity** channel. Both are
+green — **nothing relies on hue**. The two channels have separate grammars
+(1 Hz breathe, 5 Hz blink, 0.5 s pulse), not one shared flat enum.
+
+### Frame vocabulary (spec §4.3) — exact names
+
+`hello`, `event`, `status`, `ladder_sample`, `ack`, `nack`, `log`,
+`config_get`, `config_set`, `config_patch`, `config_begin`, `config_chunk`,
+`config_end`, `learn_start`, `learn_stop`, `learn_commit`, `test_key`,
+`identify`, `reboot`, `ping`, `time_sync`, `ota_begin`, `ota_chunk`, `ota_end`.
+
+Four corrections an earlier revision needs, all spec §4.3:
+
+- **`ping` → `status`**, not `pong`.
+- **`nack` carries `err` and `detail`**, not `reason`.
+- **The learn frames are `learn_start`/`learn_stop`/`learn_commit`**, not
+  `ladder_learn_start`/`_sample`/`_commit`.
+- **`reset_config` and `link_gap` are not frames.** Reset is a `config_set` with
+  defaults, or a `reboot` with a boot target.
+
+**The protocol version has exactly one definition** — the generated
+`SWC_PROTOCOL_VERSION` in `contract/swc_contract.h` (spec §10.2). A hand-written
+`kNdjsonProtocolVersion` in the link module was a second source of truth and
+defeats the anti-drift generator.
+
+### Manifest shape (spec §9.5) — nested semver
+
+```jsonc
+{ "latest_version": "1.4.0", "channel": "stable",
+  "firmware": { "version": "1.4.0", "url": "...", "size_bytes": 1234567,
+                "sha256": "..." },
+  "min_from_version": "1.0.0" }
+```
+
+**Nested with semver strings, not flat with `version_code`/`board`/
+`min_from_version_code`.** An earlier revision's flat manifest would make the
+device refuse every real release. TLS is verified against a **pinned CA** — never
+`setInsecure()` (spec §9.5).
+
+### The ladder model (spec §3.4, §6.3)
+
+```c
+typedef struct {
+    char      id[24];              // stable slug, referenced by Binding.button
+    char      name[32];
+    MilliVolt mv_center;
+    MilliVolt mv_tolerance;
+    MilliVolt learned_at_rail_mv;  // the +3V3 rail (≈3300), NOT 12 V
+    int16_t   temp_c_at_learn;     // tenths of °C
+    uint16_t  sample_count;
+    uint8_t   confidence;          // 0–100
+} LadderButton;
+
+typedef struct {
+    uint8_t      source;           // LADDER_3V3
+    MilliVolt    idle_mv;
+    uint8_t      count;
+    LadderButton buttons[16];
+} LadderProfile;
+```
+
+**Every field is required.** An earlier revision dropped `sample_count`,
+`confidence`, `temp_c_at_learn`, per-button `learned_at_rail_mv` and `source`,
+which made spec §3.4's learn-quality scoring and §6.4's temperature model
+impossible.
+
+**Units are millivolts at the pin, 0–2900.** The ADC ceiling is 2.9 V, so **no
+ladder level can exceed 2900 mV** — an earlier revision's tests used 5000+ mV
+levels and an 11000–14800 mV "rail sweep", which no hardware can produce. The
+rail sweep is now a **+3V3 sweep (3.14–3.47 V)** and is a ratio test.
+
+**Tolerance is derived at learn time** as the midpoint of the gap to the nearest
+neighbouring button, capped by a configurable maximum (spec §3.4) — *not*
+`max(2×spread, 8)` as an earlier revision had it.
+
+### NVS layout (spec §3.8)
+
+Namespace `swc_cfg`, keys `cfg_a`, `cfg_b`, `cfg_seq` — plus `cfg_a_0…n` /
+`cfg_b_0…n` **only if** the measured serialized config exceeds one NVS value.
+**Measure, then decide** — this is the one place where that is mandatory, because
+the answer changes the code. **The two slots share the 48 KB NVS partition, so
+they cannot both be 24 KB**; an earlier revision's "2 × 24 KB in a 48 KB
+partition plus a sequence key" does not fit.
+
+### Test-harness API (used by every task)
+
+`MockHal` is a **C++ class** in `test_native/mock_hal.h` (defined by Task 2,
+Step 4). The host tests are C++, so the mock is C++ — an earlier revision of
+*this section* sketched a C-style `MockHalCreate`/`MockHalInterface` free-function
+API that no task actually called. **The class below is authoritative**; it is
+what the ~100 call sites across Tasks 3–24 use.
+
+```cpp
+class MockHal {
+ public:
+  IHal &InterfaceRef();                       // passed to every unit under test
+  void  AdvanceMs(uint64_t ms);               // synthetic clock
+  void  SetAdcMilliVolts(AdcChannel ch, int mv);
+  void  SetGpioInput(GpioPin pin, bool level);
+  void  DacSetCode(DacChannel ch, uint16_t code, DacPowerMode mode);
+  uint16_t    LastDacCode(DacChannel ch) const;
+  DacPowerMode LastDacPowerMode(DacChannel ch) const;
+  int   DacWriteCount(DacChannel ch) const;
+  bool  LastLdac() const;
+  void  GpioWrite(GpioPin pin, bool level);
+  bool  GpioRead(GpioPin pin) const;
+  int   GpioWriteCount(GpioPin pin) const;
+  int   NvsSet(const char *key, const void *in, size_t len);
+  int   NvsGet(const char *key, void *out, size_t len);
+  void  FailNextNvsWrite();
+  void  TruncateNextNvsWriteAt(size_t n);
+  void  CorruptNvsValue(const char *key, size_t offset);   // flips one bit
+  void  ClearNvs();
+  int   RebootCount() const;
+};
+```
+
+**One accessor, one name — `InterfaceRef()`.** The interface is handed *in* to
+every unit under test; there is no `Interface()` and no free-function
+`MockHalInterface`. An earlier revision had `Interface()` in one task and
+`InterfaceRef()` in another, with ~45 call sites split between them.
+
+**Method names and signatures are fixed.** `SetAdcMilliVolts` (not `SetAdc`),
+`LastDacCode` returning `uint16_t` (not `int`), `SetGpioInput` (not `SetGpio`),
+`NvsGet`/`NvsSet` (not `MockHalNvsGet`), `LastLdac` (not `LastLdacAsserted` —
+the interface member is `dac_ldac`), `CorruptNvsValue(key, offset)` taking a
+**byte offset** (not `CorruptNvsValue(key)`). Renaming or re-signing any of them
+breaks call sites in later tasks.
+
+`MockHal` is declared in `test_native/MockHAL.h` and defined in
+`test_native/MockHAL.cpp`. Later tasks **extend** the class — Task 7 adds
+`CorruptNvsValue`/`ClearNvs` — so the header is edited, never re-declared.
 
 ---
 
@@ -82,26 +508,70 @@ Created under `code/` in the PCB repo.
 
 ### Task 1: PlatformIO environment that actually builds for the ESP32-S3
 
+> **STATUS: COMPLETE — commits `4832e3f` + `a2d7094`, build green.** Verified:
+> `pio run -e esp32s3` → `[SUCCESS]`, resolving **IDF 5.5.5** on pioarduino
+> `55.03.311`. The steps below are retained as the record of what was built, with
+> the four defects the brief's verbatim content contained now corrected inline.
+> **Do not re-run this task.** Its measured baseline is in
+> `code/docs/bring-up-log.md`.
+
 This task exists because the framework choice is the project's riskiest
 assumption and it must be proven before any real code is written. Stock
 PlatformIO cannot supply IDF 5.x (its `framework-espidf` stops at 4.6.1), so the
 platform is pioarduino's fork pinned to a release tag — never the rolling
 `stable` zip, which crashes the installer under Python 3.14.
 
-**Files:**
+**Files (as actually built — nine, not the six the brief listed):**
 - Create: `code/platformio.ini`
 - Create: `code/sdkconfig.defaults`
 - Create: `code/partitions.csv`
 - Create: `code/boards/swc-s3.json`
 - Create: `code/.gitignore`
 - Create: `code/src/main.c`
+- Create: `code/CMakeLists.txt` — **omitted from the brief; IDF cannot build without it**
+- Create: `code/src/CMakeLists.txt` — same
+- Create: `code/docs/bring-up-log.md` — the measured size baseline
 
 **Interfaces:**
 - Consumes: nothing (first task)
 - Produces: the env names `esp32s3` and `native`, used by every later task's test
   commands
 
-- [ ] **Step 1: Write `platformio.ini` with both envs**
+**The four defects found and fixed (all verified):**
+
+1. **`framework = espidf` could not build** — `No module named
+   'SCons.Tool.FortranCommon'`. Upstream pioarduino bug: `platform.py` installs
+   `tool-scons` only under `if "espidf" in frameworks:`, and pioarduino's pinned
+   `4.40801.0` artifact is a 2-file stub with no `SCons/` tree, while Core pins
+   `~4.41101.0`; the two fight over one directory mid-build. Resolved when Core's
+   pin won; **the platform pin was not changed.** Latent recurrence risk — a
+   future `pio upgrade` can break the IDF env with the same opaque error.
+2. **`partitions.csv` was rejected by IDF** — `Partition app1 invalid: Offset
+   0x208000 is not aligned to 0x10000`. App partitions must be 64 KiB-aligned
+   (`gen_esp32part.py`, `ALIGNMENT[APP_TYPE] = 0x10000`). Fixed → **1920 KB
+   slots**, costing 32 KB each. This is why the app budget is 1920 KB, not 1952.
+3. **Flash size silently stayed at 2 MB** — `board_build.flash_size = 4MB` is not
+   honoured on pioarduino's IDF path, and the string form
+   `CONFIG_ESPTOOLPY_FLASHSIZE="4MB"` is silently ignored because it is a Kconfig
+   *choice*. Fixed with **`CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y`**.
+4. **`-t partition-table` does not exist** on 55.03.311. The table was verified
+   by decoding `.pio/build/esp32s3/partitions.bin` (3072 bytes, ends at
+   `0x400000`) instead.
+
+**Three sdkconfig keys are inert** — IDF 5.5.5 defines none of them, and accepts
+them silently with no warning, so each was checked against the generated
+`sdkconfig.json`: `CONFIG_TINYUSB_CDC_ENABLED` (no `components/tinyusb` in IDF —
+TinyUSB is the managed component `espressif/esp_tinyusb`), and
+`CONFIG_ESP_ADC_CAL_USE_EFUSE_CALIBRATION` /
+`CONFIG_ESP_ADC_CAL_DEFAULT_ATTENUATION_12` (the real keys are
+`ADC_CALI_EFUSE_TP_ENABLE` / `ADC_CALI_EFUSE_VREF_ENABLE` / `ADC_CALI_LUT_ENABLE`;
+attenuation is a runtime `adc_oneshot` argument in IDF 5.x, not Kconfig). **The
+TinyUSB finding means spec §4.1's app USB link does not exist yet** — the `UsbCdc`
+task must add the managed component. The two ADC keys must be re-confirmed before
+the ADC task.
+
+- [ ] **Step 1: Write `platformio.ini` with both envs** *(DONE — as below, with
+  no `esp32s3-ota` env; OTA is a runtime path, not a separate build)*
 
 ```ini
 ; PlatformIO Project Configuration File
@@ -199,17 +669,24 @@ below is what proves it.**
 }
 ```
 
-- [ ] **Step 3: Write `code/partitions.csv` (spec §9.2, verbatim)**
+- [ ] **Step 3: Write `code/partitions.csv` (spec §9.2) — 1920 KB slots, 64 KiB-aligned**
 
 ```csv
 # name,     type, subtype,  offset,    size,      flags
 nvs,        data, nvs,      0x9000,    0xC000,
 otadata,    data, ota,      0x15000,   0x2000,
 phy_init,   data, phy,      0x17000,   0x1000,
-app0,       app,  ota_0,    0x20000,   0x1E8000,
-app1,       app,  ota_1,    0x208000,  0x1E8000,
+app0,       app,  ota_0,    0x20000,   0x1E0000,
+app1,       app,  ota_1,    0x200000,  0x1E0000,
 coredump,   data, coredump, 0x3F0000,  0x10000,
 ```
+
+**`app0`/`app1` are 0x1E0000 = 1920 KB, and `app1` starts at 0x200000.** Both
+app offsets are 64 KiB-aligned, which IDF's `gen_esp32part.py` requires
+(`ALIGNMENT[APP_TYPE] = 0x10000`) — the brief's `app1 @ 0x208000` is not, and the
+table was **rejected wholesale** with `Partition app1 invalid: Offset 0x208000 is
+not aligned to 0x10000`. `0x3E0000–0x3EFFFF` is reserved slack, so `coredump`
+keeps its specified `0x3F0000`. The table ends at exactly `0x400000`.
 
 - [ ] **Step 4: Write `code/sdkconfig.defaults`**
 
@@ -220,7 +697,13 @@ coredump,   data, coredump, 0x3F0000,  0x10000,
 # distinct is deliberate: the console must not corrupt app frames.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_UART_DEFAULT=n
-CONFIG_TINYUSB_CDC_ENABLED=y
+
+# --- Flash size ------------------------------------------------------------
+# REQUIRED. board_build.flash_size is NOT honoured on pioarduino's IDF path
+# (the board->sdkconfig injection is Arduino-gated), and the string form
+# CONFIG_ESPTOOLPY_FLASHSIZE="4MB" is silently ignored because it is a Kconfig
+# CHOICE. Without this the image silently builds for 2 MB.
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # --- Bluetooth: NimBLE, not Bluedroid --------------------------------------
 # Bluedroid does not fit 4MB/no-PSRAM alongside WiFi + OTA (spec 9.2).
@@ -236,16 +719,26 @@ CONFIG_MBEDTLS_HARDWARE_AES=n
 CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
 
 # --- ADC -------------------------------------------------------------------
-# Curve-fit calibration for per-chip accuracy (spec 2.3). Without this the
-# raw-ADC linear-scale assumption is off by more than the classification windows.
-CONFIG_ESP_ADC_CAL_USE_EFUSE_CALIBRATION=y
-CONFIG_ESP_ADC_CAL_DEFAULT_ATTENUATION_12=y
-
+# NOTE: CONFIG_ESP_ADC_CAL_USE_EFUSE_CALIBRATION and
+# CONFIG_ESP_ADC_CAL_DEFAULT_ATTENUATION_12 DO NOT EXIST in IDF 5.5.5. They are
+# accepted silently and do nothing, which is worse than an error because they
+# look configured. The real keys are ADC_CALI_EFUSE_TP_ENABLE /
+# ADC_CALI_EFUSE_VREF_ENABLE / ADC_CALI_LUT_ENABLE, and attenuation is a runtime
+# adc_oneshot argument in IDF 5.x, not Kconfig. Confirm the calibration defaults
+# before the ADC task rather than assuming these lines did anything.
+#
 # --- Crash handling --------------------------------------------------------
 # Coredump partition exists (partitions.csv). Reset in release; gdbstub in dev.
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
 ```
+
+> **Do not add `CONFIG_TINYUSB_CDC_ENABLED=y`.** IDF 5.5.5 has no
+> `components/tinyusb` and defines no such symbol — it is accepted **silently and
+> does nothing**. The app USB link (spec §4.1) needs the managed component
+> `espressif/esp_tinyusb` in `idf_component.yml`; that is the `UsbCdc` task's job,
+> and until it is done the console on USB-Serial-JTAG works and there is **no app
+> interface at all**.
 
 - [ ] **Step 5: Write a `main.c` that proves the board definition is honest**
 
@@ -297,19 +790,26 @@ Expected: build succeeds, ending with `Success`. **If this fails, stop and resol
 it before any other task** — spec §12.2 R-9 lists the fallback order. Do not
 proceed to Task 2 on a broken toolchain.
 
-- [ ] **Step 7: Verify the image size baseline**
+- [x] **Step 7: Verify the image size baseline** *(DONE)*
 
 Run: `pio run -e esp32s3 -t size`
-Expected: prints a size summary with the app partition at 0x1E8000 (1952 KB).
+Expected: prints a size summary with the app partition at **0x1E0000 (1920 KB)**.
 Record the number in `code/docs/bring-up-log.md` as `size-baseline:` — every
 later budget comparison is against it, and the number is a measurement, not a
 value to invent here.
 
-- [ ] **Step 8: Verify the partition table is what the spec says**
+**Measured:** `text=156257, data=59116, bss=375761, dec=591134 (0x9051e)`;
+linked `firmware.bin` = **215,488 bytes**, 10.96 % of a 1920 KB slot. Scaffolding
+with no app code, so this is a **floor, not a budget**.
 
-Run: `pio run -e esp32s3 -t partition-table`
-Expected: the generated `.bin` is 3072 bytes and the CSV in the build dir
-matches `partitions.csv` exactly, ending at 0x400000.
+- [x] **Step 8: Verify the partition table is what the spec says** *(DONE,
+  differently)*
+
+`pio run -e esp32s3 -t partition-table` **does not exist** on pioarduino
+55.03.311 — it fails with `*** Do not know how to make File target
+'partition-table'`. Verified equivalently instead: `.pio/build/esp32s3/partitions.bin`
+is **3072 bytes** and decodes to exactly `partitions.csv`, ending at `0x400000`
+with `app0 0x20000/1920K` and `app1 0x200000/1920K`.
 
 - [ ] **Step 9: Write `code/.gitignore`**
 
@@ -363,15 +863,23 @@ windows, §8's 5-minute timeout) testable in microseconds of wall time.
 - Produces:
   - `AdcChannel` — C enum `{ ADC_CH_SWC1, ADC_CH_SWC2, ADC_CH_TEMP, ADC_CH_AUX1,
     ADC_CH_AUX2, ADC_CH_AUX3, ADC_CH_KEY_SENSE1, ADC_CH_KEY_SENSE2, ADC_CH_COUNT }`
-  - `DacChannel` — C enum `{ DAC_CH_KEY1, DAC_CH_KEY2, DAC_CH_ADJ, DAC_CH_SPARE, DAC_CH_COUNT }`
+  - `DacChannel` — C enum `{ DAC_CH_KEY1, DAC_CH_ADJ1, DAC_CH_KEY2, DAC_CH_ADJ2,
+    DAC_CH_COUNT }` (**four channels, no spare** — verified against the netlist:
+    `U4.VOUTA`→ch1 signal, `VOUTB`→`/V_ADJ1`, `VOUTC`→ch2 signal,
+    `VOUTD`→`/V_ADJ2`)
   - `DacPowerMode` — C enum `{ DAC_POWER_NORMAL, DAC_POWER_GND_1K,
     DAC_POWER_GND_100K, DAC_POWER_GND_500K }`
   - `GpioPin` — C enum `{ GPIO_BUZZ, GPIO_LED_STAT, GPIO_LED2, GPIO_DAC_LDAC_B,
     GPIO_BOOT, GPIO_VBUS_VALID, GPIO_COUNT }`
-  - `struct IHal { ... }` with the function-pointer table and a `void *ctx`
-  - `MockHal` — a `MockHal` implementation with `AdvanceMs(uint32_t)`,
-    `SetAdcMilliVolts(AdcChannel, int)`, `GpioWrite(GpioPin, bool)`,
-    `LastDacCode(DacChannel)` accessors
+  - `struct IHal { ... }` — **13 members**, verbatim from spec §10.2:
+    `adc_read_mv`, `dac_set_code`, `dac_power_mode`, `dac_ldac`, `gpio_write`,
+    `gpio_read`, `buzzer_on`, `now_ms`, `now_us`, `nvs_get`, `nvs_set`, `reboot`,
+    `ctx`. `dac_set_code` takes `(ctx, ch, code)` only — **the power mode is its
+    own member**, because selecting a channel's gain mode *is* a power-mode
+    change (spec §2.3) made independently of any code write.
+  - `MockHal` — a C++ class with `InterfaceRef()`, `AdvanceMs(uint64_t)`,
+    `SetAdcMilliVolts(AdcChannel, int)`, `GpioWrite/GpioRead`, `BuzzerOn`,
+    `LastDacCode(DacChannel)`, `NvsGet/NvsSet`
 
   **These are C enums, not `enum class`, and they are the single naming
   authority for every later task.** `IHAL.h` is the one header the C host and
@@ -412,19 +920,32 @@ TEST(MockHalAdc, ReturnsTheProgrammedMillivoltValuePerChannel) {
 
 TEST(MockHalDac, RecordsTheLastCodeWrittenPerChannel) {
     MockHal hal;
-    hal.DacSetCode(DAC_CH_KEY1, 0x800, DAC_POWER_NORMAL);
+    hal.DacSetCode(DAC_CH_KEY1, 0x800);
     EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), 0x800);
-    EXPECT_EQ(hal.LastDacPowerMode(DAC_CH_KEY1), DAC_POWER_NORMAL);
-    hal.DacSetCode(DAC_CH_KEY1, 0x123, DAC_POWER_NORMAL);
+    hal.DacSetCode(DAC_CH_KEY1, 0x123);
     EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), 0x123);
+    // Power mode is a separate call: selecting a gain mode is a power-mode
+    // change (spec 2.3) and is not coupled to any code write.
+    hal.DacPowerMode(DAC_CH_ADJ1, DAC_POWER_GND_1K);
+    EXPECT_EQ(hal.LastDacPowerMode(DAC_CH_ADJ1), DAC_POWER_GND_1K);
+    EXPECT_EQ(hal.LastDacPowerMode(DAC_CH_KEY1), DAC_POWER_NORMAL);
+}
+
+TEST(MockHalBuzzer, IsAnOnOffLineNotAGpioPin) {
+    MockHal hal;
+    EXPECT_FALSE(hal.BuzzerIsOn());
+    EXPECT_EQ(hal.BuzzerOnCount(), 0);
+    hal.BuzzerOn(true);
+    EXPECT_TRUE(hal.BuzzerIsOn());
+    EXPECT_EQ(hal.BuzzerOnCount(), 1);
 }
 
 TEST(MockHalGpio, ReadsBackWhatWasWrittenAndTracksWriteCount) {
     MockHal hal;
-    EXPECT_EQ(hal.GpioWriteCount(GPIO_BUZZ), 0u);
+    EXPECT_EQ(hal.GpioWriteCount(GPIO_BUZZ), 0);
     hal.GpioWrite(GPIO_BUZZ, true);
     EXPECT_TRUE(hal.GpioRead(GPIO_BUZZ));
-    EXPECT_EQ(hal.GpioWriteCount(GPIO_BUZZ), 1u);
+    EXPECT_EQ(hal.GpioWriteCount(GPIO_BUZZ), 1);
 }
 
 TEST(MockHalNvs, PersistsBytesAcrossCallsAndCanBeMadeToFail) {
@@ -432,7 +953,9 @@ TEST(MockHalNvs, PersistsBytesAcrossCallsAndCanBeMadeToFail) {
     const char payload[] = "config-blob";
     ASSERT_EQ(hal.NvsSet("cfg", payload, sizeof(payload)), 0);
     char out[sizeof(payload)] = {};
-    ASSERT_EQ(hal.NvsGet("cfg", out, sizeof(out)), 0);
+    // NvsGet returns the number of bytes copied, not 0.
+    ASSERT_EQ(hal.NvsGet("cfg", out, sizeof(out)),
+              static_cast<int>(sizeof(payload)));
     EXPECT_STREQ(out, payload);
 
     hal.FailNextNvsWrite();
@@ -448,6 +971,18 @@ TEST(MockHalNvs, ATornWriteLeavesTheStoredBlobShortAndReportsFailure) {
     char out[sizeof(payload)] = {};
     EXPECT_EQ(hal.NvsGet("cfg", out, sizeof(out)), 5)
         << "readers must see the short blob and reject it on length + CRC";
+}
+
+TEST(MockHalNvs, CorruptingOneBitIsVisibleToTheReader) {
+    MockHal hal;
+    const uint8_t payload[] = {0x01, 0x02, 0x03, 0x04};
+    ASSERT_EQ(hal.NvsSet("cfg", payload, sizeof(payload)), 0);
+    hal.CorruptNvsValue("cfg", 2);
+    uint8_t out[sizeof(payload)] = {};
+    ASSERT_EQ(hal.NvsGet("cfg", out, sizeof(out)),
+              static_cast<int>(sizeof(payload)));
+    EXPECT_EQ(out[2], 0x02) << "bit 0 of byte 2 must have flipped";
+    EXPECT_NE(std::memcmp(out, payload, sizeof(payload)), 0);
 }
 
 TEST(MockHalInputs, OnlyBootAndVbusReadBackAsProgrammedInputs) {
@@ -494,7 +1029,10 @@ typedef enum {
 } AdcChannel;
 
 typedef enum {
-    DAC_CH_KEY1 = 0, DAC_CH_KEY2, DAC_CH_ADJ, DAC_CH_SPARE,
+    /* Per channel: one signal DAC output, one V_ADJ output. Verified against
+     * the netlist -- U4.VOUTA -> ch1 signal, VOUTB -> /V_ADJ1, VOUTC -> ch2
+     * signal, VOUTD -> /V_ADJ2. There is no spare channel. */
+    DAC_CH_KEY1 = 0, DAC_CH_ADJ1, DAC_CH_KEY2, DAC_CH_ADJ2,
     DAC_CH_COUNT
 } DacChannel;
 
@@ -521,13 +1059,23 @@ typedef enum {
  * (500ms double-press window, 750ms long-press threshold, 200ms key send,
  * 5-minute maintenance timeout) is a tested rule, and the only way to test a
  * timing rule without sleeping is to make the clock an input.
+ *
+ * dac_set_code does NOT take a power mode. Setting a channel's gain mode *is*
+ * a power-mode change (spec 2.3: PD1:PD0 = 01 selects gain 1.82), and it is
+ * made independently of any code write, so it is its own member.
+ *
+ * dac_set_code returns void deliberately (spec 6.8): the driver retries with
+ * backoff internally and latches a fault on persistent failure; it never
+ * drives a guessed code. There is no useful failure for a caller to branch on.
  */
 typedef struct IHal {
     int      (*adc_read_mv)(void *ctx, AdcChannel ch);
-    void     (*dac_set_code)(void *ctx, DacChannel ch, uint16_t code, DacPowerMode mode);
-    void     (*dac_ldac_assert)(void *ctx, bool assert);
+    void     (*dac_set_code)(void *ctx, DacChannel ch, uint16_t code);
+    void     (*dac_power_mode)(void *ctx, DacChannel ch, DacPowerMode mode);
+    void     (*dac_ldac)(void *ctx, bool assert);
     void     (*gpio_write)(void *ctx, GpioPin pin, bool level);
     bool     (*gpio_read)(void *ctx, GpioPin pin);
+    void     (*buzzer_on)(void *ctx, bool on);
     uint64_t (*now_ms)(void *ctx);
     uint64_t (*now_us)(void *ctx);
     int      (*nvs_get)(void *ctx, const char *key, void *out, size_t len);
@@ -573,17 +1121,27 @@ public:
     void SetAdcMilliVolts(AdcChannel ch, int mv) { adc_mv_[static_cast<int>(ch)] = mv; }
     int AdcReadMv(AdcChannel ch) { return adc_mv_[static_cast<int>(ch)]; }
 
-    void DacSetCode(DacChannel ch, uint16_t code, DacPowerMode mode);
+    void DacSetCode(DacChannel ch, uint16_t code);
+    void DacPowerMode(DacChannel ch, DacPowerMode mode);
+    void DacLdac(bool assert) { ldac_asserted_ = assert; }
     uint16_t LastDacCode(DacChannel ch) const;
     DacPowerMode LastDacPowerMode(DacChannel ch) const;
     int DacWriteCount(DacChannel ch) const;
-    bool LastLdacAsserted() const { return ldac_asserted_; }
+    bool LastLdac() const { return ldac_asserted_; }
 
     // --- gpio --------------------------------------------------------------
     void GpioWrite(GpioPin pin, bool level);
     bool GpioRead(GpioPin pin) const;
     void SetGpioInput(GpioPin pin, bool level) { gpio_in_[static_cast<int>(pin)] = level; }
     int GpioWriteCount(GpioPin pin) const;
+
+    // --- buzzer ------------------------------------------------------------
+    // The buzzer is active at a fixed ~2.4 kHz with no pitch control (spec
+    // 5.5), so it is a plain on/off line, not a GPIO. Level is what tests
+    // assert on; BuzzerOnCount counts edges.
+    void BuzzerOn(bool on) { buzzer_on_ = on; ++buzzer_edges_; }
+    bool BuzzerIsOn() const { return buzzer_on_; }
+    int BuzzerOnCount() const { return buzzer_edges_; }
 
     // --- nvs ---------------------------------------------------------------
     int NvsSet(const char *key, const void *in, size_t len);
@@ -596,6 +1154,9 @@ public:
         truncate_set_ = true;
         truncate_next_write_at_ = bytes;
     }
+    // Flip one bit at `offset` in a stored blob, to prove CRC catches it.
+    void CorruptNvsValue(const char *key, size_t offset);
+    void ClearNvs() { nvs_.clear(); }
     int RebootCount() const { return reboot_count_; }
 
     // Advance the clock and hand it to the interface (for poll loops).
@@ -603,10 +1164,12 @@ public:
 
 private:
     static int  AdcReadMvThunk(void *ctx, AdcChannel ch);
-    static void DacSetCodeThunk(void *ctx, DacChannel ch, uint16_t code, DacPowerMode m);
+    static void DacSetCodeThunk(void *ctx, DacChannel ch, uint16_t code);
+    static void DacPowerModeThunk(void *ctx, DacChannel ch, DacPowerMode m);
     static void DacLdacThunk(void *ctx, bool assert);
     static void GpioWriteThunk(void *ctx, GpioPin pin, bool level);
     static bool GpioReadThunk(void *ctx, GpioPin pin);
+    static void BuzzerOnThunk(void *ctx, bool on);
     static uint64_t NowMsThunk(void *ctx);
     static uint64_t NowUsThunk(void *ctx);
     static int  NvsGetThunk(void *ctx, const char *key, void *out, size_t len);
@@ -623,6 +1186,8 @@ private:
     bool gpio_out_[GPIO_COUNT] = {};
     bool gpio_in_[GPIO_COUNT] = {};
     int gpio_writes_[GPIO_COUNT] = {};
+    bool buzzer_on_ = false;
+    int buzzer_edges_ = 0;
     std::map<std::string, std::vector<uint8_t>> nvs_;
     bool fail_next_nvs_write_ = false;
     bool truncate_set_ = false;
@@ -639,9 +1204,11 @@ private:
 MockHal::MockHal() {
     iface_.adc_read_mv    = &MockHal::AdcReadMvThunk;
     iface_.dac_set_code   = &MockHal::DacSetCodeThunk;
-    iface_.dac_ldac_assert = &MockHal::DacLdacThunk;
+    iface_.dac_power_mode = &MockHal::DacPowerModeThunk;
+    iface_.dac_ldac       = &MockHal::DacLdacThunk;
     iface_.gpio_write     = &MockHal::GpioWriteThunk;
     iface_.gpio_read      = &MockHal::GpioReadThunk;
+    iface_.buzzer_on      = &MockHal::BuzzerOnThunk;
     iface_.now_ms         = &MockHal::NowMsThunk;
     iface_.now_us         = &MockHal::NowUsThunk;
     iface_.nvs_get        = &MockHal::NvsGetThunk;
@@ -650,11 +1217,20 @@ MockHal::MockHal() {
     iface_.ctx            = this;
 }
 
-void MockHal::DacSetCode(DacChannel ch, uint16_t code, DacPowerMode mode) {
+void MockHal::DacSetCode(DacChannel ch, uint16_t code) {
     const int i = static_cast<int>(ch);
     dac_code_[i] = code;
-    dac_mode_[i] = mode;
     ++dac_writes_[i];
+}
+
+void MockHal::DacPowerMode(DacChannel ch, DacPowerMode mode) {
+    dac_mode_[static_cast<int>(ch)] = mode;
+}
+
+void MockHal::CorruptNvsValue(const char *key, size_t offset) {
+    auto it = nvs_.find(key);
+    if (it == nvs_.end() || offset >= it->second.size()) return;
+    it->second[offset] ^= 0x01;
 }
 
 uint16_t MockHal::LastDacCode(DacChannel ch) const { return dac_code_[static_cast<int>(ch)]; }
@@ -710,11 +1286,17 @@ int MockHal::NvsGet(const char *key, void *out, size_t len) {
 int  MockHal::AdcReadMvThunk(void *ctx, AdcChannel ch) {
     return static_cast<MockHal *>(ctx)->AdcReadMv(ch);
 }
-void MockHal::DacSetCodeThunk(void *ctx, DacChannel ch, uint16_t code, DacPowerMode m) {
-    static_cast<MockHal *>(ctx)->DacSetCode(ch, code, m);
+void MockHal::DacSetCodeThunk(void *ctx, DacChannel ch, uint16_t code) {
+    static_cast<MockHal *>(ctx)->DacSetCode(ch, code);
+}
+void MockHal::DacPowerModeThunk(void *ctx, DacChannel ch, DacPowerMode m) {
+    static_cast<MockHal *>(ctx)->DacPowerMode(ch, m);
 }
 void MockHal::DacLdacThunk(void *ctx, bool assert) {
     static_cast<MockHal *>(ctx)->ldac_asserted_ = assert;
+}
+void MockHal::BuzzerOnThunk(void *ctx, bool on) {
+    static_cast<MockHal *>(ctx)->BuzzerOn(on);
 }
 void MockHal::GpioWriteThunk(void *ctx, GpioPin pin, bool level) {
     static_cast<MockHal *>(ctx)->GpioWrite(pin, level);
@@ -758,9 +1340,15 @@ writes, which is how the A/B persistence scheme gets tested for power loss."
 ### Task 3: `LadderDecode` — ratio-normalized classification
 
 The single most important behavior in the device. The requirement is not "decode
-a ladder"; it is **classify the same physical button identically at 11.0 V and at
-14.8 V**. Normalizing by the measured idle level is what makes that true, and
-this task's tests are the entire justification for the design.
+a ladder"; it is **classify the same physical button identically across the
++3V3 rail's ±5 % tolerance band** (spec §11 FR-30). Normalizing by the measured
+idle level is what makes that true, and this task's tests are the entire
+justification for the design.
+
+**The input pulls DOWN, so idle is the HIGH reading** (spec §6.3). Every learned
+button's ratio is *below* 1000 permille. An earlier revision had this inverted,
+with buttons above idle and a 5 V ladder swept against an 11–14.8 V "vehicle
+rail" — no such term exists in the transfer function.
 
 **Files:**
 - Create: `code/lib/Analog/LadderDecode.h`
@@ -771,11 +1359,11 @@ this task's tests are the entire justification for the design.
 - Consumes: nothing
 - Produces:
   - `struct LadderButton { int16_t ratio_permille; int16_t tolerance_permille; char id[24]; uint8_t action_id; }`
-  - `struct LadderProfile { LadderButton buttons[16]; uint8_t count; int idle_rail_mv; int idle_ratio_permille; }`
+  - `struct LadderProfile { LadderButton buttons[16]; uint8_t count; int learned_idle_mv; }`
   - `enum class ClassifyResult { kIdle, kButton, kUnknown, kFault }`
   - `struct ClassifyOutcome { ClassifyResult result; uint8_t index; int16_t ratio_permille; }`
-  - `ClassifyOutcome LadderClassify(const LadderProfile &p, int level_mv, int rail_mv)`
-  - `int16_t LadderRatioPermille(int level_mv, int rail_mv)` — `level_mv * 1000 / rail_mv`, rounded
+  - `ClassifyOutcome LadderClassify(const LadderProfile &p, int level_mv, int idle_mv)`
+  - `int16_t LadderRatioPermille(int level_mv, int idle_mv)` — `level_mv * 1000 / idle_mv`, rounded
 
 - [ ] **Step 1: Write the failing test — starting with the rail-immunity test**
 
@@ -787,23 +1375,32 @@ this task's tests are the entire justification for the design.
 
 namespace {
 
-// A representative 5V-referenced ladder, resistor R in series with the button
-// to the 5V rail, 10k to ground. The ratio at the ADC is what we normalize.
-LadderProfile MakeProfile(int rail_mv) {
+/*
+ * The spec 3.7 default ladder, in the units the decoder actually works in.
+ *
+ * The decoder normalizes against the IDLE READING, not against a rail
+ * (spec 6.3: n = V_ADC / V_ADC_idle). A press pulls the input DOWN from idle,
+ * so every button's ratio is BELOW 1000 and idle is 1000 by construction.
+ *
+ *   2835 mV idle -> VOL_UP 1430, VOL_DOWN 1785, NEXT 2145
+ *   in permille of idle: 1430/2835 = 504, 1785/2835 = 630, 2145/2835 = 757
+ *   tolerance 120 mV = 42 permille; 110 mV = 39 permille
+ */
+LadderProfile MakeProfile(int learned_idle_mv) {
     LadderProfile p{};
-    p.idle_rail_mv = rail_mv;
-    p.idle_ratio_permille = 1000;  // idle = full rail
+    p.learned_idle_mv = learned_idle_mv;
     p.count = 3;
-    // 5.00V rail: 0R->1000, 2.2k->690, 6.8k->400 (approx, ratio x1000)
-    p.buttons[0] = {"VOL_UP",   690, 40, 1};
-    p.buttons[1] = {"VOL_DOWN", 400, 40, 2};
-    p.buttons[2] = {"MUTE",     176, 40, 3};
+    p.buttons[0] = {"VOL_UP",   504, 42, 1};
+    p.buttons[1] = {"VOL_DOWN", 630, 42, 2};
+    p.buttons[2] = {"NEXT",     757, 39, 3};
     return p;
 }
 
+constexpr int kIdleMv = 2835;
+
 }  // namespace
 
-TEST(LadderRatio, IsLevelOverRailInPermille) {
+TEST(LadderRatio, IsLevelOverIdleInPermille) {
     EXPECT_EQ(LadderRatioPermille(2500, 5000), 500);
     EXPECT_EQ(LadderRatioPermille(5000, 5000), 1000);
     EXPECT_EQ(LadderRatioPermille(0, 5000), 0);
@@ -811,76 +1408,105 @@ TEST(LadderRatio, IsLevelOverRailInPermille) {
 }
 
 TEST(LadderClassify, IdleReturnsIdle) {
-    LadderProfile p = MakeProfile(5000);
-    EXPECT_EQ(LadderClassify(p, 5000, 5000).result, ClassifyResult::kIdle);
-    EXPECT_EQ(LadderClassify(p, 4998, 5000).result, ClassifyResult::kIdle);
+    LadderProfile p = MakeProfile(kIdleMv);
+    EXPECT_EQ(LadderClassify(p, kIdleMv, kIdleMv).result, ClassifyResult::kIdle);
+    EXPECT_EQ(LadderClassify(p, kIdleMv - 20, kIdleMv).result, ClassifyResult::kIdle);
 }
 
 TEST(LadderClassify, EachLearnedButtonClassifiesToItsOwnIndex) {
-    LadderProfile p = MakeProfile(5000);
-    EXPECT_EQ(LadderClassify(p, 3450, 5000).index, 0);  // 690 permille
-    EXPECT_EQ(LadderClassify(p, 2000, 5000).index, 1);  // 400 permille
-    EXPECT_EQ(LadderClassify(p,  880, 5000).index, 2);  // 176 permille
+    LadderProfile p = MakeProfile(kIdleMv);
+    EXPECT_EQ(LadderClassify(p, 1430, kIdleMv).index, 0);  // 504 permille
+    EXPECT_EQ(LadderClassify(p, 1785, kIdleMv).index, 1);  // 630 permille
+    EXPECT_EQ(LadderClassify(p, 2145, kIdleMv).index, 2);  // 757 permille
 }
 
 /*
- * THE test. The vehicle's charging voltage moves the rail from 11.0V to 14.8V.
- * The same physical button must classify identically at both, and at every
- * point in between. This is why the decode is ratio-normalized: an absolute
- * millivolt window would classify correctly at exactly one rail voltage.
+ * THE test. The +3V3 rail moves across its regulator tolerance band (spec 11
+ * FR-30). The same physical button must classify identically across the whole
+ * band. This is why the decode normalizes: an absolute millivolt window would
+ * classify correctly at exactly one rail voltage. Both the numerator and the
+ * idle reference come off the same ADC with the same reference, so the ratio
+ * is invariant to the rail.
+ *
+ * NOTE 1: this is a +3V3 sweep, NOT a vehicle-rail sweep. An earlier revision
+ * swept 11.0-14.8 V against a 5 V ladder; no such term exists in the transfer
+ * function (spec 6.3).
+ *
+ * NOTE 2: the idle reference has only **2.29 % of headroom** before it reaches
+ * the 2900 mV ADC ceiling — with the spec 3.7 nominal idle of 2835 mV, that is
+ * ~3375 mV of rail. Above that the idle reading clips while the button reading
+ * does not, so the ratio is distorted. It survives anyway (the distortion is
+ * ~3.5 % at +6 % overvoltage, well inside the +/-8.3 % window), which the
+ * clipping test below asserts. But the margin is thin, and it is another reason
+ * the bring-up measurement (spec 10.6) gates the R15/R16 decision.
  */
-TEST(LadderClassify, SameButtonClassifiesIdenticallyAcrossTheVehicleRailSweep) {
-    for (int rail_mv = 11000; rail_mv <= 14800; rail_mv += 100) {
-        LadderProfile p = MakeProfile(rail_mv);
-        // VOL_UP sits at 690 permille of whatever the rail is.
-        const int level_mv = (rail_mv * 690) / 1000;
-        const ClassifyOutcome out = LadderClassify(p, level_mv, rail_mv);
+TEST(LadderClassify, SameButtonClassifiesIdenticallyAcrossTheThreeVoltThreeSweep) {
+    for (int rail_mv = 3140; rail_mv <= 3470; rail_mv += 10) {
+        // Idle scales with the rail; so does the button level. The ratio does not.
+        const int idle_mv  = (kIdleMv * rail_mv) / 3300;
+        const int level_mv = (idle_mv * 504) / 1000;   // VOL_UP at 504 permille
+        LadderProfile p = MakeProfile(idle_mv);
+        const ClassifyOutcome out = LadderClassify(p, level_mv, idle_mv);
         ASSERT_EQ(out.result, ClassifyResult::kButton)
-            << "rail=" << rail_mv << " level=" << level_mv;
+            << "rail=" << rail_mv << " idle=" << idle_mv << " level=" << level_mv;
         ASSERT_EQ(out.index, 0) << "rail=" << rail_mv;
     }
 }
 
+TEST(LadderClassify, StillClassifiesWhenTheIdleReferenceClipsAtTheAdcCeiling) {
+    // At +6% of rail the true idle (3006 mV) is above the 2900 mV ceiling, so
+    // the measured idle reference saturates while the pressed reading does not.
+    // The ratio shifts but must stay inside the button's window: classification
+    // degrades gracefully rather than dropping the press.
+    LadderProfile p = MakeProfile(3006);
+    const int clipped_idle_mv = 2900;
+    const int pressed_mv = (3006 * 504) / 1000;   // 1515 mV, still below the ceiling
+    const ClassifyOutcome out = LadderClassify(p, pressed_mv, clipped_idle_mv);
+    EXPECT_EQ(out.result, ClassifyResult::kButton)
+        << "a saturated idle reference must not lose the press";
+    EXPECT_EQ(out.index, 0);
+}
+
 TEST(LadderClassify, UnlearnedLevelIsUnknownAndNeverGuessed) {
-    LadderProfile p = MakeProfile(5000);
-    // 300 permille matches no window (windows are 690/400/176 +/- 40).
-    const ClassifyOutcome out = LadderClassify(p, 1500, 5000);
+    LadderProfile p = MakeProfile(kIdleMv);
+    // 2400 mV is 847 permille: between NEXT (757 +/- 39) and idle (1000 - 30).
+    const ClassifyOutcome out = LadderClassify(p, 2400, kIdleMv);
     EXPECT_EQ(out.result, ClassifyResult::kUnknown);
 }
 
 TEST(LadderClassify, LevelAboveTheReferenceIsAFaultNotAButtonOrIdle) {
-    LadderProfile p = MakeProfile(5000);
-    // 1040 permille: a short to a supply above the reference. Reporting this as
-    // IDLE would be the worst outcome -- the user's button would do nothing and
+    LadderProfile p = MakeProfile(kIdleMv);
+    // A short to a supply above the idle reference. Reporting this as IDLE
+    // would be the worst outcome -- the user's button would do nothing and
     // nothing would say why.
-    EXPECT_EQ(LadderClassify(p, 5200, 5000).result, ClassifyResult::kFault);
+    EXPECT_EQ(LadderClassify(p, 3000, kIdleMv).result, ClassifyResult::kFault);
 }
 
 TEST(LadderClassify, CollapsedRailIsAFaultNotAnIdle) {
-    LadderProfile p = MakeProfile(5000);
-    // The reference has fallen to 20% of the learned rail: an open input or a
-    // dead supply, not idle. Checked against the LEARNED rail, because ratio
-    // normalization deliberately hides rail changes in the ratios themselves.
-    EXPECT_EQ(LadderClassify(p, 900, 1000).result, ClassifyResult::kFault);
+    LadderProfile p = MakeProfile(kIdleMv);
+    // FR-30: an idle reading at or below 20% of the learned value is a rail
+    // fault, not idle. Checked against the LEARNED idle, because ratio
+    // normalization deliberately cancels rail movement out of the ratios.
+    EXPECT_EQ(LadderClassify(p, 500, 500).result, ClassifyResult::kFault);
 }
 
 TEST(LadderClassify, ToleranceBoundaryIsInclusiveAtTheEdgeAndExclusiveBeyond) {
-    LadderProfile p = MakeProfile(5000);
-    // window 690 +/- 40 permille -> [650, 730]
-    EXPECT_EQ(LadderClassify(p, 3250, 5000).result, ClassifyResult::kButton);  // 650 incl
-    EXPECT_EQ(LadderClassify(p, 3650, 5000).result, ClassifyResult::kButton);  // 730 incl
-    EXPECT_EQ(LadderClassify(p, 3245, 5000).result, ClassifyResult::kUnknown); // 649
-    EXPECT_EQ(LadderClassify(p, 3655, 5000).result, ClassifyResult::kUnknown); // 731
+    LadderProfile p = MakeProfile(kIdleMv);
+    // window 504 +/- 42 permille -> [462, 546]
+    EXPECT_EQ(LadderClassify(p, 1310, kIdleMv).result, ClassifyResult::kButton);  // 462 incl
+    EXPECT_EQ(LadderClassify(p, 1548, kIdleMv).result, ClassifyResult::kButton);  // 546 incl
+    EXPECT_EQ(LadderClassify(p, 1307, kIdleMv).result, ClassifyResult::kUnknown); // 461
+    EXPECT_EQ(LadderClassify(p, 1551, kIdleMv).result, ClassifyResult::kUnknown); // 547
 }
 
 TEST(LadderClassify, OverlappingWindowsResolveToTheNearestCentreNotTheFirstMatch) {
-    LadderProfile p = MakeProfile(5000);
-    // Two deliberately overlapping windows at 500 and 540 permille.
+    LadderProfile p = MakeProfile(kIdleMv);
+    // Two deliberately overlapping windows.
     p.count = 2;
     p.buttons[0] = {"A", 500, 80, 1};  // [420,580]
     p.buttons[1] = {"B", 540, 80, 2};  // [460,620]
-    EXPECT_EQ(LadderClassify(p, 2500, 5000).index, 0);  // 500 -> centre 0
-    EXPECT_EQ(LadderClassify(p, 2700, 5000).index, 1);  // 540 -> centre 1
+    EXPECT_EQ(LadderClassify(p, 1418, kIdleMv).index, 0);  // 500 -> centre 0
+    EXPECT_EQ(LadderClassify(p, 1531, kIdleMv).index, 1);  // 540 -> centre 1
 }
 ```
 
@@ -912,8 +1538,7 @@ struct LadderButton {
 struct LadderProfile {
     LadderButton buttons[kLadderMaxButtons];
     uint8_t      count;
-    int          idle_rail_mv;          // rail at learn time
-    int16_t      idle_ratio_permille;   // normally 1000
+    int          learned_idle_mv;   // the idle reading at learn time (spec 3.4)
 };
 
 enum class ClassifyResult { kIdle, kButton, kUnknown, kFault };
@@ -924,11 +1549,13 @@ struct ClassifyOutcome {
     int16_t        ratio_permille;
 };
 
-// level_mv as a fraction of rail_mv, in permille. Callers must guarantee
-// rail_mv > 0; LadderClassify enforces that and reports kFault otherwise.
-int16_t LadderRatioPermille(int level_mv, int rail_mv);
+// level_mv as a fraction of the IDLE reading, in permille (spec 6.3:
+// n = V_ADC / V_ADC_idle). Idle is 1000 by construction; a press pulls the
+// input DOWN, so every learned button's ratio is below 1000.
+// Callers must guarantee idle_mv > 0; LadderClassify reports kFault otherwise.
+int16_t LadderRatioPermille(int level_mv, int idle_mv);
 
-ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int rail_mv);
+ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int idle_mv);
 ```
 
 - [ ] **Step 4: Write the minimal implementation**
@@ -945,39 +1572,38 @@ namespace {
 // exceeds the reference, which is a short to a higher supply rather than a
 // button or an idle.
 constexpr int16_t kIdleMarginPermille = 30;
-// The reference rail has collapsed relative to the one learned. Expressed
-// against the LEARNED rail, not the ratio: ratio normalization deliberately
-// cancels rail changes out of the ratios, so a dead supply looks perfectly
-// normal to it. This is the check that catches that.
-constexpr int16_t kRailHealthFloorPermille = 600;
+// The idle reading has collapsed relative to the one learned. Expressed
+// against the LEARNED idle, not the ratio: ratio normalization deliberately
+// cancels rail movement out of the ratios, so a dead supply looks perfectly
+// normal to it. This is the check that catches that (FR-30).
+constexpr int16_t kRailHealthFloorPermille = 200;
 }  // namespace
 
-int16_t LadderRatioPermille(int level_mv, int rail_mv) {
-    if (rail_mv <= 0) return -1;
-    const long long scaled = (static_cast<long long>(level_mv) * 1000LL + rail_mv / 2) / rail_mv;
+int16_t LadderRatioPermille(int level_mv, int idle_mv) {
+    if (idle_mv <= 0) return -1;
+    const long long scaled = (static_cast<long long>(level_mv) * 1000LL + idle_mv / 2) / idle_mv;
     if (scaled > 32767) return 32767;
     if (scaled < -32768) return -32768;
     return static_cast<int16_t>(scaled);
 }
 
-ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int rail_mv) {
+ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int idle_mv) {
     ClassifyOutcome out{ClassifyResult::kFault, 0, 0};
-    if (rail_mv <= 0) return out;
+    if (idle_mv <= 0) return out;
 
-    const int16_t ratio = LadderRatioPermille(level_mv, rail_mv);
+    const int16_t ratio = LadderRatioPermille(level_mv, idle_mv);
     out.ratio_permille = ratio;
 
-    const int16_t idle = profile.idle_ratio_permille > 0
-                             ? profile.idle_ratio_permille
-                             : 1000;
-
-    if (ratio < 0 || ratio > idle + kIdleMarginPermille) return out;   // above the reference
-    if (profile.idle_rail_mv > 0 &&
-        rail_mv < (profile.idle_rail_mv * kRailHealthFloorPermille) / 1000) {
+    // FR-30: a 3V3 sag to <=20% of the learned idle is a rail fault. Checked
+    // before anything else, because at that level every ratio is garbage.
+    if (profile.learned_idle_mv > 0 &&
+        idle_mv < (profile.learned_idle_mv * kRailHealthFloorPermille) / 1000) {
         return out;                                                    // reference collapsed
     }
 
-    if (ratio >= idle - kIdleMarginPermille) {
+    if (ratio < 0 || ratio > 1000 + kIdleMarginPermille) return out;   // above the reference
+
+    if (ratio >= 1000 - kIdleMarginPermille) {
         out.result = ClassifyResult::kIdle;
         return out;
     }
@@ -1010,7 +1636,7 @@ ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int r
 - [ ] **Step 5: Run the tests**
 
 Run: `cd code && pio test -e native -f test_analog`
-Expected: PASS — 9 tests green, including the 39-point rail sweep.
+Expected: PASS — 10 tests green, including the 34-point +3V3 sweep.
 
 - [ ] **Step 6: Commit**
 
@@ -1019,10 +1645,10 @@ git add code/lib/Analog/LadderDecode.h code/lib/Analog/LadderDecode.cpp \
         code/test_native/test_analog/LadderDecodeTest.cpp
 git commit -m "Add ratio-normalized ladder classification
 
-Classifies on level/rail rather than absolute millivolts, so a button learned
-at one rail voltage classifies identically across the 11.0-14.8V vehicle sweep.
-An unlearned level is kUnknown and is never guessed; a collapsed rail or a
-reading above the rail is a fault, never a button."
+Classifies on V_ADC/V_ADC_idle rather than absolute millivolts, so a button
+learned at one rail voltage classifies identically across the +3V3 tolerance
+band (spec 11 FR-30). An unlearned level is kUnknown and is never guessed; a
+collapsed rail or a reading above the idle reference is a fault, never a button."
 ```
 
 ---
@@ -1439,9 +2065,9 @@ parameter, so the whole grammar is testable with no sleeps.
 - Consumes: `LadderProfile`, `LadderClassify` from Task 3
 - Produces:
   - `struct GestureTimings { uint32_t debounce_ms; uint32_t double_press_off_ms; uint32_t long_press_ms; uint32_t send_duration_ms; }`
-  - `GestureTimings GestureTimingsDefault()` — 30 / 500 / 750 / 200
+  - `GestureTimings GestureTimingsDefault()` — 25 / 500 / 750 / 200
   - `enum class ChannelLevel { kIdle, kPressed, kUnknown, kFault }`
-  - `class PressClassifier { ChannelLevel Update(int level_mv, int rail_mv, uint64_t now_ms); ChannelLevel Level() const; uint8_t ButtonIndex() const; void Reset(); }`
+  - `class PressClassifier { ChannelLevel Update(int level_mv, int idle_mv, uint64_t now_ms); ChannelLevel Level() const; uint8_t ButtonIndex() const; void Reset(); }`
   - `enum class Gesture { kNone, kSingle, kDouble, kLong }`
   - `struct GestureEvent { Gesture gesture; uint8_t button_index; uint64_t at_ms; }`
   - `class GestureStateMachine` with `bool Update(ChannelLevel level, uint8_t button_index, uint64_t now_ms, GestureEvent *out)`
@@ -1456,9 +2082,9 @@ parameter, so the whole grammar is testable with no sleeps.
 namespace {
 LadderProfile Profile() {
     LadderProfile p{};
-    p.idle_ratio_permille = 1000;
+    p.learned_idle_mv = 2835;
     p.count = 1;
-    p.buttons[0] = {"VOL_UP", 690, 40, 1};
+    p.buttons[0] = {"VOL_UP", 504, 42, 1};
     return p;
 }
 }  // namespace
@@ -1466,16 +2092,16 @@ LadderProfile Profile() {
 TEST(PressClassifier, ByteNoiseBelowTheDebounceWindowIsNotAPress) {
     PressClassifier c(Profile(), GestureTimingsDefault());
     // One 10ms sample dips into the window: not a press.
-    EXPECT_EQ(c.Update(3450, 5000, 1000), ChannelLevel::kIdle);
-    EXPECT_EQ(c.Update(5000, 5000, 1010), ChannelLevel::kIdle);
+    EXPECT_EQ(c.Update(1430, 2835, 1000), ChannelLevel::kIdle);
+    EXPECT_EQ(c.Update(2835, 2835, 1010), ChannelLevel::kIdle);
 }
 
 TEST(PressClassifier, ASustainedLevelBecomesPressedAfterDebounce) {
     PressClassifier c(Profile(), GestureTimingsDefault());
     uint64_t t = 1000;
     ChannelLevel level = ChannelLevel::kIdle;
-    for (int i = 0; i < 5; ++i) {  // 50ms of sustained press > 30ms debounce
-        level = c.Update(3450, 5000, t);
+    for (int i = 0; i < 5; ++i) {  // 50ms of sustained press > 25ms debounce
+        level = c.Update(1430, 2835, t);
         t += 10;
     }
     EXPECT_EQ(level, ChannelLevel::kPressed);
@@ -1485,37 +2111,37 @@ TEST(PressClassifier, ASustainedLevelBecomesPressedAfterDebounce) {
 TEST(PressClassifier, HysteresisKeepsAPressLatchedThroughASmallDip) {
     PressClassifier c(Profile(), GestureTimingsDefault());
     uint64_t t = 1000;
-    for (int i = 0; i < 5; ++i) { c.Update(3450, 5000, t); t += 10; }
+    for (int i = 0; i < 5; ++i) { c.Update(1430, 2835, t); t += 10; }
     ASSERT_EQ(c.Level(), ChannelLevel::kPressed);
-    // 695 permille is inside the window's outer edge but outside its centre
-    // band; hysteresis must hold the press rather than flap.
-    for (int i = 0; i < 5; ++i) { c.Update(3475, 5000, t); t += 10; }
+    // 1425 mV is 503 permille: inside the window's outer edge but outside its
+    // centre band; hysteresis must hold the press rather than flap.
+    for (int i = 0; i < 5; ++i) { c.Update(1425, 2835, t); t += 10; }
     EXPECT_EQ(c.Level(), ChannelLevel::kPressed);
 }
 
 TEST(PressClassifier, ReleaseRequiresReturningToIdleNotMerelyLeavingTheWindow) {
     PressClassifier c(Profile(), GestureTimingsDefault());
     uint64_t t = 1000;
-    for (int i = 0; i < 5; ++i) { c.Update(3450, 5000, t); t += 10; }
+    for (int i = 0; i < 5; ++i) { c.Update(1430, 2835, t); t += 10; }
     ASSERT_EQ(c.Level(), ChannelLevel::kPressed);
-    // Between windows: still held.
-    c.Update(3000, 5000, t); t += 10;
+    // 2400 mV is 846 permille -- between the window and idle: still held.
+    c.Update(2400, 2835, t); t += 10;
     EXPECT_EQ(c.Level(), ChannelLevel::kPressed);
-    for (int i = 0; i < 5; ++i) { c.Update(5000, 5000, t); t += 10; }
+    for (int i = 0; i < 5; ++i) { c.Update(2835, 2835, t); t += 10; }
     EXPECT_EQ(c.Level(), ChannelLevel::kIdle);
 }
 
 TEST(PressClassifier, FaultPropagatesAndNeverReadsAsAPress) {
     PressClassifier c(Profile(), GestureTimingsDefault());
     uint64_t t = 1000;
-    for (int i = 0; i < 5; ++i) { c.Update(900, 1000, t); t += 10; }  // collapsed rail
+    for (int i = 0; i < 5; ++i) { c.Update(500, 500, t); t += 10; }  // collapsed rail
     EXPECT_EQ(c.Level(), ChannelLevel::kFault);
 }
 
 TEST(PressClassifier, UnlearnedLevelIsUnknownNotPressed) {
     PressClassifier c(Profile(), GestureTimingsDefault());
     uint64_t t = 1000;
-    for (int i = 0; i < 5; ++i) { c.Update(1500, 5000, t); t += 10; }
+    for (int i = 0; i < 5; ++i) { c.Update(2400, 2835, t); t += 10; }
     EXPECT_EQ(c.Level(), ChannelLevel::kUnknown);
     EXPECT_EQ(c.ButtonIndex(), 0xFF);
 }
@@ -1523,12 +2149,12 @@ TEST(PressClassifier, UnlearnedLevelIsUnknownNotPressed) {
 TEST(PressClassifier, SwitchingButtonsMidPressReportsTheNewButtonAfterDebounce) {
     LadderProfile p = Profile();
     p.count = 2;
-    p.buttons[1] = {"VOL_DOWN", 400, 40, 2};
+    p.buttons[1] = {"VOL_DOWN", 630, 42, 2};
     PressClassifier c(p, GestureTimingsDefault());
     uint64_t t = 1000;
-    for (int i = 0; i < 5; ++i) { c.Update(3450, 5000, t); t += 10; }
+    for (int i = 0; i < 5; ++i) { c.Update(1430, 2835, t); t += 10; }
     ASSERT_EQ(c.ButtonIndex(), 0);
-    for (int i = 0; i < 8; ++i) { c.Update(2000, 5000, t); t += 10; }
+    for (int i = 0; i < 8; ++i) { c.Update(1785, 2835, t); t += 10; }
     EXPECT_EQ(c.ButtonIndex(), 1);
 }
 ```
@@ -1554,9 +2180,9 @@ struct GestureTimings {
     uint32_t send_duration_ms;
 };
 
-// Defaults preserved from the 2022 Pico firmware so the feel is unchanged.
+// Defaults from spec 3.7, so the feel matches the 2022 Pico firmware.
 inline GestureTimings GestureTimingsDefault() {
-    return GestureTimings{/*debounce_ms=*/30,
+    return GestureTimings{/*debounce_ms=*/25,
                           /*double_press_off_ms=*/500,
                           /*long_press_ms=*/750,
                           /*send_duration_ms=*/200};
@@ -1574,8 +2200,10 @@ class PressClassifier {
 public:
     PressClassifier(const LadderProfile &profile, const GestureTimings &timings);
 
-    // level_mv and rail_mv are calibrated millivolts (Task 4).
-    ChannelLevel Update(int level_mv, int rail_mv, uint64_t now_ms);
+    // level_mv is the calibrated reading and idle_mv the current idle
+    // reference; both in millivolts (Task 4). Classification normalizes the
+    // former by the latter (spec 6.3).
+    ChannelLevel Update(int level_mv, int idle_mv, uint64_t now_ms);
 
     ChannelLevel Level() const { return level_; }
     uint8_t ButtonIndex() const { return button_index_; }
@@ -1612,8 +2240,8 @@ void PressClassifier::Reset() {
     have_candidate_ = false;
 }
 
-ChannelLevel PressClassifier::Update(int level_mv, int rail_mv, uint64_t now_ms) {
-    const ClassifyOutcome outcome = LadderClassify(profile_, level_mv, rail_mv);
+ChannelLevel PressClassifier::Update(int level_mv, int idle_mv, uint64_t now_ms) {
+    const ClassifyOutcome outcome = LadderClassify(profile_, level_mv, idle_mv);
 
     // Hysteresis: while pressed, a reading that is merely *between* windows
     // holds the current button rather than releasing. Only a return to idle
@@ -2283,12 +2911,11 @@ Config MakeConfig() {
     c.channel_count = 1;
     c.channels[0].enabled = true;
     std::strncpy(c.channels[0].name, "SWC1", sizeof(c.channels[0].name) - 1);
-    c.channels[0].ladder.idle_rail_mv = 5000;
-    c.channels[0].ladder.idle_ratio_permille = 1000;
+    c.channels[0].ladder.learned_idle_mv = 2835;
     c.channels[0].ladder.count = 1;
     std::strncpy(c.channels[0].ladder.buttons[0].id, "VOL_UP",
                  sizeof(c.channels[0].ladder.buttons[0].id) - 1);
-    c.channels[0].ladder.buttons[0] = {"VOL_UP", 690, 40, 1};
+    c.channels[0].ladder.buttons[0] = {"VOL_UP", 504, 42, 1};
     c.channels[0].output.gain_mode = GainMode::kAmplified;
     c.channels[0].binding_count = 1;
     c.channels[0].bindings[0].button_index = 0;
@@ -2312,7 +2939,7 @@ TEST(ConfigCodec, JsonRoundTripsEveryFieldThatWasSet) {
     EXPECT_EQ(out.settings.gain_policy, GainPolicy::kAuto);
     EXPECT_EQ(out.channels[0].ladder.count, 1);
     EXPECT_STREQ(out.channels[0].ladder.buttons[0].id, "VOL_UP");
-    EXPECT_EQ(out.channels[0].ladder.buttons[0].ratio_permille, 690);
+    EXPECT_EQ(out.channels[0].ladder.buttons[0].ratio_permille, 504);
     EXPECT_EQ(out.channels[0].bindings[0].action_id, 1);
     EXPECT_EQ(out.channels[0].bindings[0].gesture, Gesture::kSingle);
 }
@@ -2405,10 +3032,10 @@ TEST(ConfigCodec, ValidationRejectsInconsistentConfigs) {
 TEST(ConfigCodec, ValidationRejectsButtonsTooCloseToTellApart) {
     Config c = MakeConfig();
     c.channels[0].ladder.count = 2;
-    c.channels[0].ladder.buttons[0] = {"VOL_UP", 690, 40, 1};
-    // 10 permille apart, but each window is 40 wide: every reading in the
+    c.channels[0].ladder.buttons[0] = {"VOL_UP", 505, 42, 1};
+    // 10 permille apart, but each window is 42 wide: every reading in the
     // overlap is equally close to both, so classification would be a coin toss.
-    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", 700, 40, 2};
+    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", 515, 42, 2};
     EXPECT_FALSE(ConfigValidate(c))
         << "centres closer together than the wider tolerance can never be told apart";
 }
@@ -2416,11 +3043,11 @@ TEST(ConfigCodec, ValidationRejectsButtonsTooCloseToTellApart) {
 TEST(ConfigCodec, ValidationAcceptsButtonsExactlyTolerancePlusOneApart) {
     Config c = MakeConfig();
     c.channels[0].ladder.count = 2;
-    c.channels[0].ladder.buttons[0] = {"VOL_UP", 690, 40, 1};
-    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", 731, 40, 2};  // 41 = max(40,40) + 1
+    c.channels[0].ladder.buttons[0] = {"VOL_UP", 505, 42, 1};
+    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", 548, 42, 2};  // 43 = max(42,42) + 1
     EXPECT_TRUE(ConfigValidate(c));
 
-    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", 730, 40, 2};  // exactly tolerance apart
+    c.channels[0].ladder.buttons[1] = {"VOL_DOWN", 547, 42, 2};  // exactly tolerance apart
     EXPECT_FALSE(ConfigValidate(c));
 }
 ```
@@ -2591,13 +3218,17 @@ bool ConfigValidate(const Config &c) {
         const ChannelConfig &cc = c.channels[ch];
         if (cc.name[0] == '\0') return false;
         if (cc.ladder.count > kLadderMaxButtons) return false;
-        if (cc.ladder.idle_ratio_permille <= 0 || cc.ladder.idle_ratio_permille > 1100) return false;
+        // The idle reference must be a plausible ADC reading: above zero and
+        // no higher than the 2900 mV ADC ceiling (spec 3.2).
+        if (cc.ladder.learned_idle_mv <= 0 || cc.ladder.learned_idle_mv > 2900) return false;
         for (uint8_t i = 0; i < cc.ladder.count; ++i) {
             const LadderButton &b = cc.ladder.buttons[i];
             if (b.id[0] == '\0') return false;
             if (b.tolerance_permille <= 0) return false;
-            // A ratio above the reference is physically impossible.
-            if (b.ratio_permille <= 0 || b.ratio_permille > cc.ladder.idle_ratio_permille) return false;
+            // A ratio above the idle reference is physically impossible: a
+            // press pulls the input DOWN (spec 6.3), so every button sits
+            // below 1000 permille.
+            if (b.ratio_permille <= 0 || b.ratio_permille >= 1000) return false;
         }
         if (!CentresAreDistinguishable(cc.ladder)) return false;
 
@@ -2618,9 +3249,10 @@ behavior. Key requirements the implementation must satisfy:
 
 - `ConfigEncodeJson` writes `schema_version`, `device_id`, `settings` (including
   all four `GestureTimings` fields), and a `channels` array whose entries carry
-  `name`, `enabled`, `ladder` (`idle_rail_mv`, `idle_ratio_permille`, and a
-  `buttons` array), `output`, and `bindings` (`button_index`, `gesture` as a
-  string, `action_id`, `action_name`, `data_payload`).
+  `name`, `enabled`, `ladder` (**`idle_mv`** — the struct field is
+  `learned_idle_mv`, but the wire key is `idle_mv`, per spec §3.7's worked
+  example — and a `buttons` array), `output`, and `bindings` (`button_index`,
+  `gesture` as a string, `action_id`, `action_name`, `data_payload`).
 - `ConfigDecodeJson` returns `false` unless **every** required field is present
   and the decoded `Config` passes `ConfigValidate`. It must reject
   `schema_version != kConfigSchemaVersion` explicitly, so a future schema is
@@ -3129,9 +3761,9 @@ ChannelConfig MakeChannel() {
     ch.enabled = true;
     std::strncpy(ch.name, "SWC1", sizeof(ch.name) - 1);
     ch.ladder.count = 2;
-    ch.ladder.idle_ratio_permille = 1000;
-    ch.ladder.buttons[0] = {"VOL_UP", 690, 40, 0};
-    ch.ladder.buttons[1] = {"VOL_DOWN", 400, 40, 0};
+    ch.ladder.learned_idle_mv = 2835;
+    ch.ladder.buttons[0] = {"VOL_UP", 504, 42, 0};
+    ch.ladder.buttons[1] = {"VOL_DOWN", 630, 42, 0};
     ch.binding_count = 3;
     ch.bindings[0] = {0, Gesture::kSingle, 1, "VOL_UP", ""};
     ch.bindings[1] = {0, Gesture::kDouble, 20, "ANDROID_SEND_INTENT", "com.app/.Main"};
@@ -3507,7 +4139,7 @@ SystemOrchestrator MakeOrch(MockHal &hal) {
 TEST(SystemOrchestrator, SafeIdleIsEstablishedBeforeAnythingElse) {
     MockHal hal;
     auto o = MakeOrch(hal);
-    hal.SetAdcMilliVolts(ADC_CH_SENSE1, 2500);   // reads back as idle
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2500);   // reads back as idle
     o.Boot();
     EXPECT_TRUE(o.SafeIdleEstablished());
     // The DAC must have been written during Boot, before any USB work.
@@ -3517,27 +4149,27 @@ TEST(SystemOrchestrator, SafeIdleIsEstablishedBeforeAnythingElse) {
 TEST(SystemOrchestrator, BootDrivesTheAdjustChannelIntoTheOneKiloOhmPulldown) {
     MockHal hal;
     auto o = MakeOrch(hal);
-    hal.SetAdcMilliVolts(ADC_CH_SENSE1, 2500);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2490);
     o.Boot();
     // Gain 1.82 requires V_ADJ at 0V, which is the 1k pulldown power-down mode.
-    EXPECT_EQ(hal.LastDacPowerMode(DAC_CH_ADJ), DAC_POWER_GND_1K);
+    EXPECT_EQ(hal.LastDacPowerMode(DAC_CH_ADJ1), DAC_POWER_GND_1K);
 }
 
 TEST(SystemOrchestrator, APressProducesTheBoundOutputLevelAndThenReleases) {
     MockHal hal;
     auto o = MakeOrch(hal);
-    hal.SetAdcMilliVolts(ADC_CH_SENSE1, 2500);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2490);
     o.Boot();
     const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
 
-    // VOL_UP at 690 permille of a 5V rail.
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3450);
-    hal.SetAdcMilliVolts(ADC_CH_SENSE1, 2500);
+    // VOL_UP at its learned 1430 mV. The ladder pulls DOWN from an idle of
+    // 2835 mV, so a press is a LOWER reading -- never above idle.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
     for (uint64_t t = 0; t < 200; t += 10) { o.Tick(hal.NowMs()); hal.AdvanceMs(10); }
     EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code) << "a press must change the output";
 
     // Release and let the send duration plus the gesture window elapse.
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 5000);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
     for (uint64_t t = 0; t < 1200; t += 10) { o.Tick(hal.NowMs()); hal.AdvanceMs(10); }
     EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code) << "must return to idle";
 }
@@ -3547,42 +4179,45 @@ TEST(SystemOrchestrator, ServesPressesWithNoUsbAndNoApp) {
     // depend on a link being present.
     MockHal hal;
     auto o = MakeOrch(hal);
-    hal.SetAdcMilliVolts(ADC_CH_SENSE1, 2500);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2490);
     o.Boot();
     const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3450);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
     for (uint64_t t = 0; t < 200; t += 10) { o.Tick(hal.NowMs()); hal.AdvanceMs(10); }
     EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code);
 }
 
-TEST(SystemOrchestrator, AFaultDrivesTheOutputBackToIdleRatherThanHoldingAKey) {
+TEST(SystemOrchestrator, ARailSagDuringAPressReleasesTheKey) {
+    // FR-39: never leave a phantom key driven. FR-30: a 3V3 sag to <=20% of the
+    // learned idle is a RAIL FAULT, not an idle reading and not a button.
     MockHal hal;
     auto o = MakeOrch(hal);
-    hal.SetAdcMilliVolts(ADC_CH_SENSE1, 2500);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2490);
     o.Boot();
     const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
 
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3450);  // press
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);  // press
     for (uint64_t t = 0; t < 200; t += 10) { o.Tick(hal.NowMs()); hal.AdvanceMs(10); }
     ASSERT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code);
 
-    // Rail collapses mid-press (FR-39: never leave a phantom key driven).
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 400);
-    hal.SetAdcMilliVolts(ADC_CH_SENSE1, 250);
+    // The +3V3 rail sags: 500 mV is 18% of the learned 2835 mV idle.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 500);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 250);
     for (uint64_t t = 0; t < 200; t += 10) { o.Tick(hal.NowMs()); hal.AdvanceMs(10); }
     EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
-        << "a fault during a press must release the key, not hold it";
+        << "a rail fault during a press must release the key, not hold it";
 }
 
 TEST(SystemOrchestrator, AnUnlearnedLevelNeverChangesTheOutput) {
     MockHal hal;
     auto o = MakeOrch(hal);
-    hal.SetAdcMilliVolts(ADC_CH_SENSE1, 2500);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2490);
     o.Boot();
     const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
 
-    // 300 permille: matches no learned button.
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1500);
+    // 2400 mV: between the highest button (next, 2145 +/- 110) and idle (2835),
+    // so it matches no learned button and is far above the rail-fault floor.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2400);
     for (uint64_t t = 0; t < 1500; t += 10) { o.Tick(hal.NowMs()); hal.AdvanceMs(10); }
     EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
         << "UNKNOWN must do nothing -- the failure mode of a guess is worse";
@@ -3594,12 +4229,12 @@ TEST(SystemOrchestrator, TheTwoChannelsAreServedIndependently) {
     d.config.channel_count = 2;
     d.config.channels[1] = d.config.channels[0];
     SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
-    hal.SetAdcMilliVolts(ADC_CH_SENSE1, 2500);
-    hal.SetAdcMilliVolts(ADC_CH_SENSE2, 2500);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2490);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE2, 2490);
     o.Boot();
 
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3450);   // press only channel 1
-    hal.SetAdcMilliVolts(ADC_CH_SWC2, 5000);   // channel 2 idle
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);   // press only channel 1
+    hal.SetAdcMilliVolts(ADC_CH_SWC2, 2835);   // channel 2 idle
     for (uint64_t t = 0; t < 1000; t += 10) { o.Tick(hal.NowMs()); hal.AdvanceMs(10); }
     EXPECT_GT(hal.DacWriteCount(DAC_CH_KEY1), 0);
     // Channel 2 must still have been driven to its idle level at boot only.
@@ -3609,7 +4244,7 @@ TEST(SystemOrchestrator, TheTwoChannelsAreServedIndependently) {
 TEST(SystemOrchestrator, TickIsCheapEnoughToRunAtThePollCadence) {
     MockHal hal;
     auto o = MakeOrch(hal);
-    hal.SetAdcMilliVolts(ADC_CH_SENSE1, 2500);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2500);
     o.Boot();
     // No assertion on wall time (that is meaningless on the host); the point is
     // that Tick does no I/O beyond the HAL calls already counted, and allocates
@@ -3632,9 +4267,10 @@ requirement, not an implementation detail):
 
 1. Load the config via `ConfigStore`. `kNoConfig` → pass-through mode (FR-25).
 2. **Establish safe idle**: select gain via `GainPolicySelect`, drive
-   `DAC_CH_ADJ` into `kGnd1k` in amplified mode, and write `DAC_CH_KEYn` to its
-   idle code. Set `safe_idle_established_ = true`. **This happens before steps
-   3+** — FR-13, and `SafeIdleEstablished` is what the tests assert.
+   `DAC_CH_ADJ1`/`DAC_CH_ADJ2` into `kGnd1k` in amplified mode, and write
+   `DAC_CH_KEYn` to its idle code. Set `safe_idle_established_ = true`. **This
+   happens before steps 3+** — FR-13, and `SafeIdleEstablished` is what the
+   tests assert.
 3. Construct the per-channel `PressClassifier`, `GestureStateMachine`,
    `ServoLoop`.
 4. Play `kBootOk` / `kBootDegraded` / `kBootError` per the load result.
@@ -3653,8 +4289,11 @@ retarget that channel to idle in the same tick, which is what
 `AFaultDrivesTheOutputBackToIdleRatherThanHoldingAKey` asserts.
 
 Add `MockHal::Defaults` to `MockHAL.h` — a helper struct holding a valid
-`Config` (one channel, `VOL_UP` at 690 permille, a single-press binding to
-`VOL_UP`) and `GestureTimingsDefault()`, so these tests are readable.
+`Config` and `GestureTimingsDefault()`, so these tests are readable. The single
+channel's ladder is **`idle_mv` 2835** with **`VOL_UP` at `mv_center` 1430,
+`mv_tolerance` 120**, and a single-press binding to `VOL_UP`. These are the
+spec §3.7 defaults; **they are not arbitrary** — a press pulls the input *down*
+from idle (§6.3), so every button's `mv_center` is *below* `idle_mv`.
 
 - [ ] **Step 4: Run the tests**
 
@@ -3743,12 +4382,13 @@ TEST_CASE("esp_hal_adc_is_monotonic_with_a_known_input", "[hw]") {
 
 TEST_CASE("esp_hal_dac_reaches_both_rails", "[hw]") {
     IHal *hal = EspHalInit();
-    hal->dac_set_code(hal->ctx, DAC_CH_KEY1, 0, DAC_POWER_NORMAL);
+    hal->dac_power_mode(hal->ctx, DAC_CH_ADJ1, DAC_POWER_GND_1K);
+    hal->dac_set_code(hal->ctx, DAC_CH_KEY1, 0);
     vTaskDelay(pdMS_TO_TICKS(10));
-    hal->dac_set_code(hal->ctx, DAC_CH_KEY1, 4095, DAC_POWER_NORMAL);
+    hal->dac_set_code(hal->ctx, DAC_CH_KEY1, 4095);
     /* Read back through the sense divider: the KEY line is V/2 at the ADC. */
     vTaskDelay(pdMS_TO_TICKS(20));
-    const int sense = hal->adc_read_mv(hal->ctx, ADC_CH_SENSE1);
+    const int sense = hal->adc_read_mv(hal->ctx, ADC_CH_KEY_SENSE1);
     TEST_ASSERT_GREATER_THAN_INT(1000, sense);   /* the high code moved the line */
 }
 
@@ -3832,7 +4472,7 @@ blocked** — record it as pending rather than skipping it silently.
 - [ ] **Step 6: Verify the size gate after adding the HAL**
 
 Run: `pio run -e esp32s3 -t size`
-Expected: app ≤ 1952 KB. Record the new number next to Task 1's baseline.
+Expected: app ≤ **1920 KB**. Record the new number next to Task 1's baseline.
 
 - [ ] **Step 7: Commit**
 
@@ -4084,7 +4724,7 @@ have the head unit out of the dash.
 - Produces:
   - `enum class LearnReject { kNone, kTooNoisy, kTooCloseToExisting, kAtIdle, kOutOfRange, kTooFewSamples }`
   - `const char *LearnRejectReason(LearnReject r)` — the wire string
-  - `class LearnSession` with `void Start(int channel, const LadderProfile &existing)`, `void AddSample(int level_mv, int rail_mv, uint64_t now_ms)`, `LearnReject Commit(LadderButton *out)`, `int SampleCount() const`
+  - `class LearnSession` with `void Start(int channel, const LadderProfile &existing)`, `void AddSample(int level_mv, int idle_mv, uint64_t now_ms)`, `LearnReject Commit(LadderButton *out)`, `int SampleCount() const`
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -4095,36 +4735,36 @@ have the head unit out of the dash.
 namespace {
 LadderProfile ExistingWith(const char *id, int ratio, int tol) {
     LadderProfile p{};
-    p.idle_rail_mv = 5000;
-    p.idle_ratio_permille = 1000;
+    p.learned_idle_mv = 2835;
     p.count = 1;
     std::strncpy(p.buttons[0].id, id, sizeof(p.buttons[0].id) - 1);
     p.buttons[0].ratio_permille = ratio;
     p.buttons[0].tolerance_permille = tol;
     return p;
 }
-void Feed(LearnSession &s, int mv, int rail, int n, uint64_t &t) {
-    for (int i = 0; i < n; ++i) { s.AddSample(mv, rail, t); t += 10; }
+void Feed(LearnSession &s, int mv, int idle, int n, uint64_t &t) {
+    for (int i = 0; i < n; ++i) { s.AddSample(mv, idle, t); t += 10; }
 }
 }  // namespace
 
-TEST(LearnSession, ASteadyLevelCommitsAndRecordsTheRailItWasLearnedAt) {
+TEST(LearnSession, ASteadyLevelCommitsAndRecordsTheIdleItWasLearnedAt) {
     LearnSession s;
     s.Start(0, LadderProfile{});
     uint64_t t = 1000;
-    Feed(s, 3450, 5000, 30, t);
+    Feed(s, 1430, 2835, 30, t);
     LadderButton out{};
     ASSERT_EQ(s.Commit(&out), LearnReject::kNone);
-    ASSERT_EQ(out.ratio_permille, 690);
-    // FR-30: the rail is recorded so runtime classification can renormalize.
-    EXPECT_EQ(s.LearnedRailMv(), 5000);
+    ASSERT_EQ(out.ratio_permille, 504);
+    // FR-30: the idle reference is recorded so runtime classification can
+    // detect a rail fault and the app can display absolute millivolts.
+    EXPECT_EQ(s.LearnedIdleMv(), 2835);
 }
 
 TEST(LearnSession, TooFewSamplesIsRejectedNotAcceptedFromOneReading) {
     LearnSession s;
     s.Start(0, LadderProfile{});
     uint64_t t = 1000;
-    Feed(s, 3450, 5000, 2, t);
+    Feed(s, 1430, 2835, 2, t);
     LadderButton out{};
     EXPECT_EQ(s.Commit(&out), LearnReject::kTooFewSamples);
 }
@@ -4133,9 +4773,10 @@ TEST(LearnSession, ANoisyLevelIsRejectedWithTheNoiseReason) {
     LearnSession s;
     s.Start(0, LadderProfile{});
     uint64_t t = 1000;
-    // +/-120 permille of wobble: far wider than the classification tolerance.
+    // A 550 mV swing at a 2835 mV idle is ~195 permille of wobble: far wider
+    // than the classification tolerance.
     for (int i = 0; i < 30; ++i) {
-        s.AddSample((i % 2) ? 3450 : 2900, 5000, t);
+        s.AddSample((i % 2) ? 1430 : 1980, 2835, t);
         t += 10;
     }
     LadderButton out{};
@@ -4146,27 +4787,29 @@ TEST(LearnSession, ALevelAtIdleIsRejectedBecauseTheButtonWasNotPressed) {
     LearnSession s;
     s.Start(0, LadderProfile{});
     uint64_t t = 1000;
-    Feed(s, 5000, 5000, 30, t);
+    Feed(s, 2835, 2835, 30, t);
     LadderButton out{};
     EXPECT_EQ(s.Commit(&out), LearnReject::kAtIdle);
 }
 
 TEST(LearnSession, ALevelWithinAnExistingButtonsToleranceIsRejectedAsAmbiguous) {
     LearnSession s;
-    s.Start(0, ExistingWith("VOL_UP", 690, 40));
+    s.Start(0, ExistingWith("VOL_UP", 504, 42));
     uint64_t t = 1000;
-    Feed(s, 3475, 5000, 30, t);   // 695 permille, inside VOL_UP's window
+    Feed(s, 1450, 2835, 30, t);   // 511 permille, inside VOL_UP's window
     LadderButton out{};
     EXPECT_EQ(s.Commit(&out), LearnReject::kTooCloseToExisting);
 }
 
-TEST(LearnSession, ALevelAboveTheSenseCeilingIsRejectedAsOutOfRange) {
+TEST(LearnSession, ALevelAboveTheAdcCeilingIsRejectedAsOutOfRange) {
     LearnSession s;
     s.Start(0, LadderProfile{});
     uint64_t t = 1000;
-    // 3200mV exceeds the 2490mV the sense divider can present, so this cannot be
-    // a real reading from this hardware -- it is a wiring or calibration fault.
-    Feed(s, 3200, 5000, 30, t);
+    // 3000 mV exceeds the 2900 mV calibrated ADC ceiling (spec 3.2), so this
+    // cannot be a real reading from this hardware -- it is a wiring or
+    // calibration fault. NOTE: this is the INPUT side. The 2490 mV figure
+    // belongs to the output sense divider (spec 2.3) and is a different net.
+    Feed(s, 3000, 2835, 30, t);
     LadderButton out{};
     EXPECT_EQ(s.Commit(&out), LearnReject::kOutOfRange);
 }
@@ -4188,7 +4831,7 @@ TEST(LearnSession, ToleranceIsDerivedFromTheMeasuredSpreadNotAConstant) {
     s.Start(0, LadderProfile{});
     uint64_t t = 1000;
     for (int i = 0; i < 30; ++i) {          // a small, realistic spread
-        s.AddSample((i % 2) ? 3460 : 3440, 5000, t);
+        s.AddSample((i % 2) ? 1445 : 1415, 2835, t);
         t += 10;
     }
     LadderButton out{};
@@ -4209,16 +4852,18 @@ Expected: FAIL — `Learning/LearnSession.h` not found.
 returning the **first** failure so the user gets the most actionable reason:
 
 1. `kTooFewSamples` — fewer than 10 samples, or a span under 100 ms.
-2. `kOutOfRange` — any sample above the sense ceiling (2490 mV) or below 0.
+2. `kOutOfRange` — any sample above the **2900 mV** calibrated ADC ceiling
+   (spec §3.2) or below 0. This is the *input* ladder's ceiling; the 2490 mV
+   figure is the *output* sense divider (spec §2.3) and is a different net.
 3. `kAtIdle` — the mean ratio is within the idle margin, so the button was not
    pressed.
 4. `kTooNoisy` — the spread exceeds `noise_limit_permille` (default 60).
 5. `kTooCloseToExisting` — the mean is within an existing button's tolerance.
 
-On success, `out.tolerance_permille` is `max(spread * 2, 8)` capped at 120 — the
-doubling gives headroom over the observed spread while the cap keeps it from
-swallowing a neighbour. `out.ratio_permille` is the rounded mean ratio, and
-`LearnedRailMv()` records the rail (FR-30).
+On success, `out.tolerance_permille` is the midpoint of the gap to the nearest
+neighbouring button capped by a configurable maximum (spec §3.4) — **not**
+`max(spread * 2, 8)`. `out.ratio_permille` is the rounded mean ratio, and
+`LearnedIdleMv()` records the idle reference (FR-30).
 
 - [ ] **Step 4: Run the tests**
 
@@ -4931,11 +5576,11 @@ widget names.
 fun liveLadderView_showsEachLearnedButtonAtItsMeasuredLevel() {
     composeRule.setContent {
         LadderScreen(state = LadderUiState(
-            railMv = 5000,
+            idleMv = 2835,
             buttons = listOf(
-                LearnedButton("VOL_UP", ratioPermille = 690, tolerancePermille = 40),
-                LearnedButton("VOL_DOWN", ratioPermille = 400, tolerancePermille = 40)),
-            liveRatioPermille = 690))
+                LearnedButton("VOL_UP", ratioPermille = 504, tolerancePermille = 42),
+                LearnedButton("VOL_DOWN", ratioPermille = 630, tolerancePermille = 120)),
+            liveRatioPermille = 504))
     }
     // The point of the live view is that the user can see *which* button the
     // device currently thinks is pressed, so the matched one must be marked.
@@ -5041,13 +5686,15 @@ jobs:
         run: pio run -e esp32s3
       - name: Size gate (spec 10.5)
         working-directory: code
-        run: python3 tools/check_size.py --env esp32s3 --max-bytes 1998848
+        run: python3 tools/check_size.py --env esp32s3 --max-bytes 1966080
 ```
 
 **The size gate is a script, not an eyeball.** `tools/check_size.py` runs
 `pio run -t size --json-output`, reads the app size, and exits non-zero above
-1952 KB (`1998848`). This is the R-1 mitigation from spec §12.2: the app not
-fitting is discovered here, on day one, not the week the boards land.
+**1920 KB (`1966080`)** — the real slot size, which Task 1 established by
+correcting the partition table's alignment. This is the R-1 mitigation from spec
+§12.2: the app not fitting is discovered here, on day one, not the week the
+boards land.
 
 - [ ] **Step 2: Write `android.yml`**
 
@@ -5057,11 +5704,21 @@ tests need a device or emulator; run them on an emulator job with
 from CI so a missing device is not a false failure — **documented in the
 workflow comment**, not silently skipped.
 
-- [ ] **Step 3: Push and confirm both workflows pass**
+- [ ] **Step 3: Confirm both workflows pass**
 
-Run: `git push` and check the Actions tab.
-Expected: both green. **If the size gate fails, that is R-1 arriving early** —
-take the §9.6 fallback rather than raising the threshold.
+**Do not `git push` from inside this task.** Pushing is a shared-remote side
+effect: it is visible to others, it can trigger CI on shared infrastructure, and
+it is not reversible in the way a local commit is. An earlier revision of this
+plan put a bare `git push` in a task step, which would have an implementer
+subagent publish to the remote without the user ever deciding to.
+
+Instead: commit locally, then **hand the push to the user** as an explicit,
+separate decision. Record in the task report that the workflows are committed and
+unverified-because-unpushed, and let the user run the push when they choose.
+
+Once pushed (by the user), check the Actions tab. Expected: both green. **If the
+size gate fails, that is R-1 arriving early** — take the §9.6 fallback rather
+than raising the threshold.
 
 - [ ] **Step 4: Commit**
 
@@ -5069,7 +5726,7 @@ take the §9.6 fallback rather than raising the threshold.
 git add code/.github code/tools/check_size.py
 git commit -m "Add CI gates for host tests, contract sync, and the app size budget
 
-The 1952KB size gate runs on every push so a BLE+WiFi+OTA build that outgrows
+The 1920KB size gate runs on every push so a BLE+WiFi+OTA build that outgrows
 the OTA slot is caught on day one rather than the week the boards arrive. The
 contract-sync check fails the build if a generated header or Kotlin type drifts
 from the schema."
@@ -5097,10 +5754,18 @@ reality disagrees.
 - [ ] **Step 2: I2C and the DAC.** Scan the bus, record the MCP4728's actual strap
   address (spec §12.1, N-4). Write mid-code, measure with a meter, confirm
   `LDAC` latches.
-- [ ] **Step 3: The ADC ladder.** Sweep the bench supply 11.0 → 14.8 V with a
-  resistor ladder attached; record idle and per-button readings. **Fit the real
-  calibration curve here** — this is where §2.3's numbers become true for the
-  actual board. Update the spec's values.
+- [ ] **Step 3: The ADC ladder — and the R15/R16 decision.** With a resistor
+  ladder attached, **sweep the +3V3 rail 3.14 → 3.47 V** and record the idle and
+  per-button readings. **Do NOT sweep a 12 V vehicle rail** — no vehicle-rail
+  term exists in the transfer function (spec §6.3), and the input must never see
+  more than the 2.9 V ADC ceiling.
+  Then the measurement that gates a PCB change: **record the idle resistance and
+  confirm `R_ladder_idle ≤ R_pullup · 7.25`** (≈72.5 kΩ at the 10 kΩ `R15`/`R16`,
+  spec §6.3 consequence 4). If it is over, `R15`/`R16` go **smaller**, not
+  larger. Also note the ceiling headroom: the nominal 2835 mV idle reaches the
+  2900 mV ADC ceiling at only **+2.3 %** of rail, so confirm the real idle is
+  not already clipping. **Fit the real calibration curve here** — this is where
+  §2.3's numbers become true for the actual board. Update the spec's values.
 - [ ] **Step 4: The output stage and gain.** Measure the output envelope in both
   gain modes; verify the ratio is 1.82 and 1.00, the guard-band switch, the
   1.80 V floor and the 5.20 V ceiling. **Update §6.2 if reality disagrees — on
@@ -5128,8 +5793,10 @@ git commit -m "Record bring-up steps 1-4 measurements and correct the spec to ma
   panics before the mark-valid call; confirm rollback. **A mocked failure proves
   nothing.**
 - [ ] **Step 6: System bench tests (spec §10.4 level 4).** Every learned button,
-  100 presses each, at 11.0 / 12.6 / 14.8 V, asserting zero misclassifications
-  and the exact expected output level each time. Then the 72-hour soak.
+  100 presses each, at **3.14 / 3.30 / 3.47 V of +3V3 rail**, asserting zero
+  misclassifications and the exact expected output level each time. (Not a
+  12 V vehicle-rail sweep — that rail does not feed the ladder.) Then the
+  72-hour soak.
 - [ ] **Step 7: Commit** the results, and any spec corrections.
 
 ---
@@ -5183,17 +5850,17 @@ worked:
   tracking an `emitted` flag in the pressed branch.
 - **`LadderDecode`**: a 500-permille floor wrongly faulted any button below half
   the rail (three of the nine tests failed), and an above-rail reading was
-  reporting `kIdle`. Fixed by replacing the floor with a comparison against the
-  **learned rail** (`kRailHealthFloorPermille`) and adding an explicit
+  reporting `kIdle`. Fixed by comparing the **learned idle** against the current
+  one (`kRailHealthFloorPermille`, FR-30's ≤20 % floor) and adding an explicit
   above-reference check.
 
 `ConfigValidate`'s ambiguity rule was also corrected: the first version rejected
-windows *nested* inside one another, but 690±40 and 700±40 are not nested, so
-the test failed. Replaced with the rule that actually matters — the two centres
-must be further apart than the wider tolerance.
+windows *nested* inside one another, but two 42-permille-wide windows 10 permille
+apart are not nested, so the test failed. Replaced with the rule that actually
+matters — the two centres must be further apart than the wider tolerance.
 
 Verified standalone before committing to the plan: `LadderDecode` 18/18 checks
-including the 39-point rail sweep; the gesture state machine 11/11 including the
+including the 34-point +3V3 sweep; the gesture state machine 11/11 including the
 exact 500 ms and 750 ms boundaries and a 10-second hold emitting exactly one
 event; `ConfigValidate` 12/12.
 

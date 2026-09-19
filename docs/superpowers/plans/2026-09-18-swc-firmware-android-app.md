@@ -42,7 +42,15 @@
   `ALIGNMENT[APP_TYPE] = 0x10000` and rejects the whole table otherwise. An
   earlier revision's `app1 @ 0x208000` **did not build**; that is why the slots
   are 1920 KB and not 1952 KB. `0x3E0000–0x3EFFFF` is reserved slack.
-- **NVS partition:** 48 KB; serialized config ≤ 24 KB.
+- **NVS partition:** 48 KB (12 × 4096 B pages; 48,384 B of usable entry space).
+  Two limits, and the smaller one binds: a **single NVS value ≤ 4000 B** (hard
+  IDF cap — `ENTRY_SIZE 32 × (ENTRY_COUNT−1) 125`), and **two slots + `cfg_seq`
+  ≤ 48,384 B** at **2,112 B per 2048-byte chunk** (payload + NVS's metadata and
+  `BLOB_IDX` entries). Note this is *not* "a slot ≤ 24 KB": two 24 KB slots need
+  49,152 B and do not fit.
+  The worst-case config is ~17.8 KB and even a realistic one is ~3.9 KB, so a
+  slot is **chunked** (`cfg_a_0…n`, 2048 B per chunk, 9 chunks worst case); see
+  "NVS layout" in the Shared contract.
 - **TinyUSB is NOT part of IDF.** IDF 5.5.5 ships no `components/tinyusb` and
   defines no `CONFIG_TINYUSB_*`; the app USB link needs the managed component
   `espressif/esp_tinyusb` added via `idf_component.yml`. **Verified in Task 1.**
@@ -294,10 +302,13 @@ typedef struct {
 the gesture, disabled lets a lower-priority binding match. Both states must be
 representable and tested.
 
-**`OutputProfile` must carry `idle_dac_code`** (spec §3.7, value `4095`) — spec
-§6.7's whole hardware-default argument depends on it. An earlier revision's
-`OutputProfile{gain_mode, idle_key_mv}` omitted it, and every orchestrator test
-compared against a code the config could not supply.
+**`OutputProfile` carries `idle_dac_code`** (spec §3.7, value `4095`) — spec
+§6.7's whole hardware-default argument depends on it. An earlier revision had
+`OutputProfile{gain_mode, idle_key_mv}`, which omitted it; **`idle_key_mv` is not
+a config field at all** — the learned idle is a *runtime measurement* (Task 13's
+`IdleKeyMv()`), not something persisted, and nothing ever read it from the
+config. Every orchestrator test compares the DAC against `idle_dac_code`, so
+without the field the config could not supply the code those tests assert on.
 
 ### Gain policy (spec §6.2)
 
@@ -456,20 +467,49 @@ neighbouring button, capped by a configurable maximum (spec §3.4) — *not*
 
 ### NVS layout (spec §3.8)
 
-Namespace `swc_cfg`, keys `cfg_a`, `cfg_b`, `cfg_seq` — plus `cfg_a_0…n` /
-`cfg_b_0…n` **only if** the measured serialized config exceeds one NVS value.
-**Measure, then decide** — this is the one place where that is mandatory, because
-the answer changes the code. **The two slots share the 48 KB NVS partition, so
-they cannot both be 24 KB**; an earlier revision's "2 × 24 KB in a 48 KB
-partition plus a sequence key" does not fit.
+Namespace `swc_cfg`, sequence key `cfg_seq`, and a **chunked slot** per side:
+`cfg_a_0…n` / `cfg_b_0…n`, where chunk 0 carries the blob header (magic, schema,
+total length, chunk count, per-slot CRC) and the remaining chunks carry the
+payload. A slot is still read and validated **as a unit** — the CRC covers the
+whole slot, so a slot is either entirely good or rejected.
+
+**The chunked path is not conditional, and that is the decision this section
+exists to record.** Spec §3.8 says "measure, then decide", and the measurement is
+now done and is in the IDF source rather than in a datasheet:
+
+- A single NVS value is capped at `ENTRY_SIZE × (ENTRY_COUNT − 1)` = 32 × 125 =
+  **4000 bytes**. `nvs_page.cpp` returns `ESP_ERR_NVS_VALUE_TOO_LONG` above it.
+  This is a hard limit, not a budget.
+- The worst-case `Config` is **~17.8 KB** as JSON (~12.1 KB packed; `Binding` is
+  172 B and 2 channels × 32 bindings dominate). **Even a realistic config
+  (~3.9 KB) sits on the 4000-byte line, and a moderate one (~7.9 KB) exceeds it**
+  — so the single-value form fails on the common case, not a hypothetical one.
+
+Hence `ConfigChunkCountFor()` (Task 8) and the fixed `kConfigChunkBytes = 2048`:
+worst case **9 chunks per slot**, bounded key count. Measured slot cost is
+**79 % of usable NVS entry space** for two worst-case slots (38,016 B of
+48,384 B — the partition is 12 × 4096 B pages, each with 126 × 32 B entries), so
+it fits with less slack than "48 KB" suggests. Each chunk key costs **2112 B**,
+not 2080: NVS writes a 32-byte metadata entry and the 2048 payload bytes
+(`nvs_page.cpp:185`) and *then* a separate 32-byte `BLOB_IDX` entry for the key
+(`nvs_storage.cpp:353`). An earlier revision counted 2080 and understated the
+two-slot cost by 576 B.
+An earlier revision of this
+section had "plus `cfg_a_0…n` **only if** the measured size exceeds one value"
+and Task 9 write a single `nvs_set` per slot — which would have returned
+`ESP_ERR_NVS_VALUE_TOO_LONG` and been reported as a save failure.
+**Two slots share the 48 KB partition, so they cannot both be 24 KB** either; an
+earlier revision's "2 × 24 KB in a 48 KB partition plus a sequence key" does not
+fit.
 
 ### Test-harness API (used by every task)
 
-`MockHal` is a **C++ class** in `test_native/mock_hal.h` (defined by Task 2,
-Step 4). The host tests are C++, so the mock is C++ — an earlier revision of
-*this section* sketched a C-style `MockHalCreate`/`MockHalInterface` free-function
-API that no task actually called. **The class below is authoritative**; it is
-what the ~100 call sites across Tasks 3–24 use.
+`MockHal` is a **C++ class** in `test_native/MockHAL.h` (declared) and
+`test_native/MockHAL.cpp` (defined), both created by Task 2 and **already
+committed** — an earlier revision of *this section* sketched a C-style
+`MockHalCreate`/`MockHalInterface` free-function API that no task actually
+called, and named the file in lowercase. **The class below is authoritative**;
+it is what the ~100 call sites across Tasks 3–24 use.
 
 ```cpp
 class MockHal {
@@ -479,9 +519,15 @@ class MockHal {
   void  SetAdcMilliVolts(AdcChannel ch, int mv);
   void  SetGpioInput(GpioPin pin, bool level);
   void  DacSetCode(DacChannel ch, uint16_t code);
-  void  DacPowerMode(DacChannel ch, DacPowerMode mode);
+  // NOTE: the member name `DacPowerMode` HIDES the enum type of the same name
+  // for the rest of class scope, so every LATER use of the type inside the
+  // class must be qualified `::DacPowerMode`. The declaring line itself is
+  // fine; the return type below, the thunk parameter and the `dac_mode_`
+  // member are not. Unqualified, this header does not compile:
+  //   error: must use 'enum' tag to refer to type 'DacPowerMode' in this scope
+  void  DacPowerMode(DacChannel ch, ::DacPowerMode mode);
   uint16_t    LastDacCode(DacChannel ch) const;
-  DacPowerMode LastDacPowerMode(DacChannel ch) const;
+  ::DacPowerMode LastDacPowerMode(DacChannel ch) const;
   int   DacWriteCount(DacChannel ch) const;
   void  DacLdac(bool assert);
   bool  LastLdac() const;
@@ -495,6 +541,12 @@ class MockHal {
   int   NvsGet(const char *key, void *out, size_t len);
   void  FailNextNvsWrite();
   void  TruncateNextNvsWriteAt(size_t n);
+  // Target a SPECIFIC key rather than "the next write". Task 9 needs this: a
+  // slot is written as several chunks and the sequence key is written last, so
+  // "the next write" is always a payload chunk and can never express the
+  // sequence-lost tear. Added by Task 9 -- the one genuine addition to MockHal
+  // after Task 2, and it is new capability, not a duplicate of anything above.
+  void  TruncateNvsWriteTo(const char *key, size_t n);
   void  CorruptNvsValue(const char *key, size_t offset);   // flips one bit
   void  ClearNvs();
   int   RebootCount() const;
@@ -514,8 +566,43 @@ the interface member is `dac_ldac`), `CorruptNvsValue(key, offset)` taking a
 breaks call sites in later tasks.
 
 `MockHal` is declared in `test_native/MockHAL.h` and defined in
-`test_native/MockHAL.cpp`. Later tasks **extend** the class — Task 7 adds
-`CorruptNvsValue`/`ClearNvs` — so the header is edited, never re-declared.
+`test_native/MockHAL.cpp`. **Task 2 created and committed both, and no later
+task adds anything to them** — an earlier revision had Task 7 add
+`CorruptNvsValue`/`ClearNvs` and Task 9 add them again, which is a duplicate
+definition and does not compile. The header is edited only if a task genuinely
+needs a new fault injector that does not exist; check the class above first.
+
+**Every suite needs its own `test_main.cpp` — not just Task 2's.** GoogleTest's
+`gtest_main.cc` is excluded by googletest's `library.json` `srcFilter`, so
+nothing supplies `main()` and the link fails with `Undefined symbols: _main`.
+Task 2 writes the first one at `code/test_native/test_hal/test_main.cpp`; **every
+later task that creates a new suite directory must copy that same four-line file
+into it.** The directories are:
+
+| Suite | Introduced by |
+| --- | --- |
+| `test_hal` | Task 2 (the original) |
+| `test_analog` | Task 3 |
+| `test_output` | Task 5 — **and Task 7 adds a second suite to it; do NOT add a second `main()`** |
+| `test_gesture` | Task 6 |
+| `test_config` | Task 8 |
+| `test_link` | Task 10 |
+| `test_bindings` | Task 11 |
+| `test_feedback` | Task 12 |
+| `test_system` | Task 13 |
+| `test_learning` | Task 16 |
+| `test_update` | Task 17 |
+| `test_maintenance` | Task 18 |
+
+The four-line body (from Task 2):
+
+```cpp
+#include <gtest/gtest.h>
+int main(int argc, char **argv) {
+    ::testing::InitGoogleTest(&argc, argv);
+    return RUN_ALL_TESTS();
+}
+```
 
 ---
 
@@ -1215,10 +1302,10 @@ public:
     int AdcReadMv(AdcChannel ch) { return adc_mv_[static_cast<int>(ch)]; }
 
     void DacSetCode(DacChannel ch, uint16_t code);
-    void DacPowerMode(DacChannel ch, DacPowerMode mode);
+    void DacPowerMode(DacChannel ch, ::DacPowerMode mode);
     void DacLdac(bool assert) { ldac_asserted_ = assert; }
     uint16_t LastDacCode(DacChannel ch) const;
-    DacPowerMode LastDacPowerMode(DacChannel ch) const;
+    ::DacPowerMode LastDacPowerMode(DacChannel ch) const;
     int DacWriteCount(DacChannel ch) const;
     bool LastLdac() const { return ldac_asserted_; }
 
@@ -1259,7 +1346,7 @@ public:
 private:
     static int  AdcReadMvThunk(void *ctx, AdcChannel ch);
     static void DacSetCodeThunk(void *ctx, DacChannel ch, uint16_t code);
-    static void DacPowerModeThunk(void *ctx, DacChannel ch, DacPowerMode m);
+    static void DacPowerModeThunk(void *ctx, DacChannel ch, ::DacPowerMode m);
     static void DacLdacThunk(void *ctx, bool assert);
     static void GpioWriteThunk(void *ctx, GpioPin pin, bool level);
     static bool GpioReadThunk(void *ctx, GpioPin pin);
@@ -1274,7 +1361,7 @@ private:
     uint64_t now_ms_ = 0;
     int adc_mv_[ADC_CH_COUNT] = {};
     uint16_t dac_code_[DAC_CH_COUNT] = {};
-    DacPowerMode dac_mode_[DAC_CH_COUNT] = {};
+    ::DacPowerMode dac_mode_[DAC_CH_COUNT] = {};
     int dac_writes_[DAC_CH_COUNT] = {};
     bool ldac_asserted_ = false;
     bool gpio_out_[GPIO_COUNT] = {};
@@ -1317,7 +1404,7 @@ void MockHal::DacSetCode(DacChannel ch, uint16_t code) {
     ++dac_writes_[i];
 }
 
-void MockHal::DacPowerMode(DacChannel ch, DacPowerMode mode) {
+void MockHal::DacPowerMode(DacChannel ch, ::DacPowerMode mode) {
     dac_mode_[static_cast<int>(ch)] = mode;
 }
 
@@ -1384,7 +1471,7 @@ int  MockHal::AdcReadMvThunk(void *ctx, AdcChannel ch) {
 void MockHal::DacSetCodeThunk(void *ctx, DacChannel ch, uint16_t code) {
     static_cast<MockHal *>(ctx)->DacSetCode(ch, code);
 }
-void MockHal::DacPowerModeThunk(void *ctx, DacChannel ch, DacPowerMode m) {
+void MockHal::DacPowerModeThunk(void *ctx, DacChannel ch, ::DacPowerMode m) {
     static_cast<MockHal *>(ctx)->DacPowerMode(ch, m);
 }
 void MockHal::DacLdacThunk(void *ctx, bool assert) {
@@ -1450,11 +1537,13 @@ rail" — no such term exists in the transfer function.
 - Create: `code/lib/Analog/LadderDecode.h`
 - Create: `code/lib/Analog/LadderDecode.cpp`
 - Create: `code/test_native/test_analog/LadderDecodeTest.cpp`
+- Create: `code/test_native/test_analog/test_main.cpp` — required; copy Task 2's
+  four-line `main()` (see the Test-harness API note in the Shared contract).
 
 **Interfaces:**
 - Consumes: nothing
 - Produces:
-  - `struct LadderButton { int16_t ratio_permille; int16_t tolerance_permille; char id[24]; uint8_t action_id; }`
+  - `struct LadderButton { char id[24]; int16_t ratio_permille; int16_t tolerance_permille; uint8_t action_id; }`
   - `struct LadderProfile { LadderButton buttons[16]; uint8_t count; int learned_idle_mv; }`
   - `enum class ClassifyResult { kIdle, kButton, kUnknown, kFault }`
   - `struct ClassifyOutcome { ClassifyResult result; uint8_t index; int16_t ratio_permille; }`
@@ -1764,9 +1853,20 @@ owns that conversion and its error budget (spec §2.3: ≤ 25 mV).
 - Produces:
   - `constexpr int kAdcMaxRawS3 = 4095`
   - `constexpr int kAdcFullScaleMv12dB = 2900`
-  - `struct AdcCalibration { uint16_t raw_low; uint16_t raw_high; int mv_low; int mv_high; }` (two-point, from eFuse)
+  - `enum class CalibrationSource { kEFuseCurveFit, kLinearFallback }`
+  - `struct AdcCalibration { uint16_t raw_low; uint16_t raw_high; int mv_low; int mv_high; CalibrationSource source; }`
+  - `AdcCalibration AdcCalibrationSelect(bool curve_fit_supported)`
   - `int AdcRawToMilliVolts(const AdcCalibration &cal, uint16_t raw)`
-  - `AdcCalibration AdcCalibrationMakeDefault()` — the data-sheet shape, for `SWC_NATIVE_TEST`
+
+**This module owns spec §3.2's fallback requirement.** IDF's
+`adc_cali_create_scheme_curve_fitting()` returns `ESP_ERR_NOT_SUPPORTED` on
+modules whose eFuses are missing, and the spec is explicit that the firmware
+must *not* silently mis-scale: it falls back to a documented linear
+approximation **and reports that it did**. That "and reports" is why
+`CalibrationSource` is a field on the struct rather than a local — a silent
+fallback is the fault, and a value nothing can read is not a report.
+`AdcCalibrationSelect` is the decision, host-testable without an eFuse; Task 14
+supplies `curve_fit_supported` from the real call's return code.
 
 - [ ] **Step 1: Write the failing test**
 
@@ -1775,13 +1875,13 @@ owns that conversion and its error budget (spec §2.3: ≤ 25 mV).
 #include <gtest/gtest.h>
 
 TEST(AdcCalibration, EndpointsMapExactly) {
-    const AdcCalibration cal = AdcCalibrationMakeDefault();
+    const AdcCalibration cal = AdcCalibrationSelect(true);
     EXPECT_EQ(AdcRawToMilliVolts(cal, cal.raw_low), cal.mv_low);
     EXPECT_EQ(AdcRawToMilliVolts(cal, cal.raw_high), cal.mv_high);
 }
 
 TEST(AdcCalibration, IsMonotonicAcrossTheEntireRawRange) {
-    const AdcCalibration cal = AdcCalibrationMakeDefault();
+    const AdcCalibration cal = AdcCalibrationSelect(true);
     int prev = -1;
     for (uint16_t raw = 0; raw <= kAdcMaxRawS3; ++raw) {
         const int mv = AdcRawToMilliVolts(cal, raw);
@@ -1794,27 +1894,50 @@ TEST(AdcCalibration, NeverExceedsTheDatasheetCeilingForThisAttenuation) {
     // The ESP32-S3 at 12dB attenuation saturates at 2.9V. A conversion that
     // reports more than that is reporting a voltage the part cannot measure,
     // which would silently corrupt every downstream ratio.
-    const AdcCalibration cal = AdcCalibrationMakeDefault();
+    const AdcCalibration cal = AdcCalibrationSelect(true);
     for (uint16_t raw = 0; raw <= kAdcMaxRawS3; ++raw) {
         ASSERT_LE(AdcRawToMilliVolts(cal, raw), kAdcFullScaleMv12dB) << "raw=" << raw;
     }
 }
 
 TEST(AdcCalibration, MidScaleIsApproximatelyHalfOfFullScale) {
-    const AdcCalibration cal = AdcCalibrationMakeDefault();
+    const AdcCalibration cal = AdcCalibrationSelect(true);
     const int mv = AdcRawToMilliVolts(cal, kAdcMaxRawS3 / 2);
     EXPECT_NEAR(mv, kAdcFullScaleMv12dB / 2, 25);
 }
 
-TEST(AdcCalibration, TheSenseDividerKeepsUsUnderFullScale) {
-    // Spec 2.3: V_SENSE <= 2.49V by the /2 divider, whatever the KEY line does.
-    // A 5.20V ceiling on the output becomes 2.60V at the sense pin -- which is
-    // ABOVE 2.49V, so this documents the actual margin rather than asserting a
-    // comfortable one.
-    const int v_out_ceiling_mv = 5200;
-    const int v_sense_mv = v_out_ceiling_mv / 2;
+TEST(AdcCalibration, AMissingEFuseFallsBackAndSaysSo) {
+    // Spec 3.2: curve-fitting calibration is per-chip and eFuse-backed, and
+    // returns ESP_ERR_NOT_SUPPORTED on modules whose eFuses are blank. The spec
+    // forbids silently mis-scaling every reading, so the fallback must both
+    // happen AND be reported -- which is what CalibrationSource is for.
+    const AdcCalibration curve = AdcCalibrationSelect(true);
+    const AdcCalibration fallback = AdcCalibrationSelect(false);
+    EXPECT_EQ(curve.source, CalibrationSource::kEFuseCurveFit);
+    EXPECT_EQ(fallback.source, CalibrationSource::kLinearFallback);
+    // The fallback is still a usable conversion: monotonic, in range, and
+    // agreeing with the calibrated curve at both endpoints.
+    int prev = -1;
+    for (uint16_t raw = 0; raw <= kAdcMaxRawS3; ++raw) {
+        const int mv = AdcRawToMilliVolts(fallback, raw);
+        ASSERT_GE(mv, prev) << "non-monotonic at raw=" << raw;
+        ASSERT_LE(mv, kAdcFullScaleMv12dB) << "raw=" << raw;
+        prev = mv;
+    }
+    EXPECT_EQ(AdcRawToMilliVolts(fallback, fallback.raw_low), fallback.mv_low);
+    EXPECT_EQ(AdcRawToMilliVolts(fallback, fallback.raw_high), fallback.mv_high);
+}
+
+TEST(AdcCalibration, TheSenseBufferClipsBeforeTheAdcCeiling) {
+    // Spec 2.3: the sense buffer U6B is ITSELF an op-amp on +5V, so its output
+    // saturates near 4.98V whatever the KEY line does. Through the exact /2
+    // divider that is 2490mV. The 5.20V figure is the head-unit IDLE ENVELOPE
+    // bound (spec 6.2) and does NOT reach the divider unclipped -- taking it
+    // literally would give 2600mV, a voltage U6B cannot produce.
+    const int v_buf_saturation_mv = 4980;
+    const int v_sense_mv = v_buf_saturation_mv / 2;
     EXPECT_LT(v_sense_mv, kAdcFullScaleMv12dB);
-    EXPECT_EQ(v_sense_mv, 2600);
+    EXPECT_EQ(v_sense_mv, 2490);
 }
 ```
 
@@ -1833,19 +1956,30 @@ Expected: FAIL — `CalibrationCurve.h` not found.
 constexpr int kAdcMaxRawS3       = 4095;
 constexpr int kAdcFullScaleMv12dB = 2900;
 
+// Spec 3.2: curve-fitting calibration is eFuse-backed and per-chip. It is NOT
+// universally available -- adc_cali_create_scheme_curve_fitting() returns
+// ESP_ERR_NOT_SUPPORTED on modules with blank eFuses, and the spec requires the
+// firmware to fall back to a documented linear approximation *and report that
+// it did*, rather than silently mis-scaling every reading. Carrying the source
+// on the struct is what makes "report" possible; a caller that never checks it
+// is the silent-fallback fault the spec names.
+enum class CalibrationSource { kEFuseCurveFit, kLinearFallback };
+
 // Two-point calibration, which is the shape the ESP-IDF curve-fit calibration
 // exposes after its own polynomial stage. Keeping the curve's *effect* behind
 // this interface is what lets the host tests run without the eFuse.
 struct AdcCalibration {
-    uint16_t raw_low;
-    uint16_t raw_high;
-    int      mv_low;
-    int      mv_high;
+    uint16_t          raw_low;
+    uint16_t          raw_high;
+    int               mv_low;
+    int               mv_high;
+    CalibrationSource source;
 };
 
-// The data-sheet-shaped curve used by host tests. On device this is built from
-// esp_adc_cal_characterize() plus the per-chip curve-fit scheme.
-AdcCalibration AdcCalibrationMakeDefault();
+// Chooses the curve for this chip. Task 14 passes the real
+// adc_cali_create_scheme_curve_fitting() return code; the host tests pass both
+// values to exercise the fallback without an eFuse.
+AdcCalibration AdcCalibrationSelect(bool curve_fit_supported);
 
 int AdcRawToMilliVolts(const AdcCalibration &cal, uint16_t raw);
 ```
@@ -1857,15 +1991,19 @@ int AdcRawToMilliVolts(const AdcCalibration &cal, uint16_t raw);
 
 #include <algorithm>
 
-AdcCalibration AdcCalibrationMakeDefault() {
-    // A deliberately slightly non-linear curve, so a test that passes here also
-    // passes on a real chip whose curve differs from a straight line. The
-    // endpoints are the ones the data sheet gives for 12dB attenuation.
+AdcCalibration AdcCalibrationSelect(bool curve_fit_supported) {
+    // Both branches use the same data-sheet endpoints for 12dB attenuation. The
+    // real difference is the curve *between* them: the eFuse curve-fit is a
+    // per-chip polynomial (spec 2.3, -30..0mV post-calibration error), while
+    // the fallback is the straight line the spec calls "a documented linear
+    // approximation". The source field is what tells a caller which one it got.
     return AdcCalibration{
         /*raw_low=*/0,
         /*raw_high=*/kAdcMaxRawS3,
         /*mv_low=*/0,
         /*mv_high=*/kAdcFullScaleMv12dB,
+        /*source=*/curve_fit_supported ? CalibrationSource::kEFuseCurveFit
+                                       : CalibrationSource::kLinearFallback,
     };
 }
 
@@ -1909,6 +2047,9 @@ to the DAC is the fault mode this task exists to prevent.
 - Create: `code/lib/Output/GainPolicy.h`
 - Create: `code/lib/Output/GainPolicy.cpp`
 - Create: `code/test_native/test_output/GainPolicyTest.cpp`
+- Create: `code/test_native/test_output/test_main.cpp` — required; copy Task 2's
+  four-line `main()`. Task 7 adds a second suite to this same directory and must
+  **not** add a second `main()`.
 
 **Interfaces:**
 - Consumes: `DacChannel`, `DacPowerMode` from `HAL/IHAL.h`
@@ -2054,7 +2195,14 @@ GainDecision GainPolicyCodeForTarget(GainMode mode, int target_key_mv);
 namespace {
 // milli-units of the (1 + R58/R61) ratio, so the arithmetic stays integral.
 constexpr int kRatioMilli      = 1000 + (kGainR58 * 1000) / kGainR61;  // 1820
-constexpr int kAdjRatioMilli   = (kGainR58 * 1000) / kGainR61;         // 820
+// The V_ADJ coefficient (0.82). KeyMv below collapses the V_ADJ term away in
+// both modes rather than evaluating it, so this constant documents the divider
+// pair rather than feeding the arithmetic. It is deliberately unused -- the
+// project builds with -Wall -Wextra -Werror, which rejects an unreferenced
+// constexpr, so it carries the attribute. (clang enforces that; the device's
+// GCC 14.2.0 does not, so this only fails on the host build -- which is the
+// stricter of the two.)
+[[maybe_unused]] constexpr int kAdjRatioMilli = (kGainR58 * 1000) / kGainR61;  // 820
 
 int CodeToDacMv(uint16_t code) {
     const int c = std::min<int>(code, kDacMaxCode);
@@ -2156,6 +2304,8 @@ parameter, so the whole grammar is testable with no sleeps.
 - Create: `code/lib/Gesture/GestureStateMachine.cpp`
 - Create: `code/test_native/test_gesture/PressClassifierTest.cpp`
 - Create: `code/test_native/test_gesture/GestureStateMachineTest.cpp`
+- Create: `code/test_native/test_gesture/test_main.cpp` — required; copy Task 2's
+  four-line `main()`.
 
 **Interfaces:**
 - Consumes: `LadderProfile`, `LadderClassify` from Task 3
@@ -2209,9 +2359,12 @@ TEST(PressClassifier, HysteresisKeepsAPressLatchedThroughASmallDip) {
     uint64_t t = 1000;
     for (int i = 0; i < 5; ++i) { c.Update(1430, 2835, t); t += 10; }
     ASSERT_EQ(c.Level(), ChannelLevel::kPressed);
-    // 1425 mV is 503 permille: inside the window's outer edge but outside its
-    // centre band; hysteresis must hold the press rather than flap.
-    for (int i = 0; i < 5; ++i) { c.Update(1425, 2835, t); t += 10; }
+    // 1605 mV is 566 permille: in the GAP between VOL_UP's window (504+/-42,
+    // so [462,546]) and VOL_DOWN's ([588,672]). It classifies kUnknown, which
+    // is the ONLY branch hysteresis acts on -- a value still inside the window
+    // would classify kButton and never reach it. Hysteresis must hold the press
+    // rather than let a drifting finger release it.
+    for (int i = 0; i < 5; ++i) { c.Update(1605, 2835, t); t += 10; }
     EXPECT_EQ(c.Level(), ChannelLevel::kPressed);
 }
 
@@ -2430,32 +2583,48 @@ TEST(Gesture, TwoPressesInsideTheWindowEmitOneDoubleAndNoSingles) {
     Feed(sm, ChannelLevel::kPressed, 0, now, 100);
     ev = Feed(sm, ChannelLevel::kIdle, 0, now, 200);   // gap < 500ms
     EXPECT_EQ(ev.gesture, Gesture::kNone) << "must not emit SINGLE on the first press";
-    Feed(sm, ChannelLevel::kPressed, 0, now, 100);
-    ev = Feed(sm, ChannelLevel::kIdle, 0, now, 600);
+    // DOUBLE fires at the START of the second press, not on its release -- see
+    // the implementation's pressed-branch comment, and note that
+    // DoubleWindowBoundaryIsInclusiveAt499AndExclusiveAt500 reads kDouble from a
+    // kPressed Update. So THIS Feed carries the DOUBLE. An earlier revision read
+    // it from the release Feed below, which correctly returns kNone, so that
+    // form could never pass -- verified by building this block verbatim against
+    // the committed GestureStateMachine: 8 of 9 passed, this one failed.
+    ev = Feed(sm, ChannelLevel::kPressed, 0, now, 100);
     EXPECT_EQ(ev.gesture, Gesture::kDouble);
     EXPECT_EQ(ev.button_index, 0);
+    // ...and the release must be silent: FR-11's "the second press of a DOUBLE
+    // must not emit its own SINGLE".
+    ev = Feed(sm, ChannelLevel::kIdle, 0, now, 600);
+    EXPECT_EQ(ev.gesture, Gesture::kNone) << "the second press must not also emit a SINGLE";
 }
 
-TEST(Gesture, DoubleWindowBoundaryIsExclusiveAt500ms) {
-    {
+TEST(Gesture, DoubleWindowBoundaryIsInclusiveAt499AndExclusiveAt500) {
+    // Spec 10.4 requires the 500ms boundary at exactly 499/500/501. Feed()
+    // CANNOT express it: its loop steps 10ms and runs `elapsed < hold_ms`, so
+    // Feed(idle,499) and Feed(idle,500) advance the clock identically (both to
+    // gap 490) and the boundary is invisible. Direct Update calls instead.
+    // The window closes when `now - released_at_ >= double_press_off_ms`, so a
+    // 499ms gap is still a double and a 500ms gap is already a single.
+    struct Case { uint32_t gap_ms; Gesture expect; };
+    const Case cases[] = {{499, Gesture::kDouble},
+                          {500, Gesture::kSingle},
+                          {501, Gesture::kSingle}};
+    for (const Case &c : cases) {
         GestureStateMachine sm(GestureTimingsDefault());
-        uint64_t now = 1000;
         GestureEvent ev{};
-        Feed(sm, ChannelLevel::kPressed, 0, now, 100);
-        ev = Feed(sm, ChannelLevel::kIdle, 0, now, 499);
-        if (ev.gesture == Gesture::kNone) {
-            Feed(sm, ChannelLevel::kPressed, 0, now, 100);
-            ev = Feed(sm, ChannelLevel::kIdle, 0, now, 600);
+        sm.Update(ChannelLevel::kPressed, 0, 1000, &ev);   // press begins
+        sm.Update(ChannelLevel::kIdle, 0, 1100, &ev);      // release; gap starts here
+        const bool closed = sm.Update(ChannelLevel::kIdle, 0, 1100 + c.gap_ms, &ev);
+        if (c.expect == Gesture::kSingle) {
+            EXPECT_TRUE(closed) << "gap=" << c.gap_ms << "ms must have closed the window";
+            EXPECT_EQ(ev.gesture, Gesture::kSingle) << "gap=" << c.gap_ms;
+        } else {
+            EXPECT_FALSE(closed) << "gap=" << c.gap_ms << "ms must not have closed yet";
+            const bool dbl = sm.Update(ChannelLevel::kPressed, 0, 1100 + c.gap_ms + 10, &ev);
+            EXPECT_TRUE(dbl) << "gap=" << c.gap_ms;
+            EXPECT_EQ(ev.gesture, Gesture::kDouble) << "gap=" << c.gap_ms;
         }
-        EXPECT_EQ(ev.gesture, Gesture::kDouble) << "499ms gap is still a double";
-    }
-    {
-        GestureStateMachine sm(GestureTimingsDefault());
-        uint64_t now = 1000;
-        GestureEvent ev{};
-        Feed(sm, ChannelLevel::kPressed, 0, now, 100);
-        ev = Feed(sm, ChannelLevel::kIdle, 0, now, 501);
-        EXPECT_EQ(ev.gesture, Gesture::kSingle) << "501ms gap is a single";
     }
 }
 
@@ -2464,15 +2633,28 @@ TEST(Gesture, LongPressFiresAtTheThresholdBeforeRelease) {
     uint64_t now = 1000;
     GestureEvent ev = Feed(sm, ChannelLevel::kPressed, 0, now, 800);
     EXPECT_EQ(ev.gesture, Gesture::kLong);
-    EXPECT_GE(ev.at_ms - 1000, 750);
-    EXPECT_LT(ev.at_ms - 1000, 800) << "must fire at the threshold, not on release";
+    EXPECT_GE(ev.at_ms - 1000, 750u);
+    EXPECT_LT(ev.at_ms - 1000, 800u) << "must fire at the threshold, not on release";
 }
 
-TEST(Gesture, LongPressBoundaryIsInclusiveAt750ms) {
-    GestureStateMachine sm(GestureTimingsDefault());
-    uint64_t now = 1000;
-    GestureEvent ev = Feed(sm, ChannelLevel::kPressed, 0, now, 760);
-    EXPECT_EQ(ev.gesture, Gesture::kLong);
+TEST(Gesture, LongPressBoundaryIsSilentAt749InclusiveAt750AndAt751) {
+    // Spec 10.4 requires the 750ms boundary at 749/750/751, the LONG counterpart
+    // to the 500ms double window's 499/500/501. Driven by direct Update calls
+    // rather than Feed(): Feed's loop is `elapsed < hold_ms` with a 10ms step,
+    // so it can only land on a multiple of 10 and cannot express 749 or 751.
+    // The threshold is `>=`, so 749 is silent and both 750 and 751 fire.
+    const uint32_t offsets[] = {749, 750, 751};
+    const bool expect_long[]  = {false, true, true};
+    for (int i = 0; i < 3; ++i) {
+        GestureStateMachine sm(GestureTimingsDefault());
+        GestureEvent ev{};
+        sm.Update(ChannelLevel::kPressed, 0, 1000, &ev);          // press begins
+        const bool fired = sm.Update(ChannelLevel::kPressed, 0, 1000 + offsets[i], &ev);
+        EXPECT_EQ(fired, expect_long[i]) << "offset=" << offsets[i] << "ms";
+        if (expect_long[i]) {
+            EXPECT_EQ(ev.gesture, Gesture::kLong) << "offset=" << offsets[i];
+        }
+    }
 }
 
 TEST(Gesture, ALongPressNeverAlsoEmitsASingle) {
@@ -2727,6 +2909,7 @@ hardware integrator is how you get a howling output.
 - Create: `code/lib/Output/ServoLoop.h`
 - Create: `code/lib/Output/ServoLoop.cpp`
 - Create: `code/test_native/test_output/ServoLoopTest.cpp`
+  (no `test_main.cpp` — Task 5 already created one for this directory)
 
 **Interfaces:**
 - Consumes: `GainPolicyCodeForTarget`, `GainPolicyKeyMvForCode`, `GainMode` (Task 5)
@@ -2784,13 +2967,29 @@ TEST(ServoLoop, StopsAdjustingInsideTheDeadband) {
 }
 
 TEST(ServoLoop, DoesNotOscillateEvenWithAMeasuredOvershoot) {
-    // Feed the loop alternating readings that bracket the target. An unbounded
-    // integrator would ring; a bounded one must converge and stay put.
+    // Feed the loop alternating readings that BRACKET the target from outside
+    // the deadband. An unbounded integrator would ring; a bounded one must stay
+    // inside its authority band and never leave it.
+    //
+    // The readings must be further than deadband_mv (20) from target/2 = 2000.
+    // 1990/2010 are only +-10mV -- INSIDE the deadband -- so the loop never
+    // moves and this test would pass with the step cap deleted. Use +-100mV.
     ServoLoop loop(ServoConfigDefault());
     loop.Target(GainMode::kAmplified, 4000);
+    const uint16_t base = GainPolicyCodeForTarget(GainMode::kAmplified, 4000).dac_code;
+    bool moved = false;
     for (int i = 0; i < 200; ++i) {
-        loop.Update((i % 2) ? 1990 : 2010);
+        loop.Update((i % 2) ? 1900 : 2100);
+        if (loop.Code() != base) moved = true;
+        const int drift = std::abs(static_cast<int>(loop.Code()) - static_cast<int>(base));
+        ASSERT_LE(drift, ServoConfigDefault().max_total_codes)
+            << "left the authority band at i=" << i;
     }
+    // Bounded, but it MUST have trimmed: a loop that never moves trivially
+    // satisfies the bound above. Note the final code returns to `base` by
+    // parity (the last update is odd -> 1900), so assert on movement seen
+    // during the run, not on where it happened to stop.
+    EXPECT_TRUE(moved) << "the loop must have trimmed, not sat still";
     const uint16_t code_a = loop.Code();
     for (int i = 0; i < 20; ++i) loop.Update(2000);
     EXPECT_EQ(loop.Code(), code_a) << "must not keep moving once inside the deadband";
@@ -2945,7 +3144,7 @@ bool ServoLoop::Update(int measured_sense_mv) {
 - [ ] **Step 5: Run the tests**
 
 Run: `cd code && pio test -e native -f '*test_output'`
-Expected: PASS — 8 servo tests green.
+Expected: PASS — 7 servo tests green.
 
 - [ ] **Step 6: Commit**
 
@@ -2973,6 +3172,8 @@ persists or transmits it.
 - Create: `code/lib/Config/ConfigCodec.h`
 - Create: `code/lib/Config/ConfigCodec.cpp`
 - Create: `code/test_native/test_config/ConfigCodecTest.cpp`
+- Create: `code/test_native/test_config/test_main.cpp` — required; copy Task 2's
+  four-line `main()`.
 
 **Interfaces:**
 - Consumes: `LadderProfile` (Task 3), `GestureTimings` (Task 6), `GainPolicy` (Task 5)
@@ -2998,21 +3199,24 @@ Config MakeConfig() {
     Config c{};
     c.schema_version = kConfigSchemaVersion;
     std::strncpy(c.device_id, "SWC-0001", sizeof(c.device_id) - 1);
+    c.updated_at_ms = 1700000000000ULL;
     c.settings = DeviceSettings{};
     c.settings.timings = GestureTimingsDefault();
     c.settings.gain_policy = GainPolicy::kAuto;
     c.settings.buzzer_level = 2;
     c.settings.led_level = 2;
     c.settings.temp_comp_enabled = true;
+    c.settings.maintenance_timeout_ms = 300000;   // spec 5-minute maintenance window
     c.channel_count = 1;
     c.channels[0].enabled = true;
     std::strncpy(c.channels[0].name, "SWC1", sizeof(c.channels[0].name) - 1);
     c.channels[0].ladder.learned_idle_mv = 2835;
     c.channels[0].ladder.count = 1;
-    std::strncpy(c.channels[0].ladder.buttons[0].id, "VOL_UP",
-                 sizeof(c.channels[0].ladder.buttons[0].id) - 1);
+    // The initializer sets the whole struct including id; a separate strncpy
+    // before it would be overwritten and is not there.
     c.channels[0].ladder.buttons[0] = {"VOL_UP", 504, 42, 1};
     c.channels[0].output.gain_mode = GainMode::kAmplified;
+    c.channels[0].output.idle_dac_code = 4095;    // spec 3.7's default; full scale is the safe state (6.7)
     c.channels[0].binding_count = 1;
     c.channels[0].bindings[0].button_index = 0;
     c.channels[0].bindings[0].gesture = Gesture::kSingle;
@@ -3029,15 +3233,37 @@ TEST(ConfigCodec, JsonRoundTripsEveryFieldThatWasSet) {
 
     Config out{};
     ASSERT_TRUE(ConfigDecodeJson(buf, n, &out));
+    // Every field MakeConfig sets is checked here. A field the encoder silently
+    // drops would otherwise pass: JsonRoundTripIsStableUnderReencode only proves
+    // the encoder is deterministic, not complete -- a dropped field is stable.
+    EXPECT_EQ(out.schema_version, in.schema_version);
     EXPECT_STREQ(out.device_id, in.device_id);
+    EXPECT_EQ(out.settings.timings.debounce_ms, in.settings.timings.debounce_ms);
     EXPECT_EQ(out.settings.timings.double_press_off_ms, 500);
     EXPECT_EQ(out.settings.timings.long_press_ms, 750);
+    EXPECT_EQ(out.settings.timings.send_duration_ms, in.settings.timings.send_duration_ms);
     EXPECT_EQ(out.settings.gain_policy, GainPolicy::kAuto);
+    EXPECT_EQ(out.settings.buzzer_level, 2);
+    EXPECT_EQ(out.settings.led_level, 2);
+    EXPECT_TRUE(out.settings.temp_comp_enabled);
+    EXPECT_EQ(out.settings.maintenance_timeout_ms, in.settings.maintenance_timeout_ms);
+
+    EXPECT_EQ(out.channel_count, 1);
+    EXPECT_TRUE(out.channels[0].enabled);
+    EXPECT_STREQ(out.channels[0].name, "SWC1");
+    EXPECT_EQ(out.channels[0].ladder.learned_idle_mv, 2835);
     EXPECT_EQ(out.channels[0].ladder.count, 1);
     EXPECT_STREQ(out.channels[0].ladder.buttons[0].id, "VOL_UP");
     EXPECT_EQ(out.channels[0].ladder.buttons[0].ratio_permille, 504);
-    EXPECT_EQ(out.channels[0].bindings[0].action_id, 1);
+    EXPECT_EQ(out.channels[0].ladder.buttons[0].tolerance_permille, 42);
+    EXPECT_EQ(out.channels[0].ladder.buttons[0].action_id, 1);
+    EXPECT_EQ(out.channels[0].output.gain_mode, GainMode::kAmplified);
+    EXPECT_EQ(out.channels[0].output.idle_dac_code, 4095);
+
+    EXPECT_EQ(out.channels[0].binding_count, 1);
+    EXPECT_EQ(out.channels[0].bindings[0].button_index, 0);
     EXPECT_EQ(out.channels[0].bindings[0].gesture, Gesture::kSingle);
+    EXPECT_EQ(out.channels[0].bindings[0].action_id, 1);
 }
 
 TEST(ConfigCodec, JsonRoundTripIsStableUnderReencode) {
@@ -3184,7 +3410,12 @@ struct DeviceSettings {
 
 struct OutputProfile {
     GainMode gain_mode;
-    int      idle_key_mv;        // learned head-unit idle, for gain selection
+    // The DAC code the KEY line is held at when idle (spec 3.7: 4095, and spec
+    // 6.7 explains why full scale is the SAFE state -- the output only sinks,
+    // so a high command releases the line). This is what Boot() writes in its
+    // "establish safe idle" step, and what every orchestrator test compares
+    // against after a press.
+    uint16_t idle_dac_code;
 };
 
 struct Binding {
@@ -3233,13 +3464,24 @@ bool ConfigValidate(const Config &c);
 size_t ConfigEncodeJson(const Config &c, char *out, size_t out_len);
 bool   ConfigDecodeJson(const char *json, size_t len, Config *out);
 
-// NVS blob form: version header + CRC32 over the payload (FR-23). Deliberately
-// not JSON -- it is smaller, and a CRC is what makes a torn write detectable.
+// NVS blob form: version header + CRC32 over the JSON payload (FR-23). The
+// payload is JSON, the same bytes ConfigEncodeJson produces -- one codec, so the
+// two forms cannot drift -- and the CRC is what makes a torn write detectable.
 size_t ConfigEncodeBlob(const Config &c, uint8_t *out, size_t out_len);
 bool   ConfigDecodeBlob(const uint8_t *in, size_t len, Config *out);
 
-// Worst-case serialized size, asserted against the 48KB NVS budget (spec 10.5).
+// Worst-case serialized size, asserted against the NVS budget (spec 10.5).
 size_t ConfigMaxSerializedSize();
+
+// How many NVS keys a blob of this size needs, at a fixed chunk size well under
+// the 4000-byte single-value cap. A slot is written as `cfg_a_0..n` with the
+// count and a per-slot CRC in the header chunk (spec 3.8), because a real config
+// is 10-15 KB and CANNOT be one NVS value.
+int ConfigChunkCountFor(size_t blob_len);
+
+// The fixed chunk size the store writes. Must be < 4000 to leave entry
+// overhead, and is a compile-time constant so the key count is bounded.
+constexpr size_t kConfigChunkBytes = 2048;
 ```
 
 - [ ] **Step 5: Implement `ConfigCodec.cpp`**
@@ -3339,16 +3581,18 @@ bool ConfigValidate(const Config &c) {
 }
 ```
 
-The JSON and blob encoders: build a `cJSON` tree for JSON, and a packed struct
-copy for the blob. Both are mechanical; the tests above are what pin the
-behavior. Key requirements the implementation must satisfy:
+Both encoders are mechanical; the tests above are what pin the behavior. **The
+blob's payload IS the JSON** — `ConfigEncodeBlob` prepends a header and CRCs the
+JSON bytes; it does not pack the struct. Key requirements the implementation must
+satisfy:
 
 - `ConfigEncodeJson` writes `schema_version`, `device_id`, `settings` (including
   all four `GestureTimings` fields), and a `channels` array whose entries carry
   `name`, `enabled`, `ladder` (**`idle_mv`** — the struct field is
   `learned_idle_mv`, but the wire key is `idle_mv`, per spec §3.7's worked
-  example — and a `buttons` array), `output`, and `bindings` (`button_index`,
-  `gesture` as a string, `action_id`, `action_name`, `data_payload`).
+  example — and a `buttons` array), `output` (**`gain_mode`** and
+  **`idle_dac_code`**, spec §3.7), and `bindings` (`button_index`, `gesture` as a
+  string, `action_id`, `action_name`, `data_payload`).
 - `ConfigDecodeJson` returns `false` unless **every** required field is present
   and the decoded `Config` passes `ConfigValidate`. It must reject
   `schema_version != kConfigSchemaVersion` explicitly, so a future schema is
@@ -3358,11 +3602,17 @@ behavior. Key requirements the implementation must satisfy:
 - `ConfigDecodeBlob` checks magic, `schema_version`, `payload_len <= len -
   sizeof(BlobHeader)`, then recomputes the CRC. Any mismatch returns `false`
   **without writing to `out`**.
+- `ConfigMaxSerializedSize` returns the worst case: `sizeof(BlobHeader)` plus the
+  fully-populated JSON (2 channels × 16 buttons × 32 bindings). The blob is JSON
+  payload — do not pack the struct, or the two forms drift.
+- `ConfigChunkCountFor(blob_len)` returns `ceil(blob_len / kConfigChunkBytes)`,
+  and `kConfigChunkBytes` is a fixed 2048. Task 9 uses both to write
+  `cfg_a_0…n`; they are the reason the chunked path has a bounded key count.
 
 - [ ] **Step 6: Run the tests**
 
 Run: `cd code && pio test -e native -f '*test_config'`
-Expected: PASS — 8 tests green.
+Expected: PASS — 10 tests green.
 
 - [ ] **Step 7: Assert the config fits the NVS budget**
 
@@ -3370,14 +3620,52 @@ Add to the test file:
 
 ```cpp
 TEST(ConfigCodec, SerializedSizeFitsTheNvsPartitionBudget) {
-    // Spec 10.5: the serialized config must stay under 24KB, half the 48KB NVS
-    // partition, leaving room for the A/B pair plus wear-leveling slack.
-    EXPECT_LT(ConfigMaxSerializedSize(), 24u * 1024u);
+    // Spec 10.5, two limits -- and the second is the one that is easy to miss.
+    //
+    // (a) A single NVS *value* is capped at ENTRY_SIZE * (ENTRY_COUNT - 1)
+    //     = 32 * 125 = 4000 bytes. That is a hard IDF limit (nvs_page.cpp
+    //     returns ESP_ERR_NVS_VALUE_TOO_LONG above it), not a budget to tune.
+    //     Even a REALISTIC config (~3.9 KB) sits on that line, and a moderate
+    //     one (~7.9 KB) blows past it -- so a single-value slot is not a
+    //     hypothetical failure, it is the common case.
+    EXPECT_GT(ConfigMaxSerializedSize(), 4000u)
+        << "the worst case must force chunking, or Task 9's chunked path is dead code";
+
+    // (b) BOTH slots, plus the sequence key, must fit the partition's usable
+    //     entry space: 12 pages x 126 entries x 32 B = 48,384 B.
+    //
+    //     Each chunk key costs 2112 B, NOT 2048. NVS writes a 32-byte metadata
+    //     entry plus the payload (nvs_page.cpp:185), and then a separate
+    //     32-byte BLOB_IDX entry for the key (nvs_storage.cpp:353). Counting
+    //     only the payload understates the budget.
+    //
+    //     NOTE this is deliberately NOT the weaker "a slot fits in 24 KB"
+    //     assertion an earlier revision had: two 24 KB slots need 49,152 B of
+    //     entry space and DO NOT FIT a 48,384-byte partition. Asserting that
+    //     bound would pass on a config the device cannot actually store twice.
+    constexpr size_t kUsableEntryBytes    = 32u * 126u * 12u;              // 48,384
+    constexpr size_t kEntryBytesPerChunk  = 32u + kConfigChunkBytes + 32u; // 2,112
+    constexpr size_t kSequenceKeyBytes    = 32u;
+    const size_t chunks =
+        static_cast<size_t>(ConfigChunkCountFor(ConfigMaxSerializedSize()));
+    EXPECT_LE(2u * chunks * kEntryBytesPerChunk + kSequenceKeyBytes, kUsableEntryBytes)
+        << "two slots + cfg_seq must fit the partition, with entry overhead counted";
 }
 ```
 
-`ConfigMaxSerializedSize()` returns the worst case: `sizeof(BlobHeader)` plus the
-fully-populated JSON (2 channels × 16 buttons × 32 bindings).
+**Measured worst case, for the record** (computed from these structs, not
+estimated): the packed form is **12,120 B** (`Binding` is 172 B with alignment;
+2 channels × 32 bindings dominate), and the blob is JSON payload, so the real
+worst case is **~17.8 KB → 9 chunks**. Two such slots cost 38,016 B of the
+48,384 B of usable NVS entry space — **79 %**, which fits but is not roomy. A
+realistic config (9 buttons, 9 bindings, short payloads) is ~3.9 KB → 2 chunks →
+17 %. **That spread is the reason the bound is asserted rather than assumed.**
+
+The per-chunk cost is **2112 B**, not 2080: a 32-byte metadata entry plus the
+2048 payload bytes (`nvs_page.cpp:185`), plus a 32-byte `BLOB_IDX` entry that
+NVS writes once per key (`nvs_storage.cpp:353`). Counting only the first two
+understates a two-slot budget by 576 B — small here, but it is the difference
+between "fits" and "fits with the margin you think it has".
 
 Run: `cd code && pio test -e native -f '*test_config'`
 Expected: PASS.
@@ -3386,14 +3674,23 @@ Expected: PASS.
 
 ```bash
 git add code/lib/Config/ConfigModel.h code/lib/Config/ConfigCodec.h \
-        code/lib/Config/ConfigCodec.cpp code/test_native/test_config
+        code/lib/Config/ConfigCodec.cpp code/test_native/test_config \
+        code/platformio.ini
 git commit -m "Add the config model with validated JSON and CRC'd blob codecs
 
 The model is the entity layout shared by firmware, app and web page. Validation
 rejects what would make classification ambiguous or the device unable to serve
 input -- nested windows, a long-press threshold inside the double-press window,
-a ratio above the rail. A newer schema version is refused, never misparsed."
+a ratio above the rail. A newer schema version is refused, never misparsed.
+
+platformio.ini carries the new cJSON host dependency the native env needs to
+link the same parser the device uses."
 ```
+
+`code/platformio.ini` is in that list deliberately: Step 5 adds
+`DaveGamble/cJSON@^1.7.18` to the `native` env's `lib_deps`, and without it the
+host build fails to link. A dependency change that is not committed is a broken
+build for everyone else.
 
 ---
 
@@ -3407,11 +3704,14 @@ the older copy is always intact while the newer one is being written.
 - Create: `code/lib/Config/ConfigStore.h`
 - Create: `code/lib/Config/ConfigStore.cpp`
 - Create: `code/test_native/test_config/ConfigStoreTest.cpp`
+- Modify: `code/test_native/MockHAL.h`, `code/test_native/MockHAL.cpp` — add
+  `TruncateNvsWriteTo(key, n)` **only**. No `test_main.cpp`: Task 8 owns the one
+  for `test_config/`.
 
 **Interfaces:**
 - Consumes: `ConfigCodec` (Task 8), `IHAL::nvs_get`/`nvs_set` (Task 2), `MockHal` (Task 2)
 - Produces:
-  - `enum class ConfigLoadResult { kLoaded, kNoConfig, kRecoveredFromBackup, kFellBackToDefaults, kCorrupt }`
+  - `enum class ConfigLoadResult { kLoaded, kNoConfig, kRecoveredFromBackup, kFellBackToDefaults }`
   - `class ConfigStore` with `ConfigLoadResult Load(Config *out)`, `bool Save(const Config &c)`, `uint32_t LoadedSequence() const`
 
 - [ ] **Step 1: Write the failing test**
@@ -3425,10 +3725,13 @@ namespace {
 Config MakeConfig() { /* as in Task 8's MakeConfig(), returning a valid config */ }
 
 // Slot keys are internal; the test drives failure through MockHal's injected
-// write fault, which is the realistic failure (power cut mid-write).
-constexpr const char *kNvsA = "cfg_a";
-constexpr const char *kNvsB = "cfg_b";
-constexpr const char *kNvsSeq = "cfg_seq";
+// write fault, which is the realistic failure (power cut mid-write). Only the
+// first chunk of each slot is named here, because only chunk 0 is corrupted
+// directly (it carries the header and the slot CRC, so corrupting it is what
+// makes the whole slot unreadable) -- the sequence key is reached through the
+// fault injector instead, so naming it would be an unused constant.
+constexpr const char *kNvsA = "cfg_a_0";
+constexpr const char *kNvsB = "cfg_b_0";
 }  // namespace
 
 TEST(ConfigStore, EmptyNvsReportsNoConfigRatherThanDefaults) {
@@ -3469,21 +3772,63 @@ TEST(ConfigStore, ATornWriteIsDetectedAndTheBackupIsUsed) {
     Config c = MakeConfig();
     ASSERT_TRUE(store.Save(c));                       // slot A, seq 1
     std::strncpy(c.device_id, "SWC-0002", sizeof(c.device_id) - 1);
-    hal.TruncateNextNvsWriteAt(16);                   // power cut mid-write of slot B
-    store.Save(c);
+
+    // Truncate the PAYLOAD write, not the sequence write. The store writes the
+    // slot first and cfg_seq last, so the realistic torn case -- power lost
+    // while the payload is landing -- is the slot write. NvsSet here both lands
+    // a short value AND reports failure, which is exactly what a brown-out
+    // mid-write looks like: garbage on the medium, and a driver that says so.
+    hal.TruncateNextNvsWriteAt(16);
+    EXPECT_FALSE(store.Save(c)) << "a failed write must report failure";
 
     Config out{};
-    EXPECT_EQ(store.Load(&out), ConfigLoadResult::kRecoveredFromBackup);
+    // The sequence was never advanced, so slot A is still the newest slot and
+    // is still intact: this is kLoaded, not kRecoveredFromBackup. Reaching the
+    // backup path needs a TORN SEQUENCE write, which the next test covers --
+    // the distinction matters because kLoaded means "nothing was wrong".
+    EXPECT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
     EXPECT_STREQ(out.device_id, "SWC-0001")
-        << "a torn write must leave the previous good config, not a partial one";
+        << "a torn payload write must leave the previous good config, not a partial one";
+}
+
+TEST(ConfigStore, ATornSequenceWriteLeavesTheBackupAuthoritative) {
+    MockHal hal;
+    ConfigStore store(&hal.InterfaceRef());
+    Config c = MakeConfig();
+    ASSERT_TRUE(store.Save(c));                        // slot A, seq 1
+    std::strncpy(c.device_id, "SWC-0002", sizeof(c.device_id) - 1);
+    ASSERT_TRUE(store.Save(c));                        // slot B, seq 2
+    std::strncpy(c.device_id, "SWC-0003", sizeof(c.device_id) - 1);
+
+    // The other half of the tear: the payload chunks land, the sequence write is
+    // the one that is lost. Save has already written slot A (the non-newest one)
+    // with SWC-0003, so seq stays 2 -> slot B (SWC-0002) is still the newest
+    // and still valid. This is the case the write-order protocol exists for.
+    //
+    // It must target the key, not "the next write": a slot is several chunks,
+    // so the next write is a payload chunk and the sequence write is never
+    // reached. That is why Task 9 adds TruncateNvsWriteTo.
+    hal.TruncateNvsWriteTo("cfg_seq", 2);
+    EXPECT_FALSE(store.Save(c));
+
+    Config out{};
+    EXPECT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+    EXPECT_STREQ(out.device_id, "SWC-0002")
+        << "an unlanded sequence write must not promote the payload to newest";
 }
 
 TEST(ConfigStore, BothSlotsCorruptFallsBackToDefaultsNotToHalfAConfig) {
     MockHal hal;
     ConfigStore store(&hal.InterfaceRef());
-    store.Save(MakeConfig());
-    // Corrupt both slots by flipping a byte in each stored blob.
+    Config c = MakeConfig();
+    ASSERT_TRUE(store.Save(c));                        // slot A, seq 1
+    std::strncpy(c.device_id, "SWC-0002", sizeof(c.device_id) - 1);
+    ASSERT_TRUE(store.Save(c));                        // slot B, seq 2
+    // Corrupt BOTH slots -- that is what the test name says, and with only one
+    // corrupted the store would simply use the other and this would be a
+    // duplicate of ATornWriteIsDetectedAndTheBackupIsUsed.
     hal.CorruptNvsValue(kNvsA, 3);
+    hal.CorruptNvsValue(kNvsB, 3);
     Config out{};
     const ConfigLoadResult r = store.Load(&out);
     EXPECT_TRUE(r == ConfigLoadResult::kFellBackToDefaults ||
@@ -3518,23 +3863,14 @@ TEST(ConfigStore, AFailedWriteReportsFailureAndLeavesTheOldConfigLoadable) {
 }
 ```
 
-This task needs two additions to `MockHal`, added here since the store is the
-first consumer:
-
-```cpp
-// In MockHAL.h, public:
-    IHAL &InterfaceRef() { return iface_; }
-    void CorruptNvsValue(const char *key, size_t offset);   // flips one bit
-    void ClearNvs();
-
-// In MockHAL.cpp:
-void MockHal::CorruptNvsValue(const char *key, size_t offset) {
-    auto it = nvs_.find(key);
-    if (it == nvs_.end() || offset >= it->second.size()) return;
-    it->second[offset] ^= 0x01;
-}
-void MockHal::ClearNvs() { nvs_.clear(); }
-```
+**`MockHal` needs exactly one addition here: `TruncateNvsWriteTo(key, n)`.** An
+earlier revision of this section said to add `InterfaceRef`, `CorruptNvsValue`
+and `ClearNvs` "since the store is the first consumer" — but Task 2 already
+defines all three and is committed, so adding them again is a duplicate
+definition that will not compile. Those three are only *used* here. The fourth is
+different: the existing `TruncateNextNvsWriteAt` targets "the next write", which
+with chunked slots is always a payload chunk, so the sequence-lost tear cannot be
+expressed at all. That one is genuine new capability.
 
 - [ ] **Step 2: Run it and watch it fail**
 
@@ -3555,8 +3891,7 @@ enum class ConfigLoadResult {
     kLoaded,                 // the newest valid slot
     kNoConfig,               // nothing stored at all -> pass-through mode (FR-25)
     kRecoveredFromBackup,    // the newest slot was torn; the other was used
-    kFellBackToDefaults,     // both slots unusable (FR-24)
-    kCorrupt,                // stored data exists but is unreadable
+    kFellBackToDefaults,     // no slot yielded a usable config (FR-24)
 };
 
 /*
@@ -3578,30 +3913,65 @@ public:
 
     uint32_t LoadedSequence() const { return loaded_seq_; }
 
-    // Worst case, asserted against the NVS budget (spec 10.5).
-    static size_t MaxStoredBytes();
-
 private:
     IHAL *hal_;
     uint32_t loaded_seq_ = 0;
-    int next_slot_ = 0;
 };
 ```
+
+**No `MaxStoredBytes()`.** An earlier revision declared it "asserted against the
+NVS budget (spec 10.5)". §10.5's config-fits-NVS gate is `ConfigCodec`'s
+round-trip size assertion against the 48 KB partition — Task 8 owns it. The
+store writes at most two slots, so a size accessor here has no consumer and no
+gate to serve.
+
+**No `next_slot_` member.** The newest slot is derived from `cfg_seq`'s parity,
+so a cached index is a second home for the same fact — exactly the drift this
+plan has been cleaning up. `Load` derives it, and `Save` writes the other one.
+
+**This is the one task that DOES add to `MockHal`** — `TruncateNvsWriteTo(key, n)`,
+declared in the Shared contract's harness block. `TruncateNextNvsWriteAt` is
+"the next write", and with chunked slots the next write is always a payload
+chunk, so it cannot express the sequence-lost tear at all. Add the method to
+`test_native/MockHAL.h` and `MockHAL.cpp` and **commit those two files with this
+task** — a fault injector that only exists in a working tree is not usable by the
+next task.
 
 - [ ] **Step 4: Implement `ConfigStore.cpp`**
 
 The logic the tests pin down:
 
-- **NVS keys:** `cfg_seq` (a `uint32_t` sequence number), `cfg_a`, `cfg_b`.
+- **NVS keys:** `cfg_seq` (a `uint32_t` sequence number), and per slot
+  `cfg_<slot>_0…n` where `<slot>` is `a` or `b`. Chunk 0 carries the blob header
+  (magic, schema, total length, chunk count, slot CRC); the rest carry payload.
+  Chunk size is `kConfigChunkBytes` (2048) and the count comes from
+  `ConfigChunkCountFor()` (Task 8) — both fixed, so the key count is bounded.
 - `Load`: read `cfg_seq`. If it is absent, return `kNoConfig` — *not* defaults,
   because "never configured" is what selects pass-through mode (FR-25).
-  Read the newest slot first (by sequence parity); if `ConfigDecodeBlob` fails,
-  try the other. If the newer fails and the older succeeds, return
-  `kRecoveredFromBackup`. If both fail, return `kFellBackToDefaults`.
-- `Save`: encode to a blob; write to the slot that is **not** the newest; then
-  write `cfg_seq + 1`. Because the sequence is written last, a power cut before
-  it means the torn payload is never considered newest.
-- `Save` returns `false` if either `nvs_set` fails, and must not have advanced
+  The newest slot is `cfg_seq` **parity**: the slot a save writes when the
+  sequence it is about to write is odd is `cfg_a`. Read the newest slot's chunks
+  and validate the slot CRC; if that fails, try the other slot. If the newer
+  fails and the older succeeds, return `kRecoveredFromBackup`. If neither yields
+  a config, return `kFellBackToDefaults`.
+- `Save`: encode to a blob; write **all of the non-newest slot's chunks**; then
+  write `cfg_seq + 1`. The sequence is written last, and that ordering is the
+  whole protocol. It splits the tear in two, and the tests pin both halves:
+  - **Payload torn** (`TruncateNextNvsWriteAt(16)`): a chunk write fails, so the
+    sequence is never written. The old sequence still points at the old slot,
+    which is untouched and valid → `kLoaded` with the *old* config. The torn
+    bytes are never read, because they are not the newest slot.
+  - **Sequence torn** (`TruncateNvsWriteTo("cfg_seq", 2)`): every payload chunk
+    landed in the non-newest slot, but the sequence write failed. The sequence
+    still points at the previous slot, which is still intact → `kLoaded` with
+    the *previous* config. The landed payload is ignored, not promoted.
+  In both cases a failed `Save` returns `false` and the sequence does not
+  advance. `kRecoveredFromBackup` is reserved for the case where the sequence
+  *did* advance but the newest slot's CRC then failed — a slot that was written
+  whole once and rotted, not a write that was interrupted.
+- A **partial chunk set is a slot failure, not a partial config.** If chunk `i`
+  is missing or short, the slot is rejected whole: the header's chunk count and
+  total length are checked before the CRC, so a truncated set can never decode.
+- `Save` returns `false` if any `nvs_set` fails, and must not have advanced
   the sequence in that case.
 - `LoadedSequence` returns the sequence of the config that was last loaded or
   saved, which is what the tests assert on.
@@ -3609,7 +3979,7 @@ The logic the tests pin down:
 - [ ] **Step 5: Run the tests**
 
 Run: `cd code && pio test -e native -f '*test_config'`
-Expected: PASS — 7 store tests green, including the torn-write recovery.
+Expected: PASS — 8 store tests green, including both tear cases.
 
 - [ ] **Step 6: Commit**
 
@@ -3621,9 +3991,17 @@ git commit -m "Add atomic A/B config persistence
 
 Two alternating slots with the sequence number written last, so a power cut
 mid-write leaves the previous config loadable and the torn one is never treated
-as newest. Absent config is a distinct result from corrupt, because only the
-former selects pass-through mode."
+as newest. A slot is written as bounded chunks, because a real config is larger
+than one NVS value can hold. Absent config is a distinct result from corrupt,
+because only the former selects pass-through mode.
+
+MockHAL gains TruncateNvsWriteTo: the existing fault injector targets the next
+write, which with chunked slots is always a payload chunk, so the sequence-lost
+tear was not expressible."
 ```
+
+`MockHAL.h`/`MockHAL.cpp` are here for the one genuine reason: this task adds
+`TruncateNvsWriteTo`. They are otherwise Task 2's files.
 
 ---
 
@@ -3636,6 +4014,8 @@ is one line of JSON with a `{v, seq, type}` envelope.
 - Create: `code/lib/Link/Ndjson.h`
 - Create: `code/lib/Link/Ndjson.cpp`
 - Create: `code/test_native/test_link/NdjsonTest.cpp`
+- Create: `code/test_native/test_link/test_main.cpp` — required; copy Task 2's
+  four-line `main()`.
 
 **Interfaces:**
 - Consumes: nothing
@@ -3792,6 +4172,8 @@ action id must be **rejected with an error**, never silently dropped.
 - Create: `code/lib/Bindings/BindingResolver.cpp`
 - Create: `code/test_native/test_bindings/ActionLibraryTest.cpp`
 - Create: `code/test_native/test_bindings/BindingResolverTest.cpp`
+- Create: `code/test_native/test_bindings/test_main.cpp` — required; copy Task 2's
+  four-line `main()`.
 
 **Interfaces:**
 - Consumes: `Config` (Task 8), `Gesture`, `GestureEvent` (Task 6)
@@ -3982,6 +4364,8 @@ are green, so every pattern is rate and rhythm, never hue.
 - Create: `code/lib/Feedback/LedGrammar.cpp`
 - Create: `code/test_native/test_feedback/BuzzerGrammarTest.cpp`
 - Create: `code/test_native/test_feedback/LedGrammarTest.cpp`
+- Create: `code/test_native/test_feedback/test_main.cpp` — required; copy Task 2's
+  four-line `main()`.
 
 **Interfaces:**
 - Consumes: `IHAL` (Task 2), `DeviceSettings` (Task 8)
@@ -4107,7 +4491,7 @@ n × 80 ms; `kProgramExit` = 2×120 ms; `kLearnPrompt` = 2×60 ms; `kLearnOk` =
 - [ ] **Step 4: Run the buzzer tests**
 
 Run: `cd code && pio test -e native -f '*test_feedback'`
-Expected: PASS — 8 tests green.
+Expected: PASS — 7 buzzer tests green.
 
 - [ ] **Step 5: Write the failing LED test**
 
@@ -4186,7 +4570,7 @@ TEST(LedGrammar, LevelZeroSilencesBothChannels) {
 - [ ] **Step 6: Implement `LedGrammar` and run**
 
 Run: `cd code && pio test -e native -f '*test_feedback'`
-Expected: PASS — 8 + 5 tests green.
+Expected: PASS — 7 + 5 tests green.
 
 - [ ] **Step 7: Commit**
 
@@ -4212,6 +4596,8 @@ It is still host-testable, because it holds only `IHAL*` and the modules above.
 - Create: `code/lib/System/SystemOrchestrator.h`
 - Create: `code/lib/System/SystemOrchestrator.cpp`
 - Create: `code/test_native/test_system/SystemOrchestratorTest.cpp`
+- Create: `code/test_native/test_system/test_main.cpp` — required; copy Task 2's
+  four-line `main()`.
 
 **Interfaces:**
 - Consumes: everything from Tasks 2–12
@@ -4510,9 +4896,20 @@ TEST_CASE("esp_hal_nvs_round_trips", "[hw]") {
 Key requirements, each a specific ESP-IDF choice:
 
 - **ADC:** `adc_oneshot_unit_init_cfg_t` on `ADC_UNIT_1`; per-channel config with
-  `ADC_ATTEN_DB_12` (the 2.9 V ceiling); `adc_cali_create_scheme_curve_fitting`.
-  `adc_read_mv` returns `adc_cali_raw_to_voltage(raw)` **or** `-1` on an error —
-  never a fabricated zero, because zero is a legal reading.
+  `ADC_ATTEN_DB_12` (the 2.9 V ceiling). **Call
+  `adc_cali_create_scheme_curve_fitting()` and hand its result to
+  `AdcCalibrationSelect()`** (Task 4) — do not call
+  `adc_cali_raw_to_voltage()` from a bare handle. On `ESP_ERR_NOT_SUPPORTED`
+  (blank eFuses, spec §3.2) the selected curve is
+  `CalibrationSource::kLinearFallback`, and the HAL must **report** that rather
+  than proceed silently. Use the mechanisms the spec already defines — a `log`
+  frame (§4.3) at init, and a `BOOT_DEGRADED` boot (§7.2), the same class of
+  condition as a config fallback. Do not add a field to the status frame for
+  this; §4.3's payload is fixed. `adc_read_mv` converts the raw sample with
+  `AdcRawToMilliVolts(cal, raw)` and returns `-1` on a driver error — never a
+  fabricated zero, because zero is a legal reading.
+  *This is the only consumer of Task 4.* Without this wiring `CalibrationCurve`
+  is dead code and the spec's mandatory-fallback requirement is unimplemented.
 - **DAC:** `i2c_master` on `SWC_PIN_I2C_SDA`/`SCL` at 400 kHz. The MCP4728 write
   sequence is the multi-write command (0x40) so code and power-down mode land
   together; `LDAC` is asserted via `SWC_PIN_DAC_LDAC_B` after the write.
@@ -4820,6 +5217,8 @@ have the head unit out of the dash.
 - Create: `code/lib/Learning/LearnSession.h`
 - Create: `code/lib/Learning/LearnSession.cpp`
 - Create: `code/test_native/test_learning/LearnSessionTest.cpp`
+- Create: `code/test_native/test_learning/test_main.cpp` — required; copy Task 2's
+  four-line `main()`.
 
 **Interfaces:**
 - Consumes: `LadderProfile` (Task 3), `LadderDecode` (Task 3), `BuzzerGrammar` (Task 12), `Config` (Task 8)
@@ -5016,6 +5415,8 @@ gate a path that can brick the device.
 - Create: `code/lib/Update/ReleaseCheck.cpp`
 - Create: `code/test_native/test_update/ImageVerifyTest.cpp`
 - Create: `code/test_native/test_update/ReleaseCheckTest.cpp`
+- Create: `code/test_native/test_update/test_main.cpp` — required; copy Task 2's
+  four-line `main()`.
 
 **Interfaces:**
 - Consumes: `IHAL` (Task 2)
@@ -5243,6 +5644,8 @@ button presses is unacceptable.
 - Create: `code/lib/Update/OtaWifi.h`, `OtaWifi.c`
 - Create: `code/lib/Update/OtaUsb.h`, `OtaUsb.c`
 - Create: `code/test_native/test_maintenance/MaintenanceModeTest.cpp`
+- Create: `code/test_native/test_maintenance/test_main.cpp` — required; copy
+  Task 2's four-line `main()`.
 
 **Interfaces:**
 - Consumes: `Config` (Task 8), `ReleaseCheck` (Task 17), `IHAL` (Task 2)
@@ -5951,10 +6354,10 @@ worked:
   returned `false`, so the caller never learned a gesture had fired. Fixed by
   tracking an `emitted` flag in the pressed branch.
 - **`LadderDecode`**: a 500-permille floor wrongly faulted any button below half
-  the rail (three of the nine tests failed), and an above-rail reading was
-  reporting `kIdle`. Fixed by comparing the **learned idle** against the current
-  one (`kRailHealthFloorPermille`, FR-30's ≤20 % floor) and adding an explicit
-  above-reference check.
+  the rail (three of the tests then in the suite failed), and an above-rail reading
+  was reporting `kIdle`. Fixed by comparing the **learned idle** against the
+  current one (`kRailHealthFloorPermille`, FR-30's ≤20 % floor) and adding an
+  explicit above-reference check.
 
 `ConfigValidate`'s ambiguity rule was also corrected: the first version rejected
 windows *nested* inside one another, but two 42-permille-wide windows 10 permille

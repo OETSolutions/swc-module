@@ -458,11 +458,9 @@ out:
   than no config, which is why each slot is written and verified whole rather
   than field-by-field.
 - **Blob size is a measured quantity, not an assumption.** An NVS value has a
-  per-entry ceiling (historically ~4 KB, and **§10 requires measuring the real
-  ceiling on the actual IDF version**, not trusting that figure). The full
-  `Config` is expected to be several KB and **may exceed one NVS value.** The
-  measured serialized size therefore selects the strategy, and the firmware must
-  not assume either way:
+  per-entry ceiling. The full `Config` is expected to be several KB and **may
+  exceed one NVS value.** The measured serialized size therefore selects the
+  strategy, and the firmware must not assume either way:
   - if a slot fits one value → one blob per slot, as above;
   - if it does not → the slot's blob is **chunked across a small fixed number of
     NVS keys** (`cfg_a_0`, `cfg_a_1`, …) with the chunk count and a per-slot CRC
@@ -470,6 +468,23 @@ out:
 
   This is the one place where "measure, then decide" is mandatory rather than
   preferred, because the answer changes the persistence code.
+  **Measured, 2026-09-18 — the answer is "it does not fit, so a slot is
+  chunked."** On IDF 5.5.5 the ceiling is `ENTRY_SIZE × (ENTRY_COUNT − 1)` =
+  32 × 125 = **4000 bytes** (`nvs_page.cpp` returns `ESP_ERR_NVS_VALUE_TOO_LONG`
+  above it), and the worst-case `Config` — 2 channels × 16 buttons × 32 bindings —
+  is **~17.8 KB** as JSON. **Even a realistic config (~3.9 KB) sits on that
+  ceiling and a moderate one (~7.9 KB) exceeds it**, so a single-value slot fails
+  on the common case, not a hypothetical one; the chunked branch above is the one
+  that ships. Chunk size is a fixed 2048 B and the count is bounded (9 worst
+  case). Two worst-case slots cost **79 % of the partition's usable entry space**
+  (38,016 B of 48,384 B), so it fits, but the margin is thinner than "48 KB"
+  suggests. Each 2048-byte chunk is one NVS *key*, and NVS charges **2112 B** for
+  it — a 32-byte metadata entry, the 2048 payload bytes, and a 32-byte
+  `BLOB_IDX` entry written once per key (`nvs_storage.cpp:353`; the
+  `writeItem` span at `nvs_page.cpp:185` covers only the first two). An earlier
+  revision of this figure counted 2080 B and so understated the two-slot cost by
+  576 B. This is recorded here because a "measure, then decide" rule with no
+  recorded measurement is an assumption with extra steps.
 - **Dual-slot writes with a monotonic sequence number.** NVS is written **A/B**:
   write the inactive slot, verify it by read-back, bump the sequence, *then* flip
   the active marker. **A power loss mid-write must never destroy a working
@@ -1525,11 +1540,15 @@ example uses for 4 MB parts — gives **1700 KB** per slot, and the IDF
 is larger than both**, and that gap is affordable precisely because §9.1 removed
 the filesystem.
 
-**Why NVS is 48 KB and not 24 KB:** the whole `Config` is stored as a single NVS
-blob for atomicity (§3.8). A config with two full channels of learned buttons and
-a few dozen bindings is realistically 10–15 KB of JSON, and an NVS blob must fit
-with headroom. **§10 requires the real serialized size to be measured, not
-estimated.**
+**Why NVS is 48 KB and not 24 KB:** the whole `Config` is stored per slot for
+atomicity (§3.8), and **two slots plus the sequence key share the partition.**
+A config with two full channels of learned buttons and a few dozen bindings is
+realistically **10–15 KB of JSON**, which **exceeds a single NVS value** — an NVS
+value is capped at `ENTRY_SIZE × (ENTRY_COUNT − 1)` = 32 × 125 = **4000 bytes**
+on this IDF version, a hard limit, not a tuning knob. So a slot is written as
+**chunked NVS keys** per §3.8's measure-then-decide rule, and 48 KB is sized so
+two chunksets fit with headroom. **§10 requires the real serialized size to be
+measured, not estimated.**
 
 **Is 1920 KB enough for the app?** This is the load-bearing question and §10
 requires a **measured** answer. Reference points:
@@ -1983,7 +2002,7 @@ answer the questions the user actually cares about:
 | Device tests | `pio test -e esp32s3` | 100 % pass on the bench board |
 | App fits the slot | `pio run -e esp32s3 && pio run -t size` | ≤ 1920 KB (§9.2) — **the highest-risk gate** |
 | Free-heap headroom | runtime assertion in the device test | ≥ 20 % free at worst-case steady state |
-| Config fits NVS | `ConfigCodec` round-trip size assertion | ≤ 24 KB serialized vs the 48 KB partition |
+| Config fits NVS | `ConfigCodec` size assertion: worst case > **4000 B per value** (so the chunked path is exercised, not dead code), and **two slots + `cfg_seq` ≤ 48,384 B** of entry space at **2,112 B per 2048-byte chunk** — counting NVS's metadata and `BLOB_IDX` entries, not just the payload |
 | Contract in sync | `tools/gen_contract*.py` then `git diff --exit-code` | No diff |
 | Android builds | `./gradlew assembleDebug test` | Clean, tests pass |
 

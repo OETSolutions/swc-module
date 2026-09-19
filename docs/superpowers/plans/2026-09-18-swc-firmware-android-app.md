@@ -300,7 +300,13 @@ typedef enum { ACTION_NONE, ACTION_HW_KEY, ACTION_HW_KEY_RELEASE,
                ACTION_APP_RAW, ACTION_KIND_COUNT } ActionKind;
 ```
 
-**`Binding` is a top-level join table** (spec §3.5), not nested per channel:
+**`Binding` is a top-level join table** (spec §3.5), not nested per channel.
+**`ConfigModel.h` (Task 8) is the normative definition of these two structs; the
+C below is the same declaration in the contract's spelling, and when the two
+disagree the header wins.** They are one fact with two homes, which is why the
+header is named: an earlier revision of this block carried `// MV for HW_KEY` on
+`payload` long after Task 8's copy had been corrected, and a reader who trusted
+this one would look for the key level in the wrong field.
 
 ```c
 enum { kMaxBindings = 32, kMaxActionsPerBinding = 2 };
@@ -308,7 +314,7 @@ enum { kMaxBindings = 32, kMaxActionsPerBinding = 2 };
 typedef struct {
     uint8_t  kind;                 // ActionKind above; NOT a numeric action id
     char     target[40];           // package / intent action / command / pattern
-    char     payload[48];          // APP_INTENT's `data`; MV for HW_KEY
+    char     payload[48];          // APP_INTENT's data URI (spec 3.5); see ConfigModel.h
     uint16_t dac_code;             // HW_KEY when commanded by code
     uint32_t key_resistance_mohm;  // HW_KEY when commanded by resistance
 } Action;
@@ -3853,10 +3859,41 @@ static_assert(2u * static_cast<size_t>(ConfigChunkCountFor(ConfigMaxSerializedSi
 
 - [ ] **Step 5: Implement `ConfigCodec.cpp`**
 
-Use the checked-in `cJSON` bundled with ESP-IDF (`#include "cJSON.h"`) so the
-same parser is used on device and on host. **On the `native` env, add
-`lib_deps = ... , DaveGamble/cJSON@^1.7.18`** to `platformio.ini` so the host
-build links the same library.
+Use cJSON (`#include "cJSON.h"`) so the same parser is used on device and on
+host. **On the `native` env, add
+`lib_deps = ... , https://github.com/DaveGamble/cJSON.git#v1.7.19`** to
+`platformio.ini` so the host build links the same library.
+
+**Both halves of that line were wrong, and the fix is measured, not guessed.**
+
+- **`DaveGamble/cJSON` is not in the PlatformIO registry** — `pio pkg search`
+  finds no such owner, so the line as written fails the build outright with
+  `Could not find the package with 'DaveGamble/cJSON @ ^1.7.18' requirements`.
+  The registry's newest cJSON is `baracodadailyhealthtech/cJSON` at **1.7.18**,
+  a third-party republish.
+- **`^1.7.18` would pin the host to a parser the device does not run.** IDF 5.5.5
+  bundles **1.7.19** (`framework-espidf/components/json/cJSON`), and the 1.7.18 →
+  1.7.19 diff is not cosmetic: it adds `CJSON_NESTING_LIMIT` to both print
+  functions and `CJSON_CIRCULAR_LIMIT` to `cJSON_Duplicate_rec`, plus a
+  malloc-backed number parser in place of a fixed 64-byte stack buffer. Those are
+  the guards that bound recursion when parsing **untrusted** JSON — and this
+  parser's input arrives over USB. A host gate running a weaker parser than the
+  device is the "gate that cannot fail" pattern: the suite would pass on input
+  the device would reject, or worse, the host would accept a nesting depth that
+  overflows the device's stack.
+
+  A git-pinned `lib_deps` entry gives **one version on both sides** without
+  vendoring cJSON into the repo — PlatformIO installs it for `native`, and IDF's
+  own component still serves the device build from the framework. Verified: the
+  pin installs as `cJSON@0.0.0+…sha.c859b25` and the suite links and passes.
+
+- **`"cJSON.h"` does not resolve on the device as written.** IDF's `json`
+  component is *not* in `__COMPONENT_REQUIRES_COMMON` (the list at
+  `tools/cmake/build.cmake:282`), so it is not visible to a component that does
+  not name it. Task 14's `src/CMakeLists.txt` must add `json` to
+  `idf_component_register`'s `REQUIRES` — recorded there, and flagged here
+  because the include is introduced in this task and would otherwise look
+  satisfied by the host build alone.
 
 ```cpp
 #include "Config/ConfigCodec.h"
@@ -4143,6 +4180,24 @@ is the one that binds. A realistic config (9 buttons, 9 bindings, short payloads
 is ~3.9 KB → 2 chunks → 17 %. **That spread is the reason the bound is asserted
 rather than assumed.**
 
+**Re-measured against the built encoder, 2026-09-19 — and the bound holds.**
+Filling every string field to its declared width and every integer to its
+maximum, then running the real `ConfigEncodeJson`, gives **21,673 B**, against
+the declared bound of **22,407 B**. So `ConfigMaxSerializedSize()` is a genuine
+upper bound with **734 B of slack**, not an under-report, and `sizeof(Config)` is
+**9,168 B** packed (the earlier "~15.9 KB" was another model estimate, wrong in
+the safe direction). Two slots plus `cfg_seq` land at 11 chunks / **96 %** as
+stated.
+
+The number that matters for any future change is the **headroom: 1,888 B**. A
+12th chunk costs 4,224 B of entry space (two slots × 2,112) and the partition has
+48,384 − 46,496 = **1,888 B** left, so **a 12th chunk does not fit** — the worst
+case may grow by at most 1,888 B and no more, whatever the lever. (Chunking is
+coarse: 11 chunks cover 22,528 B of payload, so between 20,481 B and 22,528 B
+the count is 11 either way. That 2,047 B of "free" payload is *not* headroom
+until it pushes past 22,528 B, which is why the binding figure is 1,888 and not
+4,000.)
+
 **This paragraph used to say 12,120 B packed / ~17.8 KB / 9 chunks / 79 %.** Those
 figures came from the *pre-rewrite* model (a per-channel binding array, so
 `2 × 32 = 64` bindings and a `Binding` of 172 B) and were wrong twice over: wrong
@@ -4187,9 +4242,9 @@ link the same parser the device uses."
 ```
 
 `code/platformio.ini` is in that list deliberately: Step 5 adds
-`DaveGamble/cJSON@^1.7.18` to the `native` env's `lib_deps`, and without it the
-host build fails to link. A dependency change that is not committed is a broken
-build for everyone else.
+`https://github.com/DaveGamble/cJSON.git#v1.7.19` to the `native` env's
+`lib_deps`, and without it the host build fails to link. A dependency change that
+is not committed is a broken build for everyone else.
 
 ---
 

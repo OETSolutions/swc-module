@@ -1,0 +1,727 @@
+#include "Config/ConfigCodec.h"
+
+#include <stdlib.h>
+#include <string.h>
+
+#include "cJSON.h"
+
+// Declared in ConfigCodec.h so Task 9 and Task 15 share this one implementation.
+// Defined OUTSIDE the anonymous namespace for the same reason ActionIsWellFormed
+// is: a file-local definition links only here, which is how a shared checksum
+// quietly becomes two checksums.
+uint32_t Crc32(const uint8_t *data, size_t len) {
+    uint32_t crc = 0xFFFFFFFFu;
+    for (size_t i = 0; i < len; ++i) {
+        crc ^= data[i];
+        for (int b = 0; b < 8; ++b) {
+            crc = (crc >> 1) ^ (0xEDB88320u & (0u - (crc & 1u)));
+        }
+    }
+    return ~crc;
+}
+
+namespace {
+
+// Blob header: magic, schema, payload length, CRC over the payload.
+struct BlobHeader {
+    uint32_t magic;
+    uint32_t schema_version;
+    uint32_t payload_len;
+    uint32_t payload_crc;
+};
+constexpr uint32_t kBlobMagic = 0x53435743u;  // "SWCC"
+
+// Adjacent ladder windows legitimately overlap by a few permille, and the
+// classifier resolves that by nearest centre (Task 3). What is genuinely
+// ambiguous is when the *centres* are closer together than the wider of the two
+// tolerances: every reading in the overlap is then equally close to both, so
+// classification is a coin toss rather than a measurement.
+//
+// Compared in the DERIVED permille the classifier actually uses, not in raw
+// millivolts. Two buttons 10 mV apart at a high rail are a much narrower window
+// than 10 mV apart at a low one, so the raw-mv distance is not the quantity the
+// ambiguity depends on.
+bool CentresAreDistinguishable(const LadderProfile &p) {
+    if (p.learned_idle_mv == 0) return false;   // no reference, nothing to derive
+    for (uint8_t i = 0; i < p.count; ++i) {
+        for (uint8_t j = static_cast<uint8_t>(i + 1); j < p.count; ++j) {
+            const int ci = LadderRatioPermille(p.buttons[i].mv_center, p.learned_idle_mv);
+            const int cj = LadderRatioPermille(p.buttons[j].mv_center, p.learned_idle_mv);
+            const int ti = LadderRatioPermille(p.buttons[i].mv_tolerance, p.learned_idle_mv);
+            const int tj = LadderRatioPermille(p.buttons[j].mv_tolerance, p.learned_idle_mv);
+            if (ci < 0 || cj < 0 || ti < 0 || tj < 0) return false;
+            const int distance  = abs(ci - cj);
+            const int tolerance = ti > tj ? ti : tj;
+            if (distance <= tolerance) return false;
+        }
+    }
+    return true;
+}
+
+bool BindingNamesARealInput(const Config &c, const Binding &b) {
+    if (strcmp(b.button, "NONE") == 0) return true;   // gestures on the prog button
+    for (uint8_t ch = 0; ch < c.channel_count; ++ch) {
+        const LadderProfile &p = c.channels[ch].ladder;
+        for (uint8_t i = 0; i < p.count; ++i) {
+            if (strcmp(p.buttons[i].id, b.button) == 0) return true;
+        }
+    }
+    for (uint8_t i = 0; i < c.aux_count; ++i) {
+        if (strcmp(c.aux[i].id, b.button) == 0) return true;
+    }
+    return false;
+}
+
+}  // namespace
+
+// Declared in ConfigCodec.h, so it is defined OUTSIDE the anonymous namespace --
+// Task 11 calls it. A file-local definition would link only for this file, which
+// is how the earlier revision's cross-check silently became a re-derivation.
+bool ActionIsWellFormed(const Action &a) {
+    if (a.kind > ActionKind::kAppRaw) return false;   // the enum is contiguous
+    // Every kind needs its non-payload parameter, because that parameter is what
+    // the action DOES. An empty one is an action with no effect, which would be
+    // stored and reported as a binding that fires.
+    //
+    // `ActionTakesPayload` is the authority for WHICH kinds those are, and it is
+    // called rather than restated. An earlier revision of this function spelled
+    // the same eight enumerators out a second time -- two homes for one fact,
+    // and they drift the first time a kind is added.
+    if (ActionTakesPayload(a.kind) && a.target[0] == '\0') return false;
+    // HW_KEY carries its level exactly one way -- an already-resolved `dac_code`,
+    // or the head unit's own `key_resistance_mohm` for the gain policy to convert.
+    // Neither means the action would drive the output to a level nothing defined.
+    if (a.kind == ActionKind::kHwKey &&
+        a.dac_code == 0 && a.key_resistance_mohm == 0) return false;
+    return true;
+}
+
+bool ConfigValidate(const Config &c) {
+    if (c.schema_version != kConfigSchemaVersion) return false;
+    if (c.channel_count == 0 || c.channel_count > kMaxChannels) return false;
+    if (c.settings.timings.debounce_ms == 0) return false;
+    if (c.settings.timings.double_press_off_ms < c.settings.timings.debounce_ms) return false;
+    // A long-press threshold at or below the double-press window is incoherent:
+    // the gesture could be both a LONG and a DOUBLE.
+    if (c.settings.timings.long_press_ms <= c.settings.timings.double_press_off_ms) return false;
+    if (c.settings.timings.send_duration_ms == 0) return false;
+    if (c.settings.buzzer_level > 3 || c.settings.led_level > 3) return false;
+
+    for (uint8_t ch = 0; ch < c.channel_count; ++ch) {
+        const ChannelConfig &cc = c.channels[ch];
+        if (cc.name[0] == '\0') return false;
+        if (cc.ladder.count > kLadderMaxButtons) return false;
+        // The idle reference must be a plausible ADC reading: above zero and
+        // no higher than the 2900 mV ADC ceiling (spec 3.2).
+        if (cc.ladder.learned_idle_mv <= 0 || cc.ladder.learned_idle_mv > 2900) return false;
+        for (uint8_t i = 0; i < cc.ladder.count; ++i) {
+            const LadderButton &b = cc.ladder.buttons[i];
+            if (b.id[0] == '\0') return false;
+            // A button at or above the idle reference is physically impossible:
+            // a press pulls the input DOWN (spec 6.3), so every button sits
+            // below the idle. Both bounds are checked against the 2900 mV ADC
+            // ceiling (spec 3.2) rather than a 3300 mV rail -- no pin reading
+            // can exceed the ceiling, so a value above it is not a measurement.
+            if (b.mv_center == 0 || b.mv_center > 2900) return false;
+            if (b.mv_tolerance == 0) return false;
+            // And the DERIVED window must be a real one: a tolerance that
+            // rounds to zero permille can never match anything.
+            if (LadderRatioPermille(b.mv_tolerance, cc.ladder.learned_idle_mv) <= 0) return false;
+        }
+        if (!CentresAreDistinguishable(cc.ladder)) return false;
+    }
+
+    // Bindings are a top-level table (spec 3.1/3.5), so their checks are too.
+    if (c.binding_count > kMaxBindings) return false;
+    for (uint8_t i = 0; i < c.binding_count; ++i) {
+        const Binding &b = c.bindings[i];
+        if (b.action_count > kMaxActionsPerBinding) return false;
+        if (b.channel >= static_cast<uint8_t>(BindingChannel::kAny) + 1) return false;
+        // `button` is a LadderButton.id, "NONE", or -- for the AUX inputs -- an
+        // AUX id. A binding that names neither is a binding to nothing, which
+        // would silently never fire; refuse it instead.
+        if (!BindingNamesARealInput(c, b)) return false;
+        // An empty action list is legal (spec 3.5: it swallows the gesture), so
+        // action_count == 0 is NOT an error. What is an error is an action that
+        // is neither a known kind nor carries the field its kind requires.
+        for (uint8_t a = 0; a < b.action_count; ++a) {
+            if (!ActionIsWellFormed(b.actions[a])) return false;
+        }
+    }
+    return true;
+}
+
+namespace {
+
+// The wire spelling of every enum in the model. These strings ARE the contract:
+// spec 3.7's worked example is written in them, the Android app parses them, and
+// spec 4.2's frames carry them. The action kind crosses the wire as a NAME, not
+// an ordinal (spec 3.6) -- a numeric id table is the invented thing the spec
+// explicitly does not define.
+struct EnumName { int value; const char *name; };
+
+constexpr EnumName kChannelNames[] = {
+    {static_cast<int>(BindingChannel::kSwc1), "SWC1"},
+    {static_cast<int>(BindingChannel::kSwc2), "SWC2"},
+    {static_cast<int>(BindingChannel::kAux1), "AUX1"},
+    {static_cast<int>(BindingChannel::kAux2), "AUX2"},
+    {static_cast<int>(BindingChannel::kAux3), "AUX3"},
+    {static_cast<int>(BindingChannel::kAny),  "ANY"},
+};
+
+constexpr EnumName kGestureNames[] = {
+    {static_cast<int>(Gesture::kNone),   "NONE"},
+    {static_cast<int>(Gesture::kSingle), "SINGLE"},
+    {static_cast<int>(Gesture::kDouble), "DOUBLE"},
+    {static_cast<int>(Gesture::kLong),   "LONG"},
+};
+
+// Order is spec 3.6's table order and matches ActionKind's declaration, which the
+// Shared contract pins as append-only. These two lists are one fact with two
+// spellings; a reorder in either is a defect, not a refactor.
+constexpr EnumName kActionKindNames[] = {
+    {static_cast<int>(ActionKind::kNone),         "NONE"},
+    {static_cast<int>(ActionKind::kHwKey),        "HW_KEY"},
+    {static_cast<int>(ActionKind::kHwKeyRelease), "HW_KEY_RELEASE"},
+    {static_cast<int>(ActionKind::kAppLaunch),    "APP_LAUNCH"},
+    {static_cast<int>(ActionKind::kAppIntent),    "APP_INTENT"},
+    {static_cast<int>(ActionKind::kKeycode),      "KEYCODE"},
+    {static_cast<int>(ActionKind::kMedia),        "MEDIA"},
+    {static_cast<int>(ActionKind::kVolume),       "VOLUME"},
+    {static_cast<int>(ActionKind::kSystem),       "SYSTEM"},
+    {static_cast<int>(ActionKind::kBuzzer),       "BUZZ"},
+    {static_cast<int>(ActionKind::kAppRaw),       "APP_RAW"},
+};
+
+constexpr EnumName kGainModeNames[] = {
+    {static_cast<int>(GainMode::kTracking),   "TRACKING"},
+    {static_cast<int>(GainMode::kAmplified),  "AMPLIFIED"},
+};
+
+constexpr EnumName kGainPolicyNames[] = {
+    {static_cast<int>(GainPolicy::kAuto),           "AUTO"},
+    {static_cast<int>(GainPolicy::kForceTracking),  "TRACKING"},
+    {static_cast<int>(GainPolicy::kForceAmplified), "AMPLIFIED"},
+};
+
+const char *NameOf(const EnumName *table, size_t count, int value, const char *fallback) {
+    for (size_t i = 0; i < count; ++i) {
+        if (table[i].value == value) return table[i].name;
+    }
+    return fallback;
+}
+
+// Returns -1 when the string names no enumerator. The caller decides whether
+// that is fatal -- ConfigDecodeJson treats it as such.
+int ValueOf(const EnumName *table, size_t count, const char *name) {
+    if (name == nullptr) return -1;
+    for (size_t i = 0; i < count; ++i) {
+        if (strcmp(table[i].name, name) == 0) return table[i].value;
+    }
+    return -1;
+}
+
+#define NAME_OF(t, v, fb) NameOf(t, sizeof(t) / sizeof(t[0]), static_cast<int>(v), fb)
+#define VALUE_OF(t, s)    ValueOf(t, sizeof(t) / sizeof(t[0]), s)
+
+// cJSON returns NULL for an object member that is absent AND for one that is
+// present with a JSON null. For a config every required field is required, so
+// the two cases are the same failure and this collapses them deliberately.
+const cJSON *Member(const cJSON *obj, const char *key) {
+    return cJSON_GetObjectItemCaseSensitive(obj, key);
+}
+
+bool ReadU32(const cJSON *obj, const char *key, uint32_t *out) {
+    const cJSON *v = Member(obj, key);
+    if (!cJSON_IsNumber(v) || v->valuedouble < 0) return false;
+    // Bounded before the cast. A field declared uint32_t that arrives as a
+    // larger number would otherwise wrap silently -- which is how
+    // updated_at_ms's 1700000000000 became 3487969280 before this check.
+    if (v->valuedouble > 4294967295.0) return false;
+    *out = static_cast<uint32_t>(v->valuedouble);
+    return true;
+}
+
+// updated_at_ms is the one uint64_t in the model, and it needs its own reader:
+// a millisecond epoch stamp is ~1.7e12, far past uint32_t, so reading it with
+// ReadU32 truncates it to a wrong-but-plausible number rather than failing.
+bool ReadU64(const cJSON *obj, const char *key, uint64_t *out) {
+    const cJSON *v = Member(obj, key);
+    if (!cJSON_IsNumber(v) || v->valuedouble < 0) return false;
+    // 2^53 is where a double stops representing consecutive integers, so above
+    // it the value that arrived is not the value that was sent.
+    if (v->valuedouble > 9007199254740992.0) return false;
+    *out = static_cast<uint64_t>(v->valuedouble);
+    return true;
+}
+
+bool ReadU16(const cJSON *obj, const char *key, uint16_t *out) {
+    uint32_t v = 0;
+    if (!ReadU32(obj, key, &v) || v > 0xFFFFu) return false;
+    *out = static_cast<uint16_t>(v);
+    return true;
+}
+
+bool ReadU8(const cJSON *obj, const char *key, uint8_t *out) {
+    uint32_t v = 0;
+    if (!ReadU32(obj, key, &v) || v > 0xFFu) return false;
+    *out = static_cast<uint8_t>(v);
+    return true;
+}
+
+bool ReadBool(const cJSON *obj, const char *key, bool *out) {
+    const cJSON *v = Member(obj, key);
+    if (!cJSON_IsBool(v)) return false;
+    *out = cJSON_IsTrue(v) != 0;
+    return true;
+}
+
+// A string field is copied with strncpy into a fixed buffer, so a value at or
+// over the width would be silently truncated -- which is a config the device
+// would accept and then behave differently from what was sent. Spec 3.5's width
+// table says a longer value "must be refused by validation, not truncated", so
+// the length is checked before the copy and truncation is unreachable.
+bool ReadStr(const cJSON *obj, const char *key, char *out, size_t width) {
+    const cJSON *v = Member(obj, key);
+    if (!cJSON_IsString(v) || v->valuestring == nullptr) return false;
+    const size_t n = strlen(v->valuestring);
+    if (n == 0 || n >= width) return false;
+    memcpy(out, v->valuestring, n + 1);
+    return true;
+}
+
+void AddU32(cJSON *obj, const char *key, uint32_t v) {
+    cJSON_AddNumberToObject(obj, key, static_cast<double>(v));
+}
+
+// spec 3.7 writes temp_c_at_learn as a decimal (23.5) while the struct stores
+// tenths of a degree as an int16_t (235). One representation has to give, and it
+// is the wire one: the app displays a temperature, and 23.5 is what it should
+// show. The tenths field is what makes the round trip exact -- a float on the
+// wire would not survive re-encoding byte-identically, which FR-27 requires.
+void AddTenths(cJSON *obj, const char *key, int16_t tenths) {
+    cJSON_AddNumberToObject(obj, key, static_cast<double>(tenths) / 10.0);
+}
+
+bool ReadTenths(const cJSON *obj, const char *key, int16_t *out) {
+    const cJSON *v = Member(obj, key);
+    if (!cJSON_IsNumber(v)) return false;
+    const double tenths = v->valuedouble * 10.0;
+    // The bounds are the int16_t range, checked before the cast so a config
+    // claiming 4000 C is refused rather than wrapping to a negative temperature.
+    if (tenths < -32768.0 || tenths > 32767.0) return false;
+    *out = static_cast<int16_t>(tenths);
+    return true;
+}
+
+// confidence is stored 0-100 in the struct and written as 0.0-1.0 on the wire
+// (spec 3.7: 0.98). Same reasoning as the temperature: the wire form is the one
+// a human reads, and the integer is what makes it exact.
+void AddConfidence(cJSON *obj, uint8_t confidence) {
+    cJSON_AddNumberToObject(obj, "confidence", static_cast<double>(confidence) / 100.0);
+}
+
+bool ReadConfidence(const cJSON *obj, uint8_t *out) {
+    const cJSON *v = Member(obj, "confidence");
+    if (!cJSON_IsNumber(v)) return false;
+    const double pct = v->valuedouble * 100.0;
+    if (pct < 0.0 || pct > 100.0) return false;
+    *out = static_cast<uint8_t>(pct + 0.5);
+    return true;
+}
+
+cJSON *EncodeActions(const Binding &b) {
+    cJSON *arr = cJSON_CreateArray();
+    if (arr == nullptr) return nullptr;
+    for (uint8_t a = 0; a < b.action_count; ++a) {
+        const Action &act = b.actions[a];
+        cJSON *o = cJSON_CreateObject();
+        if (o == nullptr) { cJSON_Delete(arr); return nullptr; }
+        cJSON_AddStringToObject(o, "kind",
+                                NAME_OF(kActionKindNames, act.kind, "NONE"));
+        // `target` and `payload` are written for every kind that has them and
+        // omitted otherwise, so a NONE action encodes as `{"kind":"NONE"}`.
+        // Writing them unconditionally would put a `target` on a HW_KEY_RELEASE
+        // and make the wire form claim a parameter the kind does not have.
+        if (act.target[0] != '\0') cJSON_AddStringToObject(o, "target", act.target);
+        if (act.payload[0] != '\0') cJSON_AddStringToObject(o, "payload", act.payload);
+        if (act.dac_code != 0) AddU32(o, "dac_code", act.dac_code);
+        if (act.key_resistance_mohm != 0) AddU32(o, "key_resistance_mohm", act.key_resistance_mohm);
+        cJSON_AddItemToArray(arr, o);
+    }
+    return arr;
+}
+
+cJSON *EncodeBindings(const Config &c) {
+    cJSON *arr = cJSON_CreateArray();
+    if (arr == nullptr) return nullptr;
+    for (uint8_t i = 0; i < c.binding_count; ++i) {
+        const Binding &b = c.bindings[i];
+        cJSON *o = cJSON_CreateObject();
+        if (o == nullptr) { cJSON_Delete(arr); return nullptr; }
+        cJSON_AddStringToObject(o, "id", b.id);
+        cJSON_AddStringToObject(o, "channel",
+                                NAME_OF(kChannelNames, b.channel, "SWC1"));
+        cJSON_AddStringToObject(o, "button", b.button);
+        cJSON_AddStringToObject(o, "gesture",
+                                NAME_OF(kGestureNames, b.gesture, "NONE"));
+        cJSON_AddBoolToObject(o, "enabled", b.enabled);
+        cJSON *actions = EncodeActions(b);
+        if (actions == nullptr) { cJSON_Delete(o); cJSON_Delete(arr); return nullptr; }
+        // Added even when empty. An empty actions list is a distinct, legal
+        // state -- "swallow this gesture" (spec 3.5) -- and omitting the key
+        // would make it indistinguishable from a decoder's missing-field error.
+        cJSON_AddItemToObject(o, "actions", actions);
+        cJSON_AddItemToArray(arr, o);
+    }
+    return arr;
+}
+
+cJSON *EncodeChannels(const Config &c) {
+    cJSON *arr = cJSON_CreateArray();
+    if (arr == nullptr) return nullptr;
+    for (uint8_t i = 0; i < c.channel_count; ++i) {
+        const ChannelConfig &cc = c.channels[i];
+        cJSON *o = cJSON_CreateObject();
+        if (o == nullptr) { cJSON_Delete(arr); return nullptr; }
+        cJSON_AddStringToObject(o, "name", cc.name);
+        cJSON_AddBoolToObject(o, "enabled", cc.enabled);
+
+        cJSON *ladder = cJSON_CreateObject();
+        if (ladder == nullptr) { cJSON_Delete(o); cJSON_Delete(arr); return nullptr; }
+        AddU32(ladder, "source", cc.ladder.source);
+        // The struct field is `learned_idle_mv` and the wire key is `idle_mv`
+        // (spec 3.7). The struct keeps the longer name because the difference
+        // between the LEARNED idle and the CURRENT one is what FR-30's rail
+        // health check is made of; the wire keeps the short one because the
+        // example the app and the web page are written against uses it.
+        AddU32(ladder, "idle_mv", cc.ladder.learned_idle_mv);
+        cJSON *buttons = cJSON_CreateArray();
+        if (buttons == nullptr) { cJSON_Delete(ladder); cJSON_Delete(o); cJSON_Delete(arr); return nullptr; }
+        for (uint8_t k = 0; k < cc.ladder.count; ++k) {
+            const LadderButton &btn = cc.ladder.buttons[k];
+            cJSON *bo = cJSON_CreateObject();
+            if (bo == nullptr) { cJSON_Delete(buttons); cJSON_Delete(ladder); cJSON_Delete(o); cJSON_Delete(arr); return nullptr; }
+            cJSON_AddStringToObject(bo, "id", btn.id);
+            cJSON_AddStringToObject(bo, "name", btn.name);
+            AddU32(bo, "mv_center", btn.mv_center);
+            AddU32(bo, "mv_tolerance", btn.mv_tolerance);
+            AddU32(bo, "learned_at_rail_mv", btn.learned_at_rail_mv);
+            AddTenths(bo, "temp_c_at_learn", btn.temp_c_at_learn);
+            AddU32(bo, "sample_count", btn.sample_count);
+            AddConfidence(bo, btn.confidence);
+            cJSON_AddItemToArray(buttons, bo);
+        }
+        cJSON_AddItemToObject(ladder, "buttons", buttons);
+        cJSON_AddItemToObject(o, "ladder", ladder);
+
+        cJSON *output = cJSON_CreateObject();
+        if (output == nullptr) { cJSON_Delete(o); cJSON_Delete(arr); return nullptr; }
+        cJSON_AddStringToObject(output, "gain_mode",
+                                NAME_OF(kGainModeNames, cc.output.gain_mode, "TRACKING"));
+        AddU32(output, "idle_dac_code", cc.output.idle_dac_code);
+        cJSON_AddItemToObject(o, "output", output);
+
+        cJSON_AddItemToArray(arr, o);
+    }
+    return arr;
+}
+
+cJSON *EncodeAux(const Config &c) {
+    cJSON *arr = cJSON_CreateArray();
+    if (arr == nullptr) return nullptr;
+    for (uint8_t i = 0; i < c.aux_count; ++i) {
+        const AuxButtonConfig &a = c.aux[i];
+        cJSON *o = cJSON_CreateObject();
+        if (o == nullptr) { cJSON_Delete(arr); return nullptr; }
+        cJSON_AddStringToObject(o, "id", a.id);
+        AddU32(o, "source", a.source);
+        // AuxButtonConfig holds these as int16_t while LadderButton holds its
+        // equivalents as MilliVolt (uint16_t). Written the same way on the wire
+        // so the app does not need two readers for one concept.
+        cJSON_AddNumberToObject(o, "mv_center", a.mv_center);
+        cJSON_AddNumberToObject(o, "mv_tolerance", a.mv_tolerance);
+        cJSON_AddItemToArray(arr, o);
+    }
+    return arr;
+}
+
+cJSON *EncodeSettings(const DeviceSettings &s) {
+    cJSON *o = cJSON_CreateObject();
+    if (o == nullptr) return nullptr;
+    AddU32(o, "debounce_ms", s.timings.debounce_ms);
+    AddU32(o, "double_press_off_ms", s.timings.double_press_off_ms);
+    AddU32(o, "long_press_ms", s.timings.long_press_ms);
+    AddU32(o, "send_duration_ms", s.timings.send_duration_ms);
+    cJSON_AddStringToObject(o, "gain_policy",
+                            NAME_OF(kGainPolicyNames, s.gain_policy, "AUTO"));
+    AddU32(o, "buzzer_level", s.buzzer_level);
+    AddU32(o, "led_level", s.led_level);
+    cJSON_AddBoolToObject(o, "temp_comp_enabled", s.temp_comp_enabled);
+    AddU32(o, "maintenance_timeout_ms", s.maintenance_timeout_ms);
+    return o;
+}
+
+bool DecodeActions(const cJSON *arr, Binding *b) {
+    if (!cJSON_IsArray(arr)) return false;
+    const int n = cJSON_GetArraySize(arr);
+    if (n < 0 || n > kMaxActionsPerBinding) return false;
+    b->action_count = static_cast<uint8_t>(n);
+    for (int i = 0; i < n; ++i) {
+        const cJSON *o = cJSON_GetArrayItem(arr, i);
+        if (!cJSON_IsObject(o)) return false;
+        Action &act = b->actions[i];
+        const cJSON *kind = Member(o, "kind");
+        if (!cJSON_IsString(kind)) return false;
+        const int k = VALUE_OF(kActionKindNames, kind->valuestring);
+        if (k < 0) return false;
+        act.kind = static_cast<ActionKind>(k);
+        // Absent means empty, not missing: EncodeActions omits a field the kind
+        // does not use, so a NONE action is `{"kind":"NONE"}` with no target.
+        act.target[0] = '\0';
+        act.payload[0] = '\0';
+        act.dac_code = 0;
+        act.key_resistance_mohm = 0;
+        const cJSON *target = Member(o, "target");
+        if (target != nullptr) {
+            if (!ReadStr(o, "target", act.target, sizeof(act.target))) return false;
+        }
+        const cJSON *payload = Member(o, "payload");
+        if (payload != nullptr) {
+            if (!ReadStr(o, "payload", act.payload, sizeof(act.payload))) return false;
+        }
+        if (Member(o, "dac_code") != nullptr &&
+            !ReadU16(o, "dac_code", &act.dac_code)) return false;
+        if (Member(o, "key_resistance_mohm") != nullptr &&
+            !ReadU32(o, "key_resistance_mohm", &act.key_resistance_mohm)) return false;
+    }
+    return true;
+}
+
+bool DecodeBindings(const cJSON *arr, Config *c) {
+    if (!cJSON_IsArray(arr)) return false;
+    const int n = cJSON_GetArraySize(arr);
+    if (n < 0 || n > kMaxBindings) return false;
+    c->binding_count = static_cast<uint8_t>(n);
+    for (int i = 0; i < n; ++i) {
+        const cJSON *o = cJSON_GetArrayItem(arr, i);
+        if (!cJSON_IsObject(o)) return false;
+        Binding &b = c->bindings[i];
+        if (!ReadStr(o, "id", b.id, sizeof(b.id))) return false;
+        const cJSON *ch = Member(o, "channel");
+        if (!cJSON_IsString(ch)) return false;
+        const int chv = VALUE_OF(kChannelNames, ch->valuestring);
+        if (chv < 0) return false;
+        b.channel = static_cast<uint8_t>(chv);
+        if (!ReadStr(o, "button", b.button, sizeof(b.button))) return false;
+        const cJSON *g = Member(o, "gesture");
+        if (!cJSON_IsString(g)) return false;
+        const int gv = VALUE_OF(kGestureNames, g->valuestring);
+        if (gv < 0) return false;
+        b.gesture = static_cast<Gesture>(gv);
+        if (!ReadBool(o, "enabled", &b.enabled)) return false;
+        if (!DecodeActions(Member(o, "actions"), &b)) return false;
+    }
+    return true;
+}
+
+bool DecodeChannels(const cJSON *arr, Config *c) {
+    if (!cJSON_IsArray(arr)) return false;
+    const int n = cJSON_GetArraySize(arr);
+    if (n < 1 || n > kMaxChannels) return false;
+    c->channel_count = static_cast<uint8_t>(n);
+    for (int i = 0; i < n; ++i) {
+        const cJSON *o = cJSON_GetArrayItem(arr, i);
+        if (!cJSON_IsObject(o)) return false;
+        ChannelConfig &cc = c->channels[i];
+        if (!ReadStr(o, "name", cc.name, sizeof(cc.name))) return false;
+        if (!ReadBool(o, "enabled", &cc.enabled)) return false;
+
+        const cJSON *ladder = Member(o, "ladder");
+        if (!cJSON_IsObject(ladder)) return false;
+        if (!ReadU8(ladder, "source", &cc.ladder.source)) return false;
+        uint32_t idle_mv = 0;
+        if (!ReadU32(ladder, "idle_mv", &idle_mv) || idle_mv > 0xFFFFu) return false;
+        cc.ladder.learned_idle_mv = static_cast<MilliVolt>(idle_mv);
+        const cJSON *buttons = Member(ladder, "buttons");
+        if (!cJSON_IsArray(buttons)) return false;
+        const int bn = cJSON_GetArraySize(buttons);
+        if (bn < 0 || bn > kLadderMaxButtons) return false;
+        cc.ladder.count = static_cast<uint8_t>(bn);
+        for (int k = 0; k < bn; ++k) {
+            const cJSON *bo = cJSON_GetArrayItem(buttons, k);
+            if (!cJSON_IsObject(bo)) return false;
+            LadderButton &btn = cc.ladder.buttons[k];
+            if (!ReadStr(bo, "id", btn.id, sizeof(btn.id))) return false;
+            if (!ReadStr(bo, "name", btn.name, sizeof(btn.name))) return false;
+            if (!ReadU16(bo, "mv_center", &btn.mv_center)) return false;
+            if (!ReadU16(bo, "mv_tolerance", &btn.mv_tolerance)) return false;
+            if (!ReadU16(bo, "learned_at_rail_mv", &btn.learned_at_rail_mv)) return false;
+            if (!ReadTenths(bo, "temp_c_at_learn", &btn.temp_c_at_learn)) return false;
+            if (!ReadU16(bo, "sample_count", &btn.sample_count)) return false;
+            if (!ReadConfidence(bo, &btn.confidence)) return false;
+        }
+
+        const cJSON *output = Member(o, "output");
+        if (!cJSON_IsObject(output)) return false;
+        const cJSON *gm = Member(output, "gain_mode");
+        if (!cJSON_IsString(gm)) return false;
+        const int gmv = VALUE_OF(kGainModeNames, gm->valuestring);
+        if (gmv < 0) return false;
+        cc.output.gain_mode = static_cast<GainMode>(gmv);
+        if (!ReadU16(output, "idle_dac_code", &cc.output.idle_dac_code)) return false;
+    }
+    return true;
+}
+
+bool DecodeAux(const cJSON *arr, Config *c) {
+    if (arr == nullptr) { c->aux_count = 0; return true; }   // optional
+    if (!cJSON_IsArray(arr)) return false;
+    const int n = cJSON_GetArraySize(arr);
+    if (n < 0 || n > kMaxAuxButtons) return false;
+    c->aux_count = static_cast<uint8_t>(n);
+    for (int i = 0; i < n; ++i) {
+        const cJSON *o = cJSON_GetArrayItem(arr, i);
+        if (!cJSON_IsObject(o)) return false;
+        AuxButtonConfig &a = c->aux[i];
+        if (!ReadStr(o, "id", a.id, sizeof(a.id))) return false;
+        if (!ReadU8(o, "source", &a.source)) return false;
+        uint32_t mv = 0;
+        if (!ReadU32(o, "mv_center", &mv) || mv > 0x7FFFu) return false;
+        a.mv_center = static_cast<int16_t>(mv);
+        if (!ReadU32(o, "mv_tolerance", &mv) || mv > 0x7FFFu) return false;
+        a.mv_tolerance = static_cast<int16_t>(mv);
+    }
+    return true;
+}
+
+bool DecodeSettings(const cJSON *o, DeviceSettings *s) {
+    if (!cJSON_IsObject(o)) return false;
+    if (!ReadU32(o, "debounce_ms", &s->timings.debounce_ms)) return false;
+    if (!ReadU32(o, "double_press_off_ms", &s->timings.double_press_off_ms)) return false;
+    if (!ReadU32(o, "long_press_ms", &s->timings.long_press_ms)) return false;
+    if (!ReadU32(o, "send_duration_ms", &s->timings.send_duration_ms)) return false;
+    const cJSON *gp = Member(o, "gain_policy");
+    if (!cJSON_IsString(gp)) return false;
+    const int gpv = VALUE_OF(kGainPolicyNames, gp->valuestring);
+    if (gpv < 0) return false;
+    s->gain_policy = static_cast<GainPolicy>(gpv);
+    if (!ReadU8(o, "buzzer_level", &s->buzzer_level)) return false;
+    if (!ReadU8(o, "led_level", &s->led_level)) return false;
+    if (!ReadBool(o, "temp_comp_enabled", &s->temp_comp_enabled)) return false;
+    if (!ReadU32(o, "maintenance_timeout_ms", &s->maintenance_timeout_ms)) return false;
+    return true;
+}
+
+}  // namespace
+
+size_t ConfigEncodeJson(const Config &c, char *out, size_t out_len) {
+    if (out == nullptr || out_len == 0) return 0;
+    cJSON *root = cJSON_CreateObject();
+    if (root == nullptr) return 0;
+
+    // Every add is checked for allocation failure. cJSON returns NULL rather
+    // than aborting, and a partial tree would otherwise be printed as a valid
+    // but incomplete config -- the failure mode FR-27's byte-identical round
+    // trip exists to catch, arrived at from the other side.
+    bool ok = true;
+    ok = ok && cJSON_AddNumberToObject(root, "schema_version",
+                                       static_cast<double>(c.schema_version)) != nullptr;
+    ok = ok && cJSON_AddStringToObject(root, "device_id", c.device_id) != nullptr;
+    ok = ok && cJSON_AddNumberToObject(root, "updated_at_ms",
+                                       static_cast<double>(c.updated_at_ms)) != nullptr;
+    cJSON *settings = ok ? EncodeSettings(c.settings) : nullptr;
+    if (settings != nullptr) cJSON_AddItemToObject(root, "settings", settings);
+    else ok = false;
+    cJSON *aux = ok ? EncodeAux(c) : nullptr;
+    if (aux != nullptr) cJSON_AddItemToObject(root, "aux", aux);
+    else ok = false;
+    cJSON *channels = ok ? EncodeChannels(c) : nullptr;
+    if (channels != nullptr) cJSON_AddItemToObject(root, "channels", channels);
+    else ok = false;
+    cJSON *bindings = ok ? EncodeBindings(c) : nullptr;
+    if (bindings != nullptr) cJSON_AddItemToObject(root, "bindings", bindings);
+    else ok = false;
+
+    if (!ok) { cJSON_Delete(root); return 0; }
+
+    // PrintUnformatted, not Print. The blob CRCs exactly these bytes, they cross
+    // USB and NVS, and whitespace is flash the device never reads. It is also
+    // what Task 8's ANewerSchemaVersionIsRefused assumes: it searches for the
+    // substring "schema_version":1, and cJSON_Print emits ": 1" with a space.
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    if (text == nullptr) return 0;
+
+    const size_t n = strlen(text);
+    if (n + 1 > out_len) { cJSON_free(text); return 0; }
+    memcpy(out, text, n + 1);
+    cJSON_free(text);
+    return n;
+}
+
+bool ConfigDecodeJson(const char *json, size_t len, Config *out) {
+    if (json == nullptr || out == nullptr || len == 0) return false;
+    // cJSON_ParseWithLength, not cJSON_Parse: the transport is byte-exact and
+    // the caller knows the length, so the parser must not be free to read past
+    // it looking for a terminator.
+    cJSON *root = cJSON_ParseWithLength(json, len);
+    if (root == nullptr) return false;
+
+    Config c{};
+    bool ok = cJSON_IsObject(root) != 0;
+    ok = ok && ReadU32(root, "schema_version", &c.schema_version);
+    // A schema the firmware does not implement is refused HERE, as its own
+    // condition, rather than left to fail somewhere downstream. Refusing early
+    // is what makes "newer schema" distinguishable from "malformed config", and
+    // it is the whole point of versioning the blob (spec 3.8).
+    if (ok && c.schema_version != kConfigSchemaVersion) {
+        cJSON_Delete(root);
+        return false;
+    }
+    ok = ok && ReadStr(root, "device_id", c.device_id, sizeof(c.device_id));
+    ok = ok && ReadU64(root, "updated_at_ms", &c.updated_at_ms);
+    ok = ok && DecodeSettings(Member(root, "settings"), &c.settings);
+    ok = ok && DecodeAux(Member(root, "aux"), &c);
+    ok = ok && DecodeChannels(Member(root, "channels"), &c);
+    ok = ok && DecodeBindings(Member(root, "bindings"), &c);
+
+    cJSON_Delete(root);
+    // Nothing is written to *out until every field has decoded AND the result
+    // validates. A partially-applied config is worse than none (spec 3.8).
+    if (!ok || !ConfigValidate(c)) return false;
+    *out = c;
+    return true;
+}
+
+size_t ConfigEncodeBlob(const Config &c, uint8_t *out, size_t out_len) {
+    if (out == nullptr || out_len <= sizeof(BlobHeader)) return 0;
+    // The payload IS the JSON -- the header is prepended to the same bytes
+    // ConfigEncodeJson produces. Packing the struct instead would give the two
+    // forms separate codecs to drift apart.
+    const size_t n = ConfigEncodeJson(c, reinterpret_cast<char *>(out) + sizeof(BlobHeader),
+                                      out_len - sizeof(BlobHeader));
+    if (n == 0) return 0;
+
+    BlobHeader h{};
+    h.magic          = kBlobMagic;
+    h.schema_version = c.schema_version;
+    h.payload_len    = static_cast<uint32_t>(n);
+    h.payload_crc    = Crc32(out + sizeof(BlobHeader), n);
+    memcpy(out, &h, sizeof(h));
+    return sizeof(BlobHeader) + n;
+}
+
+bool ConfigDecodeBlob(const uint8_t *in, size_t len, Config *out) {
+    if (in == nullptr || out == nullptr || len < sizeof(BlobHeader)) return false;
+    BlobHeader h{};
+    memcpy(&h, in, sizeof(h));
+    if (h.magic != kBlobMagic) return false;
+    if (h.schema_version != kConfigSchemaVersion) return false;
+    // Bounded before the subtraction so a hostile or torn payload_len cannot
+    // wrap: `len - sizeof(BlobHeader)` is the bytes actually available.
+    if (h.payload_len > len - sizeof(BlobHeader)) return false;
+    const uint8_t *payload = in + sizeof(BlobHeader);
+    if (Crc32(payload, h.payload_len) != h.payload_crc) return false;
+    return ConfigDecodeJson(reinterpret_cast<const char *>(payload), h.payload_len, out);
+}

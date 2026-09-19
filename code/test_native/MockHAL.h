@@ -1,0 +1,108 @@
+#pragma once
+
+#include <cstdint>
+#include <cstring>
+#include <map>
+#include <string>
+#include <vector>
+
+#include "HAL/IHAL.h"
+
+/*
+ * Host implementation of IHAL. All state is observable, so tests assert on
+ * what the code *did to the hardware*, not on internal variables.
+ */
+class MockHal {
+public:
+    MockHal();
+
+    IHAL &InterfaceRef() { return iface_; }   // every later task's tests take &hal.InterfaceRef()
+
+    // --- clock -------------------------------------------------------------
+    uint64_t NowMs() { return now_ms_; }
+    uint64_t NowUs() { return now_ms_ * 1000ULL; }
+    void AdvanceMs(uint64_t ms) { now_ms_ += ms; }
+
+    // --- analog ------------------------------------------------------------
+    void SetAdcMilliVolts(AdcChannel ch, int mv) { adc_mv_[static_cast<int>(ch)] = mv; }
+    int AdcReadMv(AdcChannel ch) { return adc_mv_[static_cast<int>(ch)]; }
+
+    void DacSetCode(DacChannel ch, uint16_t code);
+    // NOTE: the type name must be qualified as ::DacPowerMode from here on.
+    // A member function named DacPowerMode hides the enum type of the same name
+    // for the remainder of class scope, so a bare DacPowerMode below would not
+    // name a type (the plan's MockHAL.h as written does not compile). The
+    // member *name* is fixed by the harness API, so the type is qualified.
+    void DacPowerMode(DacChannel ch, ::DacPowerMode mode);
+    void DacLdac(bool assert) { ldac_asserted_ = assert; }
+    uint16_t LastDacCode(DacChannel ch) const;
+    ::DacPowerMode LastDacPowerMode(DacChannel ch) const;
+    int DacWriteCount(DacChannel ch) const;
+    bool LastLdac() const { return ldac_asserted_; }
+
+    // --- gpio --------------------------------------------------------------
+    void GpioWrite(GpioPin pin, bool level);
+    bool GpioRead(GpioPin pin) const;
+    void SetGpioInput(GpioPin pin, bool level) { gpio_in_[static_cast<int>(pin)] = level; }
+    int GpioWriteCount(GpioPin pin) const;
+
+    // --- buzzer ------------------------------------------------------------
+    // The buzzer is active at a fixed ~2.4 kHz with no pitch control (spec
+    // 5.5), so it is a plain on/off line, not a GPIO. Level is what tests
+    // assert on; BuzzerOnCount counts drive calls, which is what makes
+    // "idle ticks must be silent" checkable.
+    void BuzzerOn(bool on) { buzzer_on_ = on; ++buzzer_calls_; }
+    bool BuzzerIsOn() const { return buzzer_on_; }
+    int BuzzerOnCount() const { return buzzer_calls_; }
+
+    // --- nvs ---------------------------------------------------------------
+    int NvsSet(const char *key, const void *in, size_t len);
+    int NvsGet(const char *key, void *out, size_t len);
+    void FailNextNvsWrite() { fail_next_nvs_write_ = true; }
+    // Simulate power loss partway through the next write: n bytes land, the
+    // write reports failure, and the stored blob is short. Readers must catch
+    // that via length + CRC, never by assuming the write completed.
+    void TruncateNextNvsWriteAt(size_t bytes) {
+        truncate_set_ = true;
+        truncate_next_write_at_ = bytes;
+    }
+    // Flip one bit at `offset` in a stored blob, to prove CRC catches it.
+    void CorruptNvsValue(const char *key, size_t offset);
+    void ClearNvs() { nvs_.clear(); }
+    int RebootCount() const { return reboot_count_; }
+
+    // Advance the clock and hand it to the interface (for poll loops).
+    void Tick(uint64_t ms) { AdvanceMs(ms); }
+
+private:
+    static int  AdcReadMvThunk(void *ctx, AdcChannel ch);
+    static void DacSetCodeThunk(void *ctx, DacChannel ch, uint16_t code);
+    static void DacPowerModeThunk(void *ctx, DacChannel ch, ::DacPowerMode m);
+    static void DacLdacThunk(void *ctx, bool assert);
+    static void GpioWriteThunk(void *ctx, GpioPin pin, bool level);
+    static bool GpioReadThunk(void *ctx, GpioPin pin);
+    static void BuzzerOnThunk(void *ctx, bool on);
+    static uint64_t NowMsThunk(void *ctx);
+    static uint64_t NowUsThunk(void *ctx);
+    static int  NvsGetThunk(void *ctx, const char *key, void *out, size_t len);
+    static int  NvsSetThunk(void *ctx, const char *key, const void *in, size_t len);
+    static void RebootThunk(void *ctx);
+
+    IHAL iface_{};
+    uint64_t now_ms_ = 0;
+    int adc_mv_[ADC_CH_COUNT] = {};
+    uint16_t dac_code_[DAC_CH_COUNT] = {};
+    ::DacPowerMode dac_mode_[DAC_CH_COUNT] = {};
+    int dac_writes_[DAC_CH_COUNT] = {};
+    bool ldac_asserted_ = false;
+    bool gpio_out_[GPIO_COUNT] = {};
+    bool gpio_in_[GPIO_COUNT] = {};
+    int gpio_writes_[GPIO_COUNT] = {};
+    bool buzzer_on_ = false;
+    int buzzer_calls_ = 0;
+    std::map<std::string, std::vector<uint8_t>> nvs_;
+    bool fail_next_nvs_write_ = false;
+    bool truncate_set_ = false;
+    size_t truncate_next_write_at_ = 0;
+    int reboot_count_ = 0;
+};

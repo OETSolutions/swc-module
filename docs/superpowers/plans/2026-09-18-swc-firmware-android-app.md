@@ -599,6 +599,24 @@ the ADC task.
 
 [platformio]
 default_envs = esp32s3
+; PlatformIO has exactly ONE global test_dir, and it is NOT a per-env option --
+; `test_dir` inside an [env:*] section is silently ignored (verified against
+; PlatformIO 6.2.0, project/options.py). So both trees live under one root:
+; test/ for the device suites (Unity) and test_native/ for the host suites
+; (GoogleTest), each env ignoring the other.
+;
+; Suite names are PATHS RELATIVE TO test_dir and are matched with fnmatch, so a
+; suite is ignored only if its whole relative path matches a pattern. That is
+; why each env needs BOTH forms: `test_native` (the tree directory itself,
+; which PlatformIO also collects as a suite) and `test_native/*` (the suites
+; inside it).
+;
+; test_dir must be the project root, because test_native/ sits beside test/.
+; The root is also where PlatformIO puts its own build output
+; (.pio/build/<env>/test/...), and the walker cannot tell that from a real
+; suite -- it collects it and copies the trees into it again, so the suite list
+; grows on every run. Hence the `.pio/*` ignores, which are load-bearing.
+test_dir = .
 
 [env]
 board_build.partitions = partitions.csv
@@ -624,11 +642,24 @@ board = swc-s3
 framework = espidf
 board_build.flash_size = 4MB
 test_framework = unity
-test_ignore = test_native
+test_ignore =
+    test_native
+    test_native/*
+    .pio/*
 monitor_speed = 115200
 
 [env:native]
 ; Host tests: pure logic only, no ESP32 toolchain involved. GoogleTest.
+;
+; `test/*` must be ignored: those suites are Unity, built for the device, and
+; GoogleTest cannot link them on the host.
+;
+; Each suite needs its OWN `main()`. GoogleTest's gtest_main.cc is filtered out
+; of the PlatformIO library build by googletest's library.json srcFilter, so
+; nothing else supplies main() and the test binary fails to link with
+; "Undefined symbols: _main". The fix is a small test_main.cpp inside the suite
+; (the proven pattern in the coop_controller project), NOT a gtest_main
+; injection script -- adding CPPPATH for it breaks the gmock objects.
 platform = native
 build_flags =
     ${env.build_flags}
@@ -637,12 +668,29 @@ build_flags =
     -I test_native
     -D SWC_NATIVE_TEST
 test_framework = googletest
-test_ignore = test
+test_ignore =
+    test
+    test/*
+    .pio/*
 build_src_filter = -<*>
 test_build_src = yes
 lib_deps =
     google/googletest@^1.15.2
 ```
+
+**Two things about this file are load-bearing and were verified on this machine,
+not reasoned about** (PlatformIO 6.2.0, Python 3.14.7):
+
+1. **`test_dir` is global-only.** Setting it inside `[env:native]` prints
+   `Warning! Ignore unknown configuration option 'test_dir'` and silently does
+   nothing — the env then looks in the default `test/` and reports "Nothing to
+   build". This is why `test_dir = .` sits at the top, with both trees under it.
+2. **`test_ignore` matches whole relative paths.** With `test_dir = .`, a suite
+   is named `test_native/test_hal`, so `test_ignore = test_native` alone leaves
+   `test_native/test_hal` to run. Both the bare tree name and the `/*` form are
+   needed. `.pio/*` is not tidiness: without it the walker collects PlatformIO's
+   own `.pio/build/<env>/test/...` output, which then self-replicates on every
+   run and grows the suite list.
 
 - [ ] **Step 2: Write `code/boards/swc-s3.json`**
 
@@ -872,6 +920,20 @@ windows, §8's 5-minute timeout) testable in microseconds of wall time.
 - Create: `code/test_native/MockHAL.h`
 - Create: `code/test_native/MockHAL.cpp`
 - Create: `code/test_native/test_hal/MockHalTest.cpp`
+- Create: `code/test_native/test_hal/test_main.cpp` — **not optional.** GoogleTest's
+  `gtest_main.cc` is filtered out of PlatformIO's library build by googletest's
+  own `library.json` `srcFilter`, so nothing supplies `main()` and every host
+  suite fails to link with `Undefined symbols: _main`. Each suite needs its own
+  four-line `main()`; see the `[env:native]` note in Task 1.
+
+  ```cpp
+  #include <gtest/gtest.h>
+
+  int main(int argc, char **argv) {
+      ::testing::InitGoogleTest(&argc, argv);
+      return RUN_ALL_TESTS();
+  }
+  ```
 
 **Interfaces:**
 - Consumes: the `native` env from Task 1
@@ -1031,7 +1093,7 @@ TEST(MockHalInputs, OnlyBootAndVbusReadBackAsProgrammedInputs) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_hal`
+Run: `cd code && pio test -e native -f '*test_hal'`
 Expected: FAIL — `MockHAL.h` not found / `MockHal` undefined.
 
 - [ ] **Step 3: Write `lib/HAL/IHAL.h`**
@@ -1350,14 +1412,15 @@ void MockHal::RebootThunk(void *ctx) { ++static_cast<MockHal *>(ctx)->reboot_cou
 
 - [ ] **Step 6: Run the tests**
 
-Run: `cd code && pio test -e native -f test_hal`
+Run: `cd code && pio test -e native -f '*test_hal'`
 Expected: PASS — 9 tests green.
 
 - [ ] **Step 7: Commit**
 
 ```bash
 git add code/lib/HAL/IHAL.h code/test_native/MockHAL.h code/test_native/MockHAL.cpp \
-        code/test_native/test_hal/MockHalTest.cpp
+        code/test_native/test_hal/MockHalTest.cpp \
+        code/test_native/test_hal/test_main.cpp
 git commit -m "Add the IHAL seam and a MockHal with an injectable clock
 
 The clock is part of the HAL so every timing rule in the spec (500ms double
@@ -1545,7 +1608,7 @@ TEST(LadderClassify, OverlappingWindowsResolveToTheNearestCentreNotTheFirstMatch
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_analog`
+Run: `cd code && pio test -e native -f '*test_analog'`
 Expected: FAIL — `Analog/LadderDecode.h` not found.
 
 - [ ] **Step 3: Write `lib/Analog/LadderDecode.h`**
@@ -1668,7 +1731,7 @@ ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int i
 
 - [ ] **Step 5: Run the tests**
 
-Run: `cd code && pio test -e native -f test_analog`
+Run: `cd code && pio test -e native -f '*test_analog'`
 Expected: PASS — 10 tests green, including the 34-point +3V3 sweep.
 
 - [ ] **Step 6: Commit**
@@ -1757,7 +1820,7 @@ TEST(AdcCalibration, TheSenseDividerKeepsUsUnderFullScale) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_analog`
+Run: `cd code && pio test -e native -f '*test_analog'`
 Expected: FAIL — `CalibrationCurve.h` not found.
 
 - [ ] **Step 3: Write `lib/Analog/CalibrationCurve.h`**
@@ -1818,7 +1881,7 @@ int AdcRawToMilliVolts(const AdcCalibration &cal, uint16_t raw) {
 
 - [ ] **Step 5: Run the tests**
 
-Run: `cd code && pio test -e native -f test_analog`
+Run: `cd code && pio test -e native -f '*test_analog'`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -1937,7 +2000,7 @@ TEST(GainPolicy, CodeForTargetIsMonotonic) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_output`
+Run: `cd code && pio test -e native -f '*test_output'`
 Expected: FAIL — `Output/GainPolicy.h` not found.
 
 - [ ] **Step 3: Write `lib/Output/GainPolicy.h`**
@@ -2056,7 +2119,7 @@ GainDecision GainPolicyCodeForTarget(GainMode mode, int target_key_mv) {
 
 - [ ] **Step 5: Run the tests**
 
-Run: `cd code && pio test -e native -f test_output`
+Run: `cd code && pio test -e native -f '*test_output'`
 Expected: PASS — including the exhaustive 241 × 2 envelope sweep.
 
 - [ ] **Step 6: Commit**
@@ -2194,7 +2257,7 @@ TEST(PressClassifier, SwitchingButtonsMidPressReportsTheNewButtonAfterDebounce) 
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_gesture`
+Run: `cd code && pio test -e native -f '*test_gesture'`
 Expected: FAIL — `Gesture/PressClassifier.h` not found.
 
 - [ ] **Step 3: Write `lib/Gesture/PressClassifier.h`**
@@ -2327,7 +2390,7 @@ ChannelLevel PressClassifier::Update(int level_mv, int idle_mv, uint64_t now_ms)
 
 - [ ] **Step 5: Run the classifier tests**
 
-Run: `cd code && pio test -e native -f test_gesture`
+Run: `cd code && pio test -e native -f '*test_gesture'`
 Expected: PASS — 7 tests green.
 
 - [ ] **Step 6: Write the failing state-machine test**
@@ -2634,7 +2697,7 @@ slow poll could drop a LONG entirely.
 
 - [ ] **Step 9: Run all gesture tests**
 
-Run: `cd code && pio test -e native -f test_gesture`
+Run: `cd code && pio test -e native -f '*test_gesture'`
 Expected: PASS — 7 classifier + 9 state-machine tests green. In particular
 `LongPressFiresAtTheThresholdBeforeRelease` must show `at_ms - 1000` in
 [750, 760), and a 10-second hold must emit **exactly one** event.
@@ -2763,7 +2826,7 @@ TEST(ServoLoop, ResetReturnsToTheOpenLoopCode) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_output`
+Run: `cd code && pio test -e native -f '*test_output'`
 Expected: FAIL — `Output/ServoLoop.h` not found.
 
 - [ ] **Step 3: Write `lib/Output/ServoLoop.h`**
@@ -2881,7 +2944,7 @@ bool ServoLoop::Update(int measured_sense_mv) {
 
 - [ ] **Step 5: Run the tests**
 
-Run: `cd code && pio test -e native -f test_output`
+Run: `cd code && pio test -e native -f '*test_output'`
 Expected: PASS — 8 servo tests green.
 
 - [ ] **Step 6: Commit**
@@ -3087,7 +3150,7 @@ TEST(ConfigCodec, ValidationAcceptsButtonsExactlyTolerancePlusOneApart) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_config`
+Run: `cd code && pio test -e native -f '*test_config'`
 Expected: FAIL — `Config/ConfigCodec.h` not found.
 
 - [ ] **Step 3: Write `lib/Config/ConfigModel.h`**
@@ -3298,7 +3361,7 @@ behavior. Key requirements the implementation must satisfy:
 
 - [ ] **Step 6: Run the tests**
 
-Run: `cd code && pio test -e native -f test_config`
+Run: `cd code && pio test -e native -f '*test_config'`
 Expected: PASS — 8 tests green.
 
 - [ ] **Step 7: Assert the config fits the NVS budget**
@@ -3316,7 +3379,7 @@ TEST(ConfigCodec, SerializedSizeFitsTheNvsPartitionBudget) {
 `ConfigMaxSerializedSize()` returns the worst case: `sizeof(BlobHeader)` plus the
 fully-populated JSON (2 channels × 16 buttons × 32 bindings).
 
-Run: `cd code && pio test -e native -f test_config`
+Run: `cd code && pio test -e native -f '*test_config'`
 Expected: PASS.
 
 - [ ] **Step 8: Commit**
@@ -3475,7 +3538,7 @@ void MockHal::ClearNvs() { nvs_.clear(); }
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_config`
+Run: `cd code && pio test -e native -f '*test_config'`
 Expected: FAIL — `Config/ConfigStore.h` not found.
 
 - [ ] **Step 3: Write `lib/Config/ConfigStore.h`**
@@ -3545,7 +3608,7 @@ The logic the tests pin down:
 
 - [ ] **Step 5: Run the tests**
 
-Run: `cd code && pio test -e native -f test_config`
+Run: `cd code && pio test -e native -f '*test_config'`
 Expected: PASS — 7 store tests green, including the torn-write recovery.
 
 - [ ] **Step 6: Commit**
@@ -3678,7 +3741,7 @@ TEST(NdjsonWriter, RefusesToEmitAFrameThatWouldExceedTheMaximum) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_link`
+Run: `cd code && pio test -e native -f '*test_link'`
 Expected: FAIL — `Link/Ndjson.h` not found.
 
 - [ ] **Step 3: Write `lib/Link/Ndjson.h` and `Ndjson.cpp`**
@@ -3699,7 +3762,7 @@ Implementation notes the tests pin:
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cd code && pio test -e native -f test_link`
+Run: `cd code && pio test -e native -f '*test_link'`
 Expected: PASS — 8 tests green.
 
 - [ ] **Step 5: Commit**
@@ -3851,7 +3914,7 @@ TEST(BindingResolver, TheStoredNameMustAgreeWithTheStoredId) {
 
 - [ ] **Step 2: Run and watch both fail**
 
-Run: `cd code && pio test -e native -f test_bindings`
+Run: `cd code && pio test -e native -f '*test_bindings'`
 Expected: FAIL — headers not found.
 
 - [ ] **Step 3: Implement**
@@ -3889,7 +3952,7 @@ ResolvedAction BindingResolve(const ChannelConfig &ch, const GestureEvent &ev) {
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cd code && pio test -e native -f test_bindings`
+Run: `cd code && pio test -e native -f '*test_bindings'`
 Expected: PASS — 4 + 6 tests green.
 
 - [ ] **Step 5: Commit**
@@ -4024,7 +4087,7 @@ TEST(BuzzerGrammar, NeverLeavesTheBuzzerStuckOnAfterAPatternCompletes) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_feedback`
+Run: `cd code && pio test -e native -f '*test_feedback'`
 Expected: FAIL — `Feedback/BuzzerGrammar.h` not found.
 
 - [ ] **Step 3: Implement `BuzzerGrammar`**
@@ -4043,7 +4106,7 @@ n × 80 ms; `kProgramExit` = 2×120 ms; `kLearnPrompt` = 2×60 ms; `kLearnOk` =
 
 - [ ] **Step 4: Run the buzzer tests**
 
-Run: `cd code && pio test -e native -f test_feedback`
+Run: `cd code && pio test -e native -f '*test_feedback'`
 Expected: PASS — 8 tests green.
 
 - [ ] **Step 5: Write the failing LED test**
@@ -4122,7 +4185,7 @@ TEST(LedGrammar, LevelZeroSilencesBothChannels) {
 
 - [ ] **Step 6: Implement `LedGrammar` and run**
 
-Run: `cd code && pio test -e native -f test_feedback`
+Run: `cd code && pio test -e native -f '*test_feedback'`
 Expected: PASS — 8 + 5 tests green.
 
 - [ ] **Step 7: Commit**
@@ -4290,7 +4353,7 @@ TEST(SystemOrchestrator, TickIsCheapEnoughToRunAtThePollCadence) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_system`
+Run: `cd code && pio test -e native -f '*test_system'`
 Expected: FAIL — `System/SystemOrchestrator.h` not found.
 
 - [ ] **Step 3: Implement**
@@ -4330,7 +4393,7 @@ from idle (§6.3), so every button's `mv_center` is *below* `idle_mv`.
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cd code && pio test -e native -f test_system`
+Run: `cd code && pio test -e native -f '*test_system'`
 Expected: PASS — 8 tests green.
 
 - [ ] **Step 5: Commit**
@@ -4698,7 +4761,7 @@ TEST(CommandRouter, ASequenceGapIsReportedAsAnEvent) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_link`
+Run: `cd code && pio test -e native -f '*test_link'`
 Expected: FAIL — `Link/CommandRouter.h` not found.
 
 - [ ] **Step 3: Implement**
@@ -4729,7 +4792,7 @@ Task 13's `MockHal::Defaults`.
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cd code && pio test -e native -f test_link`
+Run: `cd code && pio test -e native -f '*test_link'`
 Expected: PASS — 8 + 11 tests green.
 
 - [ ] **Step 5: Commit**
@@ -4882,7 +4945,7 @@ TEST(LearnSession, ToleranceIsDerivedFromTheMeasuredSpreadNotAConstant) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_learning`
+Run: `cd code && pio test -e native -f '*test_learning'`
 Expected: FAIL — `Learning/LearnSession.h` not found.
 
 - [ ] **Step 3: Implement**
@@ -4906,7 +4969,7 @@ neighbouring button capped by a configurable maximum (spec §3.4) — **not**
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cd code && pio test -e native -f test_learning`
+Run: `cd code && pio test -e native -f '*test_learning'`
 Expected: PASS — 8 tests green.
 
 - [ ] **Step 5: Add the headless AUX1-driven wizard (FR-31)**
@@ -4921,7 +4984,7 @@ Test it in `code/test_native/test_learning/LearnWizardTest.cpp`: drive `MockHal`
 AUX1 ADC and the clock, and assert the buzzer pattern sequence and that a full
 two-button learn completes with no link present.
 
-Run: `cd code && pio test -e native -f test_learning`
+Run: `cd code && pio test -e native -f '*test_learning'`
 Expected: PASS.
 
 - [ ] **Step 6: Commit**
@@ -5047,7 +5110,7 @@ TEST(ImageVerify, AMalformedHashStringIsRefusedRatherThanTreatedAsAZeroHash) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_update`
+Run: `cd code && pio test -e native -f '*test_update'`
 Expected: FAIL — `Update/ImageVerify.h` not found.
 
 - [ ] **Step 3: Implement `ImageVerify`**
@@ -5071,7 +5134,7 @@ classic way a verification system becomes decorative.
 
 - [ ] **Step 4: Run the `ImageVerify` tests**
 
-Run: `cd code && pio test -e native -f test_update`
+Run: `cd code && pio test -e native -f '*test_update'`
 Expected: PASS — 7 tests green.
 
 - [ ] **Step 5: Write the failing `ReleaseCheck` tests**
@@ -5147,7 +5210,7 @@ TEST(ReleaseCheck, ANonHttpsUrlIsRefused) {
 
 - [ ] **Step 6: Implement `ReleaseCheck` and run**
 
-Run: `cd code && pio test -e native -f test_update`
+Run: `cd code && pio test -e native -f '*test_update'`
 Expected: PASS — 7 + 6 tests green.
 
 - [ ] **Step 7: Commit**
@@ -5268,7 +5331,7 @@ TEST(MaintenanceMode, KeyPressesAreStillServedWhileMaintenanceIsActive) {
 
 - [ ] **Step 2: Run it and watch it fail**
 
-Run: `cd code && pio test -e native -f test_maintenance`
+Run: `cd code && pio test -e native -f '*test_maintenance'`
 Expected: FAIL — `Maintenance/MaintenanceMode.h` not found.
 
 - [ ] **Step 3: Implement the mode logic and run**
@@ -5279,7 +5342,7 @@ Expected: FAIL — `Maintenance/MaintenanceMode.h` not found.
 `Enter` always resets `last_activity_` to `now`, so a re-entry after a timeout
 gets a fresh window.
 
-Run: `cd code && pio test -e native -f test_maintenance`
+Run: `cd code && pio test -e native -f '*test_maintenance'`
 Expected: PASS — 7 tests green.
 
 - [ ] **Step 4: Add the BLE provisioning and web server (device-only)**

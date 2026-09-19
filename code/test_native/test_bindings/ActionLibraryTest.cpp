@@ -3,10 +3,10 @@
 #include <cstring>
 
 namespace {
-Action HwKey(uint16_t code) {
+Action OutVoltage(uint16_t mv) {
     Action a{};
-    a.kind = ActionKind::kHwKey;
-    a.dac_code = code;
+    a.kind = ActionKind::kOutVoltage;
+    a.key_mv = mv;
     return a;
 }
 Action Intent(const char *action, const char *data) {
@@ -22,7 +22,7 @@ TEST(ActionLibrary, EverySpecKindIsExecutable) {
     // Spec 3.6's eleven kinds, each given the field its own row requires. A kind
     // that cannot be made executable is a kind the firmware cannot run.
     Action none{};            none.kind = ActionKind::kNone;
-    Action release{};         release.kind = ActionKind::kHwKeyRelease;
+    Action release{};         release.kind = ActionKind::kOutRelease;
     Action launch{};          launch.kind = ActionKind::kAppLaunch;
     std::strncpy(launch.target, "com.spotify.music", sizeof(launch.target) - 1);
     Action keycode{};         keycode.kind = ActionKind::kKeycode;
@@ -41,7 +41,7 @@ TEST(ActionLibrary, EverySpecKindIsExecutable) {
     EXPECT_TRUE(ActionIsExecutable(none));
     EXPECT_TRUE(ActionIsExecutable(release));
     EXPECT_TRUE(ActionIsExecutable(launch));
-    EXPECT_TRUE(ActionIsExecutable(HwKey(1240)));
+    EXPECT_TRUE(ActionIsExecutable(OutVoltage(2400)));
     EXPECT_TRUE(ActionIsExecutable(Intent("com.oetsolutions.swc.ACTION_NAVIGATE", "geo:1,2")));
     EXPECT_TRUE(ActionIsExecutable(keycode));
     EXPECT_TRUE(ActionIsExecutable(media));
@@ -51,21 +51,19 @@ TEST(ActionLibrary, EverySpecKindIsExecutable) {
     EXPECT_TRUE(ActionIsExecutable(raw));
 }
 
-TEST(ActionLibrary, HwKeyMustCarryALevelOneWayOrTheOther) {
-    // Spec 3.6: HW_KEY takes `key_resistance_mohm`, OR `dac_code`. Neither means
-    // the output would be driven to a level nothing defined -- the exact fault
-    // spec 6.7 exists to prevent, so it is refused rather than guessed.
-    Action neither{};
-    neither.kind = ActionKind::kHwKey;
-    EXPECT_FALSE(ActionIsExecutable(neither));
+TEST(ActionLibrary, OutVoltageMustCarryALevel) {
+    // Spec 3.6: OUT_VOLTAGE takes `key_mv`. No level means the output would be
+    // driven to a voltage nothing defined -- the exact fault spec 6.7 exists to
+    // prevent, so it is refused rather than guessed. The head unit's resistance
+    // is converted to this voltage by the APP, not here: the firmware drives a
+    // voltage and has no head-unit model to convert with.
+    Action no_level{};
+    no_level.kind = ActionKind::kOutVoltage;
+    EXPECT_FALSE(ActionIsExecutable(no_level));
 
-    Action by_code = HwKey(1240);
-    EXPECT_TRUE(ActionIsExecutable(by_code));
-
-    Action by_resistance{};
-    by_resistance.kind = ActionKind::kHwKey;
-    by_resistance.key_resistance_mohm = 24000;   // spec 3.7's b1
-    EXPECT_TRUE(ActionIsExecutable(by_resistance));
+    // Spec 3.7's b1: 24 kohm down a 10 kohm pull-up from 3V3 is 2400 mV, and
+    // that is what the app sends -- the firmware never sees the resistance.
+    EXPECT_TRUE(ActionIsExecutable(OutVoltage(2400)));
 }
 
 TEST(ActionLibrary, AnIntentWithNoActionIsNotAnIntent) {
@@ -79,9 +77,9 @@ TEST(ActionLibrary, APayloadIsMeaningfulOnlyForTheKindsThatUseOne) {
     // The flag is a property of the kind, not of a stored action (spec 3.6).
     EXPECT_TRUE(ActionTakesPayload(ActionKind::kAppIntent));
     EXPECT_TRUE(ActionTakesPayload(ActionKind::kAppRaw));
-    EXPECT_FALSE(ActionTakesPayload(ActionKind::kHwKey));
+    EXPECT_FALSE(ActionTakesPayload(ActionKind::kOutVoltage));
     EXPECT_FALSE(ActionTakesPayload(ActionKind::kNone));
-    EXPECT_FALSE(ActionTakesPayload(ActionKind::kHwKeyRelease));
+    EXPECT_FALSE(ActionTakesPayload(ActionKind::kOutRelease));
 }
 
 TEST(ActionLibrary, AKindOutsideTheSpecIsRefusedNotGuessed) {

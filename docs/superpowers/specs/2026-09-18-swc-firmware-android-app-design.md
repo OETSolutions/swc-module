@@ -345,15 +345,15 @@ Two rules that matter:
 
 ### 3.6 The action library
 
-This is the union of "what the head unit's own SWC input can do" (the `HW_KEY`
+This is the union of "what the head unit's own SWC input can do" (the `OUT_`
 family) and "the extra functions the Android app provides" (everything else) —
 which is precisely the split the user described.
 
 | `kind` | Params | Executed by | Purpose |
 | --- | --- | --- | --- |
 | `NONE` | — | — | Explicit no-op; useful as a placeholder |
-| `HW_KEY` | `key_resistance_mohm`, or `dac_code` | Firmware | **The core function.** Present a key value to the head unit |
-| `HW_KEY_RELEASE` | — | Firmware | Force the KEY line to idle/high-Z |
+| `OUT_VOLTAGE` | `key_mv` | Firmware | **The core function.** Drive the KEY line to a voltage the head unit reads as a key |
+| `OUT_RELEASE` | — | Firmware | Force the KEY line to idle/high-Z |
 | `APP_LAUNCH` | `package` | Android | Launch an app by package name |
 | `APP_INTENT` | `action`, `data` | Android | Send an arbitrary intent, **including a data payload** — the user's stated example |
 | `KEYCODE` | `keycode` | Android | Inject a key event (`KEYCODE_MEDIA_NEXT`, …) |
@@ -382,16 +382,43 @@ each kind names them on the wire** — `APP_INTENT`'s `action`/`data`,
 `APP_LAUNCH`'s `package`, `KEYCODE`'s `keycode`, `MEDIA`/`SYSTEM`/`APP_RAW`'s
 `command`, `VOLUME`'s `target`, `BUZZ`'s `pattern`. The wire key is the kind's own
 name for the parameter (§3.7 is written in those names); the struct field is the
-generic one. `HW_KEY` is the exception that uses the two numeric fields instead.
+generic one. `OUT_VOLTAGE` is the exception that uses the numeric field instead.
 A kind needing more than two strings is a v2 item with its own `schema_version`,
 not a v1 action.
+
+**Why the output kind is `OUT_VOLTAGE` and not `HW_KEY`.** An earlier revision
+called this kind `HW_KEY` and gave it `key_resistance_mohm` or `dac_code`. Both
+names were wrong, and for the same reason: **the firmware does not drive a key,
+it drives a voltage.** The output stage is a closed-loop integrator servo
+(§2.3) — `V_KEY = 1.82·V_DAC − 0.82·V_ADJ` — and what it controls is the voltage
+on the KEY line. "Which key" is the *head unit's* interpretation of that voltage,
+and it differs per head unit: the same `volume up` is a different voltage in every
+car. An action that named a key would be promising an identity the firmware cannot
+know, so the action names the voltage and the head unit supplies the meaning.
+`dac_code` was wrong for a second, independent reason: a code is coupled to the
+gain mode, so changing `gain_mode` would silently change what every stored code
+means — the same "two homes for one level" defect that removed
+`output.key_values` below. `key_mv` is mode-independent.
+
+The `OUT_` prefix marks the *output* side of the device, which is the distinction
+that matters here: `OUT_VOLTAGE`/`OUT_RELEASE` act on the KEY output, while the
+ladder buttons and gestures act on the input side and `BUZZ` drives a different
+output entirely.
+
+**Resistance is the app's vocabulary, not the firmware's.** The head-unit profile
+— its ladder's resistances, its pull-up, its idle level — lives in the Android
+app, which is where a per-head-unit model belongs and where it is set up once for
+the user's car. The app converts a resistance to the voltage it produces and sends
+`key_mv`. The firmware never needs a head-unit constant, which is what keeps
+§6.5's "unknown pull-up" from being a firmware input at all. (`test_key`'s
+bench/production frame carries the same `key_mv` for the same reason.)
 
 `MACRO` is **not** an action kind — it is a binding with an ordered `actions`
 list, which is the same thing with one fewer concept to learn.
 
-**Design note on `HW_KEY` vs `APP_INTENT`:** a single physical button can be
-bound so that `SINGLE` sends a `HW_KEY` (so the stock head unit reacts even if
-the app is not running) while `DOUBLE` sends an `APP_INTENT` (an extra function
+**Design note on `OUT_VOLTAGE` vs `APP_INTENT`:** a single physical button can be
+bound so that `SINGLE` sends an `OUT_VOLTAGE` (so the stock head unit reacts even
+if the app is not running) while `DOUBLE` sends an `APP_INTENT` (an extra function
 the head unit never had). That is the whole point of the product, and the data
 model expresses it without a special case.
 
@@ -401,16 +428,16 @@ params. An earlier revision of the plan invented a numeric action-id table
 defines neither, and a generated contract must not synthesize them. `VOL_UP` is
 a `LadderButton.id`, used in a binding's `button` field — never an action name.
 
-**The `HW_KEY` level lives in the action, and there is no per-button key table.**
+**The output level lives in the action, and there is no per-button key table.**
 An earlier revision of §3.7's worked example carried an
 `output.key_values: { vol_up: { dac_code: 1240 }, … }` map alongside the
-bindings. That is a second home for the level: §3.6's `HW_KEY` row already says
-an action carries `dac_code` or `key_resistance_mohm`, and §3.5's whole design is
+bindings. That is a second home for the level: §3.6's `OUT_VOLTAGE` row already
+says an action carries `key_mv`, and §3.5's whole design is
 that a binding's own `actions` list is what decides what happens — including the
-core case where `vol_up`'s `SINGLE` sends a `HW_KEY` while its `LONG` sends
+core case where `vol_up`'s `SINGLE` sends an `OUT_VOLTAGE` while its `LONG` sends
 something else entirely. A per-button default map cannot express that, and two
 places to look for one level is how they drift. The map is removed; a binding's
-`HW_KEY` action names its own level. This is also a budget fact rather than a
+`OUT_VOLTAGE` action names its own level. This is also a budget fact rather than a
 taste one: 32 buttons × a `{dac_code}` entry is 576 B, which takes the measured
 worst case from 22,407 B to 22,983 B → **12 chunks → 50,720 B = 105 % of the
 partition** — the map does not fit.
@@ -511,10 +538,10 @@ out:
   ],
   "bindings": [
     { "id": "b1", "channel": "SWC1", "button": "vol_up", "gesture": "SINGLE",
-      "enabled": true, "actions": [ { "kind": "HW_KEY", "key_resistance_mohm": 24000 } ] },
+      "enabled": true, "actions": [ { "kind": "OUT_VOLTAGE", "key_mv": 2400 } ] },
 
     { "id": "b2", "channel": "SWC1", "button": "vol_up", "gesture": "LONG",
-      "enabled": true, "actions": [ { "kind": "HW_KEY_RELEASE" } ] },
+      "enabled": true, "actions": [ { "kind": "OUT_RELEASE" } ] },
 
     { "id": "b3", "channel": "SWC1", "button": "next", "gesture": "DOUBLE",
       "enabled": true, "actions": [
@@ -737,7 +764,7 @@ An interrupted run is discarded wholesale — a partial config is never applied.
 | App → FW | `config_patch` | `path`, `value` | Single-field change, cheaper and less racy — fits one line |
 | App → FW | `learn_start` / `learn_stop` | `channel`, `button_id` | Drive the learn wizard (§6.4) |
 | App → FW | `learn_commit` | `channel`, `button_id`, `name` | Accept the streamed samples as this button |
-| App → FW | `test_key` | `channel`, `dac_code` or `key_resistance_mohm`, `hold_ms` | Bench/production test of the output stage |
+| App → FW | `test_key` | `channel`, `key_mv`, `hold_ms` | Bench/production test of the output stage |
 | App → FW | `identify` | `pattern` | Flash LEDs / buzz, so the user knows *which* unit |
 | App → FW | `reboot` | `boot_target` (`app`/`bootloader`) | |
 | App → FW | `ping` | — | Liveness; FW answers `status` |
@@ -1163,11 +1190,11 @@ against a guess.
 
 **The local action runs first and unconditionally.** The app is an *enhancer*,
 not a dependency. If the USB link is down, the app has crashed, or the head unit
-is rebooting, every `HW_KEY` binding still works. This is FR-42, and it is the
+is rebooting, every `OUT_VOLTAGE` binding still works. This is FR-42, and it is the
 difference between a product and a toy.
 
 `APP_*` actions are reported to the app and are the app's business; their failure
-is reported back as a `nack`/`event` outcome but never blocks a `HW_KEY`.
+is reported back as a `nack`/`event` outcome but never blocks an `OUT_VOLTAGE`.
 
 ### 6.7 The safe idle state — the central safety property
 
@@ -2095,8 +2122,8 @@ RTOS, milliseconds. This is where the correctness of the *rules* lives:
   an action with a data payload round-trips it; an action whose kind is not in
   the table is rejected with an error rather than silently dropped. (There is no
   numeric action id to be unknown — §3.6 defines an action as its `kind` plus
-  params, so the rejection is on the kind and on a `HW_KEY` that carries neither
-  a `dac_code` nor a `key_resistance_mohm`.)
+  params, so the rejection is on the kind and on an `OUT_VOLTAGE` that carries no
+  `key_mv`.)
 
 **Level 2 — on-device tests (`test/`, Unity).** Runs on the real board, asserts
 what only silicon can answer. Deliberately small and mostly *measurement*, not

@@ -78,14 +78,14 @@ TEST(ConfigCodec, JsonRoundTripsEveryFieldThatWasSet) {
     EXPECT_EQ(out.bindings[0].gesture, Gesture::kSingle);
     EXPECT_TRUE(out.bindings[0].enabled);
     ASSERT_EQ(out.bindings[0].action_count, 1);
-    EXPECT_EQ(out.bindings[0].actions[0].kind, ActionKind::kHwKey);
-    EXPECT_EQ(out.bindings[0].actions[0].key_resistance_mohm, 24000u);
+    EXPECT_EQ(out.bindings[0].actions[0].kind, ActionKind::kOutVoltage);
+    EXPECT_EQ(out.bindings[0].actions[0].key_mv, 2400);
 
     // The two-action binding is the product's core case; both must survive, in
     // order, with the payload intact.
     EXPECT_EQ(out.bindings[1].gesture, Gesture::kDouble);
     ASSERT_EQ(out.bindings[1].action_count, 2);
-    EXPECT_EQ(out.bindings[1].actions[0].kind, ActionKind::kHwKeyRelease);
+    EXPECT_EQ(out.bindings[1].actions[0].kind, ActionKind::kOutRelease);
     EXPECT_EQ(out.bindings[1].actions[1].kind, ActionKind::kAppIntent);
     EXPECT_STREQ(out.bindings[1].actions[1].target, "com.oetsolutions.swc.ACTION_NAVIGATE");
     EXPECT_STREQ(out.bindings[1].actions[1].payload, "geo:40.7608,-111.8910");

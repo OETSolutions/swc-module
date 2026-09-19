@@ -50,8 +50,8 @@ inline Config MakeConfig() {
     c.bindings[0].gesture = Gesture::kSingle;
     c.bindings[0].enabled = true;
     c.bindings[0].action_count = 1;
-    c.bindings[0].actions[0].kind = ActionKind::kHwKey;
-    c.bindings[0].actions[0].key_resistance_mohm = 24000;
+    c.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    c.bindings[0].actions[0].key_mv = 2400;   // spec 3.7's b1
     // The second binding is the product's core case (spec 3.5/3.6): one button
     // whose SINGLE drives the head unit while its DOUBLE tells the app, with a
     // data payload. A single-action, id-keyed Binding could not express this,
@@ -62,7 +62,7 @@ inline Config MakeConfig() {
     c.bindings[1].gesture = Gesture::kDouble;
     c.bindings[1].enabled = true;
     c.bindings[1].action_count = 2;
-    c.bindings[1].actions[0].kind = ActionKind::kHwKeyRelease;
+    c.bindings[1].actions[0].kind = ActionKind::kOutRelease;
     c.bindings[1].actions[1].kind = ActionKind::kAppIntent;
     std::strncpy(c.bindings[1].actions[1].target, "com.oetsolutions.swc.ACTION_NAVIGATE",
                  sizeof(c.bindings[1].actions[1].target) - 1);
@@ -135,8 +135,8 @@ inline Config MakeBigConfig() {
         b.actions[0].kind = ActionKind::kAppIntent;
         std::strncpy(b.actions[0].payload, "geo:40.7608,-111.8910?q=Home",
                      sizeof(b.actions[0].payload) - 1);
-        b.actions[1].kind = ActionKind::kHwKey;
-        b.actions[1].key_resistance_mohm = 24000;
+        b.actions[1].kind = ActionKind::kOutVoltage;
+        b.actions[1].key_mv = 2400;
     }
     return c;
 }

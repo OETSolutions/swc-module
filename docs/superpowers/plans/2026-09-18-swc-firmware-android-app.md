@@ -281,7 +281,7 @@ cut implements `SINGLE`/`DOUBLE`/`LONG`. `COMBO` is deferred to v2.
 **Binding channel** is `SWC1 | SWC2 | AUX1 | AUX2 | AUX3 | ANY`. `ANY` is a real
 value, not a placeholder.
 
-**The 11 action kinds** (spec §3.6) — `NONE`, `HW_KEY`, `HW_KEY_RELEASE`,
+**The 11 action kinds** (spec §3.6) — `NONE`, `OUT_VOLTAGE`, `OUT_RELEASE`,
 `APP_LAUNCH`, `APP_INTENT`, `KEYCODE`, `MEDIA`, `VOLUME`, `SYSTEM`, `BUZZ`,
 `APP_RAW`. **There are no numeric action ids.** An earlier revision invented ids
 `1–63`; the spec defines none, and the contract generator must not synthesize
@@ -294,7 +294,7 @@ match `ConfigModel.h`'s declaration order exactly; the two lists are one fact
 with two spellings, so a reorder in either is a defect, not a refactor.
 
 ```c
-typedef enum { ACTION_NONE, ACTION_HW_KEY, ACTION_HW_KEY_RELEASE,
+typedef enum { ACTION_NONE, ACTION_OUT_VOLTAGE, ACTION_OUT_RELEASE,
                ACTION_APP_LAUNCH, ACTION_APP_INTENT, ACTION_KEYCODE,
                ACTION_MEDIA, ACTION_VOLUME, ACTION_SYSTEM, ACTION_BUZZ,
                ACTION_APP_RAW, ACTION_KIND_COUNT } ActionKind;
@@ -304,7 +304,7 @@ typedef enum { ACTION_NONE, ACTION_HW_KEY, ACTION_HW_KEY_RELEASE,
 **`ConfigModel.h` (Task 8) is the normative definition of these two structs; the
 C below is the same declaration in the contract's spelling, and when the two
 disagree the header wins.** They are one fact with two homes, which is why the
-header is named: an earlier revision of this block carried `// MV for HW_KEY` on
+header is named: an earlier revision of this block carried `// MV for OUT_VOLTAGE` on
 `payload` long after Task 8's copy had been corrected, and a reader who trusted
 this one would look for the key level in the wrong field.
 
@@ -315,8 +315,7 @@ typedef struct {
     uint8_t  kind;                 // ActionKind above; NOT a numeric action id
     char     target[40];           // package / intent action / command / pattern
     char     payload[48];          // APP_INTENT's data URI (spec 3.5); see ConfigModel.h
-    uint16_t dac_code;             // HW_KEY when commanded by code
-    uint32_t key_resistance_mohm;  // HW_KEY when commanded by resistance
+    uint16_t key_mv;               // OUT_VOLTAGE's KEY-line level, in millivolts
 } Action;
 
 typedef struct {
@@ -338,11 +337,17 @@ kind denied. Task 11 exposes it as `ActionTakesPayload(ActionKind)` instead, and
 `ConfigValidate` refuses an `APP_INTENT` with an empty `target` rather than
 trusting a flag.
 
-**`HW_KEY` carries its level two ways and needs exactly one of them**: a
-`dac_code` (already an output command) or a `key_resistance_mohm` (the head
-unit's own ladder value, which the firmware converts through the gain policy).
-An `HW_KEY` with neither is refused by `ConfigValidate` — it would drive the
-output to a level nothing defined.
+**`OUT_VOLTAGE` carries the KEY-line level, and it is a voltage rather than a
+`dac_code`**: `key_mv`, the millivolts the head unit reads as a key. An earlier
+revision carried a `dac_code` *or* a `key_resistance_mohm`. Both were wrong for
+the same reason — the firmware drives a voltage, and "which key" is the head
+unit's interpretation, which differs per head unit. `dac_code` was wrong twice
+over: a code is coupled to `gain_mode`, so changing the mode would silently
+change what every stored code means. **The resistance is the app's vocabulary,
+not the firmware's** — the app holds the head-unit profile, converts a resistance
+to the voltage it produces, and sends `key_mv`. An `OUT_VOLTAGE` with no level
+(`key_mv == 0`) is refused by `ConfigValidate` — it would drive the output to a
+voltage nothing defined.
 
 **The string widths are part of the budget, not free choices** (spec §3.5's
 width table): `target[40]`, `payload[48]`, ids and names `[16]`. A provable
@@ -3412,8 +3417,8 @@ Config MakeConfig() {
     c.bindings[0].gesture = Gesture::kSingle;
     c.bindings[0].enabled = true;
     c.bindings[0].action_count = 1;
-    c.bindings[0].actions[0].kind = ActionKind::kHwKey;
-    c.bindings[0].actions[0].key_resistance_mohm = 24000;
+    c.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    c.bindings[0].actions[0].key_mv = 2400;   // spec 3.7's b1
     // The second binding is the product's core case (spec 3.5/3.6): one button
     // whose SINGLE drives the head unit while its DOUBLE tells the app, with a
     // data payload. A single-action, id-keyed Binding could not express this,
@@ -3424,7 +3429,7 @@ Config MakeConfig() {
     c.bindings[1].gesture = Gesture::kDouble;
     c.bindings[1].enabled = true;
     c.bindings[1].action_count = 2;
-    c.bindings[1].actions[0].kind = ActionKind::kHwKeyRelease;
+    c.bindings[1].actions[0].kind = ActionKind::kOutRelease;
     c.bindings[1].actions[1].kind = ActionKind::kAppIntent;
     std::strncpy(c.bindings[1].actions[1].target, "com.oetsolutions.swc.ACTION_NAVIGATE",
                  sizeof(c.bindings[1].actions[1].target) - 1);
@@ -3483,14 +3488,14 @@ TEST(ConfigCodec, JsonRoundTripsEveryFieldThatWasSet) {
     EXPECT_EQ(out.bindings[0].gesture, Gesture::kSingle);
     EXPECT_TRUE(out.bindings[0].enabled);
     ASSERT_EQ(out.bindings[0].action_count, 1);
-    EXPECT_EQ(out.bindings[0].actions[0].kind, ActionKind::kHwKey);
-    EXPECT_EQ(out.bindings[0].actions[0].key_resistance_mohm, 24000u);
+    EXPECT_EQ(out.bindings[0].actions[0].kind, ActionKind::kOutVoltage);
+    EXPECT_EQ(out.bindings[0].actions[0].key_mv, 2400);
 
     // The two-action binding is the product's core case; both must survive, in
     // order, with the payload intact.
     EXPECT_EQ(out.bindings[1].gesture, Gesture::kDouble);
     ASSERT_EQ(out.bindings[1].action_count, 2);
-    EXPECT_EQ(out.bindings[1].actions[0].kind, ActionKind::kHwKeyRelease);
+    EXPECT_EQ(out.bindings[1].actions[0].kind, ActionKind::kOutRelease);
     EXPECT_EQ(out.bindings[1].actions[1].kind, ActionKind::kAppIntent);
     EXPECT_STREQ(out.bindings[1].actions[1].target, "com.oetsolutions.swc.ACTION_NAVIGATE");
     EXPECT_STREQ(out.bindings[1].actions[1].payload, "geo:40.7608,-111.8910");
@@ -3667,7 +3672,7 @@ constexpr int kDataPayloadLen       = 48;   // holds geo:40.7608,-111.8910?q=Hom
 // An action is identified by its KIND and params. There is no action id (spec
 // 3.6): an earlier revision invented ids 1-63 and a 3-value ActionKind, which
 // could not express the 11 kinds and made the product's core case -- one button
-// whose SINGLE sends a HW_KEY while its DOUBLE sends an APP_INTENT -- a shape
+// whose SINGLE drives the output while its DOUBLE sends an APP_INTENT -- a shape
 // the type could not hold.
 // A binding's input, spec 3.5: `SWC1 | SWC2 | AUX1 | AUX2 | AUX3 | ANY`.
 // `ANY` is a real value, not a placeholder -- it is how one gesture is bound
@@ -3677,7 +3682,7 @@ enum class BindingChannel : uint8_t {
 };
 
 enum class ActionKind : uint8_t {
-    kNone, kHwKey, kHwKeyRelease, kAppLaunch, kAppIntent,
+    kNone, kOutVoltage, kOutRelease, kAppLaunch, kAppIntent,
     kKeycode, kMedia, kVolume, kSystem, kBuzzer, kAppRaw,
 };
 
@@ -3685,8 +3690,7 @@ struct Action {
     ActionKind kind;
     char       target[kActionTargetLen];   // package / intent action / command / pattern
     char       payload[kDataPayloadLen];   // APP_INTENT's data URI (spec 3.5)
-    uint16_t   dac_code;                   // kHwKey when commanded by code
-    uint32_t   key_resistance_mohm;        // kHwKey when commanded by resistance
+    uint16_t   key_mv;                     // kOutVoltage: KEY-line level, mV
 };
 
 // Whether the kind gives `payload` a meaning (spec 3.6's table is the authority).
@@ -3990,11 +3994,12 @@ bool ActionIsWellFormed(const Action &a) {
     // the same eight enumerators out a second time -- two homes for one fact,
     // and they drift the first time a kind is added.
     if (ActionTakesPayload(a.kind) && a.target[0] == '\0') return false;
-    // HW_KEY carries its level exactly one way -- an already-resolved `dac_code`,
-    // or the head unit's own `key_resistance_mohm` for the gain policy to convert.
-    // Neither means the action would drive the output to a level nothing defined.
-    if (a.kind == ActionKind::kHwKey &&
-        a.dac_code == 0 && a.key_resistance_mohm == 0) return false;
+    // OUT_VOLTAGE carries the KEY-line level, and it is a VOLTAGE rather than a
+    // `dac_code` (spec 3.6). A code would be coupled to `gain_mode`, so changing
+    // the mode would silently change what every stored code means. Zero means
+    // "no level", which would drive the output to a voltage nothing defined; the
+    // app is what converts a head unit's resistance to this voltage.
+    if (a.kind == ActionKind::kOutVoltage && a.key_mv == 0) return false;
     return true;
 }
 
@@ -4101,7 +4106,7 @@ satisfy:
   | `MEDIA` / `SYSTEM` / `APP_RAW` | `command` | — |
   | `VOLUME` | `target` | — |
   | `BUZZ` | `pattern` | — |
-  | `NONE` / `HW_KEY` / `HW_KEY_RELEASE` | — (HW_KEY uses the numeric fields) | — |
+  | `NONE` / `OUT_VOLTAGE` / `OUT_RELEASE` | — (OUT_VOLTAGE uses `key_mv`) | — |
 
   A field the kind does not use is **omitted, not written empty**, so a `NONE`
   action is exactly `{"kind":"NONE"}`. One table in the .cpp serves both the
@@ -4781,7 +4786,7 @@ ladder-button slugs (`VOL_UP`) as action *names*. The spec defines none of that.
 `VOL_UP` is a `LadderButton.id` — the `button` field of a `Binding` — and an
 action is its `kind` plus its params, which is what `ConfigModel.h` already
 stores. The three-value enum could not even express spec §3.6's eleven kinds, and
-it made the product's core case (one button whose `SINGLE` sends a `HW_KEY` while
+it made the product's core case (one button whose `SINGLE` drives the output while
 its `DOUBLE` sends an `APP_INTENT`) a shape the type could not hold.
 
 **Files:**
@@ -4826,7 +4831,7 @@ addressable at once.
 namespace {
 Action HwKey(uint16_t code) {
     Action a{};
-    a.kind = ActionKind::kHwKey;
+    a.kind = ActionKind::kOutVoltage;
     a.dac_code = code;
     return a;
 }
@@ -4843,7 +4848,7 @@ TEST(ActionLibrary, EverySpecKindIsExecutable) {
     // Spec 3.6's eleven kinds, each given the field its own row requires. A kind
     // that cannot be made executable is a kind the firmware cannot run.
     Action none{};            none.kind = ActionKind::kNone;
-    Action release{};         release.kind = ActionKind::kHwKeyRelease;
+    Action release{};         release.kind = ActionKind::kOutRelease;
     Action launch{};          launch.kind = ActionKind::kAppLaunch;
     std::strncpy(launch.target, "com.spotify.music", sizeof(launch.target) - 1);
     Action keycode{};         keycode.kind = ActionKind::kKeycode;
@@ -4873,19 +4878,21 @@ TEST(ActionLibrary, EverySpecKindIsExecutable) {
 }
 
 TEST(ActionLibrary, HwKeyMustCarryALevelOneWayOrTheOther) {
-    // Spec 3.6: HW_KEY takes `key_resistance_mohm`, OR `dac_code`. Neither means
-    // the output would be driven to a level nothing defined -- the exact fault
-    // spec 6.7 exists to prevent, so it is refused rather than guessed.
+    // Spec 3.6: OUT_VOLTAGE takes `key_mv`. No level means the output would be
+    // driven to a voltage nothing defined -- the exact fault spec 6.7 exists to
+    // prevent, so it is refused rather than guessed. The head unit's resistance
+    // is converted to this voltage by the APP, not here: the firmware drives a
+    // voltage and has no head-unit model to convert with.
     Action neither{};
-    neither.kind = ActionKind::kHwKey;
+    neither.kind = ActionKind::kOutVoltage;
     EXPECT_FALSE(ActionIsExecutable(neither));
 
     Action by_code = HwKey(1240);
     EXPECT_TRUE(ActionIsExecutable(by_code));
 
     Action by_resistance{};
-    by_resistance.kind = ActionKind::kHwKey;
-    by_resistance.key_resistance_mohm = 24000;   // spec 3.7's b1
+    by_resistance.kind = ActionKind::kOutVoltage;
+    by_resistance.key_mv = 2400;   // spec 3.7's b1
     EXPECT_TRUE(ActionIsExecutable(by_resistance));
 }
 
@@ -4900,9 +4907,9 @@ TEST(ActionLibrary, APayloadIsMeaningfulOnlyForTheKindsThatUseOne) {
     // The flag is a property of the kind, not of a stored action (spec 3.6).
     EXPECT_TRUE(ActionTakesPayload(ActionKind::kAppIntent));
     EXPECT_TRUE(ActionTakesPayload(ActionKind::kAppRaw));
-    EXPECT_FALSE(ActionTakesPayload(ActionKind::kHwKey));
+    EXPECT_FALSE(ActionTakesPayload(ActionKind::kOutVoltage));
     EXPECT_FALSE(ActionTakesPayload(ActionKind::kNone));
-    EXPECT_FALSE(ActionTakesPayload(ActionKind::kHwKeyRelease));
+    EXPECT_FALSE(ActionTakesPayload(ActionKind::kOutRelease));
 }
 
 TEST(ActionLibrary, AKindOutsideTheSpecIsRefusedNotGuessed) {
@@ -4922,7 +4929,7 @@ TEST(ActionLibrary, AKindOutsideTheSpecIsRefusedNotGuessed) {
 namespace {
 // Spec 3.7's worked example: one channel, three buttons, idle 2835 mV, and the
 // bindings that make the product's core case real -- vol_up SINGLE drives a
-// HW_KEY (works with no app) while next DOUBLE launches an app (the app's extra).
+// the output (works with no app) while next DOUBLE launches an app (the app's extra).
 Config MakeConfig() {
     Config c{};
     c.schema_version = kConfigSchemaVersion;
@@ -4942,8 +4949,8 @@ Config MakeConfig() {
     c.bindings[0].gesture = Gesture::kSingle;
     c.bindings[0].enabled = true;
     c.bindings[0].action_count = 1;
-    c.bindings[0].actions[0].kind = ActionKind::kHwKey;
-    c.bindings[0].actions[0].key_resistance_mohm = 24000;
+    c.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    c.bindings[0].actions[0].key_mv = 2400;   // spec 3.7's b1
 
     std::strncpy(c.bindings[1].id, "b3", sizeof(c.bindings[1].id) - 1);
     c.bindings[1].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
@@ -4978,7 +4985,7 @@ Config MakeConfig() {
     c.bindings[2].gesture = Gesture::kSingle;
     c.bindings[2].enabled = true;
     c.bindings[2].action_count = 1;
-    c.bindings[2].actions[0].kind = ActionKind::kHwKeyRelease;
+    c.bindings[2].actions[0].kind = ActionKind::kOutRelease;
     return c;
 }
 GestureEvent Ev(Gesture g, uint8_t b) { return GestureEvent{g, b, 0}; }
@@ -4987,8 +4994,8 @@ GestureEvent Ev(Gesture g, uint8_t b) { return GestureEvent{g, b, 0}; }
 TEST(BindingResolver, ResolvesAButtonsSinglePressToItsAction) {
     const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kSingle, 0));
     ASSERT_TRUE(r.found);
-    EXPECT_EQ(r.action.kind, ActionKind::kHwKey);
-    EXPECT_EQ(r.action.key_resistance_mohm, 24000u);
+    EXPECT_EQ(r.action.kind, ActionKind::kOutVoltage);
+    EXPECT_EQ(r.action.key_mv, 2400);
 }
 
 TEST(BindingResolver, CarriesTheDataPayloadThroughUntouched) {
@@ -5006,7 +5013,7 @@ TEST(BindingResolver, ABindingOnAnotherChannelIsNotResolved) {
     // this is the check the earlier per-channel revision could not express.
     const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kSingle, 0));
     ASSERT_TRUE(r.found);
-    EXPECT_NE(r.action.kind, ActionKind::kHwKeyRelease) << "that binding is SWC2's";
+    EXPECT_NE(r.action.kind, ActionKind::kOutRelease) << "that binding is SWC2's";
 }
 
 TEST(BindingResolver, AnyChannelIsHonouredFromEitherChannel) {
@@ -5049,7 +5056,7 @@ TEST(BindingResolver, ADisabledBindingIsSkippedNotSwallowed) {
 
 TEST(BindingResolver, AnUnExecutableActionIsRefusedRatherThanDropped) {
     Config c = MakeConfig();
-    c.bindings[0].actions[0].key_resistance_mohm = 0;   // HW_KEY with no level
+    c.bindings[0].actions[0].key_mv = 0;   // OUT_VOLTAGE with no level
     EXPECT_FALSE(BindingResolve(c, 0, Ev(Gesture::kSingle, 0)).found);
 }
 
@@ -5730,16 +5737,21 @@ requirement, not an implementation detail):
 
 `Tick(now)` per channel: read `adc_read_mv(SWCn)` and `adc_read_mv(TEMP)`;
 `PressClassifier::Update`; feed the result to `GestureStateMachine::Update`; on a
-gesture, `BindingResolve(config_, ch, event)`. **A found `kHwKey` action names a
-level, not a button**, so the target KEY voltage comes from the action:
+gesture, `BindingResolve(config_, ch, event)`. **A found `kOutVoltage` action
+carries the target level directly** — `key_mv` is the voltage the head unit reads
+as a key, so the tick hands it straight to `ServoLoop::Target(mode, key_mv)`.
 
-- `dac_code` → `GainPolicyKeyMvForCode(mode, code)`, the already-resolved form;
-- `key_resistance_mohm` → the level that resistance presents to the head unit,
-  computed from that action's own resistance and the head unit's pull-up.
+The firmware never converts a resistance and has no model of the head unit to do
+it with: spec §6.5 calls the head unit's pull-up *unknown* ("plausibly 1 k–100 k"),
+and an earlier revision of this step told the implementer to compute the level
+"from that action's own resistance and the head unit's pull-up" — a computation
+with no constant to compute from. The app holds the head-unit profile, which is
+where a per-car model belongs, and sends the voltage. This is also why the level
+is a voltage and not a `dac_code`: a code would be coupled to `gain_mode`.
 
 **There is no per-button key table** (`output.key_values` in an earlier revision
 of spec §3.7). The level is the action's, because that is what lets `vol_up`'s
-`SINGLE` drive a `HW_KEY` while its `LONG` does something else — the core case of
+`SINGLE` drive an `OUT_VOLTAGE` while its `LONG` does something else — the core case of
 spec §3.5. The map also did not fit: 32 buttons × a `{dac_code}` entry is 576 B,
 which takes the measured worst case to 12 chunks = 105 % of the partition.
 
@@ -7386,7 +7398,7 @@ action-id table: spec §3.6 states there are no numeric action ids, and that "a
 generated contract must not synthesize them".
 
 **The action kind is a STRING on the wire and an ordinal in memory.** Spec §3.7's
-worked example writes `{ "kind": "HW_KEY", "key_resistance_mohm": 24000 }` — the
+worked example writes `{ "kind": "OUT_VOLTAGE", "key_mv": 2400 }` — the
 JSON and the NDJSON both carry the name, because a config written by one firmware
 version must be readable by another and an ordinal silently rebinds when a kind is
 inserted. The ordinal exists only inside each side's own enum.
@@ -7499,7 +7511,7 @@ The generators emit:
   `#define` per kind (the wire form — spec §3.7), and the frame type strings as
   `#define`s. There is no `SWC_ACTION_<NAME>` numeric macro, because there is no
   action id.
-- `Contract.kt` — `enum class ActionKind { NONE, HW_KEY, HW_KEY_RELEASE, … }`
+- `Contract.kt` — `enum class ActionKind { NONE, OUT_VOLTAGE, OUT_RELEASE, … }`
   with a `wireName` property per entry, and the frame names, so the app references
   symbols rather than string literals. There is no `ActionIds` object.
 

@@ -91,11 +91,13 @@ bool ActionIsWellFormed(const Action &a) {
     // the same eight enumerators out a second time -- two homes for one fact,
     // and they drift the first time a kind is added.
     if (ActionTakesPayload(a.kind) && a.target[0] == '\0') return false;
-    // HW_KEY carries its level exactly one way -- an already-resolved `dac_code`,
-    // or the head unit's own `key_resistance_mohm` for the gain policy to convert.
-    // Neither means the action would drive the output to a level nothing defined.
-    if (a.kind == ActionKind::kHwKey &&
-        a.dac_code == 0 && a.key_resistance_mohm == 0) return false;
+    // OUT_VOLTAGE carries the KEY-line level, and it is a VOLTAGE rather than a
+    // `dac_code` (spec 3.6). A code would be coupled to `gain_mode`, so changing
+    // the mode would silently change what every stored code means -- the same
+    // "two homes for one level" defect that removed `output.key_values`. Zero
+    // means "no level", which would drive the output to a voltage nothing
+    // defined; the app is what converts a head unit's resistance to this voltage.
+    if (a.kind == ActionKind::kOutVoltage && a.key_mv == 0) return false;
     return true;
 }
 
@@ -184,8 +186,8 @@ constexpr EnumName kGestureNames[] = {
 // spellings; a reorder in either is a defect, not a refactor.
 constexpr EnumName kActionKindNames[] = {
     {static_cast<int>(ActionKind::kNone),         "NONE"},
-    {static_cast<int>(ActionKind::kHwKey),        "HW_KEY"},
-    {static_cast<int>(ActionKind::kHwKeyRelease), "HW_KEY_RELEASE"},
+    {static_cast<int>(ActionKind::kOutVoltage),   "OUT_VOLTAGE"},
+    {static_cast<int>(ActionKind::kOutRelease),   "OUT_RELEASE"},
     {static_cast<int>(ActionKind::kAppLaunch),    "APP_LAUNCH"},
     {static_cast<int>(ActionKind::kAppIntent),    "APP_INTENT"},
     {static_cast<int>(ActionKind::kKeycode),      "KEYCODE"},
@@ -346,8 +348,8 @@ struct ParamKeys { ActionKind kind; const char *target; const char *payload; };
 
 constexpr ParamKeys kParamKeys[] = {
     {ActionKind::kNone,         nullptr,        nullptr},
-    {ActionKind::kHwKey,        nullptr,        nullptr},   // uses the numeric fields
-    {ActionKind::kHwKeyRelease, nullptr,        nullptr},
+    {ActionKind::kOutVoltage,   nullptr,        nullptr},   // uses `key_mv`
+    {ActionKind::kOutRelease,   nullptr,        nullptr},
     {ActionKind::kAppLaunch,    "package",      nullptr},
     {ActionKind::kAppIntent,    "action",       "data"},
     {ActionKind::kKeycode,      "keycode",      nullptr},
@@ -413,8 +415,7 @@ cJSON *EncodeActions(const Binding &b) {
         if (payload_key != nullptr && act.payload[0] != '\0') {
             cJSON_AddStringToObject(o, payload_key, act.payload);
         }
-        if (act.dac_code != 0) AddU32(o, "dac_code", act.dac_code);
-        if (act.key_resistance_mohm != 0) AddU32(o, "key_resistance_mohm", act.key_resistance_mohm);
+        if (act.key_mv != 0) AddU32(o, "key_mv", act.key_mv);
         cJSON_AddItemToArray(arr, o);
     }
     return arr;
@@ -548,8 +549,7 @@ bool DecodeActions(const cJSON *arr, Binding *b) {
         // does not use, so a NONE action is `{"kind":"NONE"}` with no target.
         act.target[0] = '\0';
         act.payload[0] = '\0';
-        act.dac_code = 0;
-        act.key_resistance_mohm = 0;
+        act.key_mv = 0;
         // The kind's own parameter names (spec 3.6), read through the same table
         // the encoder writes from. An unknown key is ignored rather than
         // rejected -- forward compatibility for a v2 field is the schema
@@ -567,10 +567,8 @@ bool DecodeActions(const cJSON *arr, Binding *b) {
                     break;
             }
         }
-        if (Member(o, "dac_code") != nullptr &&
-            !ReadU16(o, "dac_code", &act.dac_code)) return false;
-        if (Member(o, "key_resistance_mohm") != nullptr &&
-            !ReadU32(o, "key_resistance_mohm", &act.key_resistance_mohm)) return false;
+        if (Member(o, "key_mv") != nullptr &&
+            !ReadU16(o, "key_mv", &act.key_mv)) return false;
     }
     return true;
 }

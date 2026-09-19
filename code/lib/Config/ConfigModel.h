@@ -31,7 +31,7 @@ constexpr int kDataPayloadLen       = 48;   // holds geo:40.7608,-111.8910?q=Hom
 // An action is identified by its KIND and params. There is no action id (spec
 // 3.6): an earlier revision invented ids 1-63 and a 3-value ActionKind, which
 // could not express the 11 kinds and made the product's core case -- one button
-// whose SINGLE sends a HW_KEY while its DOUBLE sends an APP_INTENT -- a shape
+// whose SINGLE drives the output while its DOUBLE sends an APP_INTENT -- a shape
 // the type could not hold.
 // A binding's input, spec 3.5: `SWC1 | SWC2 | AUX1 | AUX2 | AUX3 | ANY`.
 // `ANY` is a real value, not a placeholder -- it is how one gesture is bound
@@ -40,8 +40,10 @@ enum class BindingChannel : uint8_t {
     kSwc1, kSwc2, kAux1, kAux2, kAux3, kAny,
 };
 
+// Declaration order is the Shared contract's append-only order (spec 3.6) and
+// must match `kActionKindNames` in ConfigCodec.cpp -- one fact, two spellings.
 enum class ActionKind : uint8_t {
-    kNone, kHwKey, kHwKeyRelease, kAppLaunch, kAppIntent,
+    kNone, kOutVoltage, kOutRelease, kAppLaunch, kAppIntent,
     kKeycode, kMedia, kVolume, kSystem, kBuzzer, kAppRaw,
 };
 
@@ -49,8 +51,12 @@ struct Action {
     ActionKind kind;
     char       target[kActionTargetLen];   // package / intent action / command / pattern
     char       payload[kDataPayloadLen];   // APP_INTENT's data URI (spec 3.5)
-    uint16_t   dac_code;                   // kHwKey when commanded by code
-    uint32_t   key_resistance_mohm;        // kHwKey when commanded by resistance
+    // The KEY-line voltage for `kOutVoltage`, in millivolts (spec 3.6). It is a
+    // VOLTAGE and not a `dac_code`, because a code is coupled to the gain mode:
+    // changing `gain_mode` would silently change what every stored code means.
+    // 0 means "absent" and is never a valid target -- the output floor is 1800 mV
+    // (GainPolicy.h), so the whole range below it is unrepresentable anyway.
+    uint16_t   key_mv;
 };
 
 // Whether the kind gives `payload` a meaning (spec 3.6's table is the authority).

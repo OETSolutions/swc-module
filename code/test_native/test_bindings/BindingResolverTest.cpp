@@ -5,7 +5,7 @@
 namespace {
 // Spec 3.7's worked example: one channel, three buttons, idle 2835 mV, and the
 // bindings that make the product's core case real -- vol_up SINGLE drives a
-// HW_KEY (works with no app) while next DOUBLE launches an app (the app's extra).
+// the output (works with no app) while next DOUBLE launches an app (the app's extra).
 Config MakeConfig() {
     Config c{};
     c.schema_version = kConfigSchemaVersion;
@@ -25,8 +25,8 @@ Config MakeConfig() {
     c.bindings[0].gesture = Gesture::kSingle;
     c.bindings[0].enabled = true;
     c.bindings[0].action_count = 1;
-    c.bindings[0].actions[0].kind = ActionKind::kHwKey;
-    c.bindings[0].actions[0].key_resistance_mohm = 24000;
+    c.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    c.bindings[0].actions[0].key_mv = 2400;   // spec 3.7's b1
 
     std::strncpy(c.bindings[1].id, "b3", sizeof(c.bindings[1].id) - 1);
     c.bindings[1].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
@@ -61,7 +61,7 @@ Config MakeConfig() {
     c.bindings[2].gesture = Gesture::kSingle;
     c.bindings[2].enabled = true;
     c.bindings[2].action_count = 1;
-    c.bindings[2].actions[0].kind = ActionKind::kHwKeyRelease;
+    c.bindings[2].actions[0].kind = ActionKind::kOutRelease;
     return c;
 }
 GestureEvent Ev(Gesture g, uint8_t b) { return GestureEvent{g, b, 0}; }
@@ -70,8 +70,8 @@ GestureEvent Ev(Gesture g, uint8_t b) { return GestureEvent{g, b, 0}; }
 TEST(BindingResolver, ResolvesAButtonsSinglePressToItsAction) {
     const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kSingle, 0));
     ASSERT_TRUE(r.found);
-    EXPECT_EQ(r.action.kind, ActionKind::kHwKey);
-    EXPECT_EQ(r.action.key_resistance_mohm, 24000u);
+    EXPECT_EQ(r.action.kind, ActionKind::kOutVoltage);
+    EXPECT_EQ(r.action.key_mv, 2400);
 }
 
 TEST(BindingResolver, CarriesTheDataPayloadThroughUntouched) {
@@ -89,7 +89,7 @@ TEST(BindingResolver, ABindingOnAnotherChannelIsNotResolved) {
     // this is the check the earlier per-channel revision could not express.
     const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kSingle, 0));
     ASSERT_TRUE(r.found);
-    EXPECT_NE(r.action.kind, ActionKind::kHwKeyRelease) << "that binding is SWC2's";
+    EXPECT_NE(r.action.kind, ActionKind::kOutRelease) << "that binding is SWC2's";
 }
 
 TEST(BindingResolver, AnyChannelIsHonouredFromEitherChannel) {
@@ -132,7 +132,7 @@ TEST(BindingResolver, ADisabledBindingIsSkippedNotSwallowed) {
 
 TEST(BindingResolver, AnUnExecutableActionIsRefusedRatherThanDropped) {
     Config c = MakeConfig();
-    c.bindings[0].actions[0].key_resistance_mohm = 0;   // HW_KEY with no level
+    c.bindings[0].actions[0].key_mv = 0;   // OUT_VOLTAGE with no level
     EXPECT_FALSE(BindingResolve(c, 0, Ev(Gesture::kSingle, 0)).found);
 }
 

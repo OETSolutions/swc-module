@@ -1,0 +1,31 @@
+# --- Console and USB -------------------------------------------------------
+# Console on the ROM USB-Serial-JTAG peripheral; the app link is TinyUSB CDC on
+# the same physical port but a separate USB interface (spec 4.1). Keeping them
+# distinct is deliberate: the console must not corrupt app frames.
+CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+CONFIG_TINYUSB_CDC_ENABLED=y
+
+# --- Bluetooth: NimBLE, not Bluedroid --------------------------------------
+# Bluedroid does not fit 4MB/no-PSRAM alongside WiFi + OTA (spec 9.2).
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_BLUEDROID_ENABLED=n
+
+# --- mbedTLS ---------------------------------------------------------------
+# Disable hardware AES. The field-reported TLS crashes trace to the mbedTLS
+# GCM/HARDWARE_AES path (espressif/esp-idf#14298, IDFGH-13390); with it off we
+# take the software AES path, which is what the OTA flow is tested against.
+CONFIG_MBEDTLS_HARDWARE_AES=n
+CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
+
+# --- ADC -------------------------------------------------------------------
+# Curve-fit calibration for per-chip accuracy (spec 2.3). Without this the
+# raw-ADC linear-scale assumption is off by more than the classification windows.
+CONFIG_ESP_ADC_CAL_USE_EFUSE_CALIBRATION=y
+CONFIG_ESP_ADC_CAL_DEFAULT_ATTENUATION_12=y
+
+# --- Crash handling --------------------------------------------------------
+# Coredump partition exists (partitions.csv). Reset in release; gdbstub in dev.
+CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
+CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y

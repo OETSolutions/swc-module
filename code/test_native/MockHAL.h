@@ -66,9 +66,23 @@ public:
         truncate_set_ = true;
         truncate_next_write_at_ = bytes;
     }
+    // Truncate the next write TO A SPECIFIC KEY. TruncateNextNvsWriteAt targets
+    // "the next write", which with chunked slots is always a payload chunk -- so
+    // it cannot express a torn *sequence* write, where every payload chunk landed
+    // and only the final key was lost. That is the other half of the A/B tear and
+    // the case the write-order protocol exists for, so it needs its own injector.
+    void TruncateNvsWriteTo(const char *key, size_t bytes) {
+        truncate_key_ = key;
+        truncate_key_at_ = bytes;
+    }
     // Flip one bit at `offset` in a stored blob, to prove CRC catches it.
     void CorruptNvsValue(const char *key, size_t offset);
     void ClearNvs() { nvs_.clear(); }
+    // Remove ONE key, as an interrupted erase or a partially-written chunk set
+    // leaves. Distinct from ClearNvs: the test needs the header chunk intact
+    // while a later chunk is missing, which is the case that catches a store
+    // trusting the header's length over the chunks it actually read.
+    void ClearNvsKey(const char *key) { nvs_.erase(key); }
     int RebootCount() const { return reboot_count_; }
 
     // Advance the clock and hand it to the interface (for poll loops).
@@ -104,5 +118,7 @@ private:
     bool fail_next_nvs_write_ = false;
     bool truncate_set_ = false;
     size_t truncate_next_write_at_ = 0;
+    std::string truncate_key_;          // empty = no key-targeted truncation armed
+    size_t truncate_key_at_ = 0;
     int reboot_count_ = 0;
 };

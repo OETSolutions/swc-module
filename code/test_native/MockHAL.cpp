@@ -71,6 +71,27 @@ int MockHal::NvsSet(const char *key, const void *in, size_t len) {
         truncate_next_write_at_ = 0;
         return -1;
     }
+    // Key-targeted failure, armed by TruncateNvsWriteTo. Checked after the
+    // next-write form so the two injectors stay independent, and one-shot so a
+    // later write of the same key lands whole.
+    //
+    // A write that fails to COMMIT leaves the previous value in place: NVS is
+    // copy-on-write, so an interrupted write never destroys the old entry. This
+    // is not a detail -- it is what makes the A/B protocol work. If a torn
+    // cfg_seq clobbered the old sequence, the store could not tell which slot is
+    // authoritative and would have to fall back to defaults, losing a perfectly
+    // good config. So `bytes` applies only when the key is NEW and there is
+    // nothing to preserve; for an existing key the old value survives and only
+    // the failure is reported.
+    if (!truncate_key_.empty() && truncate_key_ == key) {
+        if (nvs_.find(key) == nvs_.end()) {
+            const size_t store = truncate_key_at_ < len ? truncate_key_at_ : len;
+            nvs_[key].assign(p, p + store);
+        }
+        truncate_key_.clear();
+        truncate_key_at_ = 0;
+        return -1;
+    }
     nvs_[key].assign(p, p + len);
     return 0;
 }

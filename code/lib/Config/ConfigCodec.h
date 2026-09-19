@@ -27,6 +27,12 @@ bool   ConfigDecodeJson(const char *json, size_t len, Config *out);
 size_t ConfigEncodeBlob(const Config &c, uint8_t *out, size_t out_len);
 bool   ConfigDecodeBlob(const uint8_t *in, size_t len, Config *out);
 
+// The header on its own, for callers that need the payload length before
+// decoding -- Task 9 reads it to learn how many chunks a stored slot occupies
+// without having to decode the whole blob first. Returns the TOTAL blob length
+// (header included), or 0 if the bytes are not a well-formed header.
+size_t ConfigBlobTotalLength(const uint8_t *in, size_t len);
+
 // CRC-32 (IEEE, reflected, poly 0xEDB88320), over arbitrary bytes.
 //
 // Declared here rather than kept file-local in the .cpp because it has THREE
@@ -61,6 +67,14 @@ uint32_t Crc32(const uint8_t *data, size_t len);
 // **If any width in ConfigModel.h changes, re-measure this and spec 3.5 together.**
 // They are one fact with two homes, which is this plan's most common defect.
 inline constexpr size_t ConfigMaxSerializedSize() { return 22407; }
+
+// The blob is that JSON preceded by a fixed-size header (BlobHeader, defined in
+// ConfigCodec.cpp, which static_asserts its size against this). Task 9 sizes its
+// slot buffer from ConfigMaxBlobSize(), so the header's width has exactly one
+// home -- a second `+ 16` written by hand in the store is the two-homes defect
+// this plan keeps re-finding, and it would be wrong the moment the header grows.
+constexpr size_t kBlobHeaderBytes = 16;
+inline constexpr size_t ConfigMaxBlobSize() { return ConfigMaxSerializedSize() + kBlobHeaderBytes; }
 
 // The fixed chunk size the store writes. Must be < 4000 to leave entry
 // overhead, and is a compile-time constant so the key count is bounded.

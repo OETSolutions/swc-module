@@ -30,6 +30,9 @@ struct BlobHeader {
     uint32_t payload_crc;
 };
 constexpr uint32_t kBlobMagic = 0x53435743u;  // "SWCC"
+static_assert(sizeof(BlobHeader) == kBlobHeaderBytes,
+              "ConfigCodec.h's kBlobHeaderBytes must match the real header; Task 9 sizes its "
+              "slot buffer from it, so a divergence under-allocates silently");
 
 // Adjacent ladder windows legitimately overlap by a few permille, and the
 // classifier resolves that by nearest centre (Task 3). What is genuinely
@@ -798,4 +801,14 @@ bool ConfigDecodeBlob(const uint8_t *in, size_t len, Config *out) {
     const uint8_t *payload = in + sizeof(BlobHeader);
     if (Crc32(payload, h.payload_len) != h.payload_crc) return false;
     return ConfigDecodeJson(reinterpret_cast<const char *>(payload), h.payload_len, out);
+}
+
+size_t ConfigBlobTotalLength(const uint8_t *in, size_t len) {
+    if (in == nullptr || len < sizeof(BlobHeader)) return 0;
+    BlobHeader h{};
+    memcpy(&h, in, sizeof(h));
+    if (h.magic != kBlobMagic) return 0;
+    if (h.schema_version != kConfigSchemaVersion) return 0;
+    if (h.payload_len > ConfigMaxSerializedSize()) return 0;
+    return sizeof(BlobHeader) + h.payload_len;
 }

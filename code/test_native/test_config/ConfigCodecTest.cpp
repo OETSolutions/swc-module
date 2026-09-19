@@ -1,5 +1,8 @@
 #include "Config/ConfigCodec.h"
 #include <gtest/gtest.h>
+#include "ConfigFixtures.h"
+
+using swctest::MakeConfig;
 #include <cstring>
 #include <string>
 
@@ -24,58 +27,6 @@ static_assert(kScratch > 0u, "ConfigMaxSerializedSize must be a real bound");
 // the two together is what makes the failure legible.
 static_assert(kScratch < 100000u, "a bound this large is a bug, not a config");
 
-Config MakeConfig() {
-    Config c{};
-    c.schema_version = kConfigSchemaVersion;
-    std::strncpy(c.device_id, "SWC-0001", sizeof(c.device_id) - 1);
-    c.updated_at_ms = 1700000000000ULL;
-    c.settings = DeviceSettings{};
-    c.settings.timings = GestureTimingsDefault();
-    c.settings.gain_policy = GainPolicy::kAuto;
-    c.settings.buzzer_level = 2;
-    c.settings.led_level = 2;
-    c.settings.temp_comp_enabled = true;
-    c.settings.maintenance_timeout_ms = 300000;   // spec 5-minute maintenance window
-    c.channel_count = 1;
-    c.channels[0].enabled = true;
-    std::strncpy(c.channels[0].name, "SWC1", sizeof(c.channels[0].name) - 1);
-    c.channels[0].ladder.learned_idle_mv = 2835;
-    c.channels[0].ladder.count = 1;
-    // The initializer sets the whole struct including id; a separate strncpy
-    // before it would be overwritten and is not there. Fields are spec 3.4's
-    // millivolts: 1430 mV at the 2835 idle is the 504 permille the classifier
-    // derives (1430 x 1000 / 2835 = 504).
-    c.channels[0].ladder.buttons[0] = {"VOL_UP", "Volume Up", 1430, 120, 3300, 235, 200, 98};
-    c.channels[0].output.gain_mode = GainMode::kAmplified;
-    c.channels[0].output.idle_dac_code = 4095;    // spec 3.7's default; full scale is the safe state (6.7)
-    // Bindings are TOP-LEVEL (spec 3.1/3.5), keyed by (channel, button, gesture).
-    c.binding_count = 2;
-    std::strncpy(c.bindings[0].id, "b1", sizeof(c.bindings[0].id) - 1);
-    c.bindings[0].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
-    std::strncpy(c.bindings[0].button, "VOL_UP", sizeof(c.bindings[0].button) - 1);
-    c.bindings[0].gesture = Gesture::kSingle;
-    c.bindings[0].enabled = true;
-    c.bindings[0].action_count = 1;
-    c.bindings[0].actions[0].kind = ActionKind::kHwKey;
-    c.bindings[0].actions[0].key_resistance_mohm = 24000;
-    // The second binding is the product's core case (spec 3.5/3.6): one button
-    // whose SINGLE drives the head unit while its DOUBLE tells the app, with a
-    // data payload. A single-action, id-keyed Binding could not express this,
-    // which is why the round trip below asserts BOTH actions survive.
-    std::strncpy(c.bindings[1].id, "b2", sizeof(c.bindings[1].id) - 1);
-    c.bindings[1].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
-    std::strncpy(c.bindings[1].button, "VOL_UP", sizeof(c.bindings[1].button) - 1);
-    c.bindings[1].gesture = Gesture::kDouble;
-    c.bindings[1].enabled = true;
-    c.bindings[1].action_count = 2;
-    c.bindings[1].actions[0].kind = ActionKind::kHwKeyRelease;
-    c.bindings[1].actions[1].kind = ActionKind::kAppIntent;
-    std::strncpy(c.bindings[1].actions[1].target, "com.oetsolutions.swc.ACTION_NAVIGATE",
-                 sizeof(c.bindings[1].actions[1].target) - 1);
-    std::strncpy(c.bindings[1].actions[1].payload, "geo:40.7608,-111.8910",
-                 sizeof(c.bindings[1].actions[1].payload) - 1);
-    return c;
-}
 }  // namespace
 
 TEST(ConfigCodec, JsonRoundTripsEveryFieldThatWasSet) {

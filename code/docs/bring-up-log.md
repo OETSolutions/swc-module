@@ -83,6 +83,120 @@ settled at `4.41101.0` (SCons 4.11.1, which *does* contain
 `SCons/Tool/FortranCommon.py`), the build compiles the full IDF tree. No change
 to the platform pin was made — the framework choice stands.
 
+#### Defect 1 recurrence — 2026-09-19, and the actual mechanism
+
+Defect 1 came back with the *same* error text but a different cause, and the
+earlier "it settles" conclusion was wrong: it does not settle, it converges on
+the directory being **deleted**.
+
+Measured by polling `packages/tool-scons` every 250 ms during a build. The
+directory is created, removed, recreated with `scons.py` present, then removed
+and **left removed**. The build then dies at the lazy `FortranCommon` import
+because `scons.py` itself is gone.
+
+The mechanism is a version skew between the two owners, and this is the part the
+first write-up missed:
+
+- pioarduino's `platform.json` pins `tool-scons` **`package-version 4.40801.0`**.
+- PlatformIO Core's own `dependencies.py` pins `tool-scons` **`~4.41101.0`**.
+
+`_handle_existing_tool` (`platform.py:595`) compares the installed
+`package.json` version against the platform's `package-version`. Installed is
+`4.41101.0` (Core won the install), required is `4.40801.0` (pioarduino), so the
+comparison **always fails**, on every build, forever. It then runs
+`safe_remove_directory(tool_path)` and calls `self.install_tool()` to put it
+back.
+
+That reinstall cannot succeed. `install_tool` picks a branch from
+`_check_tool_status`:
+
+- Case 1 (`has_idf_tools and has_tools_json`) — needs `tools.json` in
+  `packages/tool-scons`, which the real SCons tree does not contain.
+- Case 2 (`has_idf_tools and has_piopm and not has_tools_json`) — true *before*
+  the delete, which is how it got here.
+- Fallthrough — "already configured", returns `True`.
+
+After `safe_remove_directory` the directory is empty, so Case 1 and Case 2 are
+both false and it takes the **fallthrough: logs success and returns without
+reinstalling anything**. The directory stays deleted, and the next build fails
+at the import. Nothing re-creates it, because every subsequent run takes the
+same path.
+
+Fix applied (machine-local, and it is a workaround, not an upstream fix): edit
+`~/.platformio/platforms/espressif32/platform.json` to set `tool-scons`
+`package-version` to **`4.41101.0`**, matching Core's pin. The version check then
+passes, `_handle_existing_tool` returns early, and the directory is left alone.
+Verified: `pio run -e esp32s3` → `[SUCCESS]`, and three consecutive builds are
+green with `tool-scons` intact at 7 entries each.
+
+**This edit lives in the PlatformIO package cache, not in the repo, so it does
+not survive a platform reinstall and is not reproduced by a fresh clone.** If
+the `FortranCommon` error reappears, re-apply it before debugging anything else:
+
+```
+python3 - <<'EOF'
+import json, os
+p = os.path.expanduser("~/.platformio/platforms/espressif32/platform.json")
+d = json.load(open(p))
+d["packages"]["tool-scons"]["package-version"] = "4.41101.0"
+json.dump(d, open(p, "w"), indent=2)
+EOF
+```
+
+A durable fix would be to pin `platform_packages = platformio/tool-scons@~4.41101.0`
+in `platformio.ini`, but that was **tested and does not work** — it was one of
+the conditions in which the original Defect 1 reproduced. The `platform.json`
+edit is what is verified.
+
+#### Defect 5 — the host test env never compiled any `lib/` source (BLOCKING)
+
+`build_src_filter = -<*>` excludes the whole project tree, which is right for a
+host build, and the plan added exactly one `+` line to put `test_native/*.cpp`
+(MockHAL.cpp) back. **No source under `lib/` was ever compiled on the host**, so
+every suite that tests real library code — not just the mock — failed to link:
+
+```
+Undefined symbols for architecture arm64:
+  "LadderClassify(LadderProfile const&, int, int)", referenced from: ...
+```
+
+This was latent until Task 3 added the first `lib/` module with a `.cpp`. The
+LDF cannot rescue it: the finder scans `src_dir`, which `-<*>` has emptied, so
+`lib/Analog` is never detected as a dependency.
+
+Fix: a second include line.
+
+```
+build_src_filter =
+    -<*>
+    +<../test_native/*.cpp>
+    +<../lib/*/*.cpp>
+```
+
+Verified load-bearing by deleting the new line, cleaning `.pio/build/native`,
+and watching `test_analog` fail to link; restoring it gives 19/19 PASSED. Note
+`lib/*/*.cpp` (not `lib/*.cpp`) — sources live one level down, in per-module
+directories.
+
+#### Defect 6 — a suite's `#include` did not match the plan (data loss)
+
+`test_native/test_analog/LadderDecodeTest.cpp` was found on disk with
+`#include "LadderDecode.h"` where the plan specifies `"Analog/LadderDecode.h"`,
+and `lib/Analog/` was **absent from the filesystem entirely** — it had been
+deleted between two builds. Neither file had ever been committed, so git held no
+copy: a scan of all 462 blobs and 30 dangling commits found no trace.
+
+Recovered from a Time Machine local snapshot
+(`com.apple.TimeMachine.2026-09-18-233541.local`, mounted read-only with
+`mount_apfs -s`). Both `LadderDecode.h` and `LadderDecode.cpp` were present
+there, and after restoring them all three files diff **byte-identical** against
+the plan's code blocks.
+
+The lesson worth keeping: the recovery window was ~70 minutes wide, and the only
+reason it existed is that the files sat uncommitted long enough to be caught by
+an automatic snapshot. **An uncommitted file on this machine is one snapshot
+generation from gone.** Commit verified work promptly.
+
 ### Defect 2 — `partitions.csv` is rejected by IDF (BLOCKING)
 
 `Partition app1 invalid: Offset 0x208000 is not aligned to 0x10000`

@@ -3667,7 +3667,7 @@ enum class ActionKind : uint8_t {
 struct Action {
     ActionKind kind;
     char       target[kActionTargetLen];   // package / intent action / command / pattern
-    char       payload[kDataPayloadLen];   // APP_INTENT's data; MV for kHwKey
+    char       payload[kDataPayloadLen];   // APP_INTENT's data URI (spec 3.5)
     uint16_t   dac_code;                   // kHwKey when commanded by code
     uint32_t   key_resistance_mohm;        // kHwKey when commanded by resistance
 };
@@ -3936,12 +3936,12 @@ bool ActionIsWellFormed(const Action &a) {
     // Every kind needs its non-payload parameter, because that parameter is what
     // the action DOES. An empty one is an action with no effect, which would be
     // stored and reported as a binding that fires.
-    const bool needs_target =
-        a.kind == ActionKind::kAppLaunch || a.kind == ActionKind::kAppIntent ||
-        a.kind == ActionKind::kKeycode   || a.kind == ActionKind::kMedia     ||
-        a.kind == ActionKind::kVolume    || a.kind == ActionKind::kSystem    ||
-        a.kind == ActionKind::kBuzzer    || a.kind == ActionKind::kAppRaw;
-    if (needs_target && a.target[0] == '\0') return false;
+    //
+    // `ActionTakesPayload` is the authority for WHICH kinds those are, and it is
+    // called rather than restated. An earlier revision of this function spelled
+    // the same eight enumerators out a second time -- two homes for one fact,
+    // and they drift the first time a kind is added.
+    if (ActionTakesPayload(a.kind) && a.target[0] == '\0') return false;
     // HW_KEY carries its level exactly one way -- an already-resolved `dac_code`,
     // or the head unit's own `key_resistance_mohm` for the gain policy to convert.
     // Neither means the action would drive the output to a level nothing defined.

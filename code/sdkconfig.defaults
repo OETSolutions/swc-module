@@ -10,15 +10,38 @@ CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # --- Console and USB -------------------------------------------------------
 # Console on the ROM USB-Serial-JTAG peripheral; the app link is TinyUSB CDC on
-# the same physical port but a separate USB interface (spec 4.1). Keeping them
-# distinct is deliberate: the console must not corrupt app frames.
+# the same physical port but a SEPARATE USB controller (spec 4.1). Keeping them
+# distinct is deliberate: the console must not corrupt app frames. Both can be
+# up at once on the S3 because USB-Serial-JTAG is a ROM peripheral independent
+# of the OTG controller TinyUSB drives.
 CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
 CONFIG_ESP_CONSOLE_UART_DEFAULT=n
-# NOTE: there is deliberately NO CONFIG_TINYUSB_CDC_ENABLED here. IDF 5.5.5
-# ships no components/tinyusb and defines no CONFIG_TINYUSB_* symbol, so such a
-# key is silently inert -- it would look like configuration while doing nothing.
-# TinyUSB is the managed component `espressif/esp_tinyusb`; the app USB link
-# does not exist until a task adds it via idf_component.yml (spec 4.1).
+
+# TinyUSB is the MANAGED component `espressif/esp_tinyusb`, fetched by
+# src/idf_component.yml -- IDF 5.5.5 ships no components/tinyusb of its own.
+#
+# These keys were absent until Task 14c, and the note that used to sit here said
+# they would be "silently inert". That was true when nothing depended on them and
+# is FALSE now: with CDC disabled the component's own header fails to COMPILE
+# ("TinyUSB CDC driver must be enabled in menuconfig", tinyusb_cdc_acm.h:18) and
+# its CMakeLists does not even add tinyusb_cdc_acm.c to the build. A managed
+# component's Kconfig IS read by this build; only IDF's OWN config was ever the
+# thing that could be missing.
+CONFIG_TINYUSB_CDC_ENABLED=y
+
+# 1024-byte frames (kNdjsonMaxFrame) over a Full-Speed link. The RX FIFO must be
+# at least the largest single callback delivery, and the EP buffer governs how
+# much moves per USB transaction. Both at the frame cap means a maximum frame can
+# arrive, and be handed to the assembler, in one pass.
+#
+# TX is deliberately NOT enlarged: a 512-byte TX FIFO is the back-pressure that
+# keeps a short write honest, and UsbCdc's retry accounting is written against it
+# (a 1024-byte frame takes two flush rounds). Raising TX to hide that would leave
+# the retry path untested on device -- the exact code path whose bug is a
+# silently missed key.
+CONFIG_TINYUSB_CDC_RX_BUFSIZE=1024
+CONFIG_TINYUSB_CDC_EP_BUFSIZE=1024
+CONFIG_TINYUSB_CDC_TX_BUFSIZE=512
 
 # --- Bluetooth: NimBLE, not Bluedroid --------------------------------------
 # Bluedroid does not fit 4MB/no-PSRAM alongside WiFi + OTA (spec 9.2).

@@ -39,6 +39,12 @@ idf_component_register(
     #                    compilable at all; without it the temptation is to drop
     #                    the bundle and reach for setInsecure, which spec 9.5
     #                    forbids outright.
+    #   esp_tinyusb      tinyusb.h, tusb_cdc_acm.h -- the CDC transport. This is a
+    #                    MANAGED component, not an IDF one: IDF 5.5.5 has no
+    #                    components/tinyusb, and src/idf_component.yml is what
+    #                    fetches it. Declaring it here is also what makes the
+    #                    include path exist; without it UsbCdc.cpp fails with
+    #                    "tinyusb.h: No such file or directory".
     REQUIRES json esp_driver_gpio esp_driver_i2c esp_adc nvs_flash esp_timer
-             app_update esp_http_client esp_https_ota mbedtls
+             app_update esp_http_client esp_https_ota mbedtls esp_tinyusb
 )

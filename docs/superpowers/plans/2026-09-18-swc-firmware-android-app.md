@@ -120,6 +120,40 @@
   revision claimed "no gaps" while FR-3, FR-5, FR-9, FR-16, FR-17, FR-25 and FR-40
   had no test at all; §11 is the checklist.
 
+### Verification discipline
+
+Five checks. The first two are cheap; the last three exist because a green build
+has already lied to this project more than once.
+
+1. **Host suite:** `pio test -e native` — all suites, expect the full count.
+2. **Device build:** `pio run -e esp32s3`.
+3. **Prove the code is IN the image, not merely built.** A build that adds a `lib/`
+   file and reports SUCCESS at a *byte-identical* size has silently not compiled it
+   (Defect 49). Check the object and the symbol, not the exit code:
+   `find .pio/build/esp32s3 -name '<NewFile>.cpp.o'` and
+   `xtensa-esp32s3-elf-nm .pio/build/esp32s3/firmware.elf | grep <Symbol>`.
+4. **Regenerate `compile_commands.json` before trusting it.** `-t compiledb` must
+   run AFTER any `CMakeLists.txt` change; otherwise the stale database agrees with
+   the broken build and reads as confirmation (Defect 64).
+5. **Compile device-only test files directly.** `pio test -e esp32s3` silently
+   reports **0 tests** with no board attached — it is not a gate. Extract the real
+   compile line from `compile_commands.json`, substitute the test file, strip `-c`
+   and its argument plus `-o` and its argument, add
+   `-I test/test_hw -I .pio/libdeps/esp32s3/Unity/src -include test/unity_config.h`,
+   and require `rc=0`. This is what catches a `test_hw` file that cannot compile
+   (Defect 61). **The on-device RUN stays blocked until the board exists; say so
+   rather than reporting it green.**
+
+**Toolchain note.** If the build dies with `Error: Missing toolchain directory
+'None'`, the toolchain package was consumed. The stable state is exactly one
+directory, `~/.platformio/packages/toolchain-xtensa-esp-elf`, extracted from
+`~/.platformio/dist/xtensa-esp-elf-14.2.0_20260121-aarch64-apple-darwin.tar.xz`
+(116 entries in `bin/`), with **both** `package.json` and `.piopm` reporting
+`14.2.0+20260121`. A second directory claiming the same spec name makes
+`get_package_dir` return `None`, which reads as a deleted toolchain rather than a
+duplicated one. See bring-up-log.md's Defect 62 recurrence — including the
+warning that `~/.platformio/tools/` is NOT a backup of `packages/`.
+
 ---
 
 ## File Structure
@@ -6615,12 +6649,52 @@ OTG** instance carries the app protocol. A debug `printf` leaking into the app
 port is the classic failure when one CDC serves both.
 
 **This task owns the managed component.** IDF 5.5.5 ships **no**
-`components/tinyusb` and defines **no** `CONFIG_TINYUSB_*` symbol, so those keys in
-`sdkconfig.defaults` are accepted **silently and do nothing** (Task 1 verified
-this). The dependency is `espressif/esp_tinyusb` (IDF Component Registry, latest
-**2.3.0**) and it is declared in `code/idf_component.yml`. **Until this task runs,
-spec §4.1's app interface does not exist at all** — the console works and nothing
-else does.
+`components/tinyusb`, so the dependency is `espressif/esp_tinyusb` (IDF Component
+Registry, latest **2.3.0**), declared in **`code/src/idf_component.yml`**.
+**Until this task runs, spec §4.1's app interface does not exist at all** — the
+console works and nothing else does.
+
+**Two corrections to this task, found by doing it — both were wrong in the plan.**
+
+1. **The manifest goes in `code/src/`, not the project root.** IDF's `build.cmake`
+   runs `idf_component_manager.prepare_components --project_dir=…`, which reads the
+   **MAIN component's** manifest. At the project root it is not read at all: the
+   component is never fetched, and the failure is `tinyusb.h: No such file or
+   directory` with no mention of the manifest.
+2. **A managed component's Kconfig IS read, so `CONFIG_TINYUSB_CDC_ENABLED` is
+   REQUIRED and its absence is a hard `#error`.** The plan (and the note that
+   stood in `sdkconfig.defaults` until this task) said `CONFIG_TINYUSB_*` keys are
+   "silently inert". That was true *when nothing declared the component*, and it
+   is false the moment `idf_component.yml` names it: `tinyusb_cdc_acm.h:18` fails
+   the build with *"TinyUSB CDC driver must be enabled in menuconfig"*, and
+   esp_tinyusb's `CMakeLists.txt` does not add `tinyusb_cdc_acm.c` at all. The
+   "inert key" reasoning was about IDF's *own* config, which is a different thing
+   from a fetched component's.
+
+**Also required, and neither was in the plan:**
+- `idf-component-manager~=2.2` is a **Python package** IDF needs and PlatformIO
+  never installs. Install into PlatformIO's own venv:
+  `~/.platformio/penv/bin/python -m ensurepip --upgrade` then
+  `pip install 'idf-component-manager~=2.2'`. Without it the build fails before
+  compiling anything.
+- `managed_components/*` must be added to **both** `test_ignore` lists in
+  `platformio.ini`: a fetched component brings its own `test_apps/`, which
+  PlatformIO collects as suites and then fails to build
+  (`native:managed_components/espressif__esp_tinyusb/test_apps [ERRORED]`).
+- `-<../lib/Link/UsbLink.cpp>` in the native env's `build_src_filter`. `UsbLink`
+  is the **second** device-only translation unit (the first is `EspHal.cpp`): it
+  includes `esp_log.h`, `tinyusb.h` and `tusb_cdc_acm.h`, none of which exist for
+  the host target. It is thin by design — everything testable lives behind
+  `UsbCdc`'s injected raw write.
+
+**The connect edge is a DTR edge, not a driver-install edge.** `UsbCdc::IsConnected`
+cannot mean "the cable is in": TinyUSB's own connection flag tracks the **bus**,
+and the bus is up the instant the host is attached — while nothing is draining
+the FIFO. `hello` (spec §4.5) must go out when the host **opens the port**, which
+is the `CDC_EVENT_LINE_STATE_CHANGED` callback's `dtr`. So `UsbLink` keeps its own
+host-open latch, calls `NoteConnected()`/`OnConnected()` on the DTR rise, and
+`NoteDisconnected()`/`OnDisconnected()` on the fall. Sending `hello` at install
+time puts the opening frame into a FIFO nobody reads.
 
 **What is host-testable, stated honestly.** The TinyUSB callbacks, the USB
 descriptors, enumeration, and re-enumeration are **device-only**; their coverage
@@ -6633,12 +6707,23 @@ write. Duplicate or dropped frames over USB are the failure that would look like
 "the app randomly missed a key", so it earns a real test.
 
 **Files:**
-- Create: `code/idf_component.yml` — declares `espressif/esp_tinyusb`
+- Create: `code/src/idf_component.yml` — declares `espressif/esp_tinyusb`
+  (**in `src/`, the MAIN component — see the correction above**)
 - Create: `code/lib/Link/UsbCdc.h`
 - Create: `code/lib/Link/UsbCdc.cpp`
+- Create: `code/lib/Link/UsbLink.h` — device-only: TinyUSB bring-up + the DTR
+  latch + the sink/router wiring
+- Create: `code/lib/Link/UsbLink.cpp`
 - Create: `code/test_native/test_link/UsbCdcTest.cpp` — the TX-buffer tests
 - Create: `code/test/test_hw/TestUsbCdc.cpp` — the on-device coverage: it
   enumerates, and it asserts the console is NOT on the CDC interface
+- Modify: `code/src/main.cpp` — call `UsbLinkStart` after the safe idle is
+  established and `UsbLinkService` in the poll loop. Without this `UsbCdc`
+  compiles but is never linked in, and the build is green at a byte-identical size
+  (Defect 49).
+- Modify: `code/sdkconfig.defaults` — the `CONFIG_TINYUSB_*` block
+- Modify: `code/platformio.ini` — `managed_components/*` in both `test_ignore`
+  lists; `-<../lib/Link/UsbLink.cpp>` in `build_src_filter`
 - **Do NOT** create `code/test_native/test_link/test_main.cpp` — Task 10 already
   created it for this suite directory (see the Test-harness API note).
 
@@ -6770,28 +6855,39 @@ spec §4.1, and Step 5's on-device test asserts it rather than trusting it.
 ```bash
 pio run -e esp32s3
 pio run -e esp32s3 -t compiledb   # prove UsbCdc.cpp is in the compile database
-pio test -e esp32s3 -f '*test_hw' # needs the board; BLOCKED until Task 23
+# No board attached: pio test -e esp32s3 silently reports 0 tests, so compile the
+# device-only test files directly with the real xtensa command line (see the
+# Verification discipline section). Both must return rc=0.
+pio test -e esp32s3 -f '*test_hw' # the actual run; BLOCKED until Task 23
 ```
 
-Expected: the device build resolves `espressif/esp_tinyusb` and links; the
-`test_hw` suite (which now also covers the ADC/DAC via Task 14) asserts that the
-CDC interface is present and the console is not on it. **The on-device run stays
-BLOCKED until the board exists** — say so rather than reporting it green.
+Expected: the device build resolves `espressif/esp_tinyusb` and links. Confirm it
+**actually linked**, not merely succeeded — `nm firmware.elf | grep UsbLink` must
+find `UsbLinkStart`, and `.pio/build/esp32s3/managed_components/espressif__esp_tinyusb/tinyusb_cdc_acm.c.o`
+must exist. A green build is not evidence here (Defect 49); the object file is.
+
+**The `test_hw` run stays BLOCKED until the board exists** — say so rather than
+reporting it green. Its compile-ability, however, is checked now.
 
 - [ ] **Step 6: Commit**
 
 ```bash
-git add code/idf_component.yml code/lib/Link/UsbCdc.h code/lib/Link/UsbCdc.cpp \
-        code/test_native/test_link/UsbCdcTest.cpp code/test/test_hw/TestUsbCdc.cpp
+git add code/src/idf_component.yml code/lib/Link/UsbCdc.h code/lib/Link/UsbCdc.cpp \
+        code/lib/Link/UsbLink.h code/lib/Link/UsbLink.cpp \
+        code/test_native/test_link/UsbCdcTest.cpp code/test/test_hw/TestUsbCdc.cpp \
+        code/src/main.cpp code/sdkconfig.defaults code/platformio.ini
 git commit -m "Add the USB CDC app link and the managed component it needs
 
 IDF 5.5.5 has no TinyUSB, so spec 4.1's app interface did not exist: the console
-worked and nothing else did. This adds espressif/esp_tinyusb via idf_component.yml
+worked and nothing else did. This adds espressif/esp_tinyusb via src/idf_component.yml
 and the CDC transport over it, keeping the console on the ROM USB-Serial-JTAG
 peripheral so a debug printf can never be read as a protocol frame. The TX byte
 buffer is sized for two maximum frames -- a single-frame buffer would make the
 second Send drop, which an app sees as a randomly missed key."
 ```
+
+Note the manifest's path: `code/src/idf_component.yml`. At the project root IDF
+never reads it, and the only symptom is a missing `tinyusb.h`.
 
 ---
 

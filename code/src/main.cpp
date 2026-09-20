@@ -9,6 +9,7 @@
 #include "freertos/task.h"
 
 #include "HAL/EspHal.h"
+#include "Link/UsbLink.h"
 #include "System/SystemOrchestrator.h"
 
 static const char *TAG = "swc-boot";
@@ -109,12 +110,19 @@ extern "C" void app_main(void)
         }
     }
 
-    // The USB link belongs here (Task 14c, the `UsbCdc` task). Nothing above
-    // depends on it, which is what makes FR-42 structural: the device serves
-    // presses with no app, no host and no radio attached.
+    // The USB link belongs here and not earlier: everything above has already
+    // made the output safe, so the device serves presses with no app, no host and
+    // no radio attached. That is what makes FR-42 structural rather than a
+    // promise -- there is no ordering in which the link is required to boot.
+    UsbLinkStart(hal, sys);
 
     for (;;) {
         SystemOrchestratorTick(sys, hal->now_ms(hal->ctx));
+        // Drains one deferred router frame and whatever the TX buffer still
+        // holds. A large config reply is chunked, so this must be called often
+        // enough that a reply finishes in a reasonable time -- 10 ms per chunk
+        // puts a maximum config out in well under a second.
+        UsbLinkService();
         vTaskDelay(pdMS_TO_TICKS(SWC_POLL_MS));
     }
 }

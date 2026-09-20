@@ -1,0 +1,14 @@
+# TinyUSB is NOT part of IDF 5.5.5 -- there is no `components/tinyusb`, and no
+# `CONFIG_TINYUSB_*` symbol is defined. Declaring it here is what CREATES those
+# Kconfig keys and links the OTG CDC peripheral; before this file exists, every
+# TinyUSB key in `sdkconfig.defaults` is accepted SILENTLY and does nothing
+# (Task 1 verified that against the generated sdkconfig.json). This is spec 4.1's
+# "the task that owns UsbCdc must add it", made real.
+#
+# Pinned to the 2.3.x line rather than a floating "^2": the TinyUSB descriptors
+# and the CDC callback names are the interface this firmware is written against,
+# and a major bump renames them. A floating pin would turn that into a build
+# failure at an arbitrary future time, in a task that did not touch USB.
+dependencies:
+  idf: ">=5.0"
+  espressif/esp_tinyusb: "~2.3.0"

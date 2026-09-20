@@ -38,3 +38,14 @@ android/**/build/
 # appear inside SOURCE directories (lib/Output/), a `git add <dir>` would catch
 # one. See the global-constraints rule on explicit file paths.
 .~*.insyncdl
+
+# Fetched IDF components from src/idf_component.yml. Vendored third-party source,
+# ~23 MB / 2570 files, and reproducible from the lock file below -- so it is
+# ignored rather than committed, exactly like .pio/.
+#
+# dependencies.lock IS committed (do not add it here): it pins the exact resolved
+# versions (esp_tinyusb 2.3.0, tinyusb 0.21.0~2) so a fresh clone fetches the same
+# components this build was verified against. Ignoring both would make the build
+# depend on whatever the registry serves that day.
+managed_components/
+

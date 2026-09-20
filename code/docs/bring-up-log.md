@@ -382,3 +382,87 @@ Nothing was flashed — the module has not arrived. `main.c`'s runtime
 assertions (4 MB flash, 2 cores) are therefore **unexecuted**; they are a
 build-time-checked expression of intent only. The flash-size claim above is
 about the *image configuration*, not a measurement off silicon.
+
+## size-after-tasks-1-14c: TinyUSB arrives, and the size jump is real
+
+`size-after-tasks-1-14c: text=278681, data=89012, bss=779541, dec=1147234 (0x118162) bytes — firmware.elf, pio run -e esp32s3 -t size, 2026-09-19`
+
+`firmware.bin` is **367,808 bytes** — 18.7 % of the 1,966,080-byte slot (RAM
+92,692 B, 28.3 %). The last recorded `firmware.bin` was **306,325 bytes** at the
+end of Task 18, so this task adds **61,483 bytes**.
+
+**Almost all of it is third-party code that did not exist in the image before.**
+Measured from the object files rather than inferred:
+
+| component | objects | text bytes |
+|---|---:|---:|
+| `espressif__tinyusb` (TinyUSB core + DCD) | 22 | 23,067 |
+| `espressif__esp_tinyusb` | 8 | 15,368 |
+| **subtotal** | **30** | **38,435** |
+
+The balance is this task's own code (`UsbCdc`, `UsbLink`) plus the linker's
+alignment and the descriptor/string tables.
+
+**`bss` is the more interesting number, and it is NOT mostly TinyUSB.** The
+firmware's bss is 779,541 B. `nm --size-sort` attributes the two largest symbols
+to this task, and they are deliberately large:
+
+| symbol | bytes | what it is |
+|---|---:|---|
+| `UsbLinkStart()::router` | 44,880 | `CommandRouter`: two `ConfigMaxSerializedSize()` buffers (11,203 each) + the 22,407-byte staging buffer + members |
+| `g_cdc` | 3,116 | `UsbCdc`: the two-maximum-frame TX buffer + `NdjsonReader` |
+
+Both are function-local `static`s inside `UsbLinkStart`, which is why they appear
+under its mangled name. The 44,880 figure is exact and worth keeping in view: the
+staging buffer is `ConfigMaxSerializedSize()` = 22,407 B **because spec 4.2
+requires that bound be a compile-time constant** — a heap buffer sized from the
+peer's `total_len` would be an overflow primitive driven from the other end of
+the wire. That is a deliberate trade of 22 KB of committed RAM for a bound that
+cannot be exceeded, and it is the kind of trade the no-PSRAM budget has to keep
+paying for.
+
+These figures are **committed BSS, not peak**: claimed at boot, never returned.
+
+**The Defect 49 check is what makes the +61 KB mean anything.** `UsbCdc.cpp.o` and
+`UsbLink.cpp.o` exist, `tinyusb_cdc_acm.c.o` exists, and `nm firmware.elf` finds
+`UsbLinkStart`, `UsbLinkService` and `tinyusb_cdcacm_write_queue`. A size that grew
+while the symbols were absent would be the 215 → 289 trap again, one directory
+over.
+
+### Defect 62 recurrence — and a correction to the recorded fix
+
+Building at the **previous commit in a git worktree** tripped Defect 62 again and
+destroyed the toolchain (and briefly `tool-ninja` / `tool-esp-rom-elfs`, which
+PlatformIO repopulated on the next run).
+
+**The recorded fix was incomplete, and the incompleteness is the interesting
+part.** It said to place the toolchain under the name `toolchain-xtensa-esp-elf`
+and label its `package.json` version `14.2.0+20260121`. What actually works is
+different in one respect: the package must carry a **`.piopm` whose `spec.name` is
+`toolchain-xtensa-esp-elf`**, which is how PlatformIO resolves
+`get_package_dir("toolchain-xtensa-esp-elf")`. Copying the directory to that name
+while leaving the original in place produces **two** packages claiming the same
+spec name, and PlatformIO then reports `Missing toolchain directory 'None'` —
+`get_package_dir` returns `None` rather than raising, and the message names the
+*absence*, which reads like a deleted toolchain rather than a duplicated one.
+
+**The state that is stable has exactly one candidate:** the directory
+`~/.platformio/packages/toolchain-xtensa-esp-elf` (extracted from
+`~/.platformio/dist/xtensa-esp-elf-14.2.0_20260121-aarch64-apple-darwin.tar.xz`,
+116 entries in `bin/`) with `package.json` **and** `.piopm` both reporting
+`14.2.0+20260121`. Verified with consecutive builds: `bin/` stays at 116 entries
+and PlatformIO reports `toolchain-xtensa-esp-elf @ 14.2.0+20260121`.
+
+Two facts that made this harder than it should have been, both recorded because
+they will recur:
+
+1. **The registry file and the manifest are two homes for one version.** When
+   `.piopm` said `14.2.0+20251107` and `package.json` said `14.2.0+20260121`, the
+   build ran fine — so the mismatch is not itself fatal — but the banner printed
+   the stale one and the platform's `_check_tool_version` compared against the
+   other. That is the project's dominant defect class appearing in the toolchain
+   cache. Both now agree.
+2. **`~/.platformio/tools/` is NOT a backup of `~/.platformio/packages/`.** It is
+   a separate install root with its own copies; the `dist/` tarball is the reliable
+   source. Restoring the package **directory** from `tools/` gives a tree whose
+   top-level `bin/` is real but whose layout otherwise differs.

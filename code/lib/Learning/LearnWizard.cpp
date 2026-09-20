@@ -58,6 +58,16 @@ void LearnWizard::Enter(uint64_t now_ms, bool aux_held) {
     aux_was_pressed_ = false;
     aux_seen_idle_ = !aux_held;
     last_result_ = LearnReject::kNone;
+    // `prompt_pressed_` is cleared ONLY here and in ServicePrompt, and this is the
+    // one that matters for an abandoned prompt. Exit(now_ms) can arrive while the
+    // state is kPrompt -- the AUX1 hold is the same gesture at 1.5 s and 3 s, so a
+    // user who over-holds to program lands in maintenance and exits the running
+    // learn -- and ServicePrompt's clear never runs on that path. Left set, the
+    // next learn skips its wait-for-press gate, samples the idle line on the first
+    // tick, and rejects with "at_idle" before the user's hand is on the button:
+    // the LEARN_REJECT tone fires at the instant the prompt starts and the wizard
+    // is back at the menu, so the press it was waiting for can never be seen.
+    prompt_pressed_ = false;
     aux_.Reset();
 
     if (buzzer_ != nullptr) buzzer_->Play(BuzzerPattern::kProgramEnter);

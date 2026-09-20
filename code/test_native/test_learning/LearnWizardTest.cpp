@@ -186,3 +186,49 @@ TEST(LearnWizard, EnteringStartsAFreshProfileRatherThanEditingTheOldOne) {
     EXPECT_EQ(r.wiz.ButtonCount(), 0) << "a new learn starts empty";
     EXPECT_EQ(r.wiz.PressCount(), 0);
 }
+
+TEST(LearnWizard, ReEnteringAfterAnAbandonedPromptDoesNotCommitAStaleIdleWindow) {
+    // The abandonment path is a real one: the AUX1 programming hold is the SAME
+    // gesture at 1.5 s and 3 s (spec 8.2), so a user who holds a little too long
+    // to start programming lands in maintenance and the running learn is exited
+    // from inside `ServicePrompt`'s state. `prompt_pressed_` says "the user is
+    // already holding the button" and is cleared only in ServicePrompt, so it
+    // survives that exit and the next learn inherits it.
+    //
+    // Inheriting it is wrong in the direction that hurts: the next learn skips the
+    // wait-for-press gate and samples the moment it is entered -- while the user
+    // is still holding AUX1 and their hand is not on the wheel button at all. The
+    // readings are the idle line, which commits into a button centred on idle with
+    // a window wide enough to swallow the real button's level.
+    Rig r;
+    r.hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    r.hal.SetAdcMilliVolts(ADC_CH_SWC1, kLevelIdleMv);
+    for (int i = 0; i < 10; ++i) r.Tick();
+
+    // First learn: reach the prompt and start sampling, then abandon it.
+    r.wiz.Enter(r.t, /*aux_held=*/false);
+    r.PressAux(1);
+    r.WaitOut(LearnWizard::kSelectGapMs + 200);
+    r.HoldLevel(kLevelHeldMv, 200);        // the user presses and holds
+    ASSERT_EQ(r.wiz.CurrentState(), LearnWizard::State::kPrompt);
+    r.wiz.Exit(r.t);
+
+    // Second learn: select a slot, then do NOT touch the wheel button. The level
+    // sits at idle the whole time, so a prompt that behaves must simply WAIT.
+    r.hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    r.hal.SetAdcMilliVolts(ADC_CH_SWC1, kLevelIdleMv);
+    r.wiz.Enter(r.t, /*aux_held=*/false);
+    r.PressAux(1);
+    r.WaitOut(LearnWizard::kSelectGapMs + 200);
+
+    // The stale flag shows up as an instant commit-and-reject: the prompt samples
+    // on its very first tick instead of waiting for a press, finds the idle line
+    // "at_idle", and drops straight back to selection. The user sees the
+    // LEARN_REJECT tone the moment the prompt starts, without having touched the
+    // button -- and the wizard is back at the menu before they can press it.
+    EXPECT_EQ(r.wiz.CurrentState(), LearnWizard::State::kPrompt)
+        << "the prompt committed before the user pressed anything (stale prompt_pressed_)";
+    r.WaitOut(400);
+    EXPECT_EQ(r.wiz.ButtonCount(), 0)
+        << "a learn with no press committed a button from the stale prompt state";
+}

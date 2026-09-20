@@ -2,6 +2,15 @@
 #include <gtest/gtest.h>
 
 namespace {
+// The trim loop ships DISABLED (FR-19 / spec 6.5), so a test that
+// exercises the loop must opt in explicitly. This keeps the enabled/disabled
+// distinction visible at every call site instead of hiding it in the default.
+ServoConfig ServoConfigEnabledForTest() {
+    ServoConfig c = ServoConfigDefault();
+    c.enabled = true;
+    return c;
+}
+
 // A plant model: sense = code-derived key volts / 2, with a 3% gain error that
 // the loop must correct for.
 class Plant {
@@ -17,7 +26,7 @@ private:
 
 TEST(ServoLoop, CorrectsAThreePercentGainErrorWithinTheCodeBudget) {
     Plant plant(1030);
-    ServoLoop loop(ServoConfigDefault());
+    ServoLoop loop(ServoConfigEnabledForTest());
     loop.Target(GainMode::kAmplified, 4000);
     for (int i = 0; i < 40; ++i) loop.Update(plant.SenseMv(loop.Code()));
     EXPECT_TRUE(loop.Settled());
@@ -26,16 +35,16 @@ TEST(ServoLoop, CorrectsAThreePercentGainErrorWithinTheCodeBudget) {
 }
 
 TEST(ServoLoop, NeverMovesMoreThanMaxStepPerUpdate) {
-    ServoLoop loop(ServoConfigDefault());
+    ServoLoop loop(ServoConfigEnabledForTest());
     loop.Target(GainMode::kAmplified, 5000);
     const uint16_t before = loop.Code();
     loop.Update(0);  // measured far below target
     const int moved = std::abs(static_cast<int>(loop.Code()) - static_cast<int>(before));
-    EXPECT_LE(moved, ServoConfigDefault().max_step_codes);
+    EXPECT_LE(moved, ServoConfigEnabledForTest().max_step_codes);
 }
 
 TEST(ServoLoop, StopsAdjustingInsideTheDeadband) {
-    ServoLoop loop(ServoConfigDefault());
+    ServoLoop loop(ServoConfigEnabledForTest());
     loop.Target(GainMode::kAmplified, 4000);
     for (int i = 0; i < 20; ++i) loop.Update(2000);  // exactly on target
     const uint16_t settled_code = loop.Code();
@@ -51,7 +60,7 @@ TEST(ServoLoop, DoesNotOscillateEvenWithAMeasuredOvershoot) {
     // The readings must be further than deadband_mv (20) from target/2 = 2000.
     // 1990/2010 are only +-10mV -- INSIDE the deadband -- so the loop never
     // moves and this test would pass with the step cap deleted. Use +-100mV.
-    ServoLoop loop(ServoConfigDefault());
+    ServoLoop loop(ServoConfigEnabledForTest());
     loop.Target(GainMode::kAmplified, 4000);
     const uint16_t base = GainPolicyCodeForTarget(GainMode::kAmplified, 4000).dac_code;
     bool moved = false;
@@ -59,7 +68,7 @@ TEST(ServoLoop, DoesNotOscillateEvenWithAMeasuredOvershoot) {
         loop.Update((i % 2) ? 1900 : 2100);
         if (loop.Code() != base) moved = true;
         const int drift = std::abs(static_cast<int>(loop.Code()) - static_cast<int>(base));
-        ASSERT_LE(drift, ServoConfigDefault().max_total_codes)
+        ASSERT_LE(drift, ServoConfigEnabledForTest().max_total_codes)
             << "left the authority band at i=" << i;
     }
     // Bounded, but it MUST have trimmed: a loop that never moves trivially
@@ -73,17 +82,17 @@ TEST(ServoLoop, DoesNotOscillateEvenWithAMeasuredOvershoot) {
 }
 
 TEST(ServoLoop, RespectsTheTotalCodeBudget) {
-    ServoLoop loop(ServoConfigDefault());
+    ServoLoop loop(ServoConfigEnabledForTest());
     loop.Target(GainMode::kAmplified, 5000);
     for (int i = 0; i < 10000; ++i) loop.Update(0);  // never reaches target
     const int base = GainPolicyCodeForTarget(GainMode::kAmplified, 5000).dac_code;
     const int drift = std::abs(static_cast<int>(loop.Code()) - base);
-    EXPECT_LE(drift, ServoConfigDefault().max_total_codes)
+    EXPECT_LE(drift, ServoConfigEnabledForTest().max_total_codes)
         << "an unreachable target must not walk the code to an extreme";
 }
 
 TEST(ServoLoop, IsInertInTrackingModeBecauseTheNodeAlreadyTracks) {
-    ServoLoop loop(ServoConfigDefault());
+    ServoLoop loop(ServoConfigEnabledForTest());
     loop.Target(GainMode::kTracking, 4000);
     const uint16_t c = loop.Code();
     for (int i = 0; i < 50; ++i) loop.Update(100);  // absurd reading
@@ -91,10 +100,36 @@ TEST(ServoLoop, IsInertInTrackingModeBecauseTheNodeAlreadyTracks) {
 }
 
 TEST(ServoLoop, ResetReturnsToTheOpenLoopCode) {
-    ServoLoop loop(ServoConfigDefault());
+    ServoLoop loop(ServoConfigEnabledForTest());
     loop.Target(GainMode::kAmplified, 4000);
     for (int i = 0; i < 10; ++i) loop.Update(1000);
     loop.Reset();
     EXPECT_EQ(loop.Code(), GainPolicyCodeForTarget(GainMode::kAmplified, 4000).dac_code);
+    EXPECT_FALSE(loop.Settled());
+}
+
+/*
+ * FR-19 / spec 6.5: the trim loop is "present but DISABLED by default in v1",
+ * open-loop until its gain is measured on hardware. This pins the default, which
+ * is the half that ships -- without it, a `ServoConfigDefault()` that drifted
+ * back to enabled would resurrect a loop tuned against a guess, and every other
+ * test in this file would still pass because they opt in.
+ */
+TEST(ServoLoop, TheDefaultConfigShipsDisabled) {
+    EXPECT_FALSE(ServoConfigDefault().enabled);
+    EXPECT_TRUE(ServoConfigEnabledForTest().enabled);
+}
+
+TEST(ServoLoop, DisabledMeansTheCodeNeverMovesOffTheOpenLoopValue) {
+    ServoLoop loop(ServoConfigDefault());   // DISABLED
+    loop.Target(GainMode::kAmplified, 4000);
+    const uint16_t base = loop.Code();
+    // A wild measurement, far outside the deadband, that an enabled loop would
+    // chase. A disabled loop must not move at all, and must not claim to settle
+    // (it is not regulating, so there is nothing to settle).
+    for (int i = 0; i < 50; ++i) {
+        EXPECT_FALSE(loop.Update(0));
+        EXPECT_EQ(loop.Code(), base);
+    }
     EXPECT_FALSE(loop.Settled());
 }

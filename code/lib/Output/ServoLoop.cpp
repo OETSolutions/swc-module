@@ -18,6 +18,14 @@ void ServoLoop::Reset() {
 }
 
 bool ServoLoop::Update(int measured_sense_mv) {
+    // FR-19 / spec 6.5: DISABLED by default in v1. The open-loop code is the
+    // primary command and the hardware integrator does the regulating; the trim
+    // is a supervisor whose gain is unknown until it is measured on hardware.
+    // Returning here (rather than at the call sites) keeps the loop constructible
+    // and unit-testable -- FR-19's test row requires exactly that -- while the
+    // running system stays open-loop.
+    if (!cfg_.enabled) return false;
+
     // Tracking mode needs no trim: V_ADJ follows V_DAC, so the summing node is
     // already at unity and any correction would be fighting the servo.
     if (mode_ == GainMode::kTracking) return false;

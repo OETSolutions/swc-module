@@ -9,13 +9,21 @@ struct ServoConfig {
     int deadband_mv;        // error below which we stop moving entirely
     int max_total_codes;    // total authority away from the open-loop code
     int samples_to_settle;  // consecutive in-deadband updates before Settled()
+    // FR-19 / spec 6.5: the trim loop ships DISABLED in v1. The spec's posture is
+    // "open-loop command with the trim loop present but disabled by default until
+    // its gain is measured on hardware", and FR-19's test row states the
+    // consequence exactly -- the unit tests "prove the implementation and not the
+    // running system". Keeping the switch here (rather than deleting the calls)
+    // is what lets both halves be true at once.
+    bool enabled;
 };
 
 inline ServoConfig ServoConfigDefault() {
     return ServoConfig{/*max_step_codes=*/8,
                        /*deadband_mv=*/20,
                        /*max_total_codes=*/120,
-                       /*samples_to_settle=*/4};
+                       /*samples_to_settle=*/4,
+                       /*enabled=*/false};
 }
 
 /*

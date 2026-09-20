@@ -78,9 +78,13 @@ PARAM_KEYS = {
 # literals -- a typo in a frame name is then a compile error, not a nack.
 FRAMES = [
     Frame("hello",         "fw2app", "fw_version,hw_id,protocol_v,caps"),
-    Frame("event",         "fw2app", "channel,button,gesture,t_ms,raw_mv,confidence"),
+    # `level_mv` is the FR-3 FILTERED level and there is no `confidence`: the
+    # field names the quantity the device actually decided on, and confidence is
+    # a learned-button property rather than a classification output, so there is
+    # nothing honest to send. See spec 4.3's notes on `event`.
+    Frame("event",         "fw2app", "channel,button,gesture,t_ms,level_mv"),
     Frame("status",        "fw2app", "vbus_present,gain_mode,rail_mv,temp_c,uptime_ms,heap_free,config_state"),
-    Frame("ladder_sample", "fw2app", "channel,raw_mv,n"),
+    Frame("ladder_sample", "fw2app", "channel,level_mv,n"),
     Frame("ack",           "fw2app", "for_seq,ok,err"),
     Frame("nack",          "fw2app", "for_seq,err,detail"),
     Frame("log",           "fw2app", "level,msg"),

@@ -30,6 +30,18 @@ void RouterSinkThunk(void *ctx, const char *line, size_t len)
     if (router != nullptr) router->OnLine(line, len);
 }
 
+// A recognized gesture -> spec 4.3's `event`. Non-blocking is a REQUIREMENT, not
+// a preference: this is called from inside `SystemOrchestrator::Tick`, on the
+// poll loop that drives the KEY line, so a sink that blocked on a full TX buffer
+// would delay the output and change what the head unit sees. `UsbCdc::Send`
+// buffers and returns false when full, which is the correct behavior here -- a
+// dropped telemetry frame is recoverable, a stalled key path is not.
+void GestureSinkThunk(void *ctx, const SystemOrchestrator::GestureEventRecord &ev)
+{
+    CommandRouter *router = static_cast<CommandRouter *>(ctx);
+    if (router != nullptr) router->EmitGesture(ev);
+}
+
 // TinyUSB hands us the bytes the host sent. They go straight into the transport's
 // assembler, which calls the sink once per COMPLETE frame -- so neither this
 // callback nor the router ever sees a partial line.
@@ -109,6 +121,12 @@ void UsbLinkStart(IHAL *hal, SystemOrchestrator *sys)
     // directions cannot end up wired to different objects.
     g_cdc.Init(&CdcRawWrite, nullptr, &RouterSinkThunk, &router);
     g_router = &router;
+
+    // Gestures are recognized by the poll loop, not by an inbound command, so
+    // they reach the link through a sink rather than through a reply. Registered
+    // unconditionally: the sink checks its own null router, and a device with a
+    // failed USB install simply never has a host to emit to.
+    if (sys != nullptr) sys->SetGestureSink(&GestureSinkThunk, &router);
 
     tinyusb_config_t tusb_cfg = {};
     tusb_cfg.port = TINYUSB_PORT_FULL_SPEED_0;

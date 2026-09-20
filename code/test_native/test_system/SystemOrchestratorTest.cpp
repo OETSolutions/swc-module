@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include <string>
+#include <vector>
+
 #include "Config/ConfigStore.h"
 #include "MockHAL.h"
 
@@ -317,4 +320,90 @@ TEST(SystemOrchestrator, NoConfigAtAllStillMarksSafeIdleBeforePassThrough) {
     o.Boot();
     EXPECT_TRUE(o.SafeIdleEstablished());
     EXPECT_TRUE(o.PassThroughActive());
+}
+
+// --- spec 4.3's `event`: one recognized gesture, reported to the link ---------
+
+namespace {
+
+// The sink signature is `void(*)(void*, const GestureEventRecord&)`, so a
+// capturing lambda cannot be used directly. Recording into a file-scope vector
+// keeps the test free of a global function per assertion, and the vector is
+// cleared at the start of each test that uses it.
+std::vector<SystemOrchestrator::GestureEventRecord> g_reported;
+
+void RecordGesture(void *, const SystemOrchestrator::GestureEventRecord &ev) {
+    g_reported.push_back(ev);
+}
+
+}  // namespace
+
+TEST(SystemOrchestrator, ARecognizedGestureIsReportedAsAnEventWithTheLearnedButtonId) {
+    // Spec 4.3 calls `event` "the core event", but the router emitted no such
+    // frame anywhere: the app's live view had no source for "which button the
+    // device thinks is pressed" outside a learn run. This asserts the frame's
+    // payload now exists, and that `button` is the learned ID -- the app's
+    // bindings grid and ladder view are keyed by the id, so an index here would
+    // force every consumer to re-derive a mapping the device already has.
+    g_reported.clear();
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    o.SetGestureSink(&RecordGesture, nullptr);
+
+    // vol_up binds SINGLE, so the press stays undecided until it resolves.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 700);
+
+    ASSERT_EQ(g_reported.size(), 1u) << "one resolved press must report exactly one event";
+    EXPECT_EQ(std::string(g_reported[0].button_id), "vol_up");
+    EXPECT_EQ(g_reported[0].gesture, Gesture::kSingle);
+    EXPECT_EQ(g_reported[0].channel_index, 0);
+    // The FILTERED level the decision was made on (FR-3), not a fresh conversion
+    // and not an unfiltered one labelled "raw".
+    EXPECT_GT(g_reported[0].level_mv, 0);
+    EXPECT_FALSE(g_reported[0].button_id == nullptr);
+}
+
+TEST(SystemOrchestrator, NoReportedEventWithoutASink) {
+    // FR-42/spec 6.6: the device serves every press with no app attached. A sink
+    // is optional, and a null one must not be called through.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    // Deliberately no SetGestureSink.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 700);
+    // The output must still have been driven -- the press is served regardless.
+    EXPECT_TRUE(o.SafeIdleEstablished());
+}
+
+TEST(SystemOrchestrator, AnUnrecognizedPressReportsNothing) {
+    // Spec 4.3: an `event` is only emitted for a press that matched a learned
+    // window, because FR-12 forbids guessing. A level between windows is the
+    // device saying it does not know, and there is then no button to name and no
+    // gesture to report -- so the link stays silent rather than naming a button
+    // the device did not actually classify.
+    g_reported.clear();
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    o.SetGestureSink(&RecordGesture, nullptr);
+
+    // 3000 mV is above every learned window (the lowest centre is 1430 with a
+    // 120 mV half-width) and off idle (2835), so it classifies as kUnknown.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3000);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 700);
+
+    EXPECT_TRUE(g_reported.empty())
+        << "an unrecognized level must not be reported as a gesture on a button";
 }

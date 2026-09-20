@@ -536,9 +536,40 @@ void CommandRouter::EmitLadderSample() {
                              : 0;
     char body[160];
     snprintf(body, sizeof(body),
-             "\"channel\":%d,\"raw_mv\":%d,\"n\":%u",
+             "\"channel\":%d,\"level_mv\":%d,\"n\":%u",
              learn_channel_, level_mv, static_cast<unsigned>(learn_samples_));
     Emit("ladder_sample", body);
+}
+
+void CommandRouter::EmitGesture(const SystemOrchestrator::GestureEventRecord &ev) {
+    // The wire spelling is the CONFIG codec's, deliberately: the app matches this
+    // gesture name against `Binding.gesture`, which is encoded by the same table.
+    // A second spelling here ("LONG_PRESS", say) would make the app's lookup miss
+    // and the event would render as an unknown gesture with no error anywhere.
+    const char *g = "NONE";
+    switch (ev.gesture) {
+        case Gesture::kSingle: g = "SINGLE"; break;
+        case Gesture::kDouble: g = "DOUBLE"; break;
+        case Gesture::kLong:   g = "LONG";   break;
+        case Gesture::kNone:   return;   // nothing recognized, nothing to report
+    }
+    char body[192];
+    // The id reaches BOTH a JSON string and a `%s`, so it is bounded and its
+    // quoting is stripped by hand. `kLadderIdLen` is 16, so 31 bytes of any
+    // hostile value survive into `id`; escaping it here would cost a
+    // JSON-escape routine for a field the config codec already validates.
+    char id[kLadderIdLen];
+    size_t n = 0;
+    while (n + 1 < sizeof(id) && ev.button_id[n] != '\0') {
+        id[n] = (ev.button_id[n] == '"' || ev.button_id[n] == '\\') ? '_' : ev.button_id[n];
+        ++n;
+    }
+    id[n] = '\0';
+    snprintf(body, sizeof(body),
+             "\"channel\":%u,\"button\":\"%s\",\"gesture\":\"%s\",\"t_ms\":%llu,\"level_mv\":%d",
+             static_cast<unsigned>(ev.channel_index), id, g,
+             static_cast<unsigned long long>(ev.at_ms), ev.level_mv);
+    Emit("event", body);
 }
 
 void CommandRouter::HandleLearnStart(const cJSON *root, uint32_t for_seq) {

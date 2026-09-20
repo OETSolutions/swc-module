@@ -753,9 +753,9 @@ An interrupted run is discarded wholesale — a partial config is never applied.
 | Direction | `type` | Payload | Notes |
 | --- | --- | --- | --- |
 | FW → App | `hello` | `fw_version`, `hw_id`, `protocol_v`, `caps[]` | Sent on connect and on request |
-| FW → App | `event` | `channel`, `button`, `gesture`, `t_ms`, `raw_mv`, `confidence` | **The core event.** Fired on every classified gesture |
+| FW → App | `event` | `channel`, `button`, `gesture`, `t_ms`, `level_mv` | **The core event.** Fired on every classified gesture |
 | FW → App | `status` | `vbus_present`, `gain_mode`, `rail_mv`, `temp_c`, `uptime_ms`, `heap_free`, `config_state` | Periodic + on change |
-| FW → App | `ladder_sample` | `channel`, `raw_mv`, `n` | Streamed **only during learn mode** |
+| FW → App | `ladder_sample` | `channel`, `level_mv`, `n` | Streamed **only during learn mode** |
 | FW → App | `ack` | `for_seq`, `ok`, `err` | Every command is acked |
 | FW → App | `nack` | `for_seq`, `err`, `detail` | Explicit failure, with a machine-readable code |
 | FW → App | `log` | `level`, `msg` | Optional, gated by a settings flag |
@@ -776,6 +776,34 @@ An interrupted run is discarded wholesale — a partial config is never applied.
 `event` is deliberately **fire-and-forget and never acked by the app**: a button
 press must not be held hostage to the app being responsive. The firmware acts on
 the local binding first and tells the app second (§6.6).
+
+**`level_mv` is the FILTERED level, not a raw conversion, and the field is named
+for what it is.** FR-3 requires the classification to run on a noise-filtered
+reading (§6.3), so a field called `raw_mv` would label the filtered number as
+unfiltered and invite a support conversation about a "raw" value that no longer
+exists anywhere in the signal path. An app that wants to show the user a
+multimeter-comparable figure must show the same number the device decided on.
+
+**There is no `confidence` field, and its absence is deliberate.** The earlier
+revision of this table listed one. `confidence` (§3.4) is a property of a
+*learned button* — a 0–100 learn-quality score, earned by the spread of the
+samples that were committed at learn time. It is not a property of a
+*classification*: the press classifier answers "which window contains this
+reading", and the answer is a window index, not a degree of belief. Emitting a
+confidence on `event` would therefore require inventing one, and an invented
+number is worse than an absent one — the App screen would render a plausible
+percentage that corresponds to nothing the device measured. An app that wants
+the button's learn quality reads it from the button in the config, which is
+where it is actually stored.
+
+**`button` is the learned id** of the classified button (e.g. `"vol_up"`), not a
+numeric index: the id is what the app's bindings grid and the ladder view are
+both keyed by, so sending the index would force every consumer to re-derive the
+mapping. A press that matches no learned window is **not** an `event` at all.
+Spec §6.3's `kUnknown` is the device saying it did not recognize the level, and
+FR-12 forbids guessing in that case; there is no button to name and no gesture to
+report, so the device stays silent on the link and plays its unknown-key feedback
+locally. The `event` stream therefore carries only recognized presses.
 
 ### 4.4 Keepalive, disconnect and reconnect
 

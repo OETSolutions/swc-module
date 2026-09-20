@@ -49,6 +49,21 @@ public:
     // interrupted run must never be applied (spec 4.2).
     void OnDisconnected();
 
+    /*
+     * Spec 4.3's `event`: one recognized gesture, reported to the app.
+     *
+     * **Public because the orchestrator owns the recognition, not the command
+     * path.** A gesture is resolved in the poll loop's own timing, so there is no
+     * inbound command whose reply could carry it -- the orchestrator calls this
+     * through `SystemOrchestrator::SetGestureSink`.
+     *
+     * It goes through `Emit` rather than the sink directly so the frame's `seq`
+     * comes from the same counter as every other outbound frame; a second writer
+     * with its own counter is how the app comes to see out-of-order sequence
+     * numbers and report a link gap that never happened.
+     */
+    void EmitGesture(const SystemOrchestrator::GestureEventRecord &ev);
+
     // Emit anything deferred. A config reply larger than the frame cap is
     // emitted ONE CHUNK PER CALL rather than in a burst, so the transport's TX
     // buffer cannot overflow and no single call blocks the poll loop.

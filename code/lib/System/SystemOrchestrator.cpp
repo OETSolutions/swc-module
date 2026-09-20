@@ -226,6 +226,27 @@ void SystemOrchestrator::Tick(uint64_t now_ms) {
     leds_.Update(now_ms);
 }
 
+void SystemOrchestrator::ReportGesture(uint8_t index, const GestureEvent &ev, int level_mv) {
+    if (gesture_sink_ == nullptr) return;
+
+    // A BOUNDS check, not a validation: `button_index` is an array index, and an
+    // index that reached here stale would read past a fixed-size array rather than
+    // merely produce a wrong frame. `Emit` in the gesture machine writes
+    // `button_`, which `Reset()` sets to 0xFF, so a gesture completing after a
+    // reset is exactly the case where the index is not a button at all. There is
+    // nothing to report then, and reporting nothing is also correct: the device
+    // did not classify a button. (An EMPTY id needs no check here -- the config
+    // codec refuses to decode one, so every loaded config has real ids.)
+    if (ev.button_index >= config_.channels[index].ladder.count) return;
+
+    // The button's learned id, which is what the app's bindings grid and ladder
+    // view are keyed by -- an index would force every consumer to re-derive a
+    // mapping the device already has.
+    const char *id = config_.channels[index].ladder.buttons[ev.button_index].id;
+    const GestureEventRecord rec{index, id, ev.gesture, level_mv, ev.at_ms};
+    gesture_sink_(gesture_sink_ctx_, rec);
+}
+
 bool SystemOrchestrator::TestDriveKeyMv(uint8_t channel_index, int key_mv, uint32_t hold_ms,
                                        uint64_t now_ms) {
     if (channel_index >= channel_count_) return false;
@@ -347,6 +368,11 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
 
     if (fired) {
         const ResolvedAction resolved = BindingResolve(config_, index, ev);
+        // Spec 4.3: the app is told AFTER the device has acted on its own local
+        // binding, never before. `event` is fire-and-forget precisely so that a
+        // button press is not held hostage to the app being responsive (spec
+        // 6.6), and reporting first would make the link part of the key path.
+        ReportGesture(index, ev, level_mv);
         if (resolved.found) {
             const Action &a = resolved.action;
             if (a.kind == ActionKind::kOutVoltage && a.key_mv != 0) {

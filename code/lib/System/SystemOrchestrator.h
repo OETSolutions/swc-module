@@ -102,6 +102,58 @@ public:
         return (channel_index < kMaxChannels) ? gain_mode_[channel_index] : GainMode::kAmplified;
     }
 
+    /*
+     * Spec 4.3's `event`: one recognized gesture, reported to the link.
+     *
+     * **`button` is the learned id, not an index.** The app's bindings grid and
+     * its live ladder are both keyed by the id, so sending an index would force
+     * every consumer to re-derive a mapping that the device already has.
+     *
+     * **There is no `confidence`.** Confidence (spec 3.4) is a learned-BUTTON
+     * quality score earned at learn time; the press classifier answers "which
+     * window contains this reading" and has no degree of belief to report. The
+     * earlier spec revision listed a confidence here, which would have meant
+     * inventing a number the device never measured.
+     *
+     * `gesture` is a `Gesture` and `level_mv` the FILTERED level the decision was
+     * made on (FR-3) -- the same figure `FilteredLevelMv` reports and the same
+     * one `ladder_sample` streams, so the app cannot show a level the device did
+     * not decide on.
+     */
+    struct GestureEventRecord {
+        uint8_t     channel_index;
+        const char *button_id;
+        Gesture     gesture;
+        int         level_mv;
+        uint64_t    at_ms;
+    };
+
+    /*
+     * Register the sink a recognized gesture is handed to, and the context to
+     * call it with. One slot, no allocation.
+     *
+     * **Why a sink rather than a return value.** A gesture is not resolved on the
+     * tick it is recognized: SINGLE waits out the double-press window when the
+     * button binds DOUBLE (spec 6.6), so the completion is emitted from inside
+     * `GestureStateMachine::Update` -- one frame deeper than `Tick`. Returning it
+     * would mean threading an out-parameter through the whole call chain, and the
+     * link could still only see it on the NEXT tick. The sink is called at the
+     * moment of recognition instead.
+     *
+     * **A sink that never returns blocks the poll loop.** The one caller is
+     * `UsbLink`, whose sink formats a frame and hands it to the CDC writer, and
+     * dropping a frame is preferable to stalling the key path -- so the caller
+     * must not block, exactly as `CommandRouter::FrameSink` already requires.
+     *
+     * A null sink is legal and means "nobody is listening": the device keeps
+     * working with no app attached (spec 6.6).
+     */
+    using GestureSink = void (*)(void *ctx, const GestureEventRecord &ev);
+    void SetGestureSink(GestureSink sink, void *ctx) {
+        gesture_sink_ = sink;
+        gesture_sink_ctx_ = ctx;
+    }
+
 private:
     struct ChannelState {
         // Both of these take their profile/timings at construction and have no
@@ -130,6 +182,11 @@ private:
 
     void EstablishSafeIdle();
     void ServiceChannel(uint8_t index, uint64_t now_ms);
+    // Spec 4.3's `event`. Called at the moment of recognition, from inside
+    // ServiceChannel's resolution branch, because a gesture can complete on any
+    // tick (a LONG fires when its threshold elapses, a SINGLE when its ambiguity
+    // window closes).
+    void ReportGesture(uint8_t index, const GestureEvent &ev, int level_mv);
     // What the channel's own bindings say about how long a press must stay
     // undecided. Derived from the config, not assumed -- a button that binds
     // only SINGLE must not wait out the double-press window (spec 6.6).
@@ -171,6 +228,11 @@ private:
     // ratio is applied TO. Distinct from `pass_through_idle_mv_`: those are two
     // different ladders, and conflating them maps every press to the wrong key.
     int  head_unit_idle_mv_ = 0;
+
+    // Where a recognized gesture is reported (spec 4.3's `event`). Null until a
+    // link registers, and legal to leave null: the device runs without an app.
+    GestureSink gesture_sink_ = nullptr;
+    void       *gesture_sink_ctx_ = nullptr;
 };
 
 #ifdef __cplusplus

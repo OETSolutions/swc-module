@@ -63,6 +63,7 @@ MockHal::Defaults::Defaults()
     : config(MockHalDefaultsConfig()), timings(GestureTimingsDefault()) {}
 
 MockHal::MockHal() {
+    ReleaseInputs();
     iface_.adc_read_mv    = &MockHal::AdcReadMvThunk;
     iface_.dac_set_code   = &MockHal::DacSetCodeThunk;
     iface_.dac_power_mode = &MockHal::DacPowerModeThunk;
@@ -76,6 +77,30 @@ MockHal::MockHal() {
     iface_.nvs_set        = &MockHal::NvsSetThunk;
     iface_.reboot         = &MockHal::RebootThunk;
     iface_.ctx            = this;
+}
+
+/*
+ * Put every input the orchestrator reads into its RELEASED state.
+ *
+ * The defaults matter because zero is not neutral: AUX1-AUX3 are active-low and
+ * 0 mV is a valid "held" reading, so a zeroed mock makes the device think a
+ * programming button is being held down. Tests that ran longer than the learn
+ * wizard's 1.5 s entry hold silently entered a learn run, which is exactly the
+ * kind of accidental state that makes a green test mean nothing.
+ *
+ * The ladders idle at their fixture's `learned_idle_mv` (2835), the KEY senses sit
+ * above the output envelope's floor (so the head unit is "present"), and TEMP is
+ * left at 0 because no path consults it yet (the NTC conversion is a bring-up
+ * deliverable, spec 6.4).
+ */
+void MockHal::ReleaseInputs() {
+    adc_mv_[ADC_CH_SWC1] = 2835;
+    adc_mv_[ADC_CH_SWC2] = 2835;
+    adc_mv_[ADC_CH_AUX1] = 3300;
+    adc_mv_[ADC_CH_AUX2] = 3300;
+    adc_mv_[ADC_CH_AUX3] = 3300;
+    adc_mv_[ADC_CH_KEY_SENSE1] = 2490;
+    adc_mv_[ADC_CH_KEY_SENSE2] = 2490;
 }
 
 void MockHal::DacSetCode(DacChannel ch, uint16_t code) {

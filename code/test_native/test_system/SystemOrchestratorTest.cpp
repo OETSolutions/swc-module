@@ -10,8 +10,29 @@
 
 namespace {
 
+/*
+ * A CONFIGURED device: the fixture's config is PERSISTED before Boot.
+ *
+ * **This helper used to skip the save, and that made 27 tests hollow.** `Boot`
+ * asks the NVS whether a config exists; an empty NVS answers `kNoConfig`, which
+ * sets the pass-through flag (FR-25) and bypasses learned-window classification
+ * for the whole run. So every test built on this helper was exercising the
+ * unconfigured code path while its name and comments described the configured
+ * one -- and it still passed, because a pass-through device also moves the DAC.
+ *
+ * `AConfiguredDeviceDoesNotUsePassThrough` had already found this ("an empty NVS
+ * reports kNoConfig, and `MakeOrch` leaves it empty... (It did.)") but repaired
+ * only itself. `AFreshDeviceTaughtHeadlesslyStopsPassingThrough` hit it too and
+ * worked around it with its own save. Fixing the helper is what makes the rest
+ * of the suite test what it says it tests.
+ */
 SystemOrchestrator MakeOrch(MockHal &hal) {
     MockHal::Defaults d;   // a valid config + the default timings
+    ConfigStore store(&hal.InterfaceRef());
+    // Not asserted: a helper cannot fail a test, and `MakeOrch` is called at
+    // construction time in dozens of places. A save that fails leaves the device
+    // unconfigured, which the tests that care about it detect directly.
+    store.Save(d.config);
     return SystemOrchestrator(&hal.InterfaceRef(), d.config, d.timings);
 }
 
@@ -861,4 +882,114 @@ TEST(SystemOrchestrator, AFreshDeviceTaughtHeadlesslyStopsPassingThrough) {
     EXPECT_FALSE(o.PassThroughActive())
         << "after a learn the device HAS learned windows, so it must classify "
            "against them rather than passing through and ignoring them";
+}
+
+// --- FR-4: an out-of-range channel must be REPORTED, not merely survived -----
+//
+// The firmware detected the fault, released the KEY line (correct, and already
+// tested) and then said nothing anywhere. Spec 7.3's entire fault indication --
+// `LED_STAT` blink, "5 Hz: fault -- the buzzer's FAULT_* says which" -- was
+// unreachable, because the only `SetStat` callers were the learn wizard and the
+// identify flash. FR-4 says "detect and report"; only the detection existed.
+
+namespace {
+// Count rising edges on LED_STAT, which is what separates the three patterns:
+// solid is one edge, 5 Hz blink is many, off is none.
+int CountStatEdges(MockHal &hal, SystemOrchestrator &o, uint32_t total_ms) {
+    int on = 0;
+    bool prev = false;
+    for (uint32_t t = 0; t < total_ms; t += 5) {
+        o.Tick(hal.NowMs());
+        const bool now = hal.GpioRead(GPIO_LED_STAT);
+        if (now && !prev) ++on;
+        prev = now;
+        hal.AdvanceMs(5);
+    }
+    return on;
+}
+}  // namespace
+
+TEST(SystemOrchestrator, AnOutOfRangeChannelBlinksTheFaultLamp) {
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    ASSERT_FALSE(o.Faulted()) << "a healthy boot is not a fault";
+
+    // A ratio of 1058 is ABOVE the idle reference, which the classifier reports
+    // as kFault -- a short to 12 V reads this way. 100 ms settles the debounce.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3000);
+    PollFor(o, hal, 100);
+
+    EXPECT_TRUE(o.Faulted()) << "FR-4 requires the out-of-range channel to be reported";
+    // Many edges over one second is the 5 Hz blink; the healthy LED is solid
+    // (one edge) or breathing (a slow pair), so the count distinguishes them.
+    EXPECT_GT(CountStatEdges(hal, o, 1000), 4)
+        << "the fault indication must be a blink, not the normal solid/breathe";
+}
+
+TEST(SystemOrchestrator, AFaultDoesNotClearItselfWhenTheLevelReturnsToIdle) {
+    // A wiring fault or a collapsed rail does not fix itself, so an indication
+    // that faded as soon as the reading looked reasonable again would be a lie:
+    // the user would see a healthy LED over a channel that is still broken.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3000);
+    PollFor(o, hal, 100);
+    ASSERT_TRUE(o.Faulted());
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 2000);
+    EXPECT_TRUE(o.Faulted()) << "the fault must latch until a reboot";
+}
+
+TEST(SystemOrchestrator, TheLedIsBreathingBeforeAnyHostAttaches) {
+    // Spec 7.3: LED_STAT answers "is this thing OK?" at a glance, and its normal
+    // states are solid WITH a host and breathing without. Both were unreachable:
+    // LedGrammar starts at kOff and nothing set a normal pattern, so a correctly
+    // running device showed a dark LED -- indistinguishable from no power.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    EXPECT_GT(CountStatEdges(hal, o, 2000), 0)
+        << "a running device must not look switched off";
+}
+
+TEST(SystemOrchestrator, ConnectingAHostMakesTheLedSolidAndDisconnectingResumesBreathing) {
+    // The two normal states must be distinguishable, or the LED says nothing
+    // about the one thing it is meant to report.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+
+    o.SetUsbConnected(true);
+    // Solid: exactly one rising edge however long it is watched.
+    EXPECT_EQ(CountStatEdges(hal, o, 2000), 1) << "solid is one edge, then held";
+
+    o.SetUsbConnected(false);
+    // Breathing: a repeating slow pattern, so more than one edge over the same
+    // window. 1 Hz (spec 7.3) gives ~2 cycles in 2 s.
+    EXPECT_GT(CountStatEdges(hal, o, 2000), 1) << "breathing must differ from solid";
+}
+
+TEST(SystemOrchestrator, AConnectedHostDoesNotRepaintOverAFault) {
+    // "Is this thing OK?" has one right answer when the device is faulted, and it
+    // is not green. Without the precedence, a link connect mid-fault silently
+    // cleared the indication.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3000);
+    PollFor(o, hal, 100);
+    ASSERT_TRUE(o.Faulted());
+
+    o.SetUsbConnected(true);
+    EXPECT_GT(CountStatEdges(hal, o, 1000), 4)
+        << "a faulted device must not show the healthy solid pattern just because a host attached";
 }

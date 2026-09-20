@@ -42,6 +42,7 @@ public:
 
     // --- analog ------------------------------------------------------------
     void SetAdcMilliVolts(AdcChannel ch, int mv) { adc_mv_[static_cast<int>(ch)] = mv; }
+    void ReleaseInputs();
     int AdcReadMv(AdcChannel ch) { return adc_mv_[static_cast<int>(ch)]; }
 
     void DacSetCode(DacChannel ch, uint16_t code);
@@ -121,6 +122,12 @@ private:
 
     IHAL iface_{};
     uint64_t now_ms_ = 0;
+    // Seeded by the constructor's ReleaseInputs(), NOT left at zero. Zero is a
+    // MEANINGFUL reading here: the AUX inputs are active-low (pulled to the rail,
+    // shorted to ground when pressed), so a zeroed AUX1 reads as "held". Every
+    // test that ticked past LearnWizard::kEnterHoldMs (1.5 s) without setting AUX1
+    // was therefore entering the learn wizard by accident, and a test that passed
+    // was passing for a reason unrelated to what it was named for.
     int adc_mv_[ADC_CH_COUNT] = {};
     uint16_t dac_code_[DAC_CH_COUNT] = {};
     ::DacPowerMode dac_mode_[DAC_CH_COUNT] = {};

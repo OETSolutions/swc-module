@@ -254,6 +254,17 @@ void SystemOrchestrator::Boot() {
         buzzer_.Play(BuzzerPattern::kBootOk);
     }
 
+    // `LED_STAT` starts blinking when the load FAILED, and breathing otherwise.
+    // A degraded boot is reported on the buzzer, which is transient, so the LED
+    // is the only lasting record that the running config is not the user's.
+    const bool config_faulted = (result == ConfigLoadResult::kFellBackToDefaults);
+    if (config_faulted) {
+        faulted_ = true;
+        leds_.SetStat(LedStatPattern::kBlink);
+    } else {
+        RestatLeds();
+    }
+
     // 5. USB/BLE would be brought up here (Tasks 16/18). Nothing in this class
     //    starts them, which is what makes FR-42 structural rather than a promise.
 }
@@ -464,6 +475,23 @@ bool SystemOrchestrator::TestDriveKeyMv(uint8_t channel_index, int key_mv, uint3
     return true;
 }
 
+/*
+ * Spec 7.3's normal `LED_STAT`: solid when a host is attached, breathing when
+ * not. Called on boot and on every link transition.
+ *
+ * The fault wins, because spec 7.3 says the LEDs answer "is this thing OK?" at a
+ * glance and a device that is both faulted and connected is NOT OK. Without this
+ * precedence a link connect mid-fault would quietly repaint the LED to green,
+ * which is the one reading the LED exists to prevent.
+ */
+void SystemOrchestrator::RestatLeds() {
+    if (faulted_) {
+        leds_.SetStat(LedStatPattern::kBlink);
+        return;
+    }
+    leds_.SetStat(usb_connected_ ? LedStatPattern::kSolid : LedStatPattern::kBreathe);
+}
+
 void SystemOrchestrator::Identify() {
     // Both channels, because "which unit is this" is a question about the box,
     // not about one steering-wheel input.
@@ -581,6 +609,12 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             cs.key_driven = false;
         }
         cs.gestures.Reset();
+        // FR-4: an out-of-range channel -- a collapsed rail, an open input, a
+        // short to 12 V -- must be REPORTED, not merely survived. Releasing the
+        // line is the safety half; this is the half the user can act on. The
+        // indication latches (see ReportFault): a wiring fault does not clear
+        // itself, and an indication that faded would be a lie.
+        ReportFault();
         return;
     }
 

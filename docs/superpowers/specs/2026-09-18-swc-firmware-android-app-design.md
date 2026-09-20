@@ -1308,7 +1308,7 @@ high command, not a low one,* because the output only sinks.
 | Config from newer schema | `schema_version` check | Defaults; report clearly, do not attempt to interpret |
 | Head unit disappears (VBUS off) | `/VBUS_VALID` | Release the KEY line immediately; report `vbus_present: false`; keep classifying |
 | USB link drops | 10 s silence | Keep serving local bindings; report nothing (there is no one to report to) |
-| Ladder out of range | Range check | Report `UNKNOWN`, emit no gesture, do not guess |
+| Ladder out of range | Range check | Report `UNKNOWN`, emit no gesture, do not guess. A reading **above the idle reference** is the out-of-range case (a short to 12 V): the channel goes `kFault`, the KEY line releases, and `LED_STAT` latches `blink` (FR-4) |
 | Rail collapse | Rail measurement | Report out-of-range; do not classify against a stale rail |
 | OTA image bad | SHA-256 mismatch | **Do not commit**; keep running the current image; report the failure |
 | OTA image boots then faults | No health confirmation | Roll back to the previous slot (§9.4) |
@@ -1456,6 +1456,14 @@ pulses grow in *length*, not in frequency.
 
 LEDs are **continuously readable state**, complementing the buzzer's **transient
 events**. They must answer "is this thing OK?" at a glance from the driver's seat.
+
+The orchestrator owns this channel. It sets **breathing** at boot and **solid**
+when a host opens the USB port (`SetUsbConnected`), and the learn wizard and the
+identify flash borrow it while they run. **A fault latches `blink` and wins over
+both normal states** — a device that is faulted is not OK at a glance, whatever
+the link is doing, and a connect mid-fault must not repaint the lamp green.
+`blink` clears only on a reboot, because a wiring fault or a collapsed rail is a
+hardware condition that does not fix itself.
 
 | `LED_STAT` (D6) | Meaning |
 | --- | --- |

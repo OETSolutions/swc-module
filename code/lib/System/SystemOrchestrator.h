@@ -227,6 +227,46 @@ public:
         gesture_sink_ctx_ = ctx;
     }
 
+    /*
+     * Whether a USB host is attached, so `LED_STAT` can be solid rather than
+     * breathing (spec 7.3).
+     *
+     * Driven by the link's connect/disconnect hooks. The orchestrator cannot
+     * observe the link itself -- and must not: spec 6.6 requires the device to
+     * keep serving presses with the link down, so this is a display input and
+     * nothing else. Feedback is never on the key path (FR-21).
+     */
+    void SetUsbConnected(bool connected) {
+        if (usb_connected_ != connected) {
+            usb_connected_ = connected;
+            RestatLeds();
+        }
+    }
+
+    /*
+     * Report a fault on the LEDs (spec 7.3's `kBlink`, "5 Hz: fault -- the
+     * buzzer's FAULT_* says which").
+     *
+     * **This was the one thing FR-4's "detect and report" had no home for.** The
+     * firmware detected an out-of-range channel, released the line and said
+     * nothing anywhere: no buzzer, no LED, no frame. The spec's entire fault
+     * indication -- `LED_STAT` blink -- was unreachable, because the only
+     * `SetStat` callers were the learn wizard and the identify flash.
+     *
+     * A fault has no timeout and no clear, deliberately: a wiring fault or a
+     * collapsed rail is a hardware condition that does not fix itself, so a
+     * self-clearing indication would be a lie. Recovery is a reboot, which spec
+     * 6.1's startup sequence already handles.
+     */
+    void ReportFault() {
+        if (faulted_) return;
+        faulted_ = true;
+        leds_.SetStat(LedStatPattern::kBlink);
+        buzzer_.Play(BuzzerPattern::kFaultDac);
+    }
+
+    bool Faulted() const { return faulted_; }
+
 private:
     struct ChannelState {
         // Both of these take their profile/timings at construction and have no
@@ -315,6 +355,9 @@ private:
     // link registers, and legal to leave null: the device runs without an app.
     GestureSink gesture_sink_ = nullptr;
     void       *gesture_sink_ctx_ = nullptr;
+    bool        usb_connected_ = false;
+    bool        faulted_ = false;
+    void RestatLeds();
 
     /*
      * FR-31's headless learn, and the AUX1 hold that enters and leaves it.

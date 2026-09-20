@@ -61,6 +61,10 @@ void CdcRxCallback(int itf, cdcacm_event_t *event)
     }
 }
 
+// The orchestrator, so the line-state callback can drive `LED_STAT` (spec 7.3).
+// Set once at start-up and never cleared: the device runs until reset.
+SystemOrchestrator *g_sys = nullptr;
+
 // The host opened the port (DTR asserted). This is when `hello` should go out:
 // a host that has not opened the port is not reading, so a frame sent earlier is
 // discarded by the driver and the app sees a missing opening frame. TinyUSB's
@@ -78,6 +82,9 @@ void CdcLineStateCallback(int itf, cdcacm_event_t *event)
         // `hello` first (spec 4.5), then the config reply run so the app can
         // render without having to ask for anything.
         if (g_router != nullptr) g_router->OnConnected();
+        // Spec 7.3: LED_STAT is solid with a host attached, breathing without.
+        // Display only -- spec 6.6 keeps every button path independent of this.
+        if (g_sys != nullptr) g_sys->SetUsbConnected(true);
         ESP_LOGI(TAG, "host opened the app port");
     } else if (!open && g_host_open) {
         g_host_open = false;
@@ -85,6 +92,7 @@ void CdcLineStateCallback(int itf, cdcacm_event_t *event)
         // Discards any half-received config run: an interrupted transfer must
         // never be applied (spec 4.2).
         if (g_router != nullptr) g_router->OnDisconnected();
+        if (g_sys != nullptr) g_sys->SetUsbConnected(false);
         ESP_LOGI(TAG, "host closed the app port");
     }
 }
@@ -114,6 +122,8 @@ void UsbLinkStart(IHAL *hal, SystemOrchestrator *sys)
     // defaults over a device that is actually configured.
     static ConfigStore store(hal);
     static CommandRouter router(hal, sys, &store);
+
+    g_sys = sys;
 
     // FR-31: the headless learn persists through this same store. It must be the
     // ONE store -- a second instance would write to the same NVS keys but with its

@@ -6,6 +6,10 @@
 # compiled -- see the lib/ CMakeLists.txt note. Ignored, not removed.
 compile_commands.json
 
+# clangd's index cache, dropped beside compile_commands.json. Machine-local and
+# absolute-path-laden, like the compile database itself.
+.cache/
+
 # Local dev secrets — never commit. Not part of this project.
 .env
 

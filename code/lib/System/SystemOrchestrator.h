@@ -43,6 +43,32 @@ public:
     // output is already safe.
     bool SafeIdleEstablished() const { return safe_idle_established_; }
 
+    /*
+     * Drive the KEY line at `key_mv` for `hold_ms`, then release. This is spec
+     * 4.3's `test_key` -- a bench/production check of the output stage -- and it
+     * shares the SERVO with the normal action path rather than writing a DAC
+     * code directly, so what the bench measures is what a real press produces.
+     *
+     * Returns false if `key_mv` is outside the output envelope (spec 6.2's
+     * 1800..5200 mV). Refusing is required: the envelope is what the servo is
+     * allowed to command, and a bench command that could exceed it would be a
+     * way to discover that the clamp is missing.
+     *
+     * It deliberately does NOT wait out a gesture: a test command has no gesture
+     * to resolve, so it drives immediately.
+     */
+    bool TestDriveKeyMv(uint8_t channel_index, int key_mv, uint32_t hold_ms, uint64_t now_ms);
+
+    // Flash both LED channels and buzz once, so a user can tell WHICH unit they
+    // are talking to (spec 4.3's `identify`). Non-blocking: it sets the patterns
+    // and returns, and the normal Tick advances them.
+    void Identify();
+
+    // A channel's active gain mode, after the boot-time policy decision.
+    GainMode ChannelGainMode(uint8_t channel_index) const {
+        return (channel_index < kMaxChannels) ? gain_mode_[channel_index] : GainMode::kAmplified;
+    }
+
 private:
     struct ChannelState {
         // Both of these take their profile/timings at construction and have no

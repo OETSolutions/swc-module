@@ -103,6 +103,12 @@ bool ActionIsWellFormed(const Action &a) {
 
 bool ConfigValidate(const Config &c) {
     if (c.schema_version != kConfigSchemaVersion) return false;
+    // An empty device id is refused because `ReadStr` refuses one, which would
+    // otherwise make this config encode successfully and then fail to DECODE --
+    // a round-trip violation (FR-27) surfacing as a mysterious "corrupt config".
+    // Validation is where that must be caught, since validation is the only gate
+    // between a hand-built config and the wire.
+    if (c.device_id[0] == '\0') return false;
     if (c.channel_count == 0 || c.channel_count > kMaxChannels) return false;
     if (c.settings.timings.debounce_ms == 0) return false;
     if (c.settings.timings.double_press_off_ms < c.settings.timings.debounce_ms) return false;

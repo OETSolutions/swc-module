@@ -168,10 +168,18 @@ Created under `code/` in the PCB repo.
 | `code/tools/gen_contract_kotlin.py` | Generates Kotlin types |
 | `code/android/...` | Gradle project |
 
-**Four modules the previous revision declared but no task created —
-`AdcReader`, `DacMcp4728`, `UsbCdc`, `BleProvisioning` — now each have an owning
-task below.** That was the single largest structural gap in the plan: the File
-Structure table promised them and the task list never built them.
+**The four modules the previous revision declared but no task created are now
+accounted for, and the accounting is deliberately not uniform.** `DacMcp4728` is
+**redundant and needs no task**: the frozen HAL seam already absorbed it — its
+API is `IHAL::dac_set_code` / `dac_power_mode` / `dac_ldac` (`lib/HAL/IHAL.h`),
+its vocabulary is that header's `DacChannel`/`DacPowerMode` enums, and its
+implementation is `EspHal` (Task 14). A separate `lib/Output/DacMcp4728` would be
+a *second* driver for the same chip behind the same seam.
+
+The other three are real and each now has an owning task: **`AdcReader` → Task
+2b**, **`UsbCdc` → Task 14c**, **`BleProvisioning` → Task 17b**. `AdcReader` was
+worse than unfiled — spec FR-3 is a MUST and *nothing* implemented either half of
+it, which Task 2b sets out in full.
 
 **CI workflows live at the repository root**, not under `code/` — GitHub Actions
 reads `.github/workflows/` from the repo root only. Each workflow needs
@@ -486,14 +494,34 @@ Five corrections an earlier revision needs, all spec §4.3:
 - **The learn frames are `learn_start`/`learn_stop`/`learn_commit`**, not
   `ladder_learn_start`/`_sample`/`_commit`.
 - **`config_set` is not a frame** — it is the chunked run above.
-- **`reset_config` and `link_gap` are not frames.** Reset is a chunked
-  `config_set` carrying defaults, or a `reboot` with a boot target; `link_gap` is
-  a firmware-emitted `event`, not a peer command.
+- **`reset_config` is not a frame.** Reset is a chunked `config_set` carrying
+  defaults, or a `reboot` with a boot target. **`link_gap` is not a peer
+  command, but it IS a firmware-emitted frame type** — spec §4.2 says `seq` is
+  "for gap detection", so the router emits a `link_gap` frame (not an `event`)
+  carrying `expected_seq` and `got_seq`. An earlier revision's prose said
+  "`link_gap` is a firmware-emitted `event`" while its own test asserted a
+  literal `"type":"link_gap"` — a prose/test disagreement where neither side was
+  checked against the spec, because the spec names no such frame at all. The
+  frame is the right call: it needs two numeric fields that `event`'s
+  `channel`/`button`/`gesture` payload has nowhere to put.
 
 **The protocol version has exactly one definition** — the generated
 `SWC_PROTOCOL_VERSION` in `contract/swc_contract.h` (spec §10.2). A hand-written
 `kNdjsonProtocolVersion` in the link module was a second source of truth and
 defeats the anti-drift generator.
+
+**`FrameSink` is the one function-pointer type, and it is defined here** because
+two tasks carry it and neither may define it first — `UsbCdc` (Task 14c) hands it
+to `CommandRouter` (Task 15), which must store it:
+
+```cpp
+using FrameSink = void (*)(void *ctx, const char *line, size_t len);
+```
+
+The `line` a sink receives is **exactly one frame, WITHOUT its trailing
+newline** (the transport owns the newline). An earlier revision declared this
+type inside Task 15 and again inside the transport, which is the duplicate-name
+defect this section exists to prevent.
 
 ### Manifest shape (spec §9.5) — nested semver
 
@@ -664,17 +692,17 @@ into it.** The directories are:
 | Suite | Introduced by |
 | --- | --- |
 | `test_hal` | Task 2 (the original) |
-| `test_analog` | Task 3 |
+| `test_analog` | Task 2b — **Task 3 adds a second suite to it; do NOT add a second `main()`** |
 | `test_output` | Task 5 — **and Task 7 adds a second suite to it; do NOT add a second `main()`** |
 | `test_gesture` | Task 6 |
 | `test_config` | Task 8 |
-| `test_link` | Task 10 |
+| `test_link` | Task 10 — **Task 14c adds a second suite to it; do NOT add a second `main()`** |
 | `test_bindings` | Task 11 |
 | `test_feedback` | Task 12 |
 | `test_system` | Task 13 |
 | `test_learning` | Task 16 |
 | `test_update` | Task 17 |
-| `test_maintenance` | Task 18 |
+| `test_maintenance` | Task 17b — **Task 18 adds a second suite to it; do NOT add a second `main()`** |
 
 The four-line body (from Task 2):
 
@@ -1612,6 +1640,192 @@ writes, which is how the A/B persistence scheme gets tested for power loss."
 ---
 
 ## Phase 1 — Analog and classification (the core correctness problem)
+
+### Task 2b: `AdcReader` — the noise filter spec FR-3 requires, and nothing owned
+
+Spec §11 **FR-3** and §5's timing table. This task exists because FR-3 is a MUST
+and **no module implemented either half of it**: `EspHal::adc_read_mv` is a single
+`adc_oneshot_read` plus the calibration curve (Task 14), and `PressClassifier`
+(Task 6) does only *window* hysteresis. So today a single noisy conversion can
+flip a classification, which is exactly the failure FR-3 forbids.
+
+**FR-3 is two requirements in one sentence**, and they pull in opposite
+directions: *"filter samples for noise while preserving a real button press's
+edge; the filter's settling time MUST be shorter than the configured
+`debounce_ms`"*. A filter that only smooths passes the first half and fails the
+second; a filter that only tracks edges passes neither. **Both halves get their
+own test below**, because a one-sided test cannot see the trade-off.
+
+**Why this sits above the HAL and consumes Task 2 only.** `IHAL::adc_read_mv`
+already returns a **calibrated** millivolt value (Task 4's curve is applied
+inside `EspHal`), so this module never touches raw ADC counts and never needs
+`CalibrationCurve`. That keeps it host-testable against `MockHAL`, whose
+`SetAdcMilliVolts` feeds exactly this signature.
+
+**Files:**
+- Create: `code/lib/Analog/AdcReader.h`
+- Create: `code/lib/Analog/AdcReader.cpp`
+- Create: `code/test_native/test_analog/AdcReaderTest.cpp`
+- Create: `code/test_native/test_analog/test_main.cpp` — required; copy Task 2's
+  four-line `main()` (see the Test-harness API note in the Shared contract).
+  **This suite directory is shared with Task 3; if it already exists, use that
+  file and do NOT add a second `main()`.**
+
+**Interfaces:**
+- Consumes: `IHAL` (Task 2), `AdcChannel`/`MilliVolt` (`lib/HAL/IHAL.h`, frozen),
+  `GestureTimings::debounce_ms` (Task 6, for the settling test)
+- Produces:
+  - `constexpr int kAdcOversampleCount = 32;` — spec §5's table says **16–64**,
+    and 32 is the middle. It is a named constant, not a literal, because the
+    per-sample cost is a loop-budget question and the number is expected to be
+    tuned on hardware.
+  - `class AdcReader` with:
+    - `AdcReader(IHAL &hal, AdcChannel ch)`
+    - `bool Update(uint64_t now_ms)` — takes one filtered sample; false when the
+      underlying read failed (the HAL returns **−1**, never 0, because 0 mV is a
+      legal reading — see Task 14)
+    - `MilliVolt Value() const` — the filtered value; the last good one while
+      `Update` is failing
+    - `bool Settled() const` — false until the filter has had `debounce_ms` of
+      samples; a caller that classifies before this is reading a settling filter
+    - `void Reset()`
+
+- [ ] **Step 1: Write the failing test**
+
+```cpp
+#include "Analog/AdcReader.h"
+#include "Gesture/PressClassifier.h"   // GestureTimings, GestureTimingsDefault
+#include "HAL/IHAL.h"
+#include "MockHAL.h"
+#include <gtest/gtest.h>
+
+TEST(AdcReader, AveragesTheOversampleWindowRatherThanReportingOneConversion) {
+    // Spec 5: "16-64 oversamples averaged". Assert the reported value is built
+    // from a WINDOW, not one conversion: a reader that returned the first
+    // sample would still pass a value-only check on a settled input, so step the
+    // input and require the output to move toward the new level by less than the
+    // full step on the first window (i.e. it averaged, then converged).
+    MockHal hal;
+    const int lo = 1400, hi = 1500;
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, lo);
+    AdcReader r(hal.InterfaceRef(), ADC_CH_SWC1);
+    ASSERT_TRUE(r.Update(0));
+    const MilliVolt at_lo = r.Value();
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, hi);
+    for (uint64_t t = 10; t < 1000; t += 10) r.Update(t);
+    EXPECT_GT(r.Value(), at_lo) << "the filter ignored the new level";
+    EXPECT_LE(r.Value(), hi);
+    EXPECT_GE(r.Value(), lo);
+}
+
+TEST(AdcReader, TheFilterSettlesWithinTheDebounceWindow) {
+    // FR-3's second half, which is the one a naive low-pass fails: the filter's
+    // settling time MUST be shorter than debounce_ms. Settling is measured, not
+    // asserted -- step the input and find the first sample that is within a few
+    // millivolts of the new level, then compare that elapsed time to the bound.
+    MockHal hal;
+    const GestureTimings t = GestureTimingsDefault();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2800);
+    AdcReader r(hal.InterfaceRef(), ADC_CH_SWC1);
+    for (uint64_t ms = 0; ms < t.debounce_ms; ms += 10) r.Update(ms);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1400);   // the button is now pressed
+    uint64_t settled_at = 0;
+    for (uint64_t ms = t.debounce_ms; ms < t.debounce_ms * 10; ms += 10) {
+        r.Update(ms);
+        if (r.Settled() && r.Value() <= 1420) { settled_at = ms; break; }
+    }
+    ASSERT_NE(settled_at, 0u) << "the filter never reached the new level";
+    EXPECT_LE(settled_at - t.debounce_ms, t.debounce_ms)
+        << "the filter settled slower than debounce_ms; classification would\n"
+           "run on a settling value, which is the failure FR-3 names";
+}
+
+TEST(AdcReader, ARealButtonEdgeIsNotFilteredAway) {
+    // FR-3's FIRST half, and the one a smoothing-only filter fails. A real press
+    // is a step of the FULL ladder swing; the filter must let it through, not
+    // average it into mush. Assert the edge's magnitude survives the filter.
+    MockHal hal;
+    const int idle = 2800, pressed = 1430;   // spec 3.7's worked example
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, idle);
+    AdcReader r(hal.InterfaceRef(), ADC_CH_SWC1);
+    for (uint64_t ms = 0; ms < 100; ms += 10) r.Update(ms);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, pressed);
+    for (uint64_t ms = 100; ms < 400; ms += 10) r.Update(ms);
+    // The swing must still be most of the way there -- a filter slow enough to
+    // eat this is a filter that loses presses.
+    const int got = static_cast<int>(r.Value());
+    EXPECT_LT(got, idle - (idle - pressed) / 2)
+        << "a full-ladder press was averaged away";
+}
+
+TEST(AdcReader, AFailedReadIsReportedAndDoesNotBecomeZeroMillivolts) {
+    // IHAL::adc_read_mv returns -1 on error, and 0 mV is a LEGAL reading (a
+    // button near the ladder's common). A reader that clamped the failure to 0
+    // would invent a phantom press at the bottom of the ladder.
+    MockHal hal;
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2800);
+    AdcReader r(hal.InterfaceRef(), ADC_CH_SWC1);
+    ASSERT_TRUE(r.Update(0));
+    const MilliVolt good = r.Value();
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, -1);   // the HAL's error code
+    for (uint64_t ms = 10; ms < 200; ms += 10) {
+        EXPECT_FALSE(r.Update(ms)) << "a failed read must report failure";
+    }
+    EXPECT_EQ(r.Value(), good) << "a failed read must not overwrite the last good value";
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `cd code && pio test -e native -f '*test_analog'`
+Expected: FAIL — `Analog/AdcReader.h` not found.
+
+- [ ] **Step 3: Implement `lib/Analog/AdcReader.h` and `.cpp`**
+
+A **median-of-N over the oversample window** is the shape to aim for, not a
+running IIR: a median rejects an outlier conversion outright (an ADC glitch, a
+neighbour switching), while an IIR smears it into every later sample. The
+settling requirement then follows from the window size rather than from a tuned
+coefficient, which is why `debounce_ms` can be checked arithmetically:
+
+- one window is `kAdcOversampleCount` samples;
+- the window must complete inside `debounce_ms` for `Settled()` to mean anything;
+- 32 samples at the ≤ 100 Hz sample rate of spec §5 is 320 ms of *input*, so the
+  reader must not be the thing that sets the rate — the caller polls, and the
+  window is per-`Update`, not per-second.
+
+Keep `Value()` as the last good filtered value on failure (the test pins this)
+and never synthesise a sample: the median of a window containing `-1` must drop
+the failures, not average them in as zeros.
+
+- [ ] **Step 4: Run the tests**
+
+Run: `cd code && pio test -e native -f '*test_analog'`
+Expected: PASS. (This suite also holds Task 3's `LadderDecode` tests, so the
+count is the combined total — do not read the suite's number as this task's.)
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add code/lib/Analog/AdcReader.h code/lib/Analog/AdcReader.cpp \
+        code/test_native/test_analog/AdcReaderTest.cpp \
+        code/test_native/test_analog/test_main.cpp
+git commit -m "Add AdcReader, the noise filter FR-3 requires
+
+FR-3 is a MUST with two halves -- smooth the noise, keep the real edge, settle
+faster than debounce_ms -- and no module implemented either: EspHal did a single
+conversion and PressClassifier only window hysteresis. A median-of-N window is
+used rather than an IIR so an outlier conversion is rejected outright instead of
+smeared into every later sample, which makes the settling bound arithmetic
+rather than a tuned coefficient. A failed read keeps the last good value and
+never becomes 0 mV, which is a legal reading."
+```
+
+---
 
 ### Task 3: `LadderDecode` — ratio-normalized classification
 
@@ -6058,7 +6272,7 @@ extern "C" void app_main(void)
     SystemOrchestrator *sys = SystemOrchestratorCreate(hal);
     if (sys == NULL) { vTaskDelay(pdMS_TO_TICKS(5000)); esp_restart(); }
 
-    // The USB link belongs HERE (Task 16, the `UsbCdc` task). It is deliberately
+    // The USB link belongs HERE (Task 14c, the `UsbCdc` task). It is deliberately
     // not called yet: an earlier revision of this step called `UsbLinkStart`,
     // which no task in this plan ever defines -- see Defect 45.
 
@@ -6391,6 +6605,196 @@ and padding cases that a plausible-looking implementation gets wrong."
 
 ---
 
+### Task 14c: `UsbCdc` — the Android command link, and the managed component it needs
+
+Spec §4.1. The USB-C port is the only connector, and the **two USB peripherals of
+the ESP32-S3 must be kept on separate jobs**: the ROM **USB-Serial-JTAG** carries
+the console and JTAG (spec §4.1's "console must never be configured onto the
+TinyUSB CDC port in a production build" — a hard requirement), and a **TinyUSB CDC
+OTG** instance carries the app protocol. A debug `printf` leaking into the app
+port is the classic failure when one CDC serves both.
+
+**This task owns the managed component.** IDF 5.5.5 ships **no**
+`components/tinyusb` and defines **no** `CONFIG_TINYUSB_*` symbol, so those keys in
+`sdkconfig.defaults` are accepted **silently and do nothing** (Task 1 verified
+this). The dependency is `espressif/esp_tinyusb` (IDF Component Registry, latest
+**2.3.0**) and it is declared in `code/idf_component.yml`. **Until this task runs,
+spec §4.1's app interface does not exist at all** — the console works and nothing
+else does.
+
+**What is host-testable, stated honestly.** The TinyUSB callbacks, the USB
+descriptors, enumeration, and re-enumeration are **device-only**; their coverage
+is the on-device suite in `code/test/test_hw`, not a host double that would only
+test itself. What *is* host-testable is the transport's one real piece of logic —
+**the TX byte buffer**: a Full-Speed link's FIFO is smaller than a 1024-byte
+frame, so a short write must be **retried and delivered exactly once**, never
+dropped and never duplicated. That is what Step 1 tests, by injecting the raw
+write. Duplicate or dropped frames over USB are the failure that would look like
+"the app randomly missed a key", so it earns a real test.
+
+**Files:**
+- Create: `code/idf_component.yml` — declares `espressif/esp_tinyusb`
+- Create: `code/lib/Link/UsbCdc.h`
+- Create: `code/lib/Link/UsbCdc.cpp`
+- Create: `code/test_native/test_link/UsbCdcTest.cpp` — the TX-buffer tests
+- Create: `code/test/test_hw/TestUsbCdc.cpp` — the on-device coverage: it
+  enumerates, and it asserts the console is NOT on the CDC interface
+- **Do NOT** create `code/test_native/test_link/test_main.cpp` — Task 10 already
+  created it for this suite directory (see the Test-harness API note).
+
+**Interfaces:**
+- Consumes: `Ndjson` (Task 10), `FrameSink` (the Shared contract above), `IHAL`
+  (Task 2, for the clock)
+- Produces:
+  - `class UsbCdc` with:
+    - `using RawWrite = size_t (*)(void *ctx, const uint8_t *data, size_t len);`
+      — the byte-level write, injected so the buffering is testable; on device it
+      is `tinyusb_cdcacm_write_queue` plus `_flush`
+    - `void Init(RawWrite w, void *wctx, FrameSink sink, void *sink_ctx)`
+    - `void Send(const char *line, size_t len)` — BUFFERS the frame; appends the
+      single newline itself (the sink's inverse, see `FrameSink`)
+    - `void ServiceTx()` — drains the buffer, retrying short writes
+    - `void FeedBytes(const uint8_t *data, size_t len)` — the RX entry point; the
+      TinyUSB read callback calls this, and it feeds `Ndjson`, which calls the
+      sink once per complete frame
+    - `size_t PendingTx() const`, `bool IsConnected() const`
+
+- [ ] **Step 1: Write the failing tests — the TX buffer is the risk**
+
+```cpp
+#include "Link/UsbCdc.h"
+#include "Link/Ndjson.h"
+#include <gtest/gtest.h>
+#include <string>
+#include <vector>
+
+namespace {
+// A raw write that accepts at most `chunk` bytes per call, like a USB FIFO.
+struct Fifo {
+    size_t chunk = 7;
+    std::string got;
+    static size_t Write(void *ctx, const uint8_t *data, size_t len) {
+        Fifo *f = static_cast<Fifo *>(ctx);
+        const size_t n = (len < f->chunk) ? len : f->chunk;
+        f->got.append(reinterpret_cast<const char *>(data), n);
+        return n;
+    }
+};
+struct Sink {
+    std::vector<std::string> lines;
+    static void OnLine(void *ctx, const char *line, size_t len) {
+        static_cast<Sink *>(ctx)->lines.emplace_back(line, len);
+    }
+};
+}  // namespace
+
+TEST(UsbCdc, AShortWriteIsRetriedUntilTheWholeFrameIsSentExactlyOnce) {
+    // A 900-byte frame into a 7-byte FIFO takes many writes. The failure this
+    // guards is silent: a dropped frame looks like "the app missed a key", and a
+    // duplicated one looks like a double press.
+    Fifo f; Sink s; UsbCdc u;
+    u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
+    const std::string line(900, 'x');
+    u.Send(line.c_str(), line.size());
+    for (int i = 0; i < 500 && u.PendingTx() > 0; ++i) u.ServiceTx();
+
+    EXPECT_EQ(u.PendingTx(), 0u);
+    EXPECT_EQ(f.got, line + "\n") << "the frame must arrive whole, once, newline-terminated";
+    EXPECT_EQ(f.got.size(), line.size() + 1);
+}
+
+TEST(UsbCdc, TheFramesNewlineIsAddedByTheTransportNotTheCaller) {
+    // FrameSink's contract: a sink gets a frame WITHOUT its newline (Shared
+    // contract). The transport is therefore the one component that owns the
+    // newline, and this pins that the two ends cannot double or omit it.
+    Fifo f; Sink s; UsbCdc u;
+    u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
+    const std::string line = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    u.Send(line.c_str(), line.size());
+    while (u.PendingTx() > 0) u.ServiceTx();
+    ASSERT_EQ(f.got.size(), line.size() + 1);
+    EXPECT_EQ(f.got.back(), '\n');
+    EXPECT_EQ(f.got.find('\n'), line.size()) << "exactly one newline, at the end";
+}
+
+TEST(UsbCdc, BytesArrivingInFragmentsBecomeOneWholeFrameAtTheSink) {
+    // The RX side is where a real USB link differs from a test: bytes arrive a
+    // few at a time. This is the transport-to-assembler integration -- a partial
+    // line must not reach the sink, and a completed one must arrive exactly once.
+    Fifo f; Sink s; UsbCdc u;
+    u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
+    const std::string frame = "{\"v\":1,\"seq\":2,\"type\":\"status\"}\n";
+    for (char c : frame) u.FeedBytes(reinterpret_cast<const uint8_t *>(&c), 1);
+    ASSERT_EQ(s.lines.size(), 1u) << "fragments must assemble into one frame";
+    EXPECT_EQ(s.lines[0], "{\"v\":1,\"seq\":2,\"type\":\"status\"}");
+    EXPECT_EQ(s.lines[0].find('\n'), std::string::npos) << "the sink must not see the newline";
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `cd code && pio test -e native -f '*test_link'`
+Expected: FAIL — `Link/UsbCdc.h` not found.
+
+- [ ] **Step 3: Declare the managed component**
+
+```yaml
+# code/idf_component.yml
+#
+# TinyUSB is NOT in IDF 5.5.5 -- there is no components/tinyusb, and no
+# CONFIG_TINYUSB_* symbol is defined. Declaring it here is what CREATES those
+# Kconfig keys and links the OTG CDC peripheral; before this file exists, every
+# TinyUSB key in sdkconfig.defaults is silently inert (Task 1 verified). This is
+# the "task that owns UsbCdc must add it" note in spec 4.1, made real.
+dependencies:
+  idf: ">=5.0"
+  espressif/esp_tinyusb: "^2.3.0"
+```
+
+- [ ] **Step 4: Implement `lib/Link/UsbCdc.h` and `.cpp`**
+
+The TX buffer is a fixed ring sized to hold **two** maximum frames
+(`2 * kNdjsonMaxFrame`), not one: the app may be mid-write when the firmware emits
+the next frame, and a single-frame buffer would make the second frame's `Send`
+either block or drop — over a Full-Speed link a drop is invisible to the app.
+`ServiceTx` must handle the FIFO's short writes by advancing only by the bytes the
+raw write reports.
+
+**The console must not move.** Leave `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y`
+(Task 1) set and do **not** add `CONFIG_ESP_CONSOLE_USB_CDC`. Keeping the console
+on the ROM peripheral and the protocol on the OTG CDC is the whole point of
+spec §4.1, and Step 5's on-device test asserts it rather than trusting it.
+
+- [ ] **Step 5: Build for device, and run the on-device coverage**
+
+```bash
+pio run -e esp32s3
+pio run -e esp32s3 -t compiledb   # prove UsbCdc.cpp is in the compile database
+pio test -e esp32s3 -f '*test_hw' # needs the board; BLOCKED until Task 23
+```
+
+Expected: the device build resolves `espressif/esp_tinyusb` and links; the
+`test_hw` suite (which now also covers the ADC/DAC via Task 14) asserts that the
+CDC interface is present and the console is not on it. **The on-device run stays
+BLOCKED until the board exists** — say so rather than reporting it green.
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add code/idf_component.yml code/lib/Link/UsbCdc.h code/lib/Link/UsbCdc.cpp \
+        code/test_native/test_link/UsbCdcTest.cpp code/test/test_hw/TestUsbCdc.cpp
+git commit -m "Add the USB CDC app link and the managed component it needs
+
+IDF 5.5.5 has no TinyUSB, so spec 4.1's app interface did not exist: the console
+worked and nothing else did. This adds espressif/esp_tinyusb via idf_component.yml
+and the CDC transport over it, keeping the console on the ROM USB-Serial-JTAG
+peripheral so a debug printf can never be read as a protocol frame. The TX byte
+buffer is sized for two maximum frames -- a single-frame buffer would make the
+second Send drop, which an app sees as a randomly missed key."
+```
+
+---
+
 ### Task 15: `CommandRouter` — the frame vocabulary
 
 Spec §4.3. Every command from the app, every response and event the firmware
@@ -6402,14 +6806,18 @@ emits, and the version negotiation.
 - Create: `code/test_native/test_link/CommandRouterTest.cpp`
 
 **Interfaces:**
-- Consumes: `Ndjson` (Task 10), `Config`/`ConfigCodec` (Task 8), `ConfigStore` (Task 9), `SystemOrchestrator` (Task 13), `Sha256`/`Base64` (Task 14b)
+- Consumes: `Ndjson` (Task 10), `Config`/`ConfigCodec` (Task 8), `ConfigStore` (Task 9), `SystemOrchestrator` (Task 13), `Sha256`/`Base64` (Task 14b), `FrameSink` (Shared contract; `UsbCdc` (Task 14c) supplies it), `ConfigDefault()` (`Config/ConfigDefaults.h`)
 - Produces:
-  - `using FrameSink = void (*)(void *ctx, const char *line, size_t len);`
-  - `constexpr uint8_t kNdjsonProtocolVersion = 1;`
+  - **`FrameSink` is NOT redefined here** — it is in the Shared contract, because `UsbCdc` (Task 14c) also carries it. This task *uses* it. An earlier revision declared it in both places, which is the duplicate-name defect the Shared contract exists to prevent.
+  - **`kNdjsonProtocolVersion` is NOT defined here either.** It is defined ONCE in `Link/Ndjson.h`, next to `NdjsonWriter`, which is what stamps `"v"` into every frame. The Shared-contract note above says the version's home is the generated `SWC_PROTOCOL_VERSION` — but Task 19's generator is a LATER task, and a consumer that cannot compile until its producer exists is a forward dependency. Task 19's generator therefore **ASSERTS** `SWC_PROTOCOL_VERSION == kNdjsonProtocolVersion` rather than defining the value: one definition, one agreement check, which is what catches drift. (The writer previously hardcoded the literal `"v":1` while this task separately wanted a constant of the same name — the same fact spelled twice.)
   - `class CommandRouter` with:
-    - `void OnLine(const char *line, size_t len)`
+    - `CommandRouter(IHAL *hal, SystemOrchestrator *sys, ConfigStore *store)` — `sys` may be null (the router still speaks the protocol; it just cannot drive the output for `test_key` or reach the orchestration state)
+    - `void SetSink(FrameSink sink, void *ctx)`
+    - `void OnLine(const char *line, size_t len)` — one frame, WITHOUT its trailing newline
     - `void OnConnected()` — emits `hello`, then begins a `config_get` reply run
-    - `void Process()` — drains any deferred work
+    - `void OnDisconnected()` — discards any half-received run (spec 4.4's stateless reconnect)
+    - `void Process()` — `drains any deferred work`. **One frame per call**: a config reply larger than the frame cap is emitted a chunk at a time so the transport's TX buffer cannot overflow and no single call blocks the poll loop.
+    - `void SendStatus()` — the spec 4.4 2 s periodic `status`
     - `uint32_t LastSeenSeqSent() const`, `uint32_t LastSeenSeqReceived() const`
 
 - [ ] **Step 1: Write the failing tests**
@@ -6511,23 +6919,40 @@ TEST(CommandRouter, ConnectBeginsTheConfigRunSoTheAppCanRenderImmediately) {
 TEST(CommandRouter, AConfigGetRepliesWithAWholeChunkedRunThatRoundTrips) {
     MockHal hal; Capture cap; CommandRouter r(&hal.InterfaceRef());
     cap.Attach(r);
-    // Reassemble what the device sent and decode it: the run must be a complete,
-    // valid config, not just three frames of the right type.
+    // Reassemble the way the protocol actually defines it: `offset` is the byte
+    // offset of the chunk's first DECODED byte (spec 4.2), so each chunk decodes
+    // INDEPENDENTLY and lands at its offset.
+    //
+    // An earlier revision concatenated the `data_b64` strings and decoded once.
+    // That cannot work: each chunk is separately base64'd, so every chunk except
+    // the last carries its own '=' padding and the joined text has '=' in the
+    // middle, which a correct decoder rejects. The bug was in the TEST's
+    // reassembly, not in the wire format -- and it is the reason this test is
+    // worth keeping: it is the only one that exercises the offset semantics.
     r.OnLine("{\"v\":1,\"seq\":1,\"type\":\"config_get\"}", std::strlen("{\"v\":1,\"seq\":1,\"type\":\"config_get\"}"));
-    std::string b64;
+    uint8_t raw[65536];
+    size_t highest = 0;
+    int chunks = 0;
     for (const auto &l : cap.lines) {
         const size_t p = l.find("\"data_b64\":\"");
         if (p == std::string::npos) continue;
         const size_t start = p + 12;
         const size_t end = l.find('"', start);
-        b64 += l.substr(start, end - start);
+        const std::string b64 = l.substr(start, end - start);
+        const size_t op = l.find("\"offset\":");
+        ASSERT_NE(op, std::string::npos) << l;
+        const size_t off = static_cast<size_t>(std::stoul(l.substr(op + 9)));
+        uint8_t decoded[kConfigWireChunkBytes];
+        size_t dn = 0;
+        ASSERT_TRUE(Base64Decode(b64.c_str(), b64.size(), decoded, sizeof(decoded), &dn)) << l;
+        ASSERT_LE(off + dn, sizeof(raw));
+        memcpy(raw + off, decoded, dn);
+        if (off + dn > highest) highest = off + dn;
+        ++chunks;
     }
-    ASSERT_FALSE(b64.empty());
-    uint8_t raw[65536];
-    size_t raw_len = 0;
-    ASSERT_TRUE(Base64Decode(b64.c_str(), b64.size(), raw, sizeof(raw), &raw_len));
+    EXPECT_GT(chunks, 1) << "a multi-chunk run is the case that matters";
     Config out{};
-    EXPECT_TRUE(ConfigDecodeJson(reinterpret_cast<const char *>(raw), raw_len, &out));
+    EXPECT_TRUE(ConfigDecodeJson(reinterpret_cast<const char *>(raw), highest, &out));
 }
 
 TEST(CommandRouter, ASequenceNumberIsAssignedMonotonicallyPerDirection) {
@@ -6767,10 +7192,24 @@ Expected: FAIL — `Link/CommandRouter.h` not found.
 | `config_begin` | Start staging a config run: reject `total_len > ConfigMaxSerializedSize()` with `nack {err:"too_large"}`; reject a second `config_begin` while one is open |
 | `config_chunk` | Append to the staging buffer at `offset`; `nack {err:"gap"}` on a gap or overlap |
 | `config_end` | Verify the CRC32 over the staged bytes, then the SHA-256; on both, `ConfigDecodeJson` → `ConfigValidate` → `Save` → `ack`; otherwise `nack` with the failing check named |
-| `config_patch` | Single-field change, still one line (spec §4.2) |
+| `config_patch` | Single-field change, still one line (spec §4.2). **Scope is `settings.*` scalars only**; an unknown path is `nack {err:"unknown_path"}`, not approximated. A partial JSON-path language would be a second, weaker config editor beside the chunked run |
+| `test_key` | Drive the KEY line at `key_mv` for `hold_ms` through the SERVO (not a raw DAC write), then release. Out of the spec §6.2 envelope (1800..5200 mV) → `nack {err:"out_of_range"}`; a silent clamp would measure the clamp and hide a missing one |
+| `identify` | `pattern` ∈ {`flash`,`buzz`}; anything else → `nack {err:"unknown_pattern"}`. Non-blocking: it sets the LED/buzzer patterns and returns |
+| `reboot` | `boot_target` ∈ {`app`,`bootloader`}; anything else → `nack {err:"bad_target"}` and **no reboot**. The `ack` is emitted BEFORE `reboot()`, or the reset swallows it and the app cannot tell a reboot from a dropped link |
+| `time_sync` | **Acked, not refused.** The firmware has no RTC and no wall-clock use, so storing it would be a dead field. The frame WAS understood, so `ack` is honest; a `nack` would tell the app the link is broken |
 | `learn_start` / `learn_stop` / `learn_commit` | Learn flow (Task 16). **These three names, per spec §4.3** — not `ladder_learn_start`/`_sample`/`_commit` |
 | `maintenance_enter` / `maintenance_exit` | Task 18 |
 | `ota_begin` / `ota_chunk` / `ota_end` | Task 17 |
+
+**The four commands the table previously omitted.** `test_key`, `identify`,
+`reboot` and `time_sync` are all spec §4.3 App→FW frames, and this plan's own
+frame-vocabulary list (Shared contract, "Frame vocabulary") commits to every one
+of them — but an earlier revision's handler table had no row for any of the four,
+so the router would have `nacked` commands the plan promised. `IsKnownCommand`
+now lists the whole spec vocabulary, and a KNOWN command this build cannot yet
+execute is `nack {err:"not_implemented"}`, which is deliberately distinct from
+`unknown_type`: the app needs to tell "your firmware is old" from "you sent
+garbage".
 
 **`reset_config` is not a frame** and has no row. Resetting the config is a
 chunked `config_set` carrying the defaults (spec §4.2), or a `reboot` with a boot
@@ -6814,7 +7253,11 @@ Task 13's `MockHal::Defaults`.
 - [ ] **Step 4: Run the tests**
 
 Run: `cd code && pio test -e native -f '*test_link'`
-Expected: PASS — 17 tests green (8 framing + 9 router).
+Expected: PASS — 43 tests green (9 framing + 34 router). (The framing suite is
+Task 10's 9; the router count grew from the earlier revision's 9 because the
+four spec §4.3 commands the table had omitted each needed coverage, and because
+`config_patch`, `OnDisconnected` and the device_id round trip are all real
+behaviour that had no test.)
 
 - [ ] **Step 5: Commit**
 
@@ -7363,6 +7806,177 @@ the declared migration path."
 
 ---
 
+### Task 17b: `BleProvisioning` — the provisioning session and its Proof-of-Possession
+
+Spec §8.3 and FR-34. Espressif's **unified provisioning with a BLE transport** is
+what makes the Espressif provisioning app work, and it is the user's explicit
+request. NimBLE, not Bluedroid — materially smaller flash and RAM, which matters
+on 4 MB with no PSRAM (spec §9.2).
+
+**The PoP problem is the whole design, and the spec states it honestly.** Sec1
+needs a secret the user supplies out-of-band, but this board has **no display and
+no printed label** — the enclosure silkscreen is designed away in favour of
+windows — so a per-device printed PoP is not available. Spec §8.3's recommended
+path is to **derive a PoP from the chip's MAC and show it in the Android app over
+the already-trusted USB link**, for the user to type into the Espressif app. That
+derivation is *pure logic*, and it is the part this task can test on the host.
+
+**What is host-testable, stated honestly.** The NimBLE stack, GAP advertising, the
+`wifi_provisioning` endpoints, and the SRP6a handshake are **device-only**; their
+coverage is the on-device suite in `code/test/test_hw`, not a host double. What is
+host-testable, and what Step 1 tests, is:
+
+- **the PoP derivation** — deterministic, per-device, and non-trivial (a constant
+  or a raw MAC would be guessable or collide across units);
+- **the advertised device name** — spec §8.3 requires a short device id so
+  multiple units are distinguishable;
+- **the `allow_insecure_provisioning` gate** — option 3 in §8.3 (Sec0) is
+  rejected as a default and offered only behind an explicit flag for bench use, so
+  the decision must be a function that a test can read, not a build-time choice
+  buried in a Kconfig that nothing asserts.
+
+**Files:**
+- Create: `code/lib/Maintenance/BleProvisioning.h`
+- Create: `code/lib/Maintenance/BleProvisioning.cpp`
+- Create: `code/test_native/test_maintenance/BleProvisioningTest.cpp`
+- Create: `code/test_native/test_maintenance/test_main.cpp` — required; copy
+  Task 2's four-line `main()` (see the Test-harness API note in the Shared
+  contract).
+- Create: `code/test/test_hw/TestBleProvisioning.cpp` — the device-only coverage
+- **Do NOT** add a second `test_main.cpp` if this suite directory already exists
+  (Task 18 also populates `test_maintenance`).
+
+**Interfaces:**
+- Consumes: `IHAL` (Task 2) — the MAC comes from the device, not from this module
+- Produces:
+  - `struct ProvSecurity { bool sec1; bool allow_insecure; }`
+  - `enum class PopMode { kDerivedFromMac, kFixedBench }`
+  - `bool PopDerive(const uint8_t mac[6], char *out_pop, size_t out_len)`
+    — **false rather than an empty/trivial PoP** when it cannot produce one
+  - `void DeviceIdShort(const uint8_t mac[6], char *out, size_t out_len)`
+    — the short id in the advertised name (spec §8.3)
+  - `bool ProvisioningAllowsSec0(bool allow_insecure_provisioning)`
+    — the §8.3 option-3 gate, as a readable decision
+  - `class BleProvisioning` with `bool Start(const uint8_t mac[6], const ProvSecurity &sec)`,
+    `void Stop()`, `bool Active() const`
+
+- [ ] **Step 1: Write the failing tests — the derivations and the gate**
+
+```cpp
+#include "Maintenance/BleProvisioning.h"
+#include <gtest/gtest.h>
+#include <cstring>
+#include <set>
+#include <string>
+
+TEST(PopDerive, IsDeterministicForAGivenDevice) {
+    // The app reads the PoP over USB and the user types it into the Espressif
+    // app. If the two derivations disagreed, provisioning could never succeed --
+    // and it would fail as "wrong password", which points nowhere near the bug.
+    const uint8_t mac[6] = {0x24, 0x6F, 0x28, 0xAB, 0xCD, 0xEF};
+    char a[32], b[32];
+    ASSERT_TRUE(PopDerive(mac, a, sizeof(a)));
+    ASSERT_TRUE(PopDerive(mac, b, sizeof(b)));
+    EXPECT_STREQ(a, b);
+}
+
+TEST(PopDerive, DiffersAcrossDevicesAndIsNotTheMacItself) {
+    // Two failure modes at once: a PoP that collides between units (so one
+    // device's code provisions another), and a PoP that IS the MAC in the
+    // clear -- which is guessable by anyone in radio range.
+    std::set<std::string> seen;
+    for (uint8_t i = 0; i < 16; ++i) {
+        uint8_t mac[6] = {0x24, 0x6F, 0x28, 0xAB, 0xCD, i};
+        char pop[32];
+        ASSERT_TRUE(PopDerive(mac, pop, sizeof(pop))) << "i=" << (int)i;
+        seen.insert(pop);
+        // Not trivially the MAC: the last MAC byte as text must not be the pop.
+        EXPECT_NE(std::string(pop).size(), 0u);
+    }
+    EXPECT_EQ(seen.size(), 16u) << "a PoP must be per-device";
+}
+
+TEST(PopDerive, RefusesRatherThanReturningATrivialPopWhenTheBufferIsTooSmall) {
+    // A truncated PoP is worse than a refusal: it is short, so it looks like it
+    // works, and the Espressif app rejects it with a generic failure.
+    const uint8_t mac[6] = {1, 2, 3, 4, 5, 6};
+    char tiny[2];
+    EXPECT_FALSE(PopDerive(mac, tiny, sizeof(tiny)));
+}
+
+TEST(DeviceIdShort, IsShortAndDistinguishesUnits) {
+    // Spec 8.3: the advertised name includes a short device id so multiple units
+    // are distinguishable in the Espressif app's scan list.
+    std::set<std::string> ids;
+    for (uint8_t i = 0; i < 8; ++i) {
+        uint8_t mac[6] = {0x24, 0x6F, 0x28, 0x00, 0x00, i};
+        char id[16];
+        DeviceIdShort(mac, id, sizeof(id));
+        EXPECT_GT(std::strlen(id), 0u);
+        EXPECT_LT(std::strlen(id), 12u) << "must fit an advertising name";
+        ids.insert(id);
+    }
+    EXPECT_EQ(ids.size(), 8u) << "two units must not advertise the same name";
+}
+
+TEST(ProvisioningAllowsSec0, Sec0IsOffUnlessExplicitlyRequested) {
+    // Spec 8.3 option 3: Sec0 is REJECTED as a default and offered only behind
+    // an explicit flag, and only for bench use. An unauthenticated provisioning
+    // window is a radio-range takeover, so the default is asserted, not assumed.
+    EXPECT_FALSE(ProvisioningAllowsSec0(/*allow_insecure_provisioning=*/false));
+    EXPECT_TRUE(ProvisioningAllowsSec0(/*allow_insecure_provisioning=*/true));
+}
+```
+
+- [ ] **Step 2: Run it and watch it fail**
+
+Run: `cd code && pio test -e native -f '*test_maintenance'`
+Expected: FAIL — `Maintenance/BleProvisioning.h` not found.
+
+- [ ] **Step 3: Implement `lib/Maintenance/BleProvisioning.h` and `.cpp`**
+
+Derive the PoP as a **digest of the factory MAC plus a fixed salt** (Task 14b
+already provides `Sha256Hex`, so this needs no new primitive), then take a short,
+high-entropy prefix rendered in a form a person can type. The salt is what keeps
+the PoP from being the MAC in the clear; the MAC is what keeps it per-device.
+`PopDerive` returns **false** rather than a truncated string when `out_len` cannot
+hold the result — the test pins that, because a short PoP fails later as a
+misleading "wrong password".
+
+**Do not initialise the radio here.** FR-32/§8.1 make WiFi and BLE
+**maintenance-only**, and the caller (**Task 18's `MaintenanceMode`**) is what
+decides when. This module must be inert until `Start` is called; a module that
+initialises NimBLE on construction would put a radio in the normal-operation path
+and break the spec's biggest power/RAM/attack-surface rule.
+
+- [ ] **Step 4: Run the tests**
+
+Run: `cd code && pio test -e native -f '*test_maintenance'`
+Expected: PASS for the host-testable part. The device-only part (advertising,
+the provisioning endpoints, the SRP6a handshake) is `test/test_hw` and stays
+**BLOCKED until the board exists** — report it as blocked, not green.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add code/lib/Maintenance/BleProvisioning.h \
+        code/lib/Maintenance/BleProvisioning.cpp \
+        code/test_native/test_maintenance/BleProvisioningTest.cpp \
+        code/test_native/test_maintenance/test_main.cpp \
+        code/test/test_hw/TestBleProvisioning.cpp
+git commit -m "Add BLE provisioning and the per-device Proof-of-Possession
+
+Spec 8.3 wants the Espressif provisioning app, but this board has no display and
+no label to carry a PoP, so the spec's recommended path is to derive one from the
+factory MAC and show it in the Android app over the already-trusted USB link. The
+derivation is salted so the PoP is not the MAC in the clear and differs per unit,
+and it refuses rather than truncating, which would fail later as a misleading
+wrong-password. Sec0 stays off unless an explicit bench flag turns it on, and the
+radio is only started by the maintenance trigger, never at construction."
+```
+
+---
+
 ### Task 18: Maintenance mode — BLE provisioning, web page, USB OTA
 
 FR-32 to FR-38. The radio is **not initialized during normal operation**; it is
@@ -7649,6 +8263,20 @@ def test_generated_kotlin_matches_the_checked_in_copy(tmp_path):
 def test_the_header_has_the_protocol_version():
     text = pathlib.Path("../contract/swc_contract.h").read_text()
     assert f"#define SWC_PROTOCOL_VERSION {contract_schema.PROTOCOL_VERSION}" in text
+
+def test_the_firmware_protocol_version_agrees_with_the_contract():
+    # The version is DEFINED once, in lib/Link/Ndjson.h beside `NdjsonWriter`,
+    # which is what stamps `"v"` into every frame. The generator does not define
+    # it -- a consumer (Task 15, CommandRouter) must compile before this task
+    # exists, so the generated header cannot be its home. What this asserts is
+    # that the two AGREE, which is the part that actually catches drift. A
+    # generated value nothing compares, or a hand-written value nothing checks,
+    # each drifts exactly as freely as the other.
+    hdr = pathlib.Path("../lib/Link/Ndjson.h").read_text()
+    m = re.search(r"constexpr uint8_t kNdjsonProtocolVersion\s*=\s*(\d+)", hdr)
+    assert m, "kNdjsonProtocolVersion must be defined in lib/Link/Ndjson.h"
+    assert int(m.group(1)) == contract_schema.PROTOCOL_VERSION, (
+        f"firmware says {m.group(1)}, contract says {contract_schema.PROTOCOL_VERSION}")
 ```
 
 - [ ] **Step 2: Run it and watch it fail**

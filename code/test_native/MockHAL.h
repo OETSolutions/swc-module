@@ -139,3 +139,14 @@ private:
     size_t truncate_key_at_ = 0;
     int reboot_count_ = 0;
 };
+
+/*
+ * The one valid default config, as a free function so tests that need a WHOLE
+ * config (rather than a MockHal) can get one without constructing a device.
+ *
+ * It returns the same config `MockHal::Defaults` builds -- that constructor now
+ * calls this, so the two cannot drift. Task 15 needs a legal multi-chunk config
+ * to exercise the chunked transport, and hand-writing a second one in the test
+ * file is how a test ends up validating a config the device never sees.
+ */
+Config MockHalDefaultsConfig();

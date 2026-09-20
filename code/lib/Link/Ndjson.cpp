@@ -61,7 +61,8 @@ void NdjsonWriter::Write(const char *type, uint32_t seq, const char *json_body_f
     const bool body_is_null = strcmp(fields, "null") == 0 || strcmp(fields, "{}") == 0;
     const bool add_comma = has_fields && !body_is_null;
 
-    int n = snprintf(line_, sizeof(line_), "{\"v\":1,\"seq\":%u,\"type\":\"%s\"%s%s}\n",
+    int n = snprintf(line_, sizeof(line_), "{\"v\":%u,\"seq\":%u,\"type\":\"%s\"%s%s}\n",
+                     static_cast<unsigned>(kNdjsonProtocolVersion),
                      static_cast<unsigned>(seq), type ? type : "", add_comma ? "," : "",
                      add_comma ? fields : "");
 

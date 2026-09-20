@@ -3,6 +3,7 @@
 #include <new>
 
 #include "Bindings/BindingResolver.h"
+#include "Config/ConfigDefaults.h"
 #include "Config/ConfigStore.h"
 #include "Output/GainPolicy.h"
 
@@ -180,6 +181,40 @@ void SystemOrchestrator::Tick(uint64_t now_ms) {
     leds_.Update(now_ms);
 }
 
+bool SystemOrchestrator::TestDriveKeyMv(uint8_t channel_index, int key_mv, uint32_t hold_ms,
+                                       uint64_t now_ms) {
+    if (channel_index >= channel_count_) return false;
+    // The envelope is the servo's contract (spec 6.2). Refusing out-of-range is
+    // the point of the check: a bench command that could exceed the clamp would
+    // be a way to discover the clamp is missing.
+    if (key_mv < kOutputFloorMv || key_mv > kOutputCeilingMv) return false;
+    if (!safe_idle_established_) return false;
+
+    ChannelState &cs = channels_[channel_index];
+    const DacChannel key_ch = (channel_index == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
+
+    // Shares the servo with the action path, so what the bench measures is what
+    // a real press produces -- a direct dac_set_code would bypass the trim loop
+    // and measure a different thing.
+    cs.servo.Target(gain_mode_[channel_index], key_mv);
+    cs.servo.Update(hal_->adc_read_mv(hal_->ctx,
+                                      (channel_index == 0) ? ADC_CH_KEY_SENSE1
+                                                           : ADC_CH_KEY_SENSE2));
+    hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());
+    cs.key_driven = true;
+    // A test command has no gesture to resolve, so it drives immediately and
+    // releases on the caller's hold time.
+    cs.key_released_at_ms = now_ms + (hold_ms ? hold_ms : 1);
+    return true;
+}
+
+void SystemOrchestrator::Identify() {
+    // Both channels, because "which unit is this" is a question about the box,
+    // not about one steering-wheel input.
+    leds_.SetStat(LedStatPattern::kDoubleFlash);
+    buzzer_.Play(BuzzerPattern::kKeyAccepted);
+}
+
 void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     ChannelState &cs = channels_[index];
     const ChannelConfig &cc = config_.channels[index];
@@ -278,18 +313,9 @@ extern "C" SystemOrchestrator *SystemOrchestratorCreate(IHAL *hal) {
 
     // A default config is what FR-25 wants anyway: if NVS holds nothing, this IS
     // the pass-through fallback, and Boot() overwrites it when a config loads.
-    Config boot_config{};
-    boot_config.schema_version = kConfigSchemaVersion;
-    boot_config.settings.timings = GestureTimingsDefault();
-    boot_config.settings.gain_policy = GainPolicy::kAuto;
-    boot_config.settings.buzzer_level = 2;
-    boot_config.settings.led_level = 2;
-    boot_config.channel_count = kMaxChannels;
-    for (uint8_t i = 0; i < kMaxChannels; ++i) {
-        boot_config.channels[i].enabled = false;   // nothing learned yet
-        boot_config.channels[i].output.gain_mode = GainMode::kAmplified;
-        boot_config.channels[i].output.idle_dac_code = kDacMaxCode;   // safe (6.7)
-    }
+    // Built by the shared `ConfigDefault()` so the router's config_get reply and
+    // this boot config cannot drift apart (Config/ConfigDefaults.h).
+    const Config boot_config = ConfigDefault();
 
     SystemOrchestrator *sys =
         new (std::nothrow) SystemOrchestrator(hal, boot_config, boot_config.settings.timings);

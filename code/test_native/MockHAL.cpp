@@ -1,9 +1,10 @@
 #include "MockHAL.h"
 
-MockHal::Defaults::Defaults() : config{}, timings(GestureTimingsDefault()) {
+Config MockHalDefaultsConfig() {
+    Config config{};
     config.schema_version = kConfigSchemaVersion;
     std::strncpy(config.device_id, "SWC-0001", sizeof(config.device_id) - 1);
-    config.settings.timings = timings;
+    config.settings.timings = GestureTimingsDefault();
     config.settings.gain_policy = GainPolicy::kAuto;
     config.settings.buzzer_level = 2;
     config.settings.led_level = 2;
@@ -55,7 +56,11 @@ MockHal::Defaults::Defaults() : config{}, timings(GestureTimingsDefault()) {
     b3.actions[0].kind = ActionKind::kAppIntent;
     std::strncpy(b3.actions[0].target, "com.oetsolutions.swc.ACTION_NAVIGATE",
                  sizeof(b3.actions[0].target) - 1);
+    return config;
 }
+
+MockHal::Defaults::Defaults()
+    : config(MockHalDefaultsConfig()), timings(GestureTimingsDefault()) {}
 
 MockHal::MockHal() {
     iface_.adc_read_mv    = &MockHal::AdcReadMvThunk;

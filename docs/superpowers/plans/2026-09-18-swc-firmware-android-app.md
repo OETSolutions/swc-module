@@ -7638,9 +7638,35 @@ gate a path that can brick the device.
   - `VerifyResult ImageVerifyBegin(const char *expected_sha256_hex, size_t expected_size, size_t max_size)`
   - `VerifyResult ImageVerifyChunk(const uint8_t *data, size_t len)`
   - `VerifyResult ImageVerifyEnd()`
-  - `struct ReleaseInfo { uint32_t version_code; char version_name[32]; char sha256_hex[65]; size_t size; char url[256]; uint32_t min_from_version_code; char board[32]; }`
+  - `void ImageVerifyReset()`, `size_t ImageVerifyBytesSoFar()`
+  - `int SemverCompare(const char *a, const char *b)` — **numeric per component**;
+    `1.10.0` is NEWER than `1.9.0`, which a string compare gets backwards
+  - `struct ReleaseInfo { char latest_version[24]; char firmware_version[24]; char sha256_hex[65]; size_t size_bytes; char url[256]; char min_from_version[24]; char channel[24]; }`
   - `enum class ReleaseCheckResult { kUpToDate, kNewer, kNotNewer, kTooOldToUpgradeFrom, kWrongBoard, kMalformed }`
-  - `ReleaseCheckResult ReleaseCheckParse(const char *json, ReleaseInfo *out, uint32_t current_version_code, const char *board)`
+  - `ReleaseCheckResult ReleaseCheckParse(const char *json, ReleaseInfo *out, const char *current_version)`
+
+> **The manifest is the NESTED SEMVER shape (spec §9.5), and this task's earlier
+> revision had it flat.** Its `ReleaseInfo` carried `version_code`,
+> `version_name`, `board`, `size` and `min_from_version_code` — the exact form the
+> Shared contract above calls out as one that **"would make the device refuse
+> every real release"**, because the pipeline publishes
+> `{latest_version, firmware:{version,url,size_bytes,sha256}, min_from_version}`
+> and a device looking for `version_code` finds nothing and reports `malformed`
+> forever. The tests passed only because they parsed the same flat shape they had
+> invented.
+>
+> **`kWrongBoard` stays in the enum but is UNREACHABLE by design.** Spec §9.5's
+> manifest has no board field, and the identity it would carry already exists as
+> `hw_id` in every `hello` (spec §4.3). Inventing a second home for "which
+> hardware is this" is the defect class this plan keeps re-discovering — and here
+> a wrong second home means flashing another board's image. Documented in the
+> header rather than faked into a passing test.
+>
+> **Two consequences the flat shape hid, both now tested:** with integer
+> `version_code`s the version comparison was an integer compare, so nothing ever
+> exercised the semver logic real users depend on; and the two published version
+> fields (`latest_version` vs `firmware.version`) can disagree, which is
+> `malformed`, not a silent pick.
 
 - [ ] **Step 1: Write the failing `ImageVerify` tests**
 
@@ -7752,7 +7778,7 @@ classic way a verification system becomes decorative.
 - [ ] **Step 4: Run the `ImageVerify` tests**
 
 Run: `cd code && pio test -e native -f '*test_update'`
-Expected: PASS — 7 tests green.
+Expected: PASS — 12 tests green (10 `ImageVerify` + 2 semver).
 
 - [ ] **Step 5: Write the failing `ReleaseCheck` tests**
 
@@ -7761,80 +7787,108 @@ Expected: PASS — 7 tests green.
 #include <gtest/gtest.h>
 
 namespace {
-// The shape emitted by the release pipeline (spec 9.5): a small manifest next to
-// the .bin, so the device needs one fetched file, not a GitHub API client.
+// Spec 9.5's manifest shape, verbatim: nested, with semver strings. The
+// top-level `latest_version` and `firmware.version` repeat the same value, which
+// is why both appear and why a disagreement is `malformed`.
 const char *kManifest = R"({
-  "version_code": 12,
-  "version_name": "0.12.0",
-  "board": "swc-s3",
-  "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-  "size": 1048576,
-  "url": "https://github.com/oetsolutions/swc-module/releases/download/v0.12.0/swc-fw.bin",
-  "min_from_version_code": 5
+  "latest_version": "0.12.0",
+  "channel": "stable",
+  "firmware": {
+    "version": "0.12.0",
+    "url": "https://github.com/oetsolutions/swc-module/releases/download/v0.12.0/firmware.bin",
+    "size_bytes": 1543210,
+    "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+  },
+  "assets": null,
+  "min_from_version": "0.5.0",
+  "release_date": "2026-09-18T00:00:00Z"
 })";
 }  // namespace
 
-TEST(ReleaseCheck, ANewerVersionForThisBoardIsOffered) {
+TEST(ReleaseCheck, ANewerVersionIsOfferedAndItsFieldsAreParsed) {
     ReleaseInfo info{};
-    EXPECT_EQ(ReleaseCheckParse(kManifest, &info, /*current=*/11, "swc-s3"),
+    EXPECT_EQ(ReleaseCheckParse(kManifest, &info, /*current=*/"0.11.0"),
               ReleaseCheckResult::kNewer);
-    EXPECT_EQ(info.version_code, 12u);
-    EXPECT_EQ(info.size, 1048576u);
+    EXPECT_STREQ(info.latest_version, "0.12.0");
+    EXPECT_EQ(info.size_bytes, 1543210u);
+    EXPECT_STREQ(info.min_from_version, "0.5.0");
 }
 
-TEST(ReleaseCheck, TheSameOrOlderVersionIsNotOffered) {
+TEST(ReleaseCheck, TheSameVersionIsUpToDateRatherThanAnUpdate) {
     ReleaseInfo info{};
-    EXPECT_EQ(ReleaseCheckParse(kManifest, &info, 12, "swc-s3"), ReleaseCheckResult::kNotNewer);
-    EXPECT_EQ(ReleaseCheckParse(kManifest, &info, 13, "swc-s3"), ReleaseCheckResult::kNotNewer)
-        << "a downgrade must not be offered as an upgrade";
+    EXPECT_EQ(ReleaseCheckParse(kManifest, &info, "0.12.0"), ReleaseCheckResult::kUpToDate);
 }
 
-TEST(ReleaseCheck, AManifestForADifferentBoardIsRefused) {
+TEST(ReleaseCheck, AnOlderVersionIsNeverOfferedAsAnUpgrade) {
+    // A downgrade is not a lesser update; it is a rollback an attacker can
+    // induce to put a known-vulnerable image back on the device.
     ReleaseInfo info{};
-    EXPECT_EQ(ReleaseCheckParse(kManifest, &info, 11, "swc-c3"),
-              ReleaseCheckResult::kWrongBoard)
-        << "flashing another board's image is worse than not updating";
+    EXPECT_EQ(ReleaseCheckParse(kManifest, &info, "0.13.0"), ReleaseCheckResult::kNotNewer);
+    EXPECT_EQ(ReleaseCheckParse(kManifest, &info, "1.0.0"), ReleaseCheckResult::kNotNewer);
 }
 
-TEST(ReleaseCheck, AVersionTooOldToUpgradeFromIsRefusedWithItsOwnReason) {
+TEST(ReleaseCheck, AVersionBelowTheDeclaredFloorIsRefusedWithItsOwnReason) {
+    // min_from_version exists for migrations that need an intermediate step: the
+    // image IS newer, but applying it directly from this version is unsupported.
     ReleaseInfo info{};
-    EXPECT_EQ(ReleaseCheckParse(kManifest, &info, /*current=*/3, "swc-s3"),
-              ReleaseCheckResult::kTooOldToUpgradeFrom)
-        << "min_from_version_code exists for migrations that need an intermediate step";
+    EXPECT_EQ(ReleaseCheckParse(kManifest, &info, "0.4.0"),
+              ReleaseCheckResult::kTooOldToUpgradeFrom);
+    // Exactly AT the floor is allowed -- the boundary belongs to the caller.
+    EXPECT_EQ(ReleaseCheckParse(kManifest, &info, "0.5.0"), ReleaseCheckResult::kNewer);
+}
+
+TEST(ReleaseCheck, ANumericVersionGapUsesSemverNotStringComparison) {
+    // The case a flat `version_code` hid entirely, and a string compare gets
+    // backwards: 0.10.0 IS newer than 0.9.0.
+    const char *m = R"({"latest_version":"0.10.0",
+      "firmware":{"version":"0.10.0","url":"https://x/y.bin","size_bytes":10,
+                  "sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}})";
+    ReleaseInfo info{};
+    EXPECT_EQ(ReleaseCheckParse(m, &info, "0.9.0"), ReleaseCheckResult::kNewer);
 }
 
 TEST(ReleaseCheck, AMalformedManifestIsRefusedNotPartlyApplied) {
     ReleaseInfo info{};
-    EXPECT_EQ(ReleaseCheckParse("{ not json", &info, 11, "swc-s3"),
-              ReleaseCheckResult::kMalformed);
-    EXPECT_EQ(ReleaseCheckParse("{}", &info, 11, "swc-s3"), ReleaseCheckResult::kMalformed);
+    EXPECT_EQ(ReleaseCheckParse("{ not json", &info, "0.11.0"), ReleaseCheckResult::kMalformed);
+    EXPECT_EQ(ReleaseCheckParse("{}", &info, "0.11.0"), ReleaseCheckResult::kMalformed);
     // A manifest missing the hash must not be accepted as "no hash to check".
-    EXPECT_EQ(ReleaseCheckParse(R"({"version_code":12,"board":"swc-s3","size":10,
-        "url":"http://x/y.bin"})", &info, 11, "swc-s3"), ReleaseCheckResult::kMalformed);
+    EXPECT_EQ(ReleaseCheckParse(R"({"latest_version":"1.0.0",
+        "firmware":{"version":"1.0.0","url":"https://x/y.bin","size_bytes":10}})",
+        &info, "0.11.0"), ReleaseCheckResult::kMalformed);
 }
 
 TEST(ReleaseCheck, ANonHttpsUrlIsRefused) {
+    // Plain http is a downgrade attack, not a lesser preference: an attacker on
+    // the path substitutes the image, and the SHA-256 does not help because the
+    // hash came over the same hijacked channel.
     std::string m = kManifest;
     const std::string https = "https://";
     const size_t pos = m.find(https);
     ASSERT_NE(pos, std::string::npos);
     m.replace(pos, https.size(), "http://");
     ReleaseInfo info{};
-    EXPECT_EQ(ReleaseCheckParse(m.c_str(), &info, 11, "swc-s3"), ReleaseCheckResult::kMalformed)
-        << "the OTA image must come over TLS; plain http is a downgrade attack";
+    EXPECT_EQ(ReleaseCheckParse(m.c_str(), &info, "0.11.0"), ReleaseCheckResult::kMalformed);
+}
+
+TEST(ReleaseCheck, AManifestWhoseTwoVersionsDisagreeIsRefused) {
+    const char *m = R"({"latest_version":"9.9.9",
+      "firmware":{"version":"1.0.0","url":"https://x/y.bin","size_bytes":10,
+                  "sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}})";
+    ReleaseInfo info{};
+    EXPECT_EQ(ReleaseCheckParse(m, &info, "0.1.0"), ReleaseCheckResult::kMalformed);
 }
 ```
 
 - [ ] **Step 6: Implement `ReleaseCheck` and run**
 
 Run: `cd code && pio test -e native -f '*test_update'`
-Expected: PASS — 7 + 6 tests green.
+Expected: PASS — 22 tests green (12 `ImageVerify`/semver + 10 `ReleaseCheck`).
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add code/lib/Update/ImageVerify.h code/lib/Update/ImageVerify.c \
-        code/lib/Update/ReleaseCheck.h code/lib/Update/ReleaseCheck.c \
+git add code/lib/Update/ImageVerify.h code/lib/Update/ImageVerify.cpp \
+        code/lib/Update/ReleaseCheck.h code/lib/Update/ReleaseCheck.cpp \
         code/test_native/test_update/ImageVerifyTest.cpp \
         code/test_native/test_update/ReleaseCheckTest.cpp \
         code/test_native/test_update/test_main.cpp

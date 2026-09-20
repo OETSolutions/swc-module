@@ -66,8 +66,12 @@ class SwcClient(private val transport: SwcTransport) {
     private val pending = ArrayList<Byte>()
     private val lineCap = 1024   // kNdjsonMaxFrame, spec 4.2
 
-    /** Replies awaiting a matching `for_seq`. */
-    private val awaiting = HashMap<Int, CompletableDeferred<Frame>>()
+    // Replies awaiting a matching `for_seq`. A CONCURRENT map, not a plain
+    // `HashMap`: it is written from a UI coroutine (registering a waiter) and from
+    // the reader coroutine (completing one) at the same time -- `Dispatchers.Default`
+    // is multi-threaded -- so a plain map is a data race that can lose a waiter,
+    // duplicate an entry, or corrupt the bucket chain.
+    private val awaiting = java.util.concurrent.ConcurrentHashMap<Int, CompletableDeferred<Frame>>()
 
     // --- inbound chunked config run (spec 4.2) -----------------------------
     //
@@ -187,6 +191,12 @@ class SwcClient(private val transport: SwcTransport) {
             return
         }
 
+        // Captured BEFORE the dispatch: a failure this frame is about to report (a
+        // bad config digest, a short run) must STICK, and clearing it below would
+        // erase the very error the frame was describing. Only a failure that
+        // predates this frame -- i.e. an earlier malformed line -- is recovered.
+        val failedBeforeThisFrame = _state.value is LinkState.Failed
+
         when (type) {
             Frames.HELLO -> {
                 _state.value = LinkState.Connected
@@ -203,6 +213,25 @@ class SwcClient(private val transport: SwcTransport) {
             Frames.CONFIG_END -> endInboundConfig(frame)
         }
 
+        // A well-formed frame means the peer is talking to us again, so a failure
+        // from an EARLIER frame is cleared.
+        //
+        // Without this, a FAILED state was terminal until the next `hello`, which
+        // arrives only on reconnect -- so ONE malformed line (a torn write during
+        // enumeration, a dropped byte) froze the UI on "No device found" for the
+        // rest of the session while the device kept answering frames. That is not
+        // the "resynchronize at the next newline" the framing contract promises,
+        // and it was reachable in normal use because the firmware's own `hello` was
+        // malformed (see FwVersion.h): the app failed on the first frame and never
+        // recovered.
+        //
+        // VersionMismatch is deliberately NOT cleared: the disagreement is a
+        // property of the peer, not a transient, and spec 4.5 requires the app to
+        // stop talking rather than carry on best-effort.
+        if (failedBeforeThisFrame && _state.value is LinkState.Failed) {
+            _state.value = LinkState.Connected
+        }
+
         val forSeq = frame.fields["for_seq"]?.jsonPrimitive?.intOrNull
         if (forSeq != null) awaiting.remove(forSeq)?.complete(frame)
 
@@ -210,6 +239,56 @@ class SwcClient(private val transport: SwcTransport) {
     }
 
     private suspend fun send(type: String, body: (JsonObject) -> JsonObject = { it }) {
+        writeLock.withLock { sendLocked(type, body) }
+    }
+
+    /**
+     * Send a frame and register its reply waiter as ONE atomic step.
+     *
+     * **This is why [request] does not call [send].** Allocating the sequence
+     * number and registering `awaiting[n]` in two separate critical sections lets
+     * two overlapping callers read the same `seq` and both adopt the same `n`: one
+     * waiter overwrites the other, whichever reply arrives completes only one of
+     * them, and the loser waits out its full timeout on a link that answered
+     * normally. Measured before the fix: two concurrent requests timed out 33 times
+     * in 50 trials. The app issues requests from several coroutines on
+     * `Dispatchers.Default` (a connect while a maintenance toggle is in flight, an
+     * OTA run while the config is re-read), so the overlap is reachable in normal
+     * use, not just in a test.
+     *
+     * Returns the allocated `seq`, so the caller can report the right `for_seq`
+     * even on a timeout.
+     */
+    private suspend fun sendAndAwait(
+        type: String,
+        timeoutMs: Long,
+        body: (JsonObject) -> JsonObject,
+    ): Pair<Int, AckResult> {
+        val deferred = CompletableDeferred<Frame>()
+        val n = writeLock.withLock {
+            val allocated = seq + 1
+            awaiting[allocated] = deferred
+            sendLocked(type, body)
+            allocated
+        }
+        val reply = awaitOrNull(deferred, timeoutMs)
+            ?: run {
+                awaiting.remove(n)
+                return n to AckResult.Timeout
+            }
+        val result = when (reply.type) {
+            Frames.ACK -> AckResult.Ok(reply.fields["for_seq"]?.jsonPrimitive?.int ?: n)
+            Frames.NACK -> AckResult.Nacked(
+                reply.fields["err"]?.jsonPrimitive?.content ?: "",
+                reply.fields["detail"]?.jsonPrimitive?.content ?: "",
+            )
+            else -> AckResult.Ok(n)
+        }
+        return n to result
+    }
+
+    /** The body of [send], already under [writeLock]. */
+    private suspend fun sendLocked(type: String, body: (JsonObject) -> JsonObject) {
         val n = ++seq
         val base = JsonObject(
             mapOf(
@@ -219,9 +298,7 @@ class SwcClient(private val transport: SwcTransport) {
             )
         )
         val frame = body(base)
-        writeLock.withLock {
-            transport.write((frame.toString() + "\n").toByteArray())
-        }
+        transport.write((frame.toString() + "\n").toByteArray())
     }
 
     /**
@@ -314,25 +391,7 @@ class SwcClient(private val transport: SwcTransport) {
         type: String,
         timeoutMs: Long = 15_000,
         body: (JsonObject) -> JsonObject = { it },
-    ): AckResult {
-        val n = seq + 1
-        val deferred = CompletableDeferred<Frame>()
-        awaiting[n] = deferred
-        send(type, body)
-        val reply = awaitOrNull(deferred, timeoutMs)
-            ?: run {
-                awaiting.remove(n)
-                return AckResult.Timeout
-            }
-        return when (reply.type) {
-            Frames.ACK -> AckResult.Ok(reply.fields["for_seq"]?.jsonPrimitive?.int ?: n)
-            Frames.NACK -> AckResult.Nacked(
-                reply.fields["err"]?.jsonPrimitive?.content ?: "",
-                reply.fields["detail"]?.jsonPrimitive?.content ?: "",
-            )
-            else -> AckResult.Ok(n)
-        }
-    }
+    ): AckResult = sendAndAwait(type, timeoutMs, body).second
 
     private suspend fun awaitOrNull(
         d: CompletableDeferred<Frame>,

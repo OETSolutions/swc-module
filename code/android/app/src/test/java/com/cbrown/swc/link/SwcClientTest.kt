@@ -6,6 +6,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -24,10 +25,22 @@ import org.junit.Test
 class SwcClientTest {
 
     private class FakeTransport : SwcTransport {
-        val written = mutableListOf<String>()
-        private val flow = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
+        // Synchronized: the concurrency test below writes from two real threads, and
+        // an unsynchronized `MutableList` would corrupt under that regardless of what
+        // the client does.
+        val written = java.util.Collections.synchronizedList(mutableListOf<String>())
+        private val flow = MutableSharedFlow<ByteArray>(extraBufferCapacity = 512)
+        // Opt-in: several tests depend on an unanswered request timing out, so the
+        // default transport stays silent like a device that never replied.
+        var autoAck = false
         override suspend fun write(bytes: ByteArray) {
-            written += String(bytes)
+            val s = String(bytes)
+            written += s
+            if (!autoAck) return
+            // A real device answers every command. The buffer is large so the ack
+            // queues even when the reader is momentarily behind.
+            val seq = Regex("\"seq\":(\\d+)").find(s)?.groupValues?.get(1)?.toInt() ?: return
+            flow.tryEmit("{\"v\":1,\"seq\":$seq,\"type\":\"ack\",\"for_seq\":$seq}\n".toByteArray())
         }
         override val incoming: Flow<ByteArray> = flow
         override fun close() {}
@@ -295,5 +308,105 @@ class SwcClientTest {
         advanceUntilIdle()
         assertTrue(call.isCompleted)
         job.cancel()
+    }
+
+    @Test
+    fun `a good frame after a malformed one recovers the link instead of staying failed`() = runTest {
+        // The failure state was terminal until the next `hello`, which only arrives
+        // on reconnect -- so ONE torn line froze the UI on "No device found" while
+        // the device kept answering. This was reachable in normal use: the firmware's
+        // own `hello` was malformed, so the app failed on the very first frame.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        t.emit("{\"v\":1,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+        assertEquals(LinkState.Connected, client.state.value)
+
+        t.emit("not json\n")
+        advanceUntilIdle()
+        assertTrue(client.state.value is LinkState.Failed)
+
+        // Any well-formed frame proves the peer is talking again. Use `status`, NOT
+        // `hello`: recovery must not depend on a reconnect.
+        t.emit("{\"v\":1,\"seq\":2,\"type\":\"status\"}\n")
+        advanceUntilIdle()
+        assertEquals(LinkState.Connected, client.state.value)
+        job.cancel()
+    }
+
+    @Test
+    fun `a config error is not erased by the frame that reported it`() = runTest {
+        // The opposite pressure: the frame that reports a bad digest is itself
+        // well-formed, so a naive "a good frame clears the failure" would clear the
+        // error on the same frame that raised it.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        val body = com.oetsolutions.swc.model.ConfigJson.encode(sampleConfig())
+        configRun(body).dropLast(1).forEach { t.emit(it + "\n") }
+        t.emit("{\"v\":1,\"seq\":3,\"type\":\"config_end\",\"sha256\":\"deadbeef\"}\n")
+        advanceUntilIdle()
+        assertTrue("the digest failure must survive its own frame",
+            client.state.value is LinkState.Failed)
+        job.cancel()
+    }
+
+    @Test
+    fun `a version mismatch is not cleared by later well-formed frames`() = runTest {
+        // Spec 4.5 requires the app to stop talking on a mismatch. Recovery would
+        // turn that into best-effort parsing, which is what the rule forbids.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        t.emit("{\"v\":99,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+        assertTrue(client.state.value is LinkState.VersionMismatch)
+        t.emit("{\"v\":99,\"seq\":2,\"type\":\"status\"}\n")
+        advanceUntilIdle()
+        assertTrue("a mismatch is a property of the peer, not a transient",
+            client.state.value is LinkState.VersionMismatch)
+        job.cancel()
+    }
+
+    @Test
+    fun `overlapping requests on real threads each resolve`() {
+        // NOT a `runTest`: this race needs genuine parallelism. `runTest`'s scheduler
+        // runs its coroutines on ONE thread, so its `launch`es can never interleave
+        // between allocating `seq` and taking the write lock -- an earlier version of
+        // this test passed against the racy client for exactly that reason.
+        //
+        // The client is documented to be driven from several coroutines on the app's
+        // multi-threaded dispatcher, so the overlap is a production shape.
+        //
+        // The observable is the OUTCOME, not the wire bytes: the racy client still put
+        // distinct `seq`s on the wire (the counter increments under the lock), but it
+        // registered the reply WAITER under a key read outside the lock, so a thread's
+        // waiter was overwritten and its acknowledged request timed out. Every racer
+        // gets its own ack here, so any timeout means a waiter was lost.
+        val racers = 16
+        val t = FakeTransport()
+        t.autoAck = true
+        val client = SwcClient(t)
+        val reader = Thread { runBlocking { client.run() } }.apply { isDaemon = true; start() }
+
+        repeat(30) {
+            val gate = java.util.concurrent.CyclicBarrier(racers)
+            val results = java.util.Collections.synchronizedList(mutableListOf<AckResult>())
+            val threads = (0 until racers).map {
+                Thread {
+                    runBlocking {
+                        gate.await(3, java.util.concurrent.TimeUnit.SECONDS)
+                        results += client.enterMaintenance(3_000)
+                    }
+                }.apply { isDaemon = true; start() }
+            }
+            threads.forEach { it.join(5_000) }
+            val timeouts = results.count { it is AckResult.Timeout }
+            assertEquals("every acknowledged request must resolve; $timeouts timed out",
+                0, timeouts)
+        }
+        reader.interrupt()
+        client.close()
     }
 }

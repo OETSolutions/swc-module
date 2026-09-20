@@ -6209,7 +6209,9 @@ TEST(Sha256, StreamingInArbitraryChunksMatchesHashingInOneGo) {
         uint8_t d[32];
         s.Final(d);
         char hex[65];
-        for (int i = 0; i < 32; ++i) std::sprintf(hex + i * 2, "%02x", d[i]);
+        // snprintf, not sprintf: macOS marks sprintf deprecated and the project
+        // sets -Werror, so a plain sprintf does not compile on the host.
+        for (int i = 0; i < 32; ++i) std::snprintf(hex + i * 2, 3, "%02x", d[i]);
         EXPECT_EQ(std::string(hex, 64), whole) << "chunk size " << chunk;
     }
 }
@@ -6274,6 +6276,38 @@ TEST(Base64, RefusesAnOutputBufferThatCannotHoldTheResult) {
                            small, sizeof(small)), 0u);
 }
 
+TEST(Base64, AMalformedInputIsRefused) {
+    uint8_t out[64];
+    size_t n = 0;
+    // Not a multiple of 4.
+    EXPECT_FALSE(Base64Decode("YWJ", 3, out, sizeof(out), &n));
+    // A character outside the alphabet.
+    EXPECT_FALSE(Base64Decode("YWJ!", 4, out, sizeof(out), &n));
+    // Padding in a position that cannot mean anything.
+    EXPECT_FALSE(Base64Decode("Y=Jj", 4, out, sizeof(out), &n));
+    EXPECT_FALSE(Base64Decode("=YWJ", 4, out, sizeof(out), &n));
+    // Output that cannot hold the decoded bytes.
+    EXPECT_FALSE(Base64Decode("YWJj", 4, out, 2, &n));
+    // Valid, so the refusals above are not vacuous.
+    EXPECT_TRUE(Base64Decode("YWJj", 4, out, sizeof(out), &n));
+    EXPECT_EQ(n, 3u);
+    EXPECT_EQ(out[0], 'a');
+}
+
+TEST(Base64, PaddedInputDecodesToTheShorterLength) {
+    // The padding cases carry the actual risk: "Zg==" is ONE byte, not three, so
+    // a length computed from the input size alone writes two bytes too many.
+    uint8_t out[8];
+    size_t n = 0;
+    ASSERT_TRUE(Base64Decode("Zg==", 4, out, sizeof(out), &n));
+    EXPECT_EQ(n, 1u);
+    EXPECT_EQ(out[0], 'f');
+
+    ASSERT_TRUE(Base64Decode("Zm8=", 4, out, sizeof(out), &n));
+    EXPECT_EQ(n, 2u);
+    EXPECT_EQ(std::string(reinterpret_cast<char *>(out), n), "fo");
+}
+
 TEST(Base64, ADecodedChunkFitsTheLineCap) {
     // The whole reason kConfigWireChunkBytes is 512 and not 1024: the DECODED
     // size is what the transport buffers, but the ENCODED size is what must fit
@@ -6296,10 +6330,31 @@ Expected: FAIL — `Util/Sha256.h` not found.
 
 - [ ] **Step 3: Implement**
 
-`Sha256Stream` wraps mbedTLS's `mbedtls_sha256_*` on device and **the same mbedTLS
-API on the host** (add `lib_deps` `mbedtls` to the `native` env). It must be *the
-same code* on both, because a host-only implementation would validate a path the
-device does not run.
+`Sha256Stream` implements SHA-256 **in-tree, in `lib/Util/Sha256.cpp`**, and both
+the host and the device compile *that one file*. This is a correction to an
+earlier revision of this task, which said to wrap mbedTLS "on device and the same
+mbedTLS API on the host (add `lib_deps` `mbedtls` to the `native` env)". That is
+**not achievable**, and following it would have caused the exact defect this task
+exists to prevent:
+
+- IDF 5.5.5 bundles **mbedTLS 3.6.6** (verified: `MBEDTLS_VERSION_STRING "3.6.6"`
+  in `framework-espidf/components/mbedtls/mbedtls/include/mbedtls/build_info.h`).
+- The PlatformIO registry's newest standalone mbedTLS is **3.6.2**
+  (`kochcodes/mbedtls`) -- a third-party republish, not the source.
+- Upstream `Mbed-TLS/mbedtls` ships **no `library.json`**, so the git-pin escape
+  used for cJSON one env-block above does not exist here either.
+
+A `lib_deps` entry would therefore put the **host on a different build of the
+hashing code than the device ships**. The other end of both digests is the Android
+app's `MessageDigest("SHA-256")`, so the standard each side must conform to is
+FIPS 180-4, not any one library -- and conformance to FIPS 180-4 is what the
+published vectors in Step 1 actually pin.
+
+**The device build's byte size is NOT evidence this compiled.** Adding a lib file
+that nothing references yet leaves `firmware.bin` **exactly the same size**, with
+a green `SUCCESS` -- the linker drops the unreferenced objects. Verify with the
+two checks that do mean something: `Sha256.cpp.o` / `Base64.cpp.o` exist under
+`.pio/build/esp32s3/lib/Util/`, and both files appear in `compile_commands.json`.
 
 `Base64Encode` returns 0 rather than truncating, and `Base64Decode` rejects
 anything that is not well-formed — including a length that is not a multiple of
@@ -6314,7 +6369,9 @@ asserts the refusal.
 - [ ] **Step 4: Run the tests**
 
 Run: `cd code && pio test -e native -f '*test_util'`
-Expected: PASS — 11 tests green (6 SHA-256 + 5 base64).
+Expected: PASS — 13 tests green (6 SHA-256 + 7 base64). (An earlier revision of
+this task said 11/6+5; the block above has always contained 13, including the
+padded-decode case that is where a base64 length bug actually hides.)
 
 - [ ] **Step 5: Commit**
 

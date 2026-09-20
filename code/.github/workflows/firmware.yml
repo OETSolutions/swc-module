@@ -3,8 +3,12 @@
 # Three jobs, and each one guards a failure that has actually happened in this
 # project rather than a hypothetical:
 #
-#   host-tests        the 263-test native suite. Every defect found so far was
-#                     reproduced by one of these first.
+#   host-tests        the native suite. Every defect found so far was
+#                     reproduced by one of these first. The count is
+#                     deliberately NOT written here: an earlier revision pinned
+#                     "263", which then drifted, and the replacement pinned a
+#                     second number while claiming not to. Treat the run's own
+#                     total as authoritative.
 #   contract-sync     regenerates the contract and FAILS if the checked-in files
 #                     differ. A stale generated header compiles fine on both
 #                     sides while meaning different things -- the defect class
@@ -60,6 +64,18 @@ jobs:
       - name: The spec's worked example still decodes
         working-directory: code
         run: python3 tools/check_spec_example.py
+
+      # The one check that can see a Kotlin/C codec divergence. Each side's own
+      # round-trip test compares that side to itself, so a field name that differs
+      # between them passes both and produces a config the device refuses, reported
+      # as "corrupt config" with nothing named.
+      #
+      # It reads the checked-in fixture the app produced. Run `pio test -e native`
+      # first: the probe needs the cJSON PlatformIO fetches into .pio/libdeps, which
+      # the step above has already done.
+      - name: The app's config decodes and re-encodes byte-identically
+        working-directory: code
+        run: bash tools/crosscheck_config.sh
 
   build-and-size-gate:
     runs-on: ubuntu-latest

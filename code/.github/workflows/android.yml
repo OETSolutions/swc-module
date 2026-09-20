@@ -72,6 +72,19 @@ jobs:
         working-directory: code/android
         run: ./gradlew --no-daemon :app:testDebugUnitTest
 
+      # `EmitFixtureTest` regenerates `contract/swc_sample_config.json` from the
+      # app's own codec as a side effect of the run above, so this is a staleness
+      # check, not a build step -- the same shape as the contract check. It catches
+      # a change to the Kotlin codec that was not reflected in the fixture the
+      # firmware decodes, which is the divergence the firmware-side crosscheck
+      # exists to catch and would otherwise be caught one workflow too late.
+      - name: The cross-language fixture is in sync
+        run: |
+          if ! git diff --exit-code -- code/contract/swc_sample_config.json; then
+            echo "::error::swc_sample_config.json is stale. Run the app's EmitFixtureTest and commit it."
+            exit 1
+          fi
+
       - name: Assemble the debug APK
         working-directory: code/android
         run: ./gradlew --no-daemon :app:assembleDebug

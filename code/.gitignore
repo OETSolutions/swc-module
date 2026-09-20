@@ -60,3 +60,13 @@ managed_components/
 # The fixture EmitFixtureTest writes. It is a build output that exists to be fed
 # to tools/crosscheck_config.sh, not a source file.
 android/app/build/
+
+# The repo-root .gitignore is a KiCad template that ignores `*.xml`, and EVERY
+# Android XML file is source: AndroidManifest.xml (without which there is no
+# app), and Task 21's res/values, res/xml and layout files. Left ignored, a fresh
+# clone simply has no manifest and the build fails in a way that says nothing
+# about a gitignore rule. Same class as the `!partitions.csv` exception above.
+#
+# A `!` pattern cannot re-include a file whose PARENT DIRECTORY is ignored, so
+# this works only because `*.xml` ignores files rather than `android/` itself.
+!android/**/*.xml

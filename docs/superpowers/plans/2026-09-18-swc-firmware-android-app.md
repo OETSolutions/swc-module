@@ -8793,8 +8793,18 @@ because that is the number a user can compare against a multimeter.
 
 - [ ] **Step 2: Run and watch it fail**
 
-Run: `cd code/android && ./gradlew :app:connectedDebugAndroidTest`
+Run: `cd code/android && ./gradlew :app:testDebugUnitTest --tests '*LadderScreenTest*'`
 Expected: FAIL — `LadderScreen` not found.
+
+**Correction: this must run on the JVM, not on a device.** The original command was
+`connectedDebugAndroidTest`, which needs an emulator or an attached board. Neither
+exists here (no AVD) nor in CI before the boards arrive, so the one test guarding
+the screen's entire diagnostic value would have been a gate that executes nowhere.
+The suite therefore depends on **Robolectric** (`org.robolectric:robolectric`,
+`androidx.compose.ui:ui-test-junit4`, and
+`testOptions.unitTests.isIncludeAndroidResources = true`) and uses the SAME Compose
+semantics assertions. Verified non-vacuous by mutation: making the content
+description always say "not matched" fails exactly this test.
 
 - [ ] **Step 3: Implement the screens**
 
@@ -8829,20 +8839,23 @@ unavailability as a clear message**, rather than silently failing.
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cd code/android && ./gradlew :app:testDebugUnitTest :app:connectedDebugAndroidTest`
-Expected: PASS.
+Run: `cd code/android && ./gradlew :app:testDebugUnitTest :app:assembleDebug`
+Expected: PASS — and the APK is produced. (There is no instrumented suite to run;
+see the correction above. What would need real hardware — USB enumeration, and
+Android 15's BAL behaviour on `startActivity` from the background — is named as a
+bring-up item instead of being silently skipped.)
 
 - [ ] **Step 5: Commit**
 
 ```bash
-git add code/android/app/src/main/java/com/oetsolutions/swc/ui/MainActivity.kt \
+git add code/android/app/build.gradle.kts \
+        code/android/app/src/main/java/com/oetsolutions/swc/ui/MainActivity.kt \
         code/android/app/src/main/java/com/oetsolutions/swc/ui/LinkScreen.kt \
         code/android/app/src/main/java/com/oetsolutions/swc/ui/LadderScreen.kt \
         code/android/app/src/main/java/com/oetsolutions/swc/ui/BindingScreen.kt \
         code/android/app/src/main/java/com/oetsolutions/swc/ui/UpdateScreen.kt \
         code/android/app/src/main/java/com/oetsolutions/swc/action/ActionRunner.kt \
-        code/android/app/src/main/res/ \
-        code/android/app/src/androidTest/java/com/oetsolutions/swc/ui/
+        code/android/app/src/test/java/com/oetsolutions/swc/ui/LadderScreenTest.kt
 git commit -m "Add the Android UI: link status, live ladder, bindings and updates
 
 The live ladder view marks which button the device currently classifies, which
@@ -8876,15 +8889,17 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
-      - run: pip install platformio
+      - run: pip install "platformio==6.1.18"
       - name: Native unit tests
         working-directory: code
         run: pio test -e native
-      - name: Contract is in sync with the schema
+      - run: pip install pytest
+      - name: Contract tests and regeneration
         working-directory: code/tools
         run: |
-          python3 gen_contract.py --out ../contract/swc_contract.h
-          python3 gen_contract_kotlin.py --out ../android/app/src/main/java/com/oetsolutions/swc/contract/Contract.kt
+          python3 -m pytest test_gen_contract.py -q
+          python3 gen_contract.py
+          python3 gen_contract_kotlin.py
       - name: Fail if the generated contract drifted
         run: git diff --exit-code code/contract code/android/app/src/main/java/com/oetsolutions/swc/contract
 
@@ -8894,29 +8909,65 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: '3.11' }
-      - run: pip install platformio
+      - run: pip install "platformio==6.1.18"
+      - name: Install the IDF component manager
+        run: python3 -m ensurepip --upgrade && pip install 'idf-component-manager~=2.2'
       - name: Build
         working-directory: code
+        env:
+          SWC_FW_VERSION: 0.0.0-ci
+          SWC_GIT_SHA: ${{ github.sha }}
         run: pio run -e esp32s3
       - name: Size gate (spec 10.5)
         working-directory: code
-        run: python3 tools/check_size.py --env esp32s3 --max-bytes 1966080
+        run: python3 tools/check_size.py
 ```
 
-**The size gate is a script, not an eyeball.** `tools/check_size.py` runs
-`pio run -t size --json-output`, reads the app size, and exits non-zero above
-**1920 KB (`1966080`)** — the real slot size, which Task 1 established by
-correcting the partition table's alignment. This is the R-1 mitigation from spec
-§12.2: the app not fitting is discovered here, on day one, not the week the
-boards land.
+**The size gate is a script, not an eyeball.** `tools/check_size.py` exits
+non-zero above **1920 KB (`1966080`)** — the real `app0`/`app1` slot size, which
+Task 1 established by correcting the partition table's alignment. This is the R-1
+mitigation from spec §12.2: the app not fitting is discovered here, on day one,
+not the week the boards land.
+
+**Correction 1 — `pio run -t size --json-output` does not exist.** Passing it is
+`Error: No such option '--json-output'` (verified on PlatformIO 6.2.0), so the
+sketch as written could not run. The gate measures
+**`.pio/build/esp32s3/firmware.bin`** instead: the file actually written to the
+slot. The ELF's `text`+`data` is a *different* number (no ELF overhead, no
+padding), so anything reporting that is measuring adjacent to the budget rather
+than the budget.
+
+**Correction 2 — read the slot size from `partitions.csv`, do not hardcode it.**
+A partition edit that shrinks the slot must not leave a gate passing at the old
+number. The script takes the **minimum** of the `app*` slots, which also makes
+A/B equal-slot sizing a checked property rather than an assumption. The `--env`
+and `--max-bytes` flags in the sketch are gone; the defaults are the right ones.
+
+**Correction 3 — the build job needs the IDF component manager.** It fetches
+`espressif/esp_tinyusb` from `src/idf_component.yml`, and IDF's component manager
+is a Python package PlatformIO never installs (Task 14c). On a clean runner the
+build fails before compiling anything, with an error naming neither the package
+nor the manifest. Install `idf-component-manager~=2.2` explicitly, and pass
+`SWC_FW_VERSION`/`SWC_GIT_SHA` — they are compiled in under `-Werror`, so unset is
+a build failure rather than a default. Pin `platformio==6.1.18`.
 
 - [ ] **Step 2: Write `android.yml`**
 
-JVM tests, `assembleDebug`, and the APK uploaded as an artifact. The instrumented
-tests need a device or emulator; run them on an emulator job with
-`reactivecircus/android-emulator-runner`, and keep USB-specific tests excluded
-from CI so a missing device is not a false failure — **documented in the
-workflow comment**, not silently skipped.
+JVM tests, `assembleDebug`, and the APK uploaded as an artifact.
+
+**Correction 4 — there is NO emulator job, because there are no instrumented
+tests.** The plan says to run them with `reactivecircus/android-emulator-runner`
+and exclude the USB-specific ones. There is no AVD on this machine and no device
+in CI, so an emulator job would run an empty suite and the ONE test that guards
+the live ladder's diagnostic value (Task 21) would execute nowhere. That test now
+runs on the JVM under Robolectric, so the emulator job is not merely unnecessary
+— adding it would imply coverage that does not exist.
+
+What genuinely needs hardware — USB enumeration, and Android 15's BAL behaviour on
+`startActivity` from the background — is named in `android.yml`'s header comment
+as a bring-up item, which is the "documented, not silently skipped" the plan
+asks for. A comment claiming skipped tests are covered elsewhere would be the
+opposite of that.
 
 - [ ] **Step 3: Confirm both workflows pass**
 

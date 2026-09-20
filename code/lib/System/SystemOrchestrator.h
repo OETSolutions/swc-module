@@ -2,6 +2,7 @@
 
 #include <stdint.h>
 
+#include "Analog/AdcReader.h"
 #include "Config/ConfigModel.h"
 #include "Feedback/BuzzerGrammar.h"
 #include "Feedback/LedGrammar.h"
@@ -76,12 +77,19 @@ private:
         // an empty profile. Boot reassigns them once the real config is known --
         // which is also after the safe idle state is established, the ordering
         // FR-13 requires. No heap: everything is a value member.
+        // `reader` is default-constructed as UNBOUND and bound in Boot(), which
+        // is the first point the HAL and the channel index are both known.
         ChannelState()
             : classifier(LadderProfile{}, GestureTimingsDefault()),
-              gestures(GestureTimingsDefault()) {}
+              gestures(GestureTimingsDefault()),
+              reader() {}
 
         PressClassifier     classifier;
         GestureStateMachine gestures;
+        // FR-3's noise filter. One per channel, because the two ladders are
+        // independent inputs and sharing a window would let a press on one
+        // channel move the other's reported level (FR-9).
+        AdcReader           reader;
         ServoLoop           servo{ServoConfigDefault()};
         GestureBindings     bindings;
         bool                key_driven = false;    // a pulse is currently on the line

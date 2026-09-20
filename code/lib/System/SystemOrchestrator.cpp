@@ -149,6 +149,10 @@ void SystemOrchestrator::Boot() {
         ChannelState &cs = channels_[i];
         cs.classifier = PressClassifier(config_.channels[i].ladder, timings_);
         cs.gestures = GestureStateMachine(timings_);
+        // FR-3's filter, bound to this channel's own ADC input. Per-channel
+        // because the two ladders are independent inputs (FR-9): one shared
+        // window would let a press on SWC1 move SWC2's reported level.
+        cs.reader.Bind(*hal_, (i == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
         cs.servo = ServoLoop(ServoConfigDefault());
         cs.bindings = BindingsFor(i);
         cs.key_driven = false;
@@ -221,12 +225,16 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
 
     const DacChannel key_ch = (index == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
 
-    // Read the ladder. The idle reference is the LEARNED idle, not the live
-    // reading: it is the ratio denominator, so it must stay pinned to the rail
-    // the button centres were measured at (spec 6.3/LadderProfile). The live
-    // rail health is a separate check on the KEY sense pin, below.
-    const int level_mv = hal_->adc_read_mv(hal_->ctx,
-                                           (index == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
+    // Read the ladder THROUGH FR-3's noise filter, not as a single conversion.
+    // A single noisy conversion can flip a classification, which is exactly the
+    // failure FR-3 forbids; the median-of-32 window rejects it.
+    //
+    // The idle reference is the LEARNED idle, not the live reading: it is the
+    // ratio denominator, so it must stay pinned to the rail the button centres
+    // were measured at (spec 6.3/LadderProfile). The live rail health is a
+    // separate check on the KEY sense pin, below.
+    cs.reader.Update(now_ms);
+    const int level_mv = cs.reader.Value();
     const int idle_ref = cc.ladder.learned_idle_mv;
     const ChannelLevel level = cs.classifier.Update(level_mv, idle_ref, now_ms);
 

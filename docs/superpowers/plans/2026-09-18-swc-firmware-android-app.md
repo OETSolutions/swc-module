@@ -9154,6 +9154,63 @@ git add code/docs/bring-up-log.md docs/superpowers/specs/2026-09-18-swc-firmware
 git commit -m "Record bring-up steps 1-4 measurements and correct the spec to match"
 ```
 
+### Task 25: Bring the radio and the update path up — the three unwired subsystems
+
+**Added after an audit, because the plan's task list had no hole in it while the
+firmware did.** Three subsystems are implemented, fully host-tested, and never
+constructed: `ImageVerify` + `ReleaseCheck` (Task 17's update-safety layer) and
+`BleProvisioning` + `WebPage` (FR-32's maintenance radio). `maintenance_enter`
+now opens a window (Task 21c) with nothing behind it, and the router refuses
+`ota_begin`/`ota_chunk`/`ota_end` with `not_implemented`, which is currently the
+TRUTHFUL answer.
+
+This task is **board-gated** for the same reason Tasks 23–24 are: the parts that
+are missing are the parts that touch hardware and the network stack.
+
+**Files:**
+- Modify: `code/lib/Link/CommandRouter.cpp` (wire `ota_begin`/`ota_chunk`/`ota_end`)
+- Create: `code/lib/Maintenance/MaintenanceRadio.cpp` — the device-only bring-up
+- Modify: `code/src/main.cpp` — poll `MaintenanceActive()` and drive transitions
+- Create: `code/lib/Update/OtaTests` coverage in `test_native/test_update/`
+
+- [ ] **Step 1: The maintenance radio**, in response to `Active()` transitions
+
+Spec 8.2 is explicit that `MaintenanceMode` "does not touch the radio" and that
+"the device-only work is driven by the caller in response to `Active()`
+transitions". `MaintenanceActive()` is correct and observable today, so this is a
+caller, not a redesign.
+
+On entry: bring up the radio and the provisioning endpoint. On exit: **fully
+de-initialize and free** (spec 8.2's wording — a leaked radio is a device that
+still has a stack up in normal operation, which is FR-32's whole prohibition).
+
+- [ ] **Step 2: The OTA frames**, gated on `OtaSupported()`
+
+`ota_begin` carries `size`/`sha256`; `ota_chunk` carries `offset`/`data` (base64,
+the same decoder the chunked config already uses); `ota_end` verifies and commits.
+Refuse with `not_implemented` when `OtaSupported()` is false, rather than acking a
+run the build cannot perform.
+
+**Both OTA paths must share the ONE gate.** `ImageVerify` and exactly one
+`OtaCommit`; neither path re-implements "is this image safe". The WiFi path
+(`OtaWifi`) and the USB path (`OtaUsb`) disagreeing about that is how the weaker
+one becomes the way in.
+
+- [ ] **Step 3: `ReleaseCheck`** — the "check for updates" the app's Update screen
+   already renders. Compare the running `SWC_FW_VERSION` against the released
+   version and report up-to-date / newer / wrong-board plainly, which is what
+   `UpdateScreen`'s four states already expect.
+
+- [ ] **Step 4: Test what is testable, and name what is not**
+
+`ImageVerify` and `ReleaseCheck` are pure logic: test them directly. The flashing
+and the radio are board-only — `OtaUsb` currently has ZERO tests, so the first
+thing a bring-up session should do is prove an image round-trips.
+
+- [ ] **Step 5: Update the plan's status table and commit**
+
+---
+
 ### Task 24: Bring-up steps 5–8 (servo dynamics, feedback, timing, NVS/OTA)
 
 - [ ] **Step 1: Servo dynamics.** Step the DAC, scope the output, measure

@@ -881,7 +881,7 @@ used in the RFC 2119 sense. Each requirement is stated so that it is
 | FR-14 | The firmware MUST select gain mode per channel from `gain_policy` (§6.2), defaulting to `AUTO` (measure the head unit, decide). |
 | FR-15 | The firmware MUST command a key value by writing the DAC code for the bound action **once the gesture has resolved**, and MUST hold it for the press duration (`send_duration_ms`), then release. The output MUST NOT be driven while the gesture is still undecided (§6.6). |
 | FR-16 | The firmware MUST implement release as "command above the head unit's idle voltage", which turns the sink FET off and returns the line to high impedance. |
-| FR-17 | The firmware MUST apply temperature compensation to the learned windows when `temp_comp_enabled` is set (§6.4). |
+| FR-17 | The firmware MUST apply temperature compensation to the learned windows when `temp_comp_enabled` is set (§6.4). **NOT IMPLEMENTED in v1** — the learned temperature and the enable flag are recorded, the correction is not; see §6.4 and open item N-9. |
 | FR-18 | The firmware MUST validate any DAC code against the current gain mode's ceiling before writing it, and clamp with a logged warning rather than driving an out-of-range value. |
 | FR-19 | The firmware SHOULD run a bounded software trim loop against the sense readings to correct for servo and resistor tolerance, and MUST NOT oscillate or inject ADC noise into the output (§6.5). |
 
@@ -1130,17 +1130,21 @@ Two independent effects, and the firmware must not conflate them:
 this vehicle and cannot be known until the board is on a car in real temperature
 conditions. Therefore:
 
-- v1 implements a **linear correction with a configurable coefficient, defaulting
-  to zero** — i.e. compensation is present, wired, and recorded, but **does not
-  change behavior until the user or a bring-up measurement supplies a non-zero
-  coefficient.**
+- `temp_c_at_learn` is recorded per button (§3.4) and `temp_comp_enabled` is
+  carried through the config, so a correction is **computable** later.
+- **No correction is implemented in v1, and this is stated plainly rather than
+  claimed as a zero-valued one.** There is no coefficient field, no correction
+  function, and no test of one; the two recorded halves are the inputs such a
+  function would consume. An earlier revision of this paragraph said the
+  correction was "present, wired, and recorded" and "testable", which was not
+  true, and it mattered -- that sentence is exactly what would have satisfied
+  FR-17 on review. See open item N-9.
 - The NTC is read and reported regardless, so a bring-up session can *measure*
-  the drift and set the coefficient, rather than guessing one now.
-- `temp_c_at_learn` is recorded (§3.4) so the correction is computable later.
+  the drift and set a coefficient, rather than guessing one now.
 
-This is called out as an open item in §12 rather than papered over with a made-up
-coefficient. The requirement FR-17 is satisfied by the correction path existing
-and being testable; the *value* is a bring-up deliverable.
+FR-17 is therefore **not satisfied** and is recorded as such, rather than
+papered over with a made-up coefficient or a claim of a path that does not
+exist.
 
 ### 6.5 The servo and the software trim loop
 
@@ -2383,7 +2387,7 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-14 | Gain-policy tests | N + D | AUTO picks 1.82 vs 1.00 per §6.2; a forced mode is honoured |
 | FR-15 | Output-command test | N | Correct DAC code written, held for `press_ms`, then released |
 | FR-16 | Release-state test | D + B | After release, the KEY line measures high-Z and the head unit sees its own idle |
-| FR-17 | Temp-comp test | N | A ±30 °C shift moves the windows by the modelled amount and classification still succeeds |
+| FR-17 | Temp-comp test | — | **Absent.** The traceability row claimed a test for a correction that does not exist; a coefficient must be measured before either can be written (N-9) |
 | FR-18 | Clamp test | N | An over-ceiling code is clamped and logged; an out-of-envelope write never reaches the DAC |
 | FR-19 | Trim-loop tests | N + B | Converges within the bound, zero overshoot beyond spec, and no ADC-noise injection into the output |
 | FR-20 | Grammar tests | N + D + B | Every pattern in §7.1/§7.3 produces the documented drive sequence |
@@ -2432,6 +2436,7 @@ ordered board and are called out in §12 as the critical path.
 | N-6 | **Android: the head unit's Android version and whether it is rooted/a system app.** Determines if launching apps from background needs the launcher role or the overlay permission (§3.6, Android BAL) | Before Android work | Yes, for the app's action library |
 | N-7 | **Long-term availability of the DOIT module.** It was chosen for JLCPCB Economic eligibility; if it goes away, the fallback changes the board JSON and possibly the pin map | Not urgent | No |
 | N-8 | **The first `pio run -e esp32s3` against pioarduino 55.03.311.** The platform/IDF pairing is verified from the published manifests, but the ESP-IDF branch of this fork has not been exercised on this machine yet — the Arduino branch has | **First task** | **Yes** — if it does not build, the framework decision is reopened |
+| N-9 | **FR-17's temperature compensation is not implemented.** `temp_c_at_learn` and `temp_comp_enabled` are recorded, but there is no coefficient field, no correction function, and no test. Needs a measured drift coefficient from a bring-up session, then a field plus the correction applied to the learned windows | After a bring-up measurement | No — v1 is correct without it, since an uncompensated ladder is the status quo |
 
 ### 12.2 Risks, ranked by expected damage
 

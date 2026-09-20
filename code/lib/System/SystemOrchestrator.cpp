@@ -50,14 +50,22 @@ int Aux1PressedMaxMv() {
 /*
  * `temp_c_at_learn`, in tenths of a degree C, when the NTC has not been read.
  *
- * Spec 6.4 is explicit that v1's temperature compensation is a LINEAR CORRECTION
- * WITH A ZERO COEFFICIENT: the correction path is present and `temp_c_at_learn` is
- * recorded so it is computable later, but it does not change behavior until a
- * bring-up measurement supplies a non-zero coefficient. The NTC-to-Celsius
- * conversion is therefore a bring-up deliverable, and this sentinel is deliberate:
- * 23.5 would be a plausible-looking number that nothing measured, and a plausible
- * number in a field a future engineer uses to compute a correction is worse than a
- * visibly unmeasured one.
+ * Spec 6.4 says v1's temperature compensation is a linear correction with a
+ * coefficient defaulting to zero, so that it "does not change behavior until the
+ * user or a bring-up measurement supplies a non-zero coefficient".
+ *
+ * **What actually exists is the two halves the coefficient would need and not the
+ * correction itself:** `temp_c_at_learn` is recorded per button, and
+ * `temp_comp_enabled` is carried through the config. There is no coefficient field,
+ * no correction function, and no test of one. An earlier version of this comment
+ * (and of the spec paragraph it was written from) claimed "the correction path is
+ * present and being testable", which overstated it -- and mattered, because that
+ * sentence is the thing that would satisfy FR-17 on review. Recording the input to
+ * a correction is not implementing it. See open item N-9.
+ *
+ * The sentinel is deliberate regardless: 23.5 would be a plausible-looking number
+ * that nothing measured, and a plausible number in a field a future engineer uses
+ * to compute a correction is worse than a visibly unmeasured one.
  */
 constexpr int kTempNotMeasuredTenths = 0;
 

@@ -382,6 +382,18 @@ void SystemOrchestrator::ApplyLearnedProfile(int channel, const LadderProfile &p
     // here and must not be re-derived from the current reading.
     config_.channels[channel].ladder = profile;
 
+    // FR-25's pass-through ends HERE, and forgetting this is how a headless learn
+    // silently does nothing on a fresh device. Pass-through RETURNS EARLY from
+    // ServiceChannel -- it exists precisely because there are no learned windows to
+    // classify against -- so a device that learned a button while still in
+    // pass-through would beep LEARN_OK and then ignore the button it just taught,
+    // with entirely correct-looking feedback. The device now HAS windows, so the
+    // condition that justified pass-through no longer holds.
+    //
+    // The learned PROFILE is the trigger, not a stored config: a user can teach a
+    // level with no app and no config, and that is the case this has to serve.
+    pass_through_ = false;
+
     // Rebuild the classifier so the new windows take effect immediately. Without
     // this the device would keep classifying against the OLD profile until the
     // next boot, and the button the user just taught would do nothing -- with

@@ -769,3 +769,40 @@ TEST(SystemOrchestrator, NoteMaintenanceActivityKeepsAWorkingUserInTheWindow) {
     EXPECT_TRUE(o.MaintenanceActive())
         << "repeated activity must keep the window open past the original 5 minutes";
 }
+
+TEST(SystemOrchestrator, AFreshDeviceTaughtHeadlesslyStopsPassingThrough) {
+    // The requirement in the user's words: the AUX1 programming must work with no
+    // Android device attached. A FRESH device is the case that matters -- there is
+    // no app to write a config, so the whole config comes from the headless learn.
+    //
+    // **A fresh device boots into FR-25 pass-through, and pass-through RETURNS
+    // EARLY from ServiceChannel.** So if a learn does not clear it, the learned
+    // windows are never consulted: the user holds AUX1, gets LEARN_OK, and the
+    // button they just taught is ignored -- with perfectly correct feedback.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.channel_count = 1;
+    d.config.channels[0].ladder.count = 0;
+    d.config.channels[0].ladder.learned_idle_mv = 0;
+    d.config.binding_count = 0;
+    // Deliberately NOT stored: this is a factory-fresh device.
+    hal.ClearNvs();
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    ASSERT_TRUE(o.PassThroughActive()) << "a device with no config passes through (FR-25)";
+
+    HoldAuxToToggle(o, hal);
+    PressAux(o, hal, 1);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 400);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 200);
+
+    ASSERT_NE(o.LastLearnedProfile(0), nullptr) << "the learn must have committed";
+    EXPECT_FALSE(o.PassThroughActive())
+        << "after a learn the device HAS learned windows, so it must classify "
+           "against them rather than passing through and ignoring them";
+}

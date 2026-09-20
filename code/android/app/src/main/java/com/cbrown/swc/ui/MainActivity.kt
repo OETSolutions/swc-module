@@ -18,6 +18,14 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.runtime.collectAsState
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.lifecycle.lifecycleScope
+import com.oetsolutions.swc.app.AppViewModel
+import com.oetsolutions.swc.link.SwcClient
+import com.oetsolutions.swc.link.UsbSerialTransport
+import com.oetsolutions.swc.model.Action
+import kotlinx.coroutines.launch
 
 /** The four top-level screens. */
 enum class Screen(val label: String) {
@@ -37,18 +45,88 @@ enum class Screen(val label: String) {
  * how the live-ladder test runs in CI.
  */
 class MainActivity : ComponentActivity() {
+    private var vm: AppViewModel? = null
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        // The transport is created here, not in the view model, because opening it
+        // needs an Activity (USB permission is requested with one). Constructing
+        // the client around it keeps every decision ABOVE the bytes testable: the
+        // view model takes an `SwcClient`, which takes an `SwcTransport`, so the
+        // whole state machine runs on the JVM against a fake.
+        val transport = UsbSerialTransport(applicationContext)
+        val model = AppViewModel(SwcClient(transport))
+        vm = model
+        lifecycleScope.launch {
+            // The transport's enumeration result is the only source for the
+            // permission and wrong-device problems, so it must reach the screen.
+            model.reportOpenProblem(transport.open())
+            model.connect()
+        }
         setContent {
             MaterialTheme {
-                Surface(Modifier.fillMaxSize()) { AppRoot() }
+                Surface(Modifier.fillMaxSize()) { AppRoot(model) }
             }
         }
     }
+
+    override fun onDestroy() {
+        vm?.close()
+        vm = null
+        super.onDestroy()
+    }
 }
 
+/**
+ * The app's navigation and the state each screen renders.
+ *
+ * `model` is a parameter rather than created inside so the screens can be driven
+ * with a fake on the JVM. The no-argument overload below is the preview/empty
+ * case: it renders the same screens against default state, which is what the
+ * Robolectric tests use.
+ */
 @Composable
-fun AppRoot() {
+fun AppRoot(model: AppViewModel) {
+    val link by model.link.collectAsState()
+    val ladder by model.ladder.collectAsState()
+    val bindings by model.bindings.collectAsState()
+    val update by model.update.collectAsState()
+    AppScaffold(
+        link = link,
+        ladder = ladder,
+        bindings = bindings,
+        update = update,
+        onRetry = model::retry,
+        onEdit = model::editBinding,
+        onSave = model::save,
+        onCheck = model::checkForUpdates,
+    )
+}
+
+/** The screens against default state, for a preview or a test that wants no device. */
+@Composable
+fun AppRoot() = AppScaffold(
+    link = LinkUiState(),
+    ladder = LadderUiState(idleMv = 0, buttons = emptyList()),
+    bindings = BindingUiState(),
+    update = UpdateUiState(),
+    onRetry = {},
+    onEdit = { _, _ -> },
+    onSave = {},
+    onCheck = {},
+)
+
+@Composable
+private fun AppScaffold(
+    link: LinkUiState,
+    ladder: LadderUiState,
+    bindings: BindingUiState,
+    update: UpdateUiState,
+    onRetry: () -> Unit,
+    onEdit: (BindingCell, Action?) -> Unit,
+    onSave: () -> Unit,
+    onCheck: () -> Unit,
+) {
     var screen by remember { mutableStateOf(Screen.LINK) }
     Scaffold(
         bottomBar = {
@@ -64,18 +142,26 @@ fun AppRoot() {
             }
         },
     ) { padding ->
-        Column(Modifier.padding(padding)) {
+        // NO `verticalScroll` here, and that is a correctness requirement rather
+        // than a style choice. `BindingScreen` scrolls with a `LazyColumn`, and a
+        // `LazyColumn` inside a `Column(verticalScroll)` is measured with an
+        // INFINITE maximum height, which Compose refuses: the app dies with
+        // "Vertically scrollable component was measured with an infinity maximum
+        // height constraints". Each screen owns its own scrolling instead — the
+        // bindings grid gives its `LazyColumn` a weight, so the Save button stays
+        // pinned and visible rather than scrolling off the bottom.
+        Column(Modifier.padding(padding).fillMaxSize()) {
             when (screen) {
-                Screen.LINK -> LinkScreen(state = LinkUiState(), onRetry = {})
-                Screen.LADDER -> LadderScreen(state = LadderUiState(idleMv = 0, buttons = emptyList()))
+                Screen.LINK -> LinkScreen(state = link, onRetry = onRetry)
+                Screen.LADDER -> LadderScreen(state = ladder)
                 Screen.BINDINGS -> BindingScreen(
-                    state = BindingUiState(),
-                    onEdit = {},
-                    onSave = {},
+                    state = bindings,
+                    onEdit = { onEdit(it, null) },
+                    onSave = onSave,
                 )
                 Screen.UPDATE -> UpdateScreen(
-                    state = UpdateUiState(),
-                    onCheck = {},
+                    state = update,
+                    onCheck = onCheck,
                     onPushOverUsb = {},
                     onUpdateOverWifi = {},
                 )

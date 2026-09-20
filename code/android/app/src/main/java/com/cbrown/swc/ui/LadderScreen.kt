@@ -23,6 +23,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import com.oetsolutions.swc.model.Gesture
 import kotlin.math.abs
 
 /**
@@ -48,6 +49,19 @@ data class LadderUiState(
     /** The current reading, or null when no samples have arrived yet. */
     val liveMv: Int? = null,
     val channelName: String = "SWC1",
+    /**
+     * The gesture of the most recent `event` (spec 4.3), and the button it was on.
+     *
+     * **This is what makes the live view a DIAGNOSTIC rather than a voltmeter.**
+     * A live millivolt reading that merely matches a band tells the user where the
+     * line is; it does not tell them what the DEVICE decided. Those differ exactly
+     * when something is wrong — a reading inside the window the classifier rejected
+     * as undecided, or a press that resolved to a different button than the one the
+     * user thought they held. Showing the reported gesture closes that gap: "the
+     * device saw vol_up, and called it a LONG" is actionable, and "1430 mV" is not.
+     */
+    val lastGesture: Gesture? = null,
+    val lastGestureButton: String? = null,
 ) {
     /**
      * The firmware's own ratio: level/idle x 1000 (`LadderRatioPermille`).
@@ -102,6 +116,16 @@ fun LadderScreen(state: LadderUiState, modifier: Modifier = Modifier) {
                     matched?.let { "Classified as: ${it.name}" } ?: "Classified as: nothing",
                     style = MaterialTheme.typography.bodyLarge,
                 )
+                // The gesture the DEVICE reported, which is not derivable from the
+                // reading: the classifier answers "which window", and the gesture
+                // machine answers "single, double or long". Showing both is what
+                // lets a user tell an adapter fault from a head-unit fault.
+                state.lastGesture?.let { g ->
+                    Text(
+                        "Last gesture: ${state.lastGestureButton ?: "?"} ${g.wireName}",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
             }
         }
 

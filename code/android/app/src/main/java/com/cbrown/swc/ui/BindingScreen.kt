@@ -65,7 +65,14 @@ fun BindingScreen(
             style = MaterialTheme.typography.bodySmall,
         )
 
-        LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+        // `weight(1f)` so the list takes the space that is LEFT after the header
+        // and the Save button, rather than measuring itself unbounded. Without it
+        // the list would push Save off the bottom of a long grid, and the user
+        // could edit a binding with no way to store it.
+        LazyColumn(
+            Modifier.weight(1f),
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
             items(state.cells, key = { "${it.buttonId}/${it.gesture}" }) { cell ->
                 Card(Modifier.fillMaxWidth()) {
                     Row(

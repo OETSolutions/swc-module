@@ -1,0 +1,325 @@
+package com.oetsolutions.swc.app
+
+import com.oetsolutions.swc.link.Frame
+import com.oetsolutions.swc.link.LinkState
+import com.oetsolutions.swc.link.SwcClient
+import com.oetsolutions.swc.link.SwcTransport
+import com.oetsolutions.swc.contract.ActionKind
+import com.oetsolutions.swc.model.ConfigJson
+import com.oetsolutions.swc.model.Gesture
+import com.oetsolutions.swc.model.sampleConfig
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.test.TestScope
+import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.StandardTestDispatcher
+import kotlinx.coroutines.test.runTest
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/**
+ * The composition of client and screens.
+ *
+ * **This test exists because nothing composed them.** The plan built the model and
+ * client (Task 20), the screens (Task 21) and the CI gates (Task 22), and no task
+ * joined them: `SwcClient` had no production caller and `MainActivity` rendered
+ * default state with no-op callbacks, so the app could not do anything. A green
+ * suite of client tests and screen tests did not notice, because the defect was the
+ * missing edge between them.
+ *
+ * So the assertions here are all about that edge: a frame from the device changes
+ * what a screen would render; a config reply populates the ladder and the bindings
+ * grid; a save is refused locally when the config is invalid and the local model is
+ * not adopted when the device nacks.
+ */
+@OptIn(ExperimentalCoroutinesApi::class)
+class AppViewModelTest {
+
+    private class FakeTransport : SwcTransport {
+        val written = mutableListOf<String>()
+        private val flow = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
+        override suspend fun write(bytes: ByteArray) {
+            written += String(bytes)
+        }
+        override val incoming: Flow<ByteArray> = flow
+        override fun close() {}
+        suspend fun emit(text: String) = flow.emit(text.toByteArray())
+        fun lastType(): String = written.lastOrNull()
+            ?.let { Regex("\"type\":\"([^\"]+)\"").find(it)?.groupValues?.get(1) } ?: ""
+    }
+
+    /**
+     * Start the receive loop and let it SUBSCRIBE before emitting.
+     *
+     * `incoming` is a `SharedFlow` with no replay and `runTest` does not start a
+     * `launch` until it is advanced, so a frame emitted first is dropped. The same
+     * race exists in production, which is why `MainActivity` opens the transport
+     * and connects inside one `lifecycleScope.launch` after the view model — whose
+     * `init` starts the collector — has been constructed.
+     */
+    /**
+     * A scope the test can DRIVE but does not have to wait for.
+     *
+     * This is the one non-obvious piece of the harness, and it was measured rather
+     * than guessed. `scope = this` (the TestScope itself) works, but then `runTest`
+     * refuses to finish: the view model's four collectors are never cancelled, so
+     * it reports active child jobs and fails a test whose assertions all passed.
+     * `backgroundScope` fixes that but the collectors never subscribe (measured via
+     * `SharedFlow.subscriptionCount`: it stayed 0), so every emitted frame went
+     * nowhere.
+     *
+     * A scope on the TEST SCHEDULER but not parented to the test's job gets both:
+     * `advanceUntilIdle()` drives its coroutines, and `runTest` does not wait for
+     * them to complete.
+     */
+    private fun TestScope.vmScope() = CoroutineScope(StandardTestDispatcher(testScheduler))
+
+    private fun TestScope.started(vm: AppViewModel) = advanceUntilIdle()
+
+    private fun frame(type: String, vararg fields: Pair<String, String>): String {
+        val body = fields.joinToString(",") { (k, v) -> "\"$k\":$v" }
+        val sep = if (body.isEmpty()) "" else ","
+        return "{\"v\":1,\"seq\":1,\"type\":\"$type\"$sep$body}\n"
+    }
+
+    /**
+     * The device's config reply, as a legal chunked run.
+     *
+     * **The chunking is not incidental.** The protocol's line cap is 1024 bytes
+     * (`kNdjsonMaxFrame`), and `kConfigWireChunkBytes` is 512 for exactly that
+     * reason: 512 decoded bytes become 684 base64 characters, which fits with the
+     * envelope around it. An earlier version of this helper emitted the whole
+     * 1409-byte config as ONE chunk, which base64s to 1940 characters — the client
+     * correctly rejected the over-long line as malformed, and the test looked like
+     * a client bug. It was the test asserting a frame the wire cannot carry.
+     */
+    private fun configRun(c: com.oetsolutions.swc.model.Config): List<String> {
+        val bytes = ConfigJson.encode(c).toByteArray()
+        val out = mutableListOf<String>()
+        out += frame("config_begin", "total_len" to "${bytes.size}", "crc32" to "${crcOf(bytes)}")
+        var off = 0
+        while (off < bytes.size) {
+            val end = minOf(off + 512, bytes.size)
+            val chunk = java.util.Base64.getEncoder()
+                .encodeToString(bytes.copyOfRange(off, end))
+            out += frame("config_chunk", "offset" to "$off", "data_b64" to "\"$chunk\"")
+            off = end
+        }
+        out += frame("config_end", "sha256" to "\"${shaOf(bytes)}\"")
+        return out
+    }
+
+    @Test
+    fun `an event frame sets the live reading and the reported gesture`() = runTest {
+        // Spec 4.3's `event` is "the core event", and it is the ONLY frame carrying
+        // a level outside a learn run -- so without this path the live ladder view
+        // has nothing to draw when the user is not learning.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(frame("event", "channel" to "0", "button" to "\"vol_up\"",
+            "gesture" to "\"LONG\"", "t_ms" to "1234", "level_mv" to "1430"))
+        advanceUntilIdle()
+
+        assertEquals(1430, vm.ladder.value.liveMv)
+        assertEquals(Gesture.LONG, vm.ladder.value.lastGesture)
+        assertEquals("vol_up", vm.ladder.value.lastGestureButton)
+        // 1430 matches vol_up's window, so the derived match must find it once the
+        // config has arrived; before that there are no buttons to match against.
+        assertNull(vm.ladder.value.matched())
+    }
+
+    @Test
+    fun `a config reply populates the ladder window and the bindings grid`() = runTest {
+        // The screens render from the config. Before this wiring the ladder showed
+        // no buttons and the bindings grid showed no cells, which is exactly what a
+        // user saw on a device that was working.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        val c = sampleConfig()
+        configRun(c).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        val ladder = vm.ladder.value
+        assertEquals(2835, ladder.idleMv)
+        assertEquals(2, ladder.buttons.size)
+        assertEquals("vol_up", ladder.buttons[0].id)
+        assertEquals(1430, ladder.buttons[0].mvCenter)
+
+        // The grid is one cell per button x gesture, with the config's own binding
+        // on the pairs it binds and null on the pairs it does not.
+        val cells = vm.bindings.value.cells
+        assertEquals(2 * 3, cells.size)
+        val volUpSingle = cells.first { it.buttonId == "vol_up" && it.gesture == "SINGLE" }
+        assertEquals(ActionKind.OUT_VOLTAGE, volUpSingle.action?.kind)
+        val volDn = cells.filter { it.buttonId == "next" }
+        assertTrue("a button with no SINGLE binding must show an empty cell",
+            volDn.first { it.gesture == "SINGLE" }.action == null)
+    }
+
+    @Test
+    fun `a version mismatch from the device becomes a link problem the screen can render`() = runTest {
+        // Spec 4.5: a mismatch must be explicit, and the link screen has a distinct
+        // message for it. A mismatch reaching only `LinkState` would render as
+        // "Failed" and lose both version numbers, which are the whole point of the
+        // message -- the user has to know WHICH side to update.
+        //
+        // Note there is no `hello` payload here, and that is the finding: the
+        // firmware writes `hello.protocol_v` from the same constant as the
+        // envelope's `v`, so a mismatched frame never reaches the `HELLO` branch at
+        // all. The version lives in exactly one place, and this is it.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit("{\"v\":99,\"seq\":1,\"type\":\"hello\",\"fw_version\":\"0.1.0\",\"protocol_v\":99}\n")
+        advanceUntilIdle()
+
+        assertEquals(LinkState.VersionMismatch(firmware = 99, app = 1), vm.link.value.link)
+        assertEquals(
+            com.oetsolutions.swc.link.LinkProblem.VersionMismatch(99, 1),
+            vm.link.value.problem,
+        )
+        // The version is NOT adopted, because the frame was never dispatched: a
+        // device speaking an unknown protocol is not one whose self-description the
+        // app should trust.
+        assertNull(vm.link.value.firmwareVersion)
+    }
+
+    @Test
+    fun `a firmware version on hello is adopted and clears a stale problem`() = runTest {
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+        vm.reportOpenProblem(com.oetsolutions.swc.link.LinkProblem.NoDevice)
+
+        t.emit(frame("hello", "fw_version" to "\"0.2.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+
+        assertEquals("0.2.0", vm.link.value.firmwareVersion)
+        assertEquals(LinkState.Connected, vm.link.value.link)
+        assertNull("a successful hello must clear the enumeration problem", vm.link.value.problem)
+    }
+
+    @Test
+    fun `a transport enumeration problem is what the link screen shows`() = runTest {
+        // The four-state LinkProblem design is unreachable without this: permission
+        // and wrong-device are known before any frame is exchanged, so no frame
+        // could ever produce them.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+        vm.reportOpenProblem(com.oetsolutions.swc.link.LinkProblem.NoUsbPermission("SWC adapter"))
+        advanceUntilIdle()
+        assertEquals(
+            com.oetsolutions.swc.link.LinkProblem.NoUsbPermission("SWC adapter"),
+            vm.link.value.problem,
+        )
+    }
+
+    @Test
+    fun `an edit is held locally and only sent on save`() = runTest {
+        val t = FakeTransport()
+        var saved: com.oetsolutions.swc.model.Config? = null
+        // The save path is injected, so this test exercises the view model's
+        // decision -- what it sends and what it adopts -- without a device.
+        val vm = AppViewModel(SwcClient(t), scope = vmScope(), saveConfig = { c -> saved = c; true })
+        started(vm)
+
+        val c = sampleConfig()
+        configRun(c).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        val cell = vm.bindings.value.cells.first { it.buttonId == "next" && it.gesture == "SINGLE" }
+        vm.editBinding(cell, com.oetsolutions.swc.model.Action(ActionKind.OUT_VOLTAGE, keyMv = 2000))
+        advanceUntilIdle()
+
+        assertNull("nothing may be sent before Save is pressed", saved)
+        // The edit is visible immediately, so the user can see what they changed.
+        assertEquals(ActionKind.OUT_VOLTAGE,
+            vm.bindings.value.cells.first { it.buttonId == "next" && it.gesture == "SINGLE" }
+                .action?.kind)
+
+        vm.save()
+        advanceUntilIdle()
+
+        assertNotNull(saved)
+        val added = saved!!.bindings.firstOrNull { it.button == "next" && it.gesture == Gesture.SINGLE }
+        assertNotNull("the edited cell must appear as a binding in what is sent", added)
+        assertEquals(2000, added!!.actions.first().keyMv)
+    }
+
+    @Test
+    fun `a refused save is reported and the pending edit is retained`() = runTest {
+        // The failure path, and it matters more than the success one: `setConfig`
+        // refuses to adopt the local model on a nack precisely so the app never
+        // displays a config the device is not running. A view model that dropped
+        // the pending edits on failure would show the user their change as saved
+        // while the device still held the old bindings -- and the user's next
+        // action would be based on that false state.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope(), saveConfig = { false })
+        started(vm)
+        configRun(sampleConfig()).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        val cell = vm.bindings.value.cells.first { it.buttonId == "next" && it.gesture == "SINGLE" }
+        vm.editBinding(cell, com.oetsolutions.swc.model.Action(ActionKind.OUT_VOLTAGE, keyMv = 2000))
+        advanceUntilIdle()
+        vm.save()
+        advanceUntilIdle()
+
+        // The edit is still what the screen shows...
+        assertEquals(ActionKind.OUT_VOLTAGE,
+            vm.bindings.value.cells.first { it.buttonId == "next" && it.gesture == "SINGLE" }
+                .action?.kind)
+        // ...and the failure is stated rather than swallowed.
+        assertTrue("a refused save must report a problem, got ${vm.bindings.value.problems}",
+            vm.bindings.value.problems.isNotEmpty())
+    }
+
+    @Test
+    fun `a locally invalid config is refused before it is sent`() = runTest {
+        // The same rule the firmware enforces, checked locally so the user gets the
+        // FIELD named rather than a nack that can only name a check (SwcClient does
+        // this too; this asserts the view model does not bypass it).
+        val t = FakeTransport()
+        var calls = 0
+        val vm = AppViewModel(SwcClient(t), scope = vmScope(), saveConfig = { calls++; true })
+
+        // No config has arrived, so the local model is the codec's default -- which
+        // is not valid (no channel name), and the refusal must happen before the
+        // injected save path is reached.
+        vm.save()
+        advanceUntilIdle()
+
+        assertTrue("the injected save path must not be reached for an invalid config", calls == 0)
+        assertTrue(vm.bindings.value.problems.isNotEmpty())
+    }
+
+    // --- helpers -----------------------------------------------------------
+
+    private fun crcOf(data: ByteArray): Long {
+        var crc = 0xFFFFFFFFL
+        for (b in data) {
+            crc = crc xor (b.toLong() and 0xFF)
+            for (i in 0 until 8) {
+                crc = if (crc and 1L != 0L) (crc ushr 1) xor 0xEDB88320L else crc ushr 1
+            }
+        }
+        return (crc xor 0xFFFFFFFFL) and 0xFFFFFFFFL
+    }
+
+    private fun shaOf(data: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(data).joinToString("") { "%02x".format(it) }
+}

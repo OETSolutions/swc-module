@@ -14,32 +14,8 @@ import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.unit.dp
+import com.oetsolutions.swc.link.LinkProblem
 import com.oetsolutions.swc.link.LinkState
-
-/**
- * Why the app cannot talk to the device, stated so the user can ACT.
- *
- * The plan is explicit that a generic "connection error" is not acceptable, and the
- * reason is practical: the four failures below have four different fixes, and
- * "connection error" tells the user none of them. A version mismatch is not fixed by
- * reseating the cable; a maintenance-mode device is not fixed by reinstalling.
- */
-sealed interface LinkProblem {
-    /** Android has not granted USB permission for this device. */
-    data class NoUsbPermission(val deviceName: String) : LinkProblem
-
-    /** A USB device is attached but it is not the adapter. */
-    data class NotOurDevice(val found: String) : LinkProblem
-
-    /** The firmware speaks a different protocol version (spec 4.5). */
-    data class VersionMismatch(val firmware: Int, val app: Int) : LinkProblem
-
-    /** The device is in maintenance mode and is not serving the app link. */
-    data object InMaintenance : LinkProblem
-
-    /** The cable is not connected, or nothing enumerated. */
-    data object NoDevice : LinkProblem
-}
 
 data class LinkUiState(
     val link: LinkState = LinkState.Disconnected,

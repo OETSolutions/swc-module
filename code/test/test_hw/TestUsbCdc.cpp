@@ -10,6 +10,13 @@
 // BLOCKED until the board exists. The plan says to report that as blocked, not
 // green.
 //
+// **A console that is unreadable is the reason this suite is worth more than it
+// looks.** Installing TinyUSB moves the S3's single internal USB PHY from
+// Serial-JTAG to USB-OTG (verified against Espressif's docs, 2026-09-20 -- spec
+// 4.1), so when these tests run there is no console to print to: a failure here
+// surfaces as a dead USB port, not as a message. Anything that must be observed
+// has to be observed over the CDC link itself or on a meter.
+//
 // The test-definition macro takes an UNQUOTED identifier and stringifies it
 // inside the macro (see test/unity_config.h).
 
@@ -113,6 +120,14 @@ TEST(ShortWritesAgainstTheRealFifoStillSendTheWholeFrame, "[hw]")
 // be the CDC interface. `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG` selects the ROM
 // peripheral; `CONFIG_ESP_CONSOLE_USB_CDC` would move the console onto TinyUSB
 // and let a debug printf be parsed as a protocol frame.
+//
+// **Note what this does NOT establish.** The S3 has one internal USB PHY, shared
+// by both controllers, so selecting Serial-JTAG here does not mean a console will
+// be OBSERVABLE once `UsbLinkStart` installs TinyUSB -- that call moves the PHY to
+// USB-OTG and the console goes dark (spec 4.1, verified 2026-09-20). This test
+// proves the CONFIGURATION is the safe one, which is what the hard requirement is
+// about: no debug byte can be parsed as a frame. An observable console is a
+// separate, unsolved problem.
 TEST(TheConsoleIsNotConfiguredOntoTheCdcPort, "[hw]")
 {
 #if defined(CONFIG_ESP_CONSOLE_USB_CDC)

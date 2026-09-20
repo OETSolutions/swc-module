@@ -674,12 +674,46 @@ decision that unlocks the whole thing:
 | **USB-Serial-JTAG** (ROM) | **Console + JTAG debug only**, and bench flashing | Built into ROM; always enumerates, even with a dead app. Never carries the app protocol. |
 | **TinyUSB CDC** (OTG) | **The Android command link** | Application-controlled, independent of the console. |
 
-**Both may be active at once.** Keeping the console on USB-Serial-JTAG and the
-protocol on TinyUSB CDC means a debug `printf` can never be mistaken by the
-Android app for a protocol frame — the classic failure when both share one CDC.
+**Both may NOT be active at once on this board — only ONE internal PHY exists.**
+Espressif's own documentation is unambiguous: for the ESP32-S3, "both controllers
+share a single internal PHY, allowing only one to operate at a time", and "by
+adding an external PHY, it is possible to enable the simultaneous operation of
+both USB-OTG and USB-Serial-JTAG" (ESP-IoT-Solution, *USB PHY/Transceiver
+Introduction*; ESP-IDF *USB Host* — both verified 2026-09-20). This board has **no
+external PHY**, so **the two are mutually exclusive.**
+
+**What the ESP-IDF documentation says must be read exactly, because it is
+counter-intuitive and it decides the design:** "If there is a need to develop a
+USB-OTG application using the USB Host Driver or the TinyUSB protocol stack,
+**during protocol stack initialization, the USB-PHY connection will
+automatically switch to USB-OTG**" (same source). So calling `tinyusb_driver_install`
+— which `UsbLinkStart` does unconditionally at boot — **takes the PHY away from
+USB-Serial-JTAG.** The consequence is not a lost convenience:
+
+- The console is gone at runtime, so the `ESP_LOG*` output the firmware is full of
+  goes nowhere, including `UsbLinkStart`'s own "tinyusb driver install failed" —
+  the message that reports the link failing is itself unreadable.
+- **ROM download mode stops using USB-Serial-JTAG.** Espressif: "In USB-OTG mode,
+  if users wish to utilize the download functionality of USB-Serial-JTAG, they need
+  to manually boot into download mode." Whether an automatic reset still enters ROM
+  download over the internal PHY is a **bring-up question**, not a settled fact —
+  and it is the difference between "reflash by unplugging and replugging" and "open
+  the enclosure and hold BOOT + RESET", which matters because §2.2 recesses the BOOT
+  button behind a Ø5 lid hole. Verify it against the board (§10.6 step 1); the eFuse
+  route (`USB_PHY_SEL`) is one-way and must not be burned to find out.
+
+**The requirement the design actually keeps is the important one**, and it holds
+regardless: the app protocol must never share a CDC interface with debug output, so
+a stray `printf` can never be parsed as a protocol frame. Today that is satisfied by
+`CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` with the console gone once TinyUSB installs.
+The two ways to restore an observable console are a **UART0 console on unused
+GPIO43/44** (needs header pins or test pads on a respin) or an external PHY (≥6
+GPIOs, worse). Neither is in the current design — so **a production build has no
+console**, and §10.5's free-heap gate cannot be instrumented on-device as written.
 
 **This is a hard requirement:** the console must never be configured onto the
-TinyUSB CDC port in a production build. §10 tests it.
+TinyUSB CDC port in a production build. §10 tests it — and that test, as written,
+asserts a state (both enumerate at once) this board cannot reach.
 
 > **Build consequence, verified 2026-09-18 (Task 1, against IDF 5.5.5): TinyUSB
 > is not part of IDF — it is the managed component `espressif/esp_tinyusb`.**
@@ -2273,8 +2307,13 @@ logic:
 - **Gain-mode envelope** — drive the DAC across its range in both gain modes and
   assert the measured output stays in 1.80–5.20 V and switches cleanly at the
   guard band. §6.2's numbers are only true if this passes.
-- **USB enumeration** — both the CDC interface and the console enumerate
-  simultaneously on one cable, and the console does not corrupt the app link.
+- **USB enumeration** — the CDC interface enumerates on the cable and carries the
+  app protocol. **Do NOT assert that the console enumerates at the same time**: the
+  S3 has one internal PHY and installing TinyUSB moves it to USB-OTG, so the
+  Serial-JTAG console is gone once the link is up (§4.1). The real checks are
+  (a) the CDC interface carries a well-formed frame, and (b) **whether a
+  reset still enters ROM download mode over USB** — which is a question, not a
+  given, and the one that decides how the board is reflashed in the car.
 - **NVS round-trip and power-loss** — write a config, cut power mid-write
   (hardware-interruptible power switch on the bench), assert boot delivers the
   old config.
@@ -2314,6 +2353,7 @@ answer the questions the user actually cares about:
 | Free-heap headroom | runtime assertion in the device test | ≥ 20 % free at worst-case steady state |
 | Config fits NVS | `ConfigCodec` size assertion: worst case > **4000 B per value** (so the chunked path is exercised, not dead code), and **two slots + `cfg_seq` ≤ 48,384 B** of entry space at **2,112 B per 2048-byte chunk** — counting NVS's metadata and `BLOB_IDX` entries, not just the payload |
 | Contract in sync | `tools/gen_contract*.py` then `git diff --exit-code` | No diff |
+| Cross-language codec agreement | `tools/crosscheck_config.sh` | The app's `contract/swc_sample_config.json` decodes with the firmware's own decoder, validates, and re-encodes **byte-identically** (exit 0). This is the only gate that can see a Kotlin/C codec divergence: each side's own round-trip test compares that side to itself |
 | Android builds | `./gradlew assembleDebug test` | Clean, tests pass |
 
 **If the app does not fit 1920 KB**, the documented fallback is §9.6's separate
@@ -2462,6 +2502,7 @@ ordered board and are called out in §12 as the critical path.
 | N-13 | **Two of §8.2's four maintenance triggers are unreachable.** The USB command and the 3 s AUX1 hold are wired and tested. The **config flag on next boot** needs a `DeviceSettings` field that does not exist, so nothing can set it; the **reset-reason + no-config** trigger needs a reset-reason source, which `IHAL` does not expose either. Both `MaintenanceTrigger::kConfigFlag` and `kNoConfigAtBoot` are therefore defined and tested in isolation but never produced by the device. A user whose car has no WiFi and no working AUX1 has no way into the window | Before the board arrives | No — the primary trigger works from the app, and the AUX1 hold is the documented no-app fallback, so one of the two no-tool paths is live |
 | N-14 | **USB OTA (spec 9.3) is not reachable, and its flash write is untested.** `OtaUsb` implements the whole run — the verify gate, the chunk accumulation, the commit — and `CommandRouter` still nacks `ota_begin`/`ota_chunk`/`ota_end` as `not_implemented`, so no host can start one. The commit `30c00df` added `OtaUsb.c` and its plan step 5 says the router drives it; the router was never changed, so the "both OTA paths" claim in that message described one working path and one library. A host suite now covers the verification half (the `ESP_PLATFORM`-guarded flash write cannot run on the host, and `OtaSupported()` is false there by design), but until the router is wired, USB OTA needs the `app_update`/`esp_partition` calls exercised on a real board. **Do NOT wire the router to `OtaUsb` before the board exists.** The wiring itself is small, which is exactly the trap: it would switch on the only path in this project that can brick a device, and it could not be run once before shipping. Today the router refuses safely and no host can start a run. Wire it and verify it with the board present, together, on an image that is deliberately corrupt first — the refusal is then proved before the write is ever trusted. No radio is needed either way; the verification half is already host-tested | With the board, as one change — **not before** | No — the WiFi path exists and needs no USB, so the feature is one path down |
 | N-15 | **`MaintenanceMode` is pure state and nothing starts the radio.** `lib/Maintenance/BleProvisioning.cpp` and `lib/Maintenance/WebPage.cpp` are written and unit-tested but no translation unit calls them, and the plan's `MaintenanceStartRadio()`/`MaintenanceStopRadio()` entry points named in Task 18 step 4 do not exist. So a maintenance window currently opens and lights `LED_STAT` without bringing up NimBLE or the web server, and spec §8.2's "on exit the radio stacks are fully de-initialized" has nothing to de-initialize. The wiring is device-only work: it needs NimBLE, `wifi_provisioning` and an HTTP server running, none of which can be exercised on the host | After the board arrives | Yes, for FR-34 — the provisioning test needs the real Espressif app and a real radio |
+| N-16 | **A production build has no readable console, and reflash-by-USB is unverified.** The S3 has ONE internal USB PHY shared by USB-Serial-JTAG (the console) and USB-OTG (TinyUSB CDC, the app link), so installing TinyUSB at boot moves the PHY and the console goes dark -- Espressif: "both controllers share a single internal PHY, allowing only one to operate at a time" and "during protocol stack initialization, the USB-PHY connection will automatically switch to USB-OTG" (verified 2026-09-20). Consequences: every `ESP_LOG*` line the firmware emits is unreadable at runtime, including `UsbLinkStart`'s own install-failure warning; and whether a reset still enters ROM download mode over USB is unverified, which decides whether reflashing needs the recessed BOOT button (§2.2) to be pressed. §4.1 previously claimed "both may be active at once", which this board cannot do. The console can be restored with a UART0 console on unused GPIO43/44 (needs header pins or test pads on a respin), or an external PHY (≥6 GPIOs). Decide which before finalising the PCB | **Before the board is finalised** for the hardware question; the download-mode check is §10.6 step 1 | Yes — it changes the pinout or the bring-up procedure |
 
 ### 12.2 Risks, ranked by expected damage
 

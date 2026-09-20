@@ -8322,6 +8322,15 @@ driven by `ota_begin`/`ota_chunk`/`ota_end` frames from `CommandRouter`.
 Both write to the **non-running** OTA slot and call `esp_ota_set_boot_partition`
 only after `ImageVerifyEnd()` returns `kOk`.
 
+> **The USB half of this step was never wired.** `CommandRouter` still nacks
+> `ota_begin`/`ota_chunk`/`ota_end` as `not_implemented`, so nothing can start a
+> run. `OtaUsb` itself is complete and now host-tested
+> (`test_native/test_update/OtaUsbTest.cpp`, covering the verify gate and the
+> state machine's refusals); the flash write is `ESP_PLATFORM`-guarded and needs
+> the board. Task 18 step 4 has the same gap: it names
+> `MaintenanceStartRadio()`/`MaintenanceStopRadio()`, which do not exist, so
+> nothing starts the radio either. See open items N-14 and N-15.
+
 - [ ] **Step 6: Implement the health confirmation (FR-37) — on device**
 
 In `main.c`, after `SystemOrchestratorBoot()` succeeds and the first successful

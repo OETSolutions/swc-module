@@ -68,7 +68,14 @@ OtaResult OtaBegin(size_t image_size, const char *sha256_hex, size_t max_size) {
 
 OtaResult OtaChunk(const uint8_t *data, size_t len) {
     if (!run_open_) return OtaResult::kNotStarted;
-    if (data == nullptr && len != 0) return OtaResult::kVerifyFailed;
+    if (data == nullptr && len != 0) {
+        // A malformed frame, and it must CLOSE the run like every other failure
+        // here. Returning a failure while staying open leaves the caller with a
+        // run the device has already rejected but will keep accepting chunks
+        // into, which is not a state any of the other exit paths can produce.
+        OtaAbort();
+        return OtaResult::kVerifyFailed;
+    }
 
     // Verify and write from the SAME buffer. Two passes over data that could
     // change between them is how a device verifies one image and flashes another.

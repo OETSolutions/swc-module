@@ -66,11 +66,6 @@ class UsbSerialTransport(private val context: Context) : SwcTransport {
     private var reader: Job? = null
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
-    /** The last enumeration failure, for the UI to render as a specific problem. */
-    @Volatile
-    var lastProblem: LinkProblem? = null
-        private set
-
     /**
      * Find the adapter, get permission if needed, and open the port.
      *
@@ -86,22 +81,22 @@ class UsbSerialTransport(private val context: Context) : SwcTransport {
             // Distinguish "nothing plugged in" from "something else is". The two
             // have different fixes, which is the whole reason LinkProblem exists.
             val any = manager.deviceList.values.firstOrNull()
-            return (if (any == null) LinkProblem.NoDevice
-            else LinkProblem.NotOurDevice(any.deviceName)).also { lastProblem = it }
+            return if (any == null) LinkProblem.NoDevice
+            else LinkProblem.NotOurDevice(any.deviceName)
         }
         if (!manager.hasPermission(device)) {
             if (!awaitPermission(device)) {
-                return LinkProblem.NoUsbPermission(device.deviceName).also { lastProblem = it }
+                return LinkProblem.NoUsbPermission(device.deviceName)
             }
         }
         val (iface, inEp, outEp) = findEndpoints(device)
-            ?: return LinkProblem.NotOurDevice(device.deviceName).also { lastProblem = it }
+            ?: return LinkProblem.NotOurDevice(device.deviceName)
 
         val conn = manager.openDevice(device)
-            ?: return LinkProblem.NotOurDevice(device.deviceName).also { lastProblem = it }
+            ?: return LinkProblem.NotOurDevice(device.deviceName)
         if (!conn.claimInterface(iface, true)) {
             conn.close()
-            return LinkProblem.NotOurDevice(device.deviceName).also { lastProblem = it }
+            return LinkProblem.NotOurDevice(device.deviceName)
         }
         // The firmware waits for DTR before it sends `hello`, because a host that
         // has not opened the port is not reading. Asserting it here is what makes
@@ -118,7 +113,6 @@ class UsbSerialTransport(private val context: Context) : SwcTransport {
         epIn = inEp
         epOut = outEp
         startReader()
-        lastProblem = null
         return null
     }
 

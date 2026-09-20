@@ -2372,7 +2372,7 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR | Verified by | Location | The assertion that actually decides it |
 | --- | --- | --- | --- |
 | FR-1 | Non-blocking acquisition test | N + D | Under a 20 ms injected USB stall, ADC sample cadence stays within 5 % of nominal |
-| FR-2 | `CalibrationCurve` + ADC linearity | N + D | Curve-fit error ≤ 25 mV over 0–2.9 V; a fixed-linear-scale implementation fails this |
+| FR-2 | `CalibrationCurve` + ADC linearity | N + **D** | **N:** endpoints map exactly, monotonic across the full raw range, never above the 2.9 V ceiling for this attenuation, midscale within 25 mV of half-scale, and a blank eFuse falls back to the linear curve *and reports which source it used*. **D (not yet run):** the curve-fit *accuracy* against a bench reference — it needs the real eFuse, so it cannot be a host test, and an earlier revision of this row claimed a host test for it |
 | FR-3 | Filter settling test | N | Step response settles in < `debounce_ms`, and a 20 ms press is not attenuated below the detection threshold |
 | FR-4 | Fault-injection tests | N + D | Open input and a short-to-rail each release the KEY line and latch `LED_STAT` blink rather than classifying as a button. **Not** a `FAULT_*` buzzer: no such pattern names this subsystem (N-10) |
 | FR-5 | Live-sample stream test | N + D | During learn, ≥ 20 samples/s reach the link with bounded latency |

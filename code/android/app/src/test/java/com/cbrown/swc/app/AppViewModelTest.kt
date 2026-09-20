@@ -4,6 +4,7 @@ import com.oetsolutions.swc.link.Frame
 import com.oetsolutions.swc.link.LinkState
 import com.oetsolutions.swc.link.SwcClient
 import com.oetsolutions.swc.link.SwcTransport
+import com.oetsolutions.swc.action.ActionOutcome
 import com.oetsolutions.swc.contract.ActionKind
 import com.oetsolutions.swc.model.ConfigJson
 import com.oetsolutions.swc.model.Gesture
@@ -304,6 +305,74 @@ class AppViewModelTest {
 
         assertTrue("the injected save path must not be reached for an invalid config", calls == 0)
         assertTrue(vm.bindings.value.problems.isNotEmpty())
+    }
+
+    @Test
+    fun `a recognized event runs the app-side action bound to that button and gesture`() = runTest {
+        // Spec 3.6 splits the library: the firmware does the OUT_ family and the APP
+        // does everything else. The firmware releases the line for an app-side kind
+        // rather than hold a key with no action behind it, so if the app does not
+        // resolve the binding here, the user's binding does nothing at all --
+        // which is exactly what happened while ActionRunner had no caller.
+        val t = FakeTransport()
+        val ran = mutableListOf<String>()
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            runAppAction = { kind, target, _ -> ran += "$kind:$target"; ActionOutcome.Ran },
+        )
+        started(vm)
+        configRun(sampleConfig()).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        // The fixture binds `next` DOUBLE to APP_LAUNCH of com.spotify.music.
+        t.emit(frame("event", "channel" to "0", "button" to "\"next\"",
+            "gesture" to "\"DOUBLE\"", "t_ms" to "10", "level_mv" to "2145"))
+        advanceUntilIdle()
+
+        assertEquals(listOf("APP_LAUNCH:com.spotify.music"), ran)
+        assertTrue("a successful action reports no problem", vm.actionOutcomes.value.isEmpty())
+    }
+
+    @Test
+    fun `an app-side action that cannot run is reported, not swallowed`() = runTest {
+        // "The button did nothing" is the outcome ActionOutcome exists to prevent.
+        val t = FakeTransport()
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            runAppAction = { _, _, _ -> ActionOutcome.Blocked("Android refused from the background") },
+        )
+        started(vm)
+        configRun(sampleConfig()).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        t.emit(frame("event", "channel" to "0", "button" to "\"next\"",
+            "gesture" to "\"DOUBLE\"", "t_ms" to "10", "level_mv" to "2145"))
+        advanceUntilIdle()
+
+        assertTrue("a blocked action must be reported",
+            vm.actionOutcomes.value.any { it.contains("refused") })
+    }
+
+    @Test
+    fun `an event with no binding for that pair runs nothing`() = runTest {
+        // vol_up SINGLE is bound to OUT_VOLTAGE, which is the FIRMWARE's to execute.
+        // The app must not treat it as its own and must not report it as a failure.
+        val t = FakeTransport()
+        val ran = mutableListOf<String>()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope(),
+            runAppAction = { kind, target, _ -> ran += "$kind:$target"; ActionOutcome.Ran })
+        started(vm)
+        configRun(sampleConfig()).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        t.emit(frame("event", "channel" to "0", "button" to "\"vol_up\"",
+            "gesture" to "\"SINGLE\"", "t_ms" to "10", "level_mv" to "1430"))
+        advanceUntilIdle()
+
+        assertTrue("an OUT_ binding is the firmware's, not the app's", ran.isEmpty())
+        assertTrue("and it is not an app-side failure", vm.actionOutcomes.value.isEmpty())
     }
 
     // --- helpers -----------------------------------------------------------

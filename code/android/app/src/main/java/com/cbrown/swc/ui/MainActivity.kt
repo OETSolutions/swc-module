@@ -21,6 +21,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.runtime.collectAsState
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.lifecycleScope
+import com.oetsolutions.swc.action.ActionRunner
 import com.oetsolutions.swc.app.AppViewModel
 import com.oetsolutions.swc.link.SwcClient
 import com.oetsolutions.swc.link.UsbSerialTransport
@@ -55,7 +56,13 @@ class MainActivity : ComponentActivity() {
         // view model takes an `SwcClient`, which takes an `SwcTransport`, so the
         // whole state machine runs on the JVM against a fake.
         val transport = UsbSerialTransport(applicationContext)
-        val model = AppViewModel(SwcClient(transport))
+        val model = AppViewModel(
+            SwcClient(transport),
+            // Spec 3.6: the app executes the non-OUT_ kinds. Passing the runner is
+            // what makes an app-side binding (launch an app, send an intent)
+            // actually fire when the wheel reports a press.
+            runAppAction = ActionRunner(applicationContext)::run,
+        )
         vm = model
         lifecycleScope.launch {
             // The transport's enumeration result is the only source for the

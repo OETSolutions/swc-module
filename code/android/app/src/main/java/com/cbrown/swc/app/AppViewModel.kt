@@ -1,5 +1,7 @@
 package com.oetsolutions.swc.app
 
+import com.oetsolutions.swc.action.ActionOutcome
+import com.oetsolutions.swc.action.ActionRunner
 import com.oetsolutions.swc.contract.Frames
 import com.oetsolutions.swc.link.Frame
 import com.oetsolutions.swc.link.LinkProblem
@@ -54,7 +56,35 @@ class AppViewModel(
      * to know how the bytes travel.
      */
     private val saveConfig: suspend (Config) -> Boolean = { c -> client.setConfig(c) is com.oetsolutions.swc.link.AckResult.Ok },
+    /**
+     * Running a kind the FIRMWARE does not execute, or null when this build has no
+     * way to (a test, a preview).
+     *
+     * Spec 3.6 splits the action library in two: the `OUT_` family is executed by
+     * the firmware, and **everything else is executed by Android**. The firmware
+     * confirms a recognized press with `event` and then, for an app-side kind,
+     * releases the line rather than holding a key with no action behind it — the
+     * phantom-key hazard. So the app must run the action on receipt, and without
+     * this it never did: `ActionRunner` had no caller at all.
+     *
+     * A FUNCTION rather than an `ActionRunner`, because the real class needs a
+     * `Context` and is not open. Injecting the three-argument call keeps the
+     * dispatch decision testable on the JVM, with `ActionRunner` left as the thin
+     * `when` it already is.
+     */
+    private val runAppAction: ((kind: String, target: String, payload: String) -> ActionOutcome)? = null,
 ) {
+
+    private val _actionOutcomes = MutableStateFlow<List<String>>(emptyList())
+
+    /**
+     * App-side actions that could not run, stated so the user can act.
+     *
+     * This is the surface for spec 3.6's Android BAL limitation: an app launched
+     * from the background may be refused by the system (hence `targetSdk` 34), and
+     * "the button did nothing" is the outcome `ActionOutcome` exists to prevent.
+     */
+    val actionOutcomes: StateFlow<List<String>> = _actionOutcomes.asStateFlow()
 
     private val _link = MutableStateFlow(LinkUiState())
     val link: StateFlow<LinkUiState> = _link.asStateFlow()
@@ -154,6 +184,11 @@ class AppViewModel(
                         lastGesture = gesture?.let { Gesture.fromWireName(it) ?: Gesture.NONE },
                         lastGestureButton = id,
                     )
+                    // Spec 3.6: an app-side kind is the APP's job, and the firmware
+                    // has already released the line rather than hold a key with no
+                    // action behind it. Resolving here is what makes an app-side
+                    // binding do anything at all.
+                    if (gesture != null) runAppSideAction(id, gesture)
                 }
             }
 
@@ -181,6 +216,57 @@ class AppViewModel(
         if (index == null || index < 0 || index >= channels.size) return _ladder.value.channelName
         return channels[index].name.ifEmpty { "SWC${index + 1}" }
     }
+
+    /**
+     * Run the actions bound to (button, gesture), for the kinds Android executes.
+     *
+     * Spec 3.6's split: the firmware does the `OUT_` family, and every other kind is
+     * the app's. A kind neither side knows is reported rather than dropped — a
+     * binding the user made that silently does nothing is the failure mode
+     * `ActionOutcome` exists to prevent.
+     *
+     * **The firmware still executes its own actions for this press.** This is not a
+     * replacement path: the device drives the KEY line and confirms with `event`
+     * regardless, and spec 3.5 requires that a failed app-side action never
+     * prevents the hardware key press. So a failure here is reported and nothing
+     * else is affected.
+     */
+    private fun runAppSideAction(buttonId: String, gestureName: String) {
+        val gesture = Gesture.fromWireName(gestureName) ?: return
+        val bindings = client.config.value.bindings.filter {
+            it.enabled && it.button == buttonId && it.gesture == gesture
+        }
+        if (bindings.isEmpty()) return
+
+        val outcomes = mutableListOf<String>()
+        for (binding in bindings) {
+            for (action in binding.actions) {
+                val outcome = when (action.kind.wireName) {
+                    "OUT_VOLTAGE", "OUT_RELEASE", "NONE", "BUZZ" ->
+                        // The firmware's half of spec 3.6. It has already done it.
+                        null
+                    else -> runOne(action)
+                }
+                if (outcome != null) outcomes += "$buttonId $gestureName: $outcome"
+            }
+        }
+        _actionOutcomes.value = outcomes
+    }
+
+    /** One action, through the injected runner if this build has one. */
+    private fun runOne(action: Action): String? {
+        val run = runAppAction
+            ?: return "${action.kind.wireName} needs the app, but no action runner is available"
+        val outcome = run(action.kind.wireName, action.target, action.payload)
+        return when (outcome) {
+            ActionOutcome.Ran -> null
+            is ActionOutcome.AppNotInstalled -> "${outcome.pkg} is not installed"
+            is ActionOutcome.NoHandler -> "nothing on this phone handles ${outcome.action}"
+            is ActionOutcome.Blocked -> outcome.reason
+            is ActionOutcome.NotAppSide -> "${outcome.kind} is not an app-side action"
+        }
+    }
+
 
     /**
      * The device's config became known (from a `config_get` reply run).

@@ -144,6 +144,11 @@ bool ConfigValidate(const Config &c) {
 
     // Bindings are a top-level table (spec 3.1/3.5), so their checks are too.
     if (c.binding_count > kMaxBindings) return false;
+    // The AUX table is read the same way as every other counted array, and its
+    // count was the one left unbounded. `BindingNamesARealInput` loops
+    // `i < c.aux_count` over `c.aux[i]`, so a count past the 3-entry array reads
+    // off the end -- in this function, which exists to reject exactly that.
+    if (c.aux_count > kMaxAuxButtons) return false;
     for (uint8_t i = 0; i < c.binding_count; ++i) {
         const Binding &b = c.bindings[i];
         if (b.action_count > kMaxActionsPerBinding) return false;

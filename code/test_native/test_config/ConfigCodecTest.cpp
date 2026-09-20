@@ -168,6 +168,16 @@ TEST(ConfigCodec, ValidationRejectsInconsistentConfigs) {
     c.binding_count = static_cast<uint8_t>(kMaxBindings + 1);
     EXPECT_FALSE(ConfigValidate(c)) << "more bindings than the budget allows";
 
+    // Every OTHER count in a Config is checked against its array before use --
+    // channel_count, ladder.count, binding_count, action_count -- because a count
+    // past its array makes the next read run off the end. `aux_count` is the one
+    // that is not, and it is read the same way: BindingNamesARealInput loops
+    // `i < c.aux_count` over `c.aux[i]`. An out-of-range count is a read past the
+    // 3-entry array, in the validation function that exists to catch exactly this.
+    c = MakeConfig();
+    c.aux_count = static_cast<uint8_t>(kMaxAuxButtons + 1);
+    EXPECT_FALSE(ConfigValidate(c)) << "more AUX buttons than the array holds";
+
     c = MakeConfig();
     c.bindings[1].action_count = static_cast<uint8_t>(kMaxActionsPerBinding + 1);
     EXPECT_FALSE(ConfigValidate(c)) << "more actions per binding than the budget allows";

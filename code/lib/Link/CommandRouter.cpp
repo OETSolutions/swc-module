@@ -119,6 +119,13 @@ void CommandRouter::BeginConfigReplyRun() {
 }
 
 void CommandRouter::Process() {
+    // A learn run streams whether or not a config reply is in flight. One sample
+    // per call, so the stream cannot starve the reply run or the key path.
+    if (learn_open_ && !reply_open_) {
+        EmitLadderSample();
+        ++learn_samples_;
+        return;
+    }
     if (!reply_open_) return;
 
     // config_begin is emitted EXACTLY ONCE. Keying it off `reply_off_ == 0`
@@ -250,6 +257,12 @@ void CommandRouter::OnLine(const char *line, size_t len) {
         HandleIdentify(root, h.seq);
     } else if (strcmp(h.type, "reboot") == 0) {
         HandleReboot(root, h.seq);
+    } else if (strcmp(h.type, "learn_start") == 0) {
+        HandleLearnStart(root, h.seq);
+    } else if (strcmp(h.type, "learn_stop") == 0) {
+        HandleLearnStop(root, h.seq);
+    } else if (strcmp(h.type, "learn_commit") == 0) {
+        HandleLearnCommit(root, h.seq);
     } else if (strcmp(h.type, "time_sync") == 0) {
         // Accepted and acked: the firmware has no RTC and no wall-clock use, so
         // storing it would be a field nothing reads. Acking is honest -- the
@@ -259,7 +272,7 @@ void CommandRouter::OnLine(const char *line, size_t len) {
         snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(h.seq));
         Emit("ack", body);
     } else {
-        // learn_*, ota_*, maintenance_* belong to later tasks. They are KNOWN
+        // ota_* and maintenance_* belong to later tasks. They are KNOWN
         // commands (so they are not "unknown_type"), but this build cannot yet
         // execute them, and saying that is better than a silent no-op.
         Nack(h.seq, "not_implemented", h.type);
@@ -495,6 +508,149 @@ void CommandRouter::HandleIdentify(const cJSON *root, uint32_t for_seq) {
     }
     char body[64];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
+    Emit("ack", body);
+}
+
+/*
+ * FR-5's live stream. `ladder_sample` carries the FILTERED level so the app can
+ * render the ladder while the user holds a button -- which is what makes learn
+ * usable at all: the user needs to see the reading move as they press.
+ *
+ * It is emitted one per Process() call while a learn run is open, not in a burst,
+ * for the same reason the config reply is chunked: the transport's TX buffer is
+ * two frames deep, and a burst would overflow it and drop samples.
+ *
+ * Spec 4.3 says >=20 samples/s reaches the link with bounded latency. At the
+ * 10 ms poll rate that is satisfied with margin; the bound here is that Process()
+ * emits AT MOST one sample per tick, so the stream cannot starve the key path.
+ */
+void CommandRouter::EmitLadderSample() {
+    if (!learn_open_) return;
+    // `sys_ == nullptr` reports 0 rather than suppressing the frame. The stream's
+    // contract is "a sample per tick while the run is open" (FR-5), and a reader
+    // that suddenly gets NO frames cannot tell a missing level from a dead link.
+    // 0 mV is unambiguous: it is below the ladder's floor, so the app renders it
+    // as "no reading" rather than as a real level.
+    const int level_mv = (sys_ != nullptr)
+                             ? sys_->FilteredLevelMv(static_cast<uint8_t>(learn_channel_))
+                             : 0;
+    char body[160];
+    snprintf(body, sizeof(body),
+             "\"channel\":%d,\"raw_mv\":%d,\"n\":%u",
+             learn_channel_, level_mv, static_cast<unsigned>(learn_samples_));
+    Emit("ladder_sample", body);
+}
+
+void CommandRouter::HandleLearnStart(const cJSON *root, uint32_t for_seq) {
+    // No orchestrator is required HERE. `learn_start` only opens the stream; the
+    // orchestrator is needed to SAMPLE (`learn_commit`), and requiring it here
+    // would refuse a legitimate stream in any host build without one.
+    const cJSON *ch = Num(root, "channel");
+    if (ch == nullptr) {
+        Nack(for_seq, "bad_param", "channel is required");
+        return;
+    }
+    const int channel = static_cast<int>(ch->valuedouble);
+    if (channel < 0 || channel >= kMaxChannels) {
+        Nack(for_seq, "bad_param", "channel out of range");
+        return;
+    }
+    // A learn run that is already open is RE-STARTED rather than refused: the app
+    // sends learn_start again when the user switches button, and refusing would
+    // make the UI show an error for a legitimate action.
+    learn_open_ = true;
+    learn_channel_ = channel;
+    learn_samples_ = 0;
+    // The session is seeded with the channel's CURRENT profile so a learn that
+    // overlaps an existing button can be refused (LearnReject::kTooCloseToExisting)
+    // rather than silently creating two windows that classify the same level.
+    LadderProfile existing{};
+    if (store_ != nullptr) {
+        Config cur{};
+        if (store_->Load(&cur) == ConfigLoadResult::kLoaded) {
+            existing = cur.channels[channel].ladder;
+        }
+    }
+    session_.Start(channel, existing);
+
+    char body[64];
+    snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
+    Emit("ack", body);
+}
+
+void CommandRouter::HandleLearnStop(const cJSON *root, uint32_t for_seq) {
+    (void)root;
+    // Closing the stream. The app is expected to follow with learn_commit if it
+    // wants the button stored; stopping alone stores nothing.
+    learn_open_ = false;
+    char body[64];
+    snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
+    Emit("ack", body);
+}
+
+void CommandRouter::HandleLearnCommit(const cJSON *root, uint32_t for_seq) {
+    if (sys_ == nullptr || store_ == nullptr) {
+        Nack(for_seq, "unavailable", "no orchestrator");
+        return;
+    }
+    const cJSON *ch = Num(root, "channel");
+    const cJSON *btn = Str(root, "button_id");
+    const cJSON *name = Str(root, "name");
+    if (ch == nullptr || btn == nullptr || name == nullptr) {
+        Nack(for_seq, "bad_param", "channel, button_id and name are required");
+        return;
+    }
+    const int channel = static_cast<int>(ch->valuedouble);
+    if (channel < 0 || channel >= kMaxChannels) {
+        Nack(for_seq, "bad_param", "channel out of range");
+        return;
+    }
+
+    // The session holds every sample the stream carried. The idle reference is
+    // the LEARNED one from the running config (spec 6.3) -- reading the live idle
+    // here would make the ratio denominator move with the rail, which is exactly
+    // what renormalizing by a pinned idle exists to prevent.
+    const int level_mv = sys_->FilteredLevelMv(static_cast<uint8_t>(channel));
+    const int idle_mv = sys_->IdleReferenceMv(static_cast<uint8_t>(channel));
+    session_.AddSample(level_mv, idle_mv, static_cast<MilliVolt>(idle_mv), 0,
+                       hal_ ? hal_->now_ms(hal_->ctx) : 0);
+
+    LadderButton out{};
+    // id and name are the CALLER's: a slug and a display label are not facts
+    // about a voltage, and learn cannot invent them (LearnSession.h).
+    snprintf(out.id, sizeof(out.id), "%s", btn->valuestring);
+    snprintf(out.name, sizeof(out.name), "%s", name->valuestring);
+    const LearnReject r = session_.Commit(&out);
+
+    if (r != LearnReject::kNone) {
+        // FR-29: the reason is specific and actionable. "it didn't work" is not
+        // something a user holding a button one-handed can act on.
+        Nack(for_seq, "learn_rejected", LearnRejectReason(r));
+        return;
+    }
+
+    // Persisted through the config, NOT as a side channel: a learned button that
+    // is not in the config is a button that vanishes at reboot.
+    Config c{};
+    if (store_->Load(&c) != ConfigLoadResult::kLoaded) c = ConfigDefault();
+    LadderProfile &lp = c.channels[channel].ladder;
+    if (lp.count < kLadderMaxButtons) {
+        lp.buttons[lp.count++] = out;
+        lp.learned_idle_mv = session_.LearnedIdleMv();
+    } else {
+        Nack(for_seq, "no_space", "the ladder has no free button slot");
+        return;
+    }
+    if (!store_->Save(c)) {
+        Nack(for_seq, "save_failed", "could not persist the learned button");
+        return;
+    }
+
+    char body[192];
+    snprintf(body, sizeof(body),
+             "\"for_seq\":%u,\"ok\":true,\"mv_center\":%u,\"mv_tolerance\":%u",
+             static_cast<unsigned>(for_seq), static_cast<unsigned>(out.mv_center),
+             static_cast<unsigned>(out.mv_tolerance));
     Emit("ack", body);
 }
 

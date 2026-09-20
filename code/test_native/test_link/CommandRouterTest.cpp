@@ -499,17 +499,48 @@ TEST(CommandRouter, AConfigPatchToAnUnknownPathIsRefusedAndChangesNothing) {
 }
 
 TEST(CommandRouter, AKnownButUnimplementedCommandIsDistinguishedFromAnUnknownOne) {
-    // learn_* / ota_* / maintenance_* are in the spec's vocabulary (so they are
-    // not unknown_type) but this build cannot execute them. Saying so is better
-    // than a silent no-op, which the app would read as success.
+    // ota_* and maintenance_* are in the spec's vocabulary (so they are not
+    // unknown_type) but this build cannot execute them. Saying so is better than
+    // a silent no-op, which the app would read as success.
+    //
+    // `learn_start` USED to be in this set and is now implemented (FR-5), so it
+    // is asserted separately below -- leaving it here would have made this test
+    // pass for the wrong reason the moment the learn path landed.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string ota = "{\"v\":1,\"seq\":1,\"type\":\"ota_begin\"}";
+    r.OnLine(ota.c_str(), ota.size());
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("not_implemented"), std::string::npos);
+    EXPECT_EQ(cap.lines.back().find("unknown_type"), std::string::npos);
+}
+
+TEST(CommandRouter, LearnStartOpensTheLiveStreamAndIsNotUnimplemented) {
+    // FR-5: during learn, the filtered level must reach the link so the app can
+    // render it live. The stream is opened by learn_start and drained by
+    // Process() one sample per call.
     MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
     CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
     cap.Attach(r);
     const std::string ls = "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0}";
     r.OnLine(ls.c_str(), ls.size());
-    ASSERT_TRUE(HasType(cap, "nack"));
-    EXPECT_NE(cap.lines.back().find("not_implemented"), std::string::npos);
-    EXPECT_EQ(cap.lines.back().find("unknown_type"), std::string::npos);
+    ASSERT_TRUE(HasType(cap, "ack")) << "learn_start must be implemented, not nacked";
+    EXPECT_EQ(cap.lines.back().find("not_implemented"), std::string::npos);
+
+    cap.lines.clear();
+    r.Process();
+    ASSERT_TRUE(HasType(cap, "ladder_sample"))
+        << "an open learn run must stream the level (FR-5)";
+    EXPECT_NE(cap.lines.back().find("\"channel\":0"), std::string::npos);
+
+    // learn_stop closes it; Process must then be silent.
+    const std::string lstop = "{\"v\":1,\"seq\":2,\"type\":\"learn_stop\",\"channel\":0}";
+    r.OnLine(lstop.c_str(), lstop.size());
+    cap.lines.clear();
+    r.Process();
+    EXPECT_FALSE(HasType(cap, "ladder_sample"))
+        << "a closed learn run must stop streaming";
 }
 
 TEST(CommandRouter, ASecondConfigBeginWhileOneIsOpenIsRefused) {

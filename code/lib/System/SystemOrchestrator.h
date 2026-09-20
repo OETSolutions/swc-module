@@ -65,6 +65,29 @@ public:
     // and returns, and the normal Tick advances them.
     void Identify();
 
+    /*
+     * The channel's most recent FILTERED ladder level, in millivolts (FR-3).
+     *
+     * This is the value `ServiceChannel` classified on, cached rather than
+     * re-read: a caller that sampled the ADC again would get a different
+     * conversion and could disagree with what the device just acted on. It is
+     * what FR-5's `ladder_sample` stream reports during learn.
+     *
+     * Returns 0 for an out-of-range channel.
+     */
+    int FilteredLevelMv(uint8_t channel_index) const
+    {
+        if (channel_index >= kMaxChannels) return 0;
+        return static_cast<int>(channels_[channel_index].reader.Value());
+    }
+
+    /* The channel's LEARNED idle reference: the ratio denominator (spec 6.3). */
+    int IdleReferenceMv(uint8_t channel_index) const
+    {
+        if (channel_index >= kMaxChannels) return 0;
+        return static_cast<int>(config_.channels[channel_index].ladder.learned_idle_mv);
+    }
+
     // A channel's active gain mode, after the boot-time policy decision.
     GainMode ChannelGainMode(uint8_t channel_index) const {
         return (channel_index < kMaxChannels) ? gain_mode_[channel_index] : GainMode::kAmplified;

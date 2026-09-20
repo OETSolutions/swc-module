@@ -8,6 +8,7 @@
 #include "Config/ConfigCodec.h"
 #include "Config/ConfigStore.h"
 #include "HAL/IHAL.h"
+#include "Learning/LearnSession.h"
 #include "Link/Ndjson.h"
 #include "System/SystemOrchestrator.h"
 
@@ -74,6 +75,11 @@ private:
     void HandleTestKey(const cJSON *root, uint32_t for_seq);
     void HandleIdentify(const cJSON *root, uint32_t for_seq);
     void HandleReboot(const cJSON *root, uint32_t for_seq);
+    // Learn mode (FR-5, FR-28..FR-31). learn_start opens FR-5's live stream;
+    // learn_commit turns the accumulated samples into a stored button.
+    void HandleLearnStart(const cJSON *root, uint32_t for_seq);
+    void HandleLearnStop(const cJSON *root, uint32_t for_seq);
+    void HandleLearnCommit(const cJSON *root, uint32_t for_seq);
     // Replies to `ping`/`status` request and to `hello`.
     void ReplyStatus(uint32_t for_seq);
     void BeginConfigReplyRun();
@@ -83,6 +89,9 @@ private:
     void Nack(uint32_t for_seq, const char *err, const char *detail);
 
     void ResetRun();
+
+    // FR-5's live sample, one per Process() while a run is open.
+    void EmitLadderSample();
 
     IHAL              *hal_;
     SystemOrchestrator *sys_;
@@ -123,4 +132,13 @@ private:
     // known at connect, so the first frame establishes the baseline; without
     // this every first frame looks like a gap and emits a spurious link_gap.
     bool     seen_any_ = false;
+
+    // --- learn run (FR-5) ---------------------------------------------------
+    // A learn run is an OPEN STREAM, not a request/response: the app sends
+    // learn_start, receives ladder_sample frames, then sends learn_commit. The
+    // session accumulates what the stream reports.
+    LearnSession session_;
+    bool         learn_open_ = false;
+    int          learn_channel_ = 0;
+    uint32_t     learn_samples_ = 0;
 };

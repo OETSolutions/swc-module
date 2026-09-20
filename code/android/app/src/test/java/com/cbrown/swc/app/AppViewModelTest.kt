@@ -419,6 +419,39 @@ class AppViewModelTest {
         assertTrue("and it is not an app-side failure", vm.actionOutcomes.value.isEmpty())
     }
 
+    @Test
+    fun `a log frame from the device is surfaced on the link screen`() = runTest {
+        // FR-18's clamp warning reaches the app as a `log` frame. Dropping it
+        // would leave the warning's only consumer with nothing to show -- the
+        // "detected but not reported" defect it was added to close, one layer up.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(frame("log", "level" to "\"WARN\"", "msg" to "\"key_mv 9000 clamped\""))
+        advanceUntilIdle()
+
+        assertEquals(1, vm.link.value.logs.size)
+        assertTrue("the level must be kept, so a warning reads as one",
+            vm.link.value.logs[0].startsWith("WARN"))
+        assertTrue(vm.link.value.logs[0].contains("9000"))
+    }
+
+    @Test
+    fun `device logs are bounded so a chatty device cannot grow the state`() = runTest {
+        // A device that logs on every poll tick would otherwise grow this list
+        // without limit for as long as the app is connected.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        repeat(50) { t.emit(frame("log", "level" to "\"INFO\"", "msg" to "\"line $it\"")) }
+        advanceUntilIdle()
+
+        assertEquals(20, vm.link.value.logs.size)
+        assertTrue("the NEWEST are the useful ones", vm.link.value.logs.last().contains("line 49"))
+    }
+
     // --- helpers -----------------------------------------------------------
 
     private fun crcOf(data: ByteArray): Long {

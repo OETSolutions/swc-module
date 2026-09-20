@@ -21,6 +21,16 @@ data class LinkUiState(
     val link: LinkState = LinkState.Disconnected,
     val firmwareVersion: String? = null,
     val problem: LinkProblem? = null,
+    /**
+     * Warnings the device raised (spec 4.3's `log` frame), newest last.
+     *
+     * The firmware's one producer is FR-18's clamp warning: a stored `key_mv` the
+     * device refused to drive as written and clamped instead. Without a place to
+     * show it, that warning reaches a host and is dropped on the floor, which is
+     * indistinguishable from the device having nothing to say -- exactly the
+     * "detected but not reported" defect the warning was added to close.
+     */
+    val logs: List<String> = emptyList(),
 )
 
 /**
@@ -66,6 +76,23 @@ fun LinkScreen(
                 Column(Modifier.padding(16.dp)) {
                     Text(title, style = MaterialTheme.typography.titleMedium)
                     Text(detail, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        }
+
+        if (state.logs.isNotEmpty()) {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3E0)),
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Device warnings", style = MaterialTheme.typography.titleMedium)
+                    // Newest LAST, so the most recent warning is the one nearest
+                    // the bottom edge and the user does not have to scroll to find
+                    // what just happened.
+                    state.logs.forEach {
+                        Text(it, style = MaterialTheme.typography.bodySmall)
+                    }
                 }
             }
         }

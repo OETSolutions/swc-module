@@ -57,6 +57,7 @@ class AppViewModel(
      * to know how the bytes travel.
      */
     private val saveConfig: suspend (Config) -> Boolean = { c -> client.setConfig(c) is com.oetsolutions.swc.link.AckResult.Ok },
+
     /**
      * Running a kind the FIRMWARE does not execute, or null when this build has no
      * way to (a test, a preview).
@@ -197,6 +198,22 @@ class AppViewModel(
                     // binding do anything at all. Skipped for a null button: no
                     // binding can name a button that was not recognised.
                     if (id != null && gesture != "NONE") runAppSideAction(id, gesture)
+                }
+            }
+
+            // Spec 4.3's `log`: a diagnostic line the device raised. The one
+            // producer is FR-18's clamp warning, so an ignored frame here means a
+            // stored config value the device refused to drive as written goes
+            // unmentioned -- the user's symptom would be "that button does the
+            // wrong thing" with nothing anywhere saying why.
+            Frames.LOG -> {
+                val level = frame.fields["level"]?.jsonPrimitive?.content ?: "INFO"
+                val msg = frame.fields["msg"]?.jsonPrimitive?.content
+                if (msg != null) {
+                    // Bounded: a device that logs on every poll tick must not grow
+                    // the state without limit. The newest are the useful ones.
+                    val kept = (_link.value.logs + "$level: $msg").takeLast(kMaxLogLines)
+                    _link.value = _link.value.copy(logs = kept)
                 }
             }
 
@@ -404,4 +421,9 @@ class AppViewModel(
     }
 
     fun close() = client.close()
+
+    private companion object {
+        /** How many device log lines the link screen keeps. */
+        const val kMaxLogLines = 20
+    }
 }

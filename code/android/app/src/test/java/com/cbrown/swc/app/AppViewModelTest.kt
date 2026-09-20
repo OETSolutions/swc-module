@@ -9,6 +9,7 @@ import com.oetsolutions.swc.contract.ActionKind
 import com.oetsolutions.swc.model.ConfigJson
 import com.oetsolutions.swc.model.Gesture
 import com.oetsolutions.swc.model.sampleConfig
+import com.oetsolutions.swc.ui.UpdateStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.flow.Flow
@@ -493,6 +494,31 @@ class AppViewModelTest {
             assertFalse("and must NOT claim the binding is not app-side: $msg",
                 msg.contains("not an app-side action"))
         }
+
+    @Test
+    fun `checking for updates never claims to be up to date without checking`() = runTest {
+        // The app has no release-manifest client and no INTERNET permission, so it
+        // has never seen a manifest. Reporting UpToDate would be a claim about the
+        // world that no code verified -- and a green "up to date" is precisely what
+        // stops a user looking for an update that does exist.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "hw_id" to "\"swc\"",
+            "protocol_v" to "1", "caps" to "[]"))
+        advanceUntilIdle()
+
+        vm.checkForUpdates()
+        advanceUntilIdle()
+
+        val status = vm.update.value.status
+        assertFalse("an unchecked build must not report UpToDate: $status",
+            status is UpdateStatus.UpToDate)
+        assertTrue("and it must say why, not silently do nothing: $status",
+            status is UpdateStatus.Failed)
+        assertTrue("the message must name the real reason: ${(status as UpdateStatus.Failed).reason}",
+            status.reason.contains("cannot check") || status.reason.contains("manifest"))
+    }
 
     // --- helpers -----------------------------------------------------------
 

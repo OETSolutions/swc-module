@@ -7,10 +7,14 @@
   Declaring it required keeps the app off those devices entirely rather than
   installing it and failing at the first connect.
 
-  There is deliberately NO `INTERNET` permission here. WiFi is the firmware's
-  maintenance path (spec 8), not the app's: the app writes an OTA image over USB,
-  and the device fetches its own manifest. Granting INTERNET speculatively would
-  be a permission for a feature that does not exist.
+  There is no `INTERNET` permission here YET, and that is a gap rather than a
+  decision. An earlier version of this comment claimed it was deliberate, that "the
+  device fetches its own manifest", which contradicts spec 9.5: the ESP32 may
+  have no WiFi in the car, so the spec puts the release check in the APP, over the
+  phone's own connection, with the resulting file pushed to the device over USB.
+  That path needs `INTERNET` plus a pinned-CA TLS client, and neither exists. It
+  is recorded as open item N-12, and until it lands `checkForUpdates` reports that
+  it cannot check rather than claiming the device is current.
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 

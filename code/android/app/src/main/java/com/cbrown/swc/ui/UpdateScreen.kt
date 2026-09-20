@@ -118,8 +118,11 @@ internal fun describeStatus(status: UpdateStatus): Pair<String, String> = when (
     UpdateStatus.Unknown -> "Not checked yet" to
         "Tap \"Check for updates\" to compare this device against the released version."
 
+    // "Up to date" is only reachable after a REAL comparison against a release
+    // manifest. Nothing sets it today, because nothing can check -- see
+    // `checkForUpdates`. The copy stays honest about what was compared.
     is UpdateStatus.UpToDate -> "Up to date" to
-        "This device is running ${status.version}, which is the current release."
+        "This device is running ${status.version}, which matched the released version."
 
     is UpdateStatus.Newer -> "A newer version is available" to
         "You are running ${status.current}; ${status.available} is available. " +

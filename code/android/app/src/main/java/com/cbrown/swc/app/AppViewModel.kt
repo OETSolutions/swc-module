@@ -409,6 +409,27 @@ class AppViewModel(
         )
     }
 
+    /**
+     * Report what this build can honestly say about updates.
+     *
+     * **It does NOT check anything, and it must not pretend to.** The previous
+     * version reported `UpToDate(version)` whenever a device was connected — a
+     * comparison against nothing. The screen then said "This device is running
+     * X, which is the current release", which is a claim about the world that no
+     * code verified: the app has no manifest client and no `INTERNET` permission,
+     * so it has never seen a release manifest.
+     *
+     * Spec §9.5 says the app "should also be able to perform the check over its own
+     * internet connection" and push the result over USB, precisely because the
+     * ESP32 may have no WiFi in the car. That is not implemented — it needs a
+     * pinned-CA TLS client and the INTERNET permission — and it is recorded as open
+     * item N-12. Until then the truthful report is that this build cannot check,
+     * rather than a green "up to date" that would stop a user looking for an update
+     * that does exist.
+     *
+     * The firmware CAN check, over WiFi in maintenance mode, which is what the next
+     * line points at.
+     */
     fun checkForUpdates() {
         scope.launch {
             _update.value = _update.value.copy(inProgress = true)
@@ -416,8 +437,14 @@ class AppViewModel(
             _update.value = _update.value.copy(
                 inProgress = false,
                 currentVersion = version ?: "—",
-                status = if (version == null) UpdateStatus.Failed("No device is connected.")
-                else UpdateStatus.UpToDate(version),
+                status = when {
+                    version == null -> UpdateStatus.Failed("No device is connected.")
+                    else -> UpdateStatus.Failed(
+                        "This build has no release-manifest client, so it cannot check " +
+                            "for updates (spec §9.5). Open the device's maintenance page " +
+                            "over WiFi to check there."
+                    )
+                },
             )
         }
     }

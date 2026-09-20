@@ -598,6 +598,18 @@ void SystemOrchestrator::Identify() {
     buzzer_.Play(BuzzerPattern::kKeyAccepted);
 }
 
+void SystemOrchestrator::ReleaseKey(uint8_t index) {
+    ChannelState &cs = channels_[index];
+    if (!cs.key_driven) return;
+    const DacChannel key_ch = (index == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
+    // Re-point the servo at idle BEFORE writing, so a later `Update()` trims
+    // toward idle rather than toward the key just released.
+    cs.servo.Target(gain_mode_[index],
+                    GainPolicyKeyMvForCode(gain_mode_[index], idle_code_[index]));
+    hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
+    cs.key_driven = false;
+}
+
 void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     ChannelState &cs = channels_[index];
     const ChannelConfig &cc = config_.channels[index];
@@ -636,11 +648,44 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     // for 504 permille of the head unit's idle. The wheel's and the head unit's
     // resistances need not match, and this mapping does not care.
     if (pass_through_) {
+        // The LIVE ladder reading, unfiltered. The reference below was captured
+        // this same way at Boot, so comparing like with like needs no filter (and
+        // `cs.reader` must warm up for the configured path's debounce).
+        int level_now_mv =
+            hal_->adc_read_mv(hal_->ctx, (index == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
+
+        // Self-heal a reference captured while a button was held. It is read once
+        // at Boot; if the user was holding a button at power-on then it is a
+        // PRESSED level, which makes every later press look like "less off idle"
+        // and can suppress pass-through for the whole session. Seeing the line
+        // ABOVE the captured reference means the capture was a press -- no button
+        // pulls the ladder UP from true idle -- so adopt the higher value. Only
+        // the HIGHEST reading is ever adopted, so a press cannot drag the
+        // reference down the way a naive re-capture would.
+        if (level_now_mv > pass_through_idle_mv_) {
+            pass_through_idle_mv_ = level_now_mv;
+            cs.pass_through_pressed = false;
+        }
+        // `idle` is re-read AFTER the heal so a press in this same tick is not
+        // measured against the reference it just replaced.
         const int idle = pass_through_idle_mv_;
-        // Off idle by more than the classifier's own idle band means a press.
-        // Reusing the same band keeps one definition of "at idle" in the system.
-        const bool pressed = (idle - level_mv) > kPassThroughPressDeltaMv;
-        if (pressed && !cs.key_driven && head_unit_idle_mv_ > 0) {
+
+        // FR-25 / spec 6.9: "a press is clearly off idle (> 300 mV from the
+        // wheel's idle)", read directly off the ADC rather than through the noisy
+        // median -- the reference was captured the same way, so like is compared
+        // with like. `level_mv`/`cs.reader` stay for the configured path, whose
+        // debounce genuinely needs the filter.
+        const bool pressed = (idle - level_now_mv) > kPassThroughPressDeltaMv;
+        // RISING EDGE only. The pulse self-releases on `send_duration_ms` below,
+        // so without this latch the very next tick would see the button still
+        // held, `key_driven` false, and re-arm -- the line would pulse once per
+        // send_duration instead of once per press, and a held button would emit a
+        // key every 200 ms forever. The edge also matches the configured path,
+        // where a SINGLE cannot fire twice without a release between.
+        const bool rising_edge = pressed && !cs.pass_through_pressed;
+        cs.pass_through_pressed = pressed;
+
+        if (rising_edge && head_unit_idle_mv_ > 0) {
             // The head unit's OWN idle is the denominator: the wheel asks for a
             // fraction of a full-scale ladder position, and that fraction is then
             // applied to the head unit's range. Using the output's safe-idle code
@@ -656,57 +701,124 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             // ONE key event, not a line held down (spec 6.6 -- it is
             // gesture-blind, so a held line is a different thing to it).
             cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
-        } else if (!pressed && cs.key_driven) {
-            hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
-            cs.key_driven = false;
+        } else if (!pressed) {
+            ReleaseKey(index);
         }
         // No gesture state machine, no bindings, no buzzer pattern: there is
         // nothing configured to resolve against, and inventing feedback for an
         // event the user did not bind would be noise.
-        return;
-    }
-
-    GestureEvent ev{};
-    const bool fired = cs.gestures.Update(level, cs.classifier.ButtonIndex(), now_ms, &ev,
-                                          cs.bindings);
-
-    // FR-12, stated in the spec three times (§6.3, §7.2, and the FR table): a press
-    // that matches no learned window is reported as `event{button: null}` and beeps
-    // KEY_UNKNOWN, and is NEVER guessed at.
-    //
-    // `GestureStateMachine` treats kUnknown as not-pressed, so no gesture can fire
-    // for it -- which is the "never guessed" half, and correct. But that also means
-    // nothing else in this function sees it, so before this branch existed the
-    // device ignored an unrecognised press COMPLETELY: no event, no beep, nothing.
-    // The user's own button silently did nothing, with no way to tell that from a
-    // broken adapter.
-    //
-    // Reported once per press (the latch), because a held level is unrecognised on
-    // every tick and would otherwise flood the link at 100 events/s.
-    if (level == ChannelLevel::kUnknown) {
-        if (!cs.unknown_reported) {
-            cs.unknown_reported = true;
-            if (gesture_sink_ != nullptr) {
-                // A null id is the whole point: naming a button here would be the
-                // guess FR-12 forbids, and no binding can match a null.
-                const GestureEventRecord rec{index, nullptr, Gesture::kNone, level_mv, now_ms};
-                gesture_sink_(gesture_sink_ctx_, rec);
-            }
-            buzzer_.Play(BuzzerPattern::kKeyUnknown);
-        }
+        //
+        // NOTE: this block deliberately no longer RETURNS. The early return that
+        // used to sit here skipped both the pulse-timeout release below and the
+        // rail-fault release, so a held pass-through press drove the line for as
+        // long as the button was held (spec 6.6 rule 2 requires a bounded pulse)
+        // and a head unit that went away mid-press was never released (FR-39's
+        // phantom key). Release is not configuration-dependent.
     } else {
-        cs.unknown_reported = false;
+        GestureEvent ev{};
+        const bool fired = cs.gestures.Update(level, cs.classifier.ButtonIndex(), now_ms, &ev,
+                                              cs.bindings);
+
+        // FR-12, stated in the spec three times (§6.3, §7.2, and the FR table): a
+        // press that matches no learned window is reported as `event{button:
+        // null}` and beeps KEY_UNKNOWN, and is NEVER guessed at.
+        //
+        // `GestureStateMachine` treats kUnknown as not-pressed, so no gesture can
+        // fire for it -- which is the "never guessed" half, and correct. But that
+        // also means nothing else in this function sees it, so before this branch
+        // existed the device ignored an unrecognised press COMPLETELY: no event,
+        // no beep, nothing. The user's own button silently did nothing, with no
+        // way to tell that from a broken adapter.
+        //
+        // Reported once per press (the latch), because a held level is
+        // unrecognised on every tick and would otherwise flood the link at 100
+        // events/s.
+        if (level == ChannelLevel::kUnknown) {
+            if (!cs.unknown_reported) {
+                cs.unknown_reported = true;
+                if (gesture_sink_ != nullptr) {
+                    // A null id is the whole point: naming a button here would be
+                    // the guess FR-12 forbids, and no binding can match a null.
+                    const GestureEventRecord rec{index, nullptr, Gesture::kNone, level_mv,
+                                                 now_ms};
+                    gesture_sink_(gesture_sink_ctx_, rec);
+                }
+                buzzer_.Play(BuzzerPattern::kKeyUnknown);
+            }
+        } else {
+            cs.unknown_reported = false;
+        }
+
+        if (fired) {
+            const ResolvedAction resolved = BindingResolve(config_, index, ev);
+            // Spec 4.3: the app is told AFTER the device has acted on its own
+            // local binding, never before. `event` is fire-and-forget precisely
+            // so that a button press is not held hostage to the app being
+            // responsive (spec 6.6), and reporting first would make the link part
+            // of the key path.
+            ReportGesture(index, ev, level_mv);
+            if (resolved.found) {
+                const Action &a = resolved.action;
+                if (a.kind == ActionKind::kOutVoltage && a.key_mv != 0) {
+                    // The action names the voltage directly (spec 3.6) -- there is
+                    // no head-unit model here and no resistance to convert. One
+                    // bounded pulse, held for the recognition time, then released:
+                    // the head unit sees a single key event, not a held line.
+                    //
+                    // FR-18: a key_mv outside the gain mode's envelope is
+                    // VALIDATED and CLAMPED, with a warning -- never driven out of
+                    // range. The clamp itself lives in GainPolicyCodeForTarget
+                    // (both the floor and the ceiling, then a second clamp to the
+                    // DAC's range); what was missing was the warning. The action is
+                    // clamped rather than refused because the alternative is a
+                    // press that silently does nothing, and a clamped level still
+                    // reaches the radio as a key.
+                    //
+                    // The comparison is against `GainDecision::clamped` rather
+                    // than a second copy of the envelope bounds, so the envelope
+                    // has one definition and this cannot drift from the clamp it
+                    // reports on.
+                    const GainDecision decision =
+                        GainPolicyCodeForTarget(gain_mode_[index], a.key_mv);
+                    if (decision.clamped) {
+                        char msg[128];
+                        snprintf(msg, sizeof(msg),
+                                 "key_mv %d clamped to DAC code %u in gain mode %d",
+                                 a.key_mv, static_cast<unsigned>(decision.dac_code),
+                                 static_cast<int>(gain_mode_[index]));
+                        if (log_sink_ != nullptr) log_sink_(log_sink_ctx_, "WARN", msg);
+                    }
+                    cs.servo.Target(gain_mode_[index], a.key_mv);
+                    cs.servo.Update(sense_mv);
+                    hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());
+                    cs.key_driven = true;
+                    cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
+                } else {
+                    // Not a level (an OUT_RELEASE, a NONE, or an app-side action
+                    // this firmware does not execute). Release rather than hold:
+                    // a stale key with no action behind it is the phantom-key
+                    // hazard.
+                    ReleaseKey(index);
+                }
+                buzzer_.Play(BuzzerPattern::kKeyAccepted);
+            } else {
+                // FR-12: an unlearned press is never guessed at. The failure mode
+                // of a wrong guess is the radio doing something the driver did not
+                // ask for, which is worse than doing nothing.
+                ReleaseKey(index);
+                buzzer_.Play(BuzzerPattern::kKeyUnknown);
+            }
+        }
     }
 
-    // A fault, or a lost head unit, releases in the same tick. Everything in
-    // flight is discarded: a half-recognised gesture must not reach the radio.
+    // FR-39 / spec 6.8: a fault, or a lost head unit, releases in the same tick,
+    // on BOTH paths -- a collapsed rail is not a configuration issue. Everything
+    // in flight is discarded: a half-recognised gesture must not reach the radio.
+    // This sits outside the branch because the pass-through path used to return
+    // before reaching it, leaving the line driven against a head unit that had
+    // gone away.
     if (level == ChannelLevel::kFault || rail_fault) {
-        if (cs.key_driven) {
-            cs.servo.Target(gain_mode_[index], GainPolicyKeyMvForCode(gain_mode_[index],
-                                                                      idle_code_[index]));
-            hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
-            cs.key_driven = false;
-        }
+        ReleaseKey(index);
         cs.gestures.Reset();
         // FR-4: an out-of-range channel -- a collapsed rail, an open input, a
         // short to 12 V -- must be REPORTED, not merely survived. Releasing the
@@ -717,75 +829,12 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
         return;
     }
 
-    if (fired) {
-        const ResolvedAction resolved = BindingResolve(config_, index, ev);
-        // Spec 4.3: the app is told AFTER the device has acted on its own local
-        // binding, never before. `event` is fire-and-forget precisely so that a
-        // button press is not held hostage to the app being responsive (spec
-        // 6.6), and reporting first would make the link part of the key path.
-        ReportGesture(index, ev, level_mv);
-        if (resolved.found) {
-            const Action &a = resolved.action;
-            if (a.kind == ActionKind::kOutVoltage && a.key_mv != 0) {
-                // The action names the voltage directly (spec 3.6) -- there is
-                // no head-unit model here and no resistance to convert. One
-                // bounded pulse, held for the recognition time, then released:
-                // the head unit sees a single key event, not a held line.
-                //
-                // FR-18: a key_mv outside the gain mode's envelope is VALIDATED and
-                // CLAMPED, with a warning -- never driven out of range. The clamp
-                // itself lives in GainPolicyCodeForTarget (both the floor and the
-                // ceiling, then a second clamp to the DAC's range); what was missing
-                // was the warning. The action is clamped rather than refused because
-                // the alternative is a press that silently does nothing, and a
-                // clamped level still reaches the radio as a key.
-                //
-                // The comparison is against `GainDecision::clamped` rather than a
-                // second copy of the envelope bounds, so the envelope has one
-                // definition and this cannot drift from the clamp it reports on.
-                const GainDecision decision = GainPolicyCodeForTarget(gain_mode_[index], a.key_mv);
-                if (decision.clamped) {
-                    char msg[128];
-                    snprintf(msg, sizeof(msg),
-                             "key_mv %d clamped to DAC code %u in gain mode %d",
-                             a.key_mv, static_cast<unsigned>(decision.dac_code),
-                             static_cast<int>(gain_mode_[index]));
-                    if (log_sink_ != nullptr) log_sink_(log_sink_ctx_, "WARN", msg);
-                }
-                cs.servo.Target(gain_mode_[index], a.key_mv);
-                cs.servo.Update(sense_mv);
-                hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());
-                cs.key_driven = true;
-                cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
-            } else {
-                // Not a level (an OUT_RELEASE, a NONE, or an app-side action this
-                // firmware does not execute). Release rather than hold: a stale
-                // key with no action behind it is the phantom-key hazard.
-                if (cs.key_driven) {
-                    hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
-                    cs.key_driven = false;
-                }
-            }
-            buzzer_.Play(BuzzerPattern::kKeyAccepted);
-        } else {
-            // FR-12: an unlearned press is never guessed at. The failure mode of
-            // a wrong guess is the radio doing something the driver did not ask
-            // for, which is worse than doing nothing.
-            if (cs.key_driven) {
-                hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
-                cs.key_driven = false;
-            }
-            buzzer_.Play(BuzzerPattern::kKeyUnknown);
-        }
-    }
-
-    // End the pulse once the recognition time has elapsed. Checked every tick,
-    // so a press that is never released cannot leave the line driven.
+    // End the pulse once the recognition time has elapsed. Checked every tick, so
+    // a press that is never released cannot leave the line driven -- and this
+    // includes the pass-through pulse, which set `key_released_at_ms` and then
+    // (before this was restructured) returned above it.
     if (cs.key_driven && now_ms >= cs.key_released_at_ms) {
-        cs.servo.Target(gain_mode_[index], GainPolicyKeyMvForCode(gain_mode_[index],
-                                                                  idle_code_[index]));
-        hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
-        cs.key_driven = false;
+        ReleaseKey(index);
     }
 }
 

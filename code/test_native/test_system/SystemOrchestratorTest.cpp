@@ -1544,3 +1544,96 @@ TEST(SystemOrchestrator, PROBE_LEARN_LED2) {
                (int)hal.GpioRead(GPIO_LED2), hal.GpioWriteCount(GPIO_LED2));
     }
 }
+
+/*
+ * Spec 6.6 rule 2: "Every drive is a bounded pulse, held for `send_duration_ms`
+ * and then released ... never a held line."
+ *
+ * The pass-through path set `key_released_at_ms` and then RETURNED above the
+ * release check, so the line stayed driven for as long as the button was held --
+ * and the release check it reached on the configured path was the only thing that
+ * ever released a pass-through pulse. A held button therefore produced one long
+ * key event, not one event.
+ */
+TEST(SystemOrchestrator, APassThroughPulseSelfReleasesWhileTheButtonIsStillHeld) {
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    ASSERT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "precondition: the press must drive the line";
+
+    // Hold well past send_duration_ms (200 ms) and sample every tick, so a
+    // re-arm (a second press pulse) is visible as a second transition.
+    int transitions = 0;
+    int last = hal.LastDacCode(DAC_CH_KEY1);
+    for (uint32_t t = 0; t < 1000; t += 10) {
+        o.Tick(hal.NowMs());
+        hal.AdvanceMs(10);
+        const int now = hal.LastDacCode(DAC_CH_KEY1);
+        if (now != last) {
+            ++transitions;
+            last = now;
+        }
+    }
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "a held pass-through press must self-release after send_duration_ms";
+    EXPECT_EQ(transitions, 1)
+        << "exactly one transition (pressed -> idle); a still-held button must not "
+           "re-arm the pulse every send_duration_ms";
+}
+
+// FR-39 / spec 6.8: a lost head unit releases the line in the same tick. The
+// pass-through path used to return above that check as well, so a head unit that
+// went away mid-press left the KEY line driven against nothing.
+TEST(SystemOrchestrator, APassThroughPressReleasesWhenTheHeadUnitGoesAway) {
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 20);   // driving, still inside send_duration_ms
+    ASSERT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "precondition: the press must drive the line";
+
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 0);   // head unit unplugged
+    PollFor(o, hal, 400);
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "a collapsed KEY sense means the head unit is gone; holding the line "
+           "is the phantom-key hazard FR-39 forbids";
+}
+
+/*
+ * The pass-through reference is captured once at Boot. If the user is holding a
+ * button at power-on, the captured "idle" is a PRESSED level, and every later
+ * press then looks too close to idle to register -- pass-through would be dead
+ * for the whole session with no recovery but a reboot, which is exactly the
+ * "steering wheel does nothing" outcome FR-25 exists to prevent.
+ *
+ * Seeing the line ABOVE the captured reference proves the capture was a press (no
+ * button pulls the ladder UP from true idle), so the reference self-heals.
+ */
+TEST(SystemOrchestrator, AHeldButtonAtBootDoesNotKillPassThroughForTheSession) {
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);   // button held at power-on
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);   // released -> the true idle
+    PollFor(o, hal, 200);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);   // press the same button again
+    PollFor(o, hal, 100);
+
+    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "pass-through must recover after a boot-time press poisoned its reference";
+}

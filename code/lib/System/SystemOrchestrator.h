@@ -318,6 +318,11 @@ private:
         GestureBindings     bindings;
         bool                key_driven = false;    // a pulse is currently on the line
         uint64_t            key_released_at_ms = 0;
+        // FR-25: pass-through has no gesture machine to latch a press, and its
+        // pulse self-releases after `send_duration_ms`, so it needs its own
+        // edge detector -- otherwise a held button re-arms the pulse every tick
+        // after each release and emits a key every 200 ms.
+        bool                pass_through_pressed = false;
         // FR-12: one report and one KEY_UNKNOWN beep per unrecognised press, not
         // one per poll tick. A held level is unrecognised on every tick, so
         // without this latch a held press would emit 100 events/s and play a
@@ -330,6 +335,12 @@ private:
     void ServiceChannel(uint8_t index, uint64_t now_ms);
     // FR-31: the headless learn wizard and the AUX1 hold that drives it.
     void ServiceLearn(uint64_t now_ms);
+    // Return a channel's KEY line to its safe idle. One definition, because every
+    // release must ALSO re-point the servo at the idle level: `ServoLoop::Update`
+    // trims toward whatever `Target()` last set, so a release that only wrote the
+    // DAC code would let the next update pull the line back toward the released
+    // key's voltage.
+    void ReleaseKey(uint8_t index);
     void ApplyLearnedProfile(int channel, const LadderProfile &profile);
     // Spec 4.3's `event`. Called at the moment of recognition, from inside
     // ServiceChannel's resolution branch, because a gesture can complete on any

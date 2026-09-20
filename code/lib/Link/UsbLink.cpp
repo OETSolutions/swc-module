@@ -8,6 +8,7 @@
 
 #include "Config/ConfigStore.h"
 #include "Link/CommandRouter.h"
+#include "Link/LinkWiring.h"
 #include "Link/UsbCdc.h"
 
 static const char *TAG = "swc-usb";
@@ -21,14 +22,8 @@ bool           g_started = false;
 // because the driver being installed does not mean anything is reading.
 bool           g_host_open = false;
 
-// Frame -> the router's single entry point. `UsbCdc` is handed this thunk rather
-// than a `CommandRouter::*` member, so the transport never has to know the
-// router exists and the router keeps needing nothing from the transport.
-void RouterSinkThunk(void *ctx, const char *line, size_t len)
-{
-    CommandRouter *router = static_cast<CommandRouter *>(ctx);
-    if (router != nullptr) router->OnLine(line, len);
-}
+// Gesture and log sinks deliberately stay here: they are wired to the
+// orchestrator, not to the transport, and only this TU names TinyUSB.
 
 // A recognized gesture -> spec 4.3's `event`. Non-blocking is a REQUIREMENT, not
 // a preference: this is called from inside `SystemOrchestrator::Tick`, on the
@@ -138,11 +133,11 @@ void UsbLinkStart(IHAL *hal, SystemOrchestrator *sys)
     // each save and then overwrite the other's result.
     if (sys != nullptr) sys->SetStore(&store);
 
-    router.SetSink(&RouterSinkThunk, &router);
-    // Buffers the router's frames and owns the single trailing newline. The
-    // inverse binding (transport -> router) goes in at the same time, so the two
-    // directions cannot end up wired to different objects.
-    g_cdc.Init(&CdcRawWrite, nullptr, &RouterSinkThunk, &router);
+    // Both directions of the router<->transport binding, in one call in a TU
+    // that has no device dependency so the wiring itself is host-testable
+    // (`LinkWiringTest.cpp`). Inlining it here is how the two directions got
+    // crossed -- see LinkWiring.h.
+    LinkBind(router, g_cdc, &CdcRawWrite, nullptr);
     g_router = &router;
 
     // Gestures are recognized by the poll loop, not by an inbound command, so

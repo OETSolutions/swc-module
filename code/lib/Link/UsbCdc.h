@@ -78,6 +78,4 @@ private:
     NdjsonReader reader_;
     bool         connected_ = false;
     uint32_t     dropped_ = 0;
-
-    static void ReaderSinkThunk(void *ctx, const char *line, size_t len);
 };

@@ -13,11 +13,6 @@ void UsbCdc::Init(RawWrite w, void *wctx, FrameSink sink, void *sink_ctx) {
     dropped_ = 0;
 }
 
-void UsbCdc::ReaderSinkThunk(void *ctx, const char *line, size_t len) {
-    UsbCdc *self = static_cast<UsbCdc *>(ctx);
-    if (self->sink_ != nullptr) self->sink_(self->sink_ctx_, line, len);
-}
-
 bool UsbCdc::Send(const char *line, size_t len) {
     if (line == nullptr) return false;
     // +1 for the newline the transport owns. A frame that cannot fit even in an

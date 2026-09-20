@@ -92,7 +92,7 @@ void CommandRouter::OnConnected() {
     char body[192];
     snprintf(body, sizeof(body),
              "\"fw_version\":\"%s\",\"hw_id\":\"SWC-S3\",\"protocol_v\":%u,\"caps\":[\"config\",\"ota\",\"learn\"]",
-             SWC_FW_VERSION, static_cast<unsigned>(kNdjsonProtocolVersion));
+             FwVersionString(), static_cast<unsigned>(kNdjsonProtocolVersion));
     Emit("hello", body);
     BeginConfigReplyRun();
 }

@@ -31,5 +31,14 @@ idf_component_register(
     #   esp_adc          esp_adc/*.h          -- EspHal's ADC + eFuse calibration
     #   nvs_flash        nvs.h                -- EspHal's NVS blob access
     #   esp_timer        esp_timer.h          -- EspHal's now_ms/now_us
+    #   app_update       esp_ota_ops.h        -- OtaUsb's slot read + boot switch
+    #   esp_http_client  esp_http_client.h    -- OtaWifi's manifest + image fetch
+    #   esp_https_ota    esp_https_ota.h      -- the esp_https_ota path (spec 9.5)
+    #   mbedtls          esp_crt_bundle.h     -- OtaWifi's PINNED CA. Listing
+    #                    mbedtls here is what makes the verified-TLS path
+    #                    compilable at all; without it the temptation is to drop
+    #                    the bundle and reach for setInsecure, which spec 9.5
+    #                    forbids outright.
     REQUIRES json esp_driver_gpio esp_driver_i2c esp_adc nvs_flash esp_timer
+             app_update esp_http_client esp_https_ota mbedtls
 )

@@ -29,6 +29,75 @@ App partition is **1920 KB (1,966,080 bytes)** per slot; the scaffolding image
 occupies 10.96 % of one slot. **Note the slot is 1920 KB, not the 1952 KB the
 spec §9.2 states** — see "Defect 2" below.
 
+## The Xtensa toolchain is DELETED on every build (Defect 1's sibling)
+
+**Symptom:** `Error: Missing toolchain directory 'None'`, or with `-v` a
+`FileNotFoundError: ... 'package-postinstall.py'`. It recurs on every build, and
+retrying does not help.
+
+**Three defects stack here. The third is the one that wastes an hour.**
+
+1. **`platform.json` points at a 2-FILE STUB.** The pioarduino registry zip
+   (`.../0.0.1/xtensa-esp-elf-14.2.0_20260121.zip`) unpacks to `package.json` +
+   `tools.json` and nothing else — 4,133 bytes, no `bin/`. Exactly the
+   `tool-scons` stub of Defect 1, now on the toolchain. `install_required_packages`
+   reports success and leaves an unusable directory.
+
+2. **The version strings disagree, so the check never passes.** Both halves were
+   measured:
+
+   | Source | Says |
+   | --- | --- |
+   | `platform.json` `package-version` | `14.2.0+20260121` |
+   | the stub's `package.json` | `14.2.0+20260121` |
+   | the crosstool-NG tarball's own `package.json` | `14.2.0_20260121` (underscore) |
+   | IDF's own install (`.piopm`) | `14.2.0+20260121` |
+
+   So `_check_tool_version` can never be satisfied by anything the tarball
+   provides: a manual install always mismatches, and PlatformIO then runs
+   `safe_remove_directory` and re-unpacks the stub. **Deleting the tool is the
+   steady state, not a transient fault.**
+
+3. **IDF and PlatformIO install the same toolchain under DIFFERENT names.** IDF's
+   `idf_tools.py` (driven by `_run_idf_tools_install`) puts a complete, working
+   toolchain at `~/.platformio/packages/xtensa-esp-elf/` — note, **no
+   `toolchain-` prefix** — with the correct `package.json` version. The
+   PlatformIO/CMake side resolves `toolchain-xtensa-esp-elf`. So a fully working
+   compiler can be sitting right there while the build reports it missing. That is
+   the red herring: the fix looks like "reinstall the toolchain" when the
+   toolchain is fine and simply is not where the build looks.
+
+**The fix** (keep the working one, put it where it is expected, label it with the
+exact string the checker wants):
+
+```
+cp -R ~/.platformio/packages/xtensa-esp-elf/* ~/.platformio/packages/toolchain-xtensa-esp-elf/
+# then set package.json "version" to EXACTLY "14.2.0+20260121"
+```
+
+Verified: two consecutive `pio run -e esp32s3` builds succeed and the toolchain's
+`bin/` stays at 116 entries. Before the label fix, every build emptied it.
+
+**The label is load-bearing.** It looks like a cosmetic edit and it is not: it is
+what makes `_check_tool_version` return true, which is the early-return that
+skips the destructive reinstall.
+
+### `IDF_MAINTAINER=1` is needed for the build
+
+IDF's `tools/cmake/tool_version_check.cmake` runs
+`idf_tools.py check-tool-supported`. **This IDF does not implement that
+subcommand** — it exits with an argparse error, the check reads the empty stdout
+as "unsupported", and it raises a FATAL_ERROR naming
+`Tool doesn't match supported version from list ['esp-14.2.0_20260121']`. The
+installed compiler *is* that version; the check cannot tell, because its own
+helper is missing. The check's message documents the override, so builds here run
+as `IDF_MAINTAINER=1 pio run -e esp32s3`.
+
+Neither edit is in the repo (they live in the PlatformIO package cache), so
+**neither survives a platform reinstall and neither is reproduced by a fresh
+clone.** If the toolchain error reappears, apply both before debugging anything
+else.
+
 ## size-after-tasks-1-14b: the real number
 
 `size-after-tasks-1-14b: text=218361, data=71716, bss=531253, dec=821330 (0xc8852) bytes — firmware.elf, pio run -e esp32s3 -t size, 2026-09-19`

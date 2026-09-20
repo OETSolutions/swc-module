@@ -1,0 +1,159 @@
+<!DOCTYPE html>
+<!--
+  The maintenance page (spec 8.4). Served ONLY in maintenance mode, and it is
+  deliberately NOT a config UI: the Android app owns configuration. Its entire
+  job is device status, WiFi setup, and firmware update.
+
+  Every API call must carry the token (spec 8.4: "no default password, no
+  admin/admin"). The token is derived the same way as the BLE PoP and is shown
+  to the user over the trusted USB link, so there is nothing to guess.
+-->
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SWC adapter &mdash; maintenance</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 16px/1.5 system-ui, sans-serif; margin: 0 auto; max-width: 40rem; padding: 1.5rem; }
+  h1 { font-size: 1.25rem; margin: 0 0 1rem; }
+  h2 { font-size: 1rem; margin: 2rem 0 .5rem; }
+  label { display: block; margin: .75rem 0 .25rem; }
+  input, button { font: inherit; padding: .5rem; width: 100%; box-sizing: border-box; }
+  button { margin-top: .75rem; }
+  dl { display: grid; grid-template-columns: auto 1fr; gap: .25rem 1rem; margin: 0; }
+  dt { opacity: .7; }
+  dd { margin: 0; font-variant-numeric: tabular-nums; }
+  #msg { margin-top: 1rem; min-height: 1.5em; }
+  .warn { border-left: 3px solid currentColor; padding-left: .75rem; opacity: .85; }
+</style>
+</head>
+<body>
+<h1>SWC adapter &mdash; maintenance</h1>
+
+<p class="warn">
+  Maintenance mode ends automatically after 5 minutes of inactivity, and the
+  device serves your steering wheel again. Nothing here is needed for normal
+  operation.
+</p>
+
+<h2>Status</h2>
+<dl id="status"><dt>Loading&hellip;</dt></dl>
+
+<h2>WiFi</h2>
+<p>Prefer the Espressif provisioning app over Bluetooth; this form is here for a
+browser.</p>
+<label for="ssid">Network name</label>
+<input id="ssid" autocomplete="off">
+<label for="pass">Passphrase</label>
+<input id="pass" type="password" autocomplete="off">
+<button id="join">Join</button>
+
+<h2>Firmware</h2>
+<label for="fw">Choose a firmware file</label>
+<input id="fw" type="file" accept=".bin">
+<button id="upload">Upload and install</button>
+<button id="check">Check for a newer release</button>
+
+<h2>Reboot</h2>
+<button id="reboot">Reboot into the installed image</button>
+
+<p id="msg"></p>
+
+<script>
+  const msg = (t, ok) => {
+    const el = document.getElementById('msg');
+    el.textContent = t;
+    el.style.opacity = ok === false ? '1' : '.85';
+  };
+
+  // The token is derived per device and shown over USB; the user pastes it once
+  // and the page keeps it for the session. It is never baked into this file.
+  const token = new URLSearchParams(location.search).get('token') || '';
+
+  async function api(path, opts) {
+    const r = await fetch(path, Object.assign({
+      headers: { 'X-SWC-Token': token },
+    }, opts || {}));
+    const text = await r.text();
+    if (!r.ok) throw new Error(text || ('HTTP ' + r.status));
+    return text;
+  }
+
+  async function refreshStatus() {
+    const dl = document.getElementById('status');
+    try {
+      const s = JSON.parse(await api('/api/status'));
+      dl.innerHTML = '';
+      for (const [k, v] of Object.entries(s)) {
+        const dt = document.createElement('dt');
+        dt.textContent = k.replace(/_/g, ' ');
+        const dd = document.createElement('dd');
+        dd.textContent = String(v);
+        dl.append(dt, dd);
+      }
+    } catch (e) {
+      dl.innerHTML = '';
+      const dt = document.createElement('dt');
+      dt.textContent = 'unavailable';
+      dl.append(dt);
+      msg(String(e.message), false);
+    }
+  }
+
+  document.getElementById('join').onclick = async () => {
+    try {
+      // A POST with credentials is not idempotent and carries a secret, so the
+      // body is sent once and never echoed back into the page.
+      await api('/api/wifi', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'X-SWC-Token': token },
+        body: JSON.stringify({
+          ssid: document.getElementById('ssid').value,
+          passphrase: document.getElementById('pass').value,
+        }),
+      });
+      document.getElementById('pass').value = '';
+      msg('Credentials sent. The device will join and then restart the radio.', true);
+    } catch (e) {
+      msg(String(e.message), false);
+    }
+  };
+
+  document.getElementById('upload').onclick = async () => {
+    const f = document.getElementById('fw').files[0];
+    if (!f) { msg('Choose a file first.', false); return; }
+    try {
+      const fd = new FormData();
+      fd.append('firmware', f);
+      await api('/api/ota/upload', { method: 'POST', body: fd });
+      msg('Uploaded and verified. Reboot to run it.', true);
+    } catch (e) {
+      msg(String(e.message), false);
+    }
+  };
+
+  document.getElementById('check').onclick = async () => {
+    try {
+      msg(await api('/api/ota/check', { method: 'POST' }), true);
+    } catch (e) {
+      msg(String(e.message), false);
+    }
+  };
+
+  document.getElementById('reboot').onclick = async () => {
+    try {
+      await api('/api/reboot', { method: 'POST' });
+      msg('Rebooting…', true);
+    } catch (e) {
+      // A reboot can drop the connection before a response lands, which is not a
+      // failure worth alarming the user about.
+      msg('Rebooting…', true);
+    }
+  };
+
+  refreshStatus();
+  setInterval(refreshStatus, 3000);
+</script>
+</body>
+</html>

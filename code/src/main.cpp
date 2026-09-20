@@ -3,6 +3,7 @@
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_log.h"
+#include "esp_ota_ops.h"
 #include "esp_system.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
@@ -84,11 +85,33 @@ extern "C" void app_main(void)
     }
     if (!SystemOrchestratorSafeIdle(sys)) {
         ESP_LOGE(TAG, "safe idle NOT established -- output state is unverified");
+        // Deliberately NOT marked valid: see the mark-valid call below.
     }
 
-    // The USB link belongs here (Task 16). Nothing above depends on it, which is
-    // what makes FR-42 structural: the device serves presses with no app, no
-    // host and no radio attached.
+    // FR-37: mark valid only once the device has PROVEN it can do its job --
+    // the safe idle is established and the output is reachable. Marking this at
+    // the top of app_main would confirm an image that boots but cannot drive the
+    // DAC, stranding the user with a bricked-but-"valid" device and no rollback.
+    //
+    // This is the line that decides whether a bad image is recoverable, so the
+    // condition above it matters more than the call itself. `esp_ota_mark_app_
+    // valid_cancel_rollback` is a no-op when the running image was not started
+    // from a pending-verify state (the normal case after a successful boot), so
+    // calling it unconditionally on the good path is correct.
+    if (SystemOrchestratorSafeIdle(sys)) {
+        const esp_err_t mark = esp_ota_mark_app_valid_cancel_rollback();
+        if (mark != ESP_OK) {
+            // Not fatal: the device works, it just will not be treated as
+            // confirmed if this boot came from an OTA. Say so rather than hide it.
+            ESP_LOGW(TAG, "could not mark the image valid: %s", esp_err_to_name(mark));
+        } else {
+            ESP_LOGI(TAG, "image confirmed valid; rollback cancelled");
+        }
+    }
+
+    // The USB link belongs here (Task 14c, the `UsbCdc` task). Nothing above
+    // depends on it, which is what makes FR-42 structural: the device serves
+    // presses with no app, no host and no radio attached.
 
     for (;;) {
         SystemOrchestratorTick(sys, hal->now_ms(hal->ctx));

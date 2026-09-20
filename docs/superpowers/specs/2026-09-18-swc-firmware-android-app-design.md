@@ -1286,11 +1286,37 @@ FR-25 exists so the device is useful before it is configured, and so a
 config-loss event degrades to "the steering wheel works like stock" rather than
 "the steering wheel does nothing".
 
-With no config: each channel's learned level passes through 1:1 — the incoming
-ladder position is presented to the head unit as the same corresponding key
-value, using the auto-detected gain mode. The user gets a working steering wheel
-immediately, and the app is an *upgrade*, not a prerequisite. This is also the
-fallback if learning was never done.
+With no config there are **no learned windows to classify against**, so the
+pass-through cannot be "present the same key value" — there is no table mapping a
+level to a key. What it can do, and does, is **map the incoming RATIO onto the
+head unit's own idle**:
+
+```
+wheel_ratio   = level_mv / wheel_idle_mv          (the wheel's live idle)
+output_key_mv = head_unit_idle_mv · wheel_ratio   (spec 6.2 step 1's measurement)
+```
+
+This is the same normalization §6.3 already uses for the configured case, so a
+press maps to the *same key* on the head unit even though **the wheel's ladder and
+the head unit's ladder need not have the same resistances** — which is the whole
+reason not to copy the incoming millivolts across. The two idles are
+deliberately distinct quantities: the wheel's idle is the ratio's denominator, the
+head unit's idle is what the ratio is applied to. Using the output's safe-idle
+level (~5200 mV, full scale) as the denominator would scale every press against
+the wrong range and push low buttons into the 1.80 V output floor, i.e. onto a
+different key.
+
+A press is "clearly off idle" (`> 300 mV` from the wheel's idle), because with no
+config there is no learned window to compare against. Feedback patterns are not
+played: there is nothing configured to resolve against.
+
+The user gets a working steering wheel immediately, and the app is an *upgrade*,
+not a prerequisite. This is also the fallback if learning was never done.
+
+**With no usable ladder reference, pass-through is DISABLED rather than guessed**
+— a fabricated denominator would map every press to a voltage nothing defined.
+FR-13 is unaffected: this changes *what* is served, never *when* the output
+becomes safe.
 
 
 ---
@@ -2323,7 +2349,7 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-22 | Level-setting tests | N | Each level, including fully-off, suppresses the right classes and nothing else |
 | FR-23 | Atomic-persist test | N + D | Power loss at any byte offset yields the previous good config, never a torn one |
 | FR-24 | Corrupt/newer-config test | N | Corrupt CRC and newer `schema_version` each fall back to defaults **and** signal audibly |
-| FR-25 | No-config pass-through test | N + D + B | With empty config, output tracks input 1:1 |
+| FR-25 | No-config pass-through test | N | With empty config, a press drives a key at the wheel's ratio against the head unit's idle (not a copy of the wheel's volts), and no usable ladder reference disables pass-through rather than guessing |
 | FR-26 | Config-validation test | N + A | Invalid config → `nack`, and a read-back proves the old config is intact |
 | FR-27 | Export/import test | N + A | Full config JSON round-trips byte-identically through export → import |
 | FR-28 | Learn-mode tests | N + D + B | Measured level, tolerance and rail are stored and match the bench instrument |

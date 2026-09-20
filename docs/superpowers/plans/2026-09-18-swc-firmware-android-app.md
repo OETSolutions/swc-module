@@ -5991,7 +5991,14 @@ Expected: FAIL — `System/SystemOrchestrator.h` not found.
 `Boot()` in this exact order (mirroring spec §6.1, and the ordering is the
 requirement, not an implementation detail):
 
-1. Load the config via `ConfigStore`. `kNoConfig` → pass-through mode (FR-25).
+1. Load the config via `ConfigStore`. `kNoConfig` → **pass-through mode
+   (FR-25)**, and it is more than a flag: the channels are served by a ratio
+   mapping rather than by learned windows. Spec §6.9 is the authority, and the two
+   details that make it work are (a) the ratio is taken against the WHEEL's live
+   idle and applied to the HEAD UNIT's measured idle — two different ladders — and
+   (b) with no usable ladder reference the mode is DISABLED rather than guessing a
+   denominator. Implemented after this plan was written, because Task 13 as
+   specified only mentioned the flag and the flag alone serves nothing.
 2. **Establish safe idle**: select gain via `GainPolicySelect`, drive
    `DAC_CH_ADJ1`/`DAC_CH_ADJ2` into `DAC_POWER_GND_1K` in amplified mode, and write
    `DAC_CH_KEYn` to its idle code. Set `safe_idle_established_ = true`. **This

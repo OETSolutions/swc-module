@@ -207,6 +207,7 @@ constexpr EnumName kActionKindNames[] = {
 constexpr EnumName kGainModeNames[] = {
     {static_cast<int>(GainMode::kTracking),   "TRACKING"},
     {static_cast<int>(GainMode::kAmplified),  "AMPLIFIED"},
+    {static_cast<int>(GainMode::kAuto),       "AUTO"},
 };
 
 constexpr EnumName kGainPolicyNames[] = {

@@ -18,7 +18,22 @@ constexpr int kGuardHighMv     = 3400;
 constexpr int kDacFullScaleMv  = 3300;   // VREF = VDD
 constexpr int kDacMaxCode      = 4095;
 
-enum class GainMode { kTracking = 0, kAmplified = 1 };   // 1.00, 1.82
+/*
+ * Gain 1.00, gain 1.82, or "decide from the measurement" (spec 6.2).
+ *
+ * `kAuto` is a CONFIG value, not a gain: it is what a channel's
+ * `output.gain_mode` may say, and `Boot` resolves it through `settings.gain_policy`
+ * before any arithmetic. Every function that computes a voltage treats anything
+ * other than `kTracking` as amplified, so a value that somehow reaches the math
+ * unresolved falls to 1.82 -- the safe direction per spec 6.2's asymmetry.
+ *
+ * It exists because the spec's own worked-example config sets a channel's
+ * `gain_mode` to "AUTO", and without this the codec rejected that config
+ * outright: `settings.gain_policy` could therefore never be consulted, because
+ * every decodable channel already named a concrete mode. FR-14's AUTO rule was
+ * implemented and unit-tested but unreachable from any legal config.
+ */
+enum class GainMode { kTracking = 0, kAmplified = 1, kAuto = 2 };
 enum class GainPolicy { kAuto = 0, kForceTracking, kForceAmplified };
 
 struct GainDecision {

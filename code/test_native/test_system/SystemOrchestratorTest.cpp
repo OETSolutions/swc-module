@@ -69,6 +69,73 @@ TEST(SystemOrchestrator, BootDrivesTheAdjustChannelIntoTheOneKiloOhmPulldown) {
     EXPECT_EQ(hal.LastDacPowerMode(DAC_CH_ADJ1), DAC_POWER_GND_1K);
 }
 
+TEST(SystemOrchestrator, BootAppliesTheGainPolicyWhenTheChannelDefers) {
+    /*
+     * FR-14's AUTO rule, END TO END rather than at the unit.
+     *
+     * This test is what found the real defect: the fixture's channel named a
+     * CONCRETE gain mode, and a concrete mode overrides the policy, so
+     * `settings.gain_policy` was never consulted from any config the codec would
+     * accept -- spec 6.2's AUTO rule was unit-tested but unreachable. Fixing it
+     * needed `GainMode::kAuto`, which the spec's own worked example already used
+     * on a channel and the codec REJECTED.
+     *
+     * So a channel that defers (`kAuto`) plus the default device policy must
+     * measure this channel's own head-unit idle and pick from it.
+     *
+     * The threshold is on the DOUBLED reading: `kGuardLowMv` is 2600, so tracking
+     * needs a sense reading under 1300.
+     */
+    constexpr int kSenseBelowGuard = 1200;   // x2 = 2400 mV < 2600 -> a 3 V line
+    // 2490 x2 = 4980 mV, above the guard -> a 5 V line (kSenseFor5vHeadUnit).
+
+    {
+        MockHal hal;
+        MockHal::Defaults d;
+        d.config.channels[0].output.gain_mode = GainMode::kAuto;   // defer to policy
+        d.config.settings.gain_policy = GainPolicy::kAuto;
+        ConfigStore store(&hal.InterfaceRef());
+        ASSERT_TRUE(store.Save(d.config));
+        SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+        hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+        o.Boot();
+        EXPECT_EQ(o.ChannelGainMode(0), GainMode::kAmplified)
+            << "4980 mV is above the guard, so AUTO must amplify";
+        EXPECT_EQ(hal.LastDacPowerMode(DAC_CH_ADJ1), DAC_POWER_GND_1K)
+            << "gain 1.82 needs the 1k pulldown";
+    }
+    {
+        MockHal hal;
+        MockHal::Defaults d;
+        d.config.channels[0].output.gain_mode = GainMode::kAuto;
+        d.config.settings.gain_policy = GainPolicy::kAuto;
+        ConfigStore store(&hal.InterfaceRef());
+        ASSERT_TRUE(store.Save(d.config));
+        SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+        hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseBelowGuard);
+        o.Boot();
+        EXPECT_EQ(o.ChannelGainMode(0), GainMode::kTracking)
+            << "2400 mV is below the guard, so AUTO must take gain 1.00";
+        EXPECT_EQ(hal.LastDacPowerMode(DAC_CH_ADJ1), DAC_POWER_NORMAL)
+            << "gain 1.00 needs V_ADJ tracking, not the pulldown";
+    }
+    {
+        // A CONCRETE channel mode still overrides the policy -- the other half of
+        // the rule, and the reason the policy was unreachable before.
+        MockHal hal;
+        MockHal::Defaults d;
+        d.config.channels[0].output.gain_mode = GainMode::kTracking;   // concrete
+        d.config.settings.gain_policy = GainPolicy::kForceAmplified;
+        ConfigStore store(&hal.InterfaceRef());
+        ASSERT_TRUE(store.Save(d.config));
+        SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+        hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);   // would say 1.82
+        o.Boot();
+        EXPECT_EQ(o.ChannelGainMode(0), GainMode::kTracking)
+            << "a channel that names a gain must not be overridden by the policy";
+    }
+}
+
 TEST(SystemOrchestrator, APressProducesTheBoundOutputLevelAndThenReleases) {
     MockHal hal;
     auto o = MakeOrch(hal);

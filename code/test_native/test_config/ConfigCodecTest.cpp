@@ -252,3 +252,44 @@ TEST(ConfigCodec, SerializedSizeFitsTheNvsPartitionBudget) {
     EXPECT_LE(2u * chunks * kEntryBytesPerChunk + kSequenceKeyBytes, kUsableEntryBytes)
         << "two slots + cfg_seq must fit the partition, with entry overhead counted";
 }
+
+TEST(ConfigCodec, AChannelMayDeferItsGainModeToTheDevicePolicy) {
+    // Spec 6.2: gain comes from `settings.gain_policy`, and the spec's own worked
+    // example sets a CHANNEL's `gain_mode` to "AUTO". The codec had no "AUTO" in
+    // its channel name table, so it REJECTED that config -- the spec's own example
+    // was undecodable, and because every decodable channel named a concrete mode,
+    // `settings.gain_policy` was never consulted and FR-14's AUTO rule was
+    // unreachable.
+    Config in = MakeConfig();
+    in.channels[0].output.gain_mode = GainMode::kAuto;
+    char buf[8192];
+    const size_t n = ConfigEncodeJson(in, buf, sizeof(buf));
+    ASSERT_GT(n, 0u);
+    const std::string json(buf, n);
+
+    Config out{};
+    ASSERT_TRUE(ConfigDecodeJson(buf, n, &out))
+        << "a channel that defers to the device policy must decode";
+    EXPECT_EQ(out.channels[0].output.gain_mode, GainMode::kAuto);
+    // The device-wide policy is the thing it defers TO, so it must survive too.
+    EXPECT_EQ(out.settings.gain_policy, GainPolicy::kAuto);
+
+    // And it round-trips as the word "AUTO", not as a silent default.
+    EXPECT_NE(json.find("\"gain_mode\":\"AUTO\""), std::string::npos) << json;
+}
+
+TEST(ConfigCodec, EveryGainModeRoundTripsByItsOwnName) {
+    // The three channel values must be distinguishable on the wire, or a deferring
+    // channel and a forced one would decode to the same thing -- which is the
+    // defect in its quietest form.
+    char buf[8192];
+    for (const auto mode : {GainMode::kTracking, GainMode::kAmplified, GainMode::kAuto}) {
+        Config in = MakeConfig();
+        in.channels[0].output.gain_mode = mode;
+        const size_t n = ConfigEncodeJson(in, buf, sizeof(buf));
+        ASSERT_GT(n, 0u);
+        Config out{};
+        ASSERT_TRUE(ConfigDecodeJson(buf, n, &out));
+        EXPECT_EQ(out.channels[0].output.gain_mode, mode);
+    }
+}

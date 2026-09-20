@@ -142,14 +142,19 @@ void SystemOrchestrator::EstablishSafeIdle() {
         // full scale, 5200 mV, and would push every mapped level to the ceiling).
         if (i == 0) head_unit_idle_mv_ = no_head_unit ? 0 : measured_key_idle_mv;
 
-        const GainMode mode = GainPolicySelect(config_.channels[i].output.gain_mode ==
-                                                       GainMode::kTracking
-                                                   ? GainPolicy::kForceTracking
-                                                   : (config_.channels[i].output.gain_mode ==
-                                                              GainMode::kAmplified
-                                                          ? GainPolicy::kForceAmplified
-                                                          : config_.settings.gain_policy),
-                                               for_gain);
+        // A channel's own `gain_mode` overrides the device-wide policy, but only
+        // when it names a CONCRETE gain. `kAuto` -- the value the spec's example
+        // uses -- defers to `settings.gain_policy`, which is the AUTO rule FR-14
+        // actually specifies. Before `kAuto` existed this branch was dead: every
+        // config the codec would accept already named a concrete mode, so
+        // `settings.gain_policy` was never read and AUTO was unreachable.
+        const GainMode requested = config_.channels[i].output.gain_mode;
+        const GainPolicy policy =
+            (requested == GainMode::kTracking)
+                ? GainPolicy::kForceTracking
+                : ((requested == GainMode::kAmplified) ? GainPolicy::kForceAmplified
+                                                       : config_.settings.gain_policy);
+        const GainMode mode = GainPolicySelect(policy, for_gain);
         gain_mode_[i] = mode;
 
         // Gain 1.82 needs V_ADJ at 0 V, which is the 1 kohm pulldown power-down

@@ -3,6 +3,7 @@ package com.oetsolutions.swc.app
 import com.oetsolutions.swc.action.ActionOutcome
 import com.oetsolutions.swc.action.ActionRunner
 import com.oetsolutions.swc.contract.Frames
+import com.oetsolutions.swc.link.AckResult
 import com.oetsolutions.swc.link.Frame
 import com.oetsolutions.swc.link.LinkProblem
 import com.oetsolutions.swc.link.LinkState
@@ -141,6 +142,50 @@ class AppViewModel(
     }
 
     fun retry() = connect()
+
+    /**
+     * Ask the device to open its maintenance window (spec 8.2), which is what
+     * turns the radio on.
+     *
+     * The window is shown as open only on a NON-NACKED reply. A nack means the
+     * device refused -- it has no orchestrator, so it cannot enter the mode -- and
+     * saying "WiFi is on" there would send the user hunting for an access point
+     * that does not exist, which is worse than the request having failed.
+     */
+    fun enterMaintenance() {
+        setMaintenance(true)
+    }
+
+    fun exitMaintenance() {
+        setMaintenance(false)
+    }
+
+    private fun setMaintenance(want: Boolean) {
+        if (_link.value.maintenanceBusy) return
+        scope.launch {
+            _link.value = _link.value.copy(maintenanceBusy = true, maintenanceProblem = null)
+            val result = try {
+                if (want) client.enterMaintenance() else client.exitMaintenance()
+            } catch (e: Exception) {
+                AckResult.Nacked("link", e.message ?: "the link failed")
+            }
+            _link.value = when (result) {
+                is AckResult.Ok -> _link.value.copy(
+                    maintenanceBusy = false,
+                    maintenanceOpen = want,
+                    maintenanceProblem = null,
+                )
+                is AckResult.Nacked -> _link.value.copy(
+                    maintenanceBusy = false,
+                    maintenanceProblem = "The device refused: ${result.err} (${result.detail}).",
+                )
+                AckResult.Timeout -> _link.value.copy(
+                    maintenanceBusy = false,
+                    maintenanceProblem = "The device did not answer. Check the cable and try again.",
+                )
+            }
+        }
+    }
 
     private fun linkStateFor(state: LinkState): LinkUiState {
         // The problem is REPLACED, not merged with `?:`. A problem that survived a

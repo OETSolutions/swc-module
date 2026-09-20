@@ -17,6 +17,7 @@ import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.TestScope
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
@@ -518,6 +519,73 @@ class AppViewModelTest {
             status is UpdateStatus.Failed)
         assertTrue("the message must name the real reason: ${(status as UpdateStatus.Failed).reason}",
             status.reason.contains("cannot check") || status.reason.contains("manifest"))
+    }
+
+    // --- spec 8.2: the app's maintenance control --------------------------
+
+    @Test
+    fun `entering maintenance is shown as open only once the device acks`() = runTest {
+        // Spec 8.2 makes the USB command the PRIMARY trigger and warns the car
+        // "may have no WiFi", so this control is the app's only path to turning
+        // the radio on. Showing the window open before the device confirmed it
+        // would send the user hunting for an access point that does not exist.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "hw_id" to "\"swc\"",
+            "protocol_v" to "1", "caps" to "[]"))
+        advanceUntilIdle()
+
+        vm.enterMaintenance()
+        // `runCurrent`, NOT `advanceUntilIdle`: the latter advances virtual time
+        // past the request's own 5 s wait and the request times out before the
+        // reply below can be delivered, which is what the first version of this
+        // test measured. Every other test in this suite sidesteps a live ack by
+        // injecting the operation; this one is the first that must observe a real
+        // reply, so it has to hold the clock still.
+        runCurrent()
+
+        val sent = t.written.last()
+        assertTrue("the request must go out as maintenance_enter: $sent",
+            sent.contains("\"type\":\"maintenance_enter\""))
+        assertFalse("and must not claim the window is open before the ack",
+            vm.link.value.maintenanceOpen)
+
+        val seq = Regex("\"seq\":(\\d+)").find(sent)!!.groupValues[1]
+
+        // A NACK means the device refused, which is not the same as it being open.
+        t.emit("{\"v\":1,\"seq\":2,\"type\":\"nack\",\"for_seq\":$seq," +
+            "\"err\":\"unavailable\",\"detail\":\"no orchestrator\"}\n")
+        advanceUntilIdle()
+        assertFalse("a refusal must not read as open", vm.link.value.maintenanceOpen)
+        assertTrue("and it must say why: ${vm.link.value.maintenanceProblem}",
+            vm.link.value.maintenanceProblem?.contains("unavailable") == true)
+    }
+
+    @Test
+    fun `an acked maintenance enter opens the window and a later exit closes it`() = runTest {
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "hw_id" to "\"swc\"",
+            "protocol_v" to "1", "caps" to "[]"))
+        advanceUntilIdle()
+
+        vm.enterMaintenance()
+        runCurrent()
+        val enterSeq = Regex("\"seq\":(\\d+)").find(t.written.last())!!.groupValues[1]
+        t.emit("{\"v\":1,\"seq\":2,\"type\":\"ack\",\"for_seq\":$enterSeq,\"ok\":true}\n")
+        advanceUntilIdle()
+        assertTrue("an ack means the window is open", vm.link.value.maintenanceOpen)
+
+        vm.exitMaintenance()
+        runCurrent()
+        assertTrue("leaving must send its own frame, not _enter",
+            t.written.last().contains("\"type\":\"maintenance_exit\""))
+        val exitSeq = Regex("\"seq\":(\\d+)").find(t.written.last())!!.groupValues[1]
+        t.emit("{\"v\":1,\"seq\":3,\"type\":\"ack\",\"for_seq\":$exitSeq,\"ok\":true}\n")
+        advanceUntilIdle()
+        assertFalse("an acked exit closes it", vm.link.value.maintenanceOpen)
     }
 
     // --- helpers -----------------------------------------------------------

@@ -107,6 +107,8 @@ fun AppRoot(model: AppViewModel) {
         onEdit = model::editBinding,
         onSave = model::save,
         onCheck = model::checkForUpdates,
+        onEnterMaintenance = model::enterMaintenance,
+        onExitMaintenance = model::exitMaintenance,
     )
 }
 
@@ -121,6 +123,8 @@ fun AppRoot() = AppScaffold(
     onEdit = { _, _ -> },
     onSave = {},
     onCheck = {},
+    onEnterMaintenance = {},
+    onExitMaintenance = {},
 )
 
 @Composable
@@ -133,6 +137,8 @@ private fun AppScaffold(
     onEdit: (BindingCell, Action?) -> Unit,
     onSave: () -> Unit,
     onCheck: () -> Unit,
+    onEnterMaintenance: () -> Unit,
+    onExitMaintenance: () -> Unit,
 ) {
     var screen by remember { mutableStateOf(Screen.LINK) }
     Scaffold(
@@ -159,7 +165,12 @@ private fun AppScaffold(
         // pinned and visible rather than scrolling off the bottom.
         Column(Modifier.padding(padding).fillMaxSize()) {
             when (screen) {
-                Screen.LINK -> LinkScreen(state = link, onRetry = onRetry)
+                Screen.LINK -> LinkScreen(
+                    state = link,
+                    onRetry = onRetry,
+                    onEnterMaintenance = onEnterMaintenance,
+                    onExitMaintenance = onExitMaintenance,
+                )
                 Screen.LADDER -> LadderScreen(state = ladder)
                 Screen.BINDINGS -> BindingScreen(
                     state = bindings,

@@ -31,6 +31,20 @@ data class LinkUiState(
      * "detected but not reported" defect the warning was added to close.
      */
     val logs: List<String> = emptyList(),
+    /**
+     * Whether the device is in a maintenance window, as far as the app knows.
+     *
+     * Only the app's OWN requests move this: the firmware sends no frame when the
+     * window opens or closes, so a window opened by an AUX1 hold is invisible
+     * here. It is deliberately not derived from anything else -- the app's
+     * maintenance requests are the only ones it can observe, and guessing at the
+     * rest would show a state the app has no evidence for.
+     */
+    val maintenanceOpen: Boolean = false,
+    /** Set while the enter/exit request is in flight, so the button cannot double-fire. */
+    val maintenanceBusy: Boolean = false,
+    /** Why the last maintenance request did not take effect. Null when it did. */
+    val maintenanceProblem: String? = null,
 )
 
 /**
@@ -40,6 +54,8 @@ data class LinkUiState(
 fun LinkScreen(
     state: LinkUiState,
     onRetry: () -> Unit,
+    onEnterMaintenance: () -> Unit,
+    onExitMaintenance: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
     Column(
@@ -93,6 +109,52 @@ fun LinkScreen(
                     state.logs.forEach {
                         Text(it, style = MaterialTheme.typography.bodySmall)
                     }
+                }
+            }
+        }
+
+        /*
+         * Maintenance (spec 8.2). Spec 8.2 calls the USB command the PRIMARY way
+         * in and warns that the car "may have no WiFi" -- so this is the control
+         * that turns the device's radio on, and without it a user has no path to
+         * the provisioning page from the app at all.
+         *
+         * One button that flips, rather than two: the window has exactly two
+         * states and the app knows which one it asked for, so two permanent
+         * buttons would leave one of them always wrong to press.
+         */
+        Card(Modifier.fillMaxWidth()) {
+            Column(
+                Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text("Maintenance mode", style = MaterialTheme.typography.titleMedium)
+                Text(
+                    if (state.maintenanceOpen) {
+                        "The device's WiFi is on. Connect to its setup page to " +
+                            "configure WiFi or update the firmware. It returns to " +
+                            "normal by itself after 5 minutes of no activity."
+                    } else {
+                        "Turn the device's WiFi on, so it can be configured or " +
+                            "updated over the network."
+                    },
+                    style = MaterialTheme.typography.bodyMedium,
+                )
+                Button(
+                    onClick = if (state.maintenanceOpen) onExitMaintenance else onEnterMaintenance,
+                    enabled = !state.maintenanceBusy &&
+                        state.link is com.oetsolutions.swc.link.LinkState.Connected,
+                ) {
+                    Text(
+                        when {
+                            state.maintenanceBusy -> "Working…"
+                            state.maintenanceOpen -> "Leave maintenance mode"
+                            else -> "Enter maintenance mode"
+                        },
+                    )
+                }
+                state.maintenanceProblem?.let {
+                    Text(it, style = MaterialTheme.typography.bodySmall)
                 }
             }
         }

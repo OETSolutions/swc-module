@@ -115,6 +115,12 @@ void UsbLinkStart(IHAL *hal, SystemOrchestrator *sys)
     static ConfigStore store(hal);
     static CommandRouter router(hal, sys, &store);
 
+    // FR-31: the headless learn persists through this same store. It must be the
+    // ONE store -- a second instance would write to the same NVS keys but with its
+    // own idea of the config, so a headless learn and an app config_set could
+    // each save and then overwrite the other's result.
+    if (sys != nullptr) sys->SetStore(&store);
+
     router.SetSink(&RouterSinkThunk, &router);
     // Buffers the router's frames and owns the single trailing newline. The
     // inverse binding (transport -> router) goes in at the same time, so the two

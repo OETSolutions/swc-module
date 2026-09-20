@@ -28,13 +28,44 @@ constexpr int kPassThroughPressDeltaMv = 300;
 constexpr int kKeyEnvelopeLowMv  = kOutputFloorMv;    // 1800
 constexpr int kKeyEnvelopeHighMv = kOutputCeilingMv;  // 5200
 
+/*
+ * The top of AUX1's press window, in millivolts (1700 with the default profile).
+ *
+ * Derived from `Aux1ProfileDefault()` rather than written again, because a second
+ * number for "AUX1 is pressed" is a second answer, and the hold detector and the
+ * wizard's own classifier would then disagree about the same switch -- exactly at
+ * the boundary a user's finger lands on.
+ */
+int Aux1PressedMaxMv() {
+    const LadderProfile p = Aux1ProfileDefault();
+    return p.buttons[0].mv_center + p.buttons[0].mv_tolerance;
+}
+
+/*
+ * `temp_c_at_learn`, in tenths of a degree C, when the NTC has not been read.
+ *
+ * Spec 6.4 is explicit that v1's temperature compensation is a LINEAR CORRECTION
+ * WITH A ZERO COEFFICIENT: the correction path is present and `temp_c_at_learn` is
+ * recorded so it is computable later, but it does not change behavior until a
+ * bring-up measurement supplies a non-zero coefficient. The NTC-to-Celsius
+ * conversion is therefore a bring-up deliverable, and this sentinel is deliberate:
+ * 23.5 would be a plausible-looking number that nothing measured, and a plausible
+ * number in a field a future engineer uses to compute a correction is worse than a
+ * visibly unmeasured one.
+ */
+constexpr int kTempNotMeasuredTenths = 0;
+
 }  // namespace
 
 SystemOrchestrator::SystemOrchestrator(IHAL *hal, const Config &config,
                                        const GestureTimings &timings)
     : hal_(hal), config_(config), timings_(timings),
       buzzer_(hal, config.settings.buzzer_level),
-      leds_(hal, config.settings.led_level) {}
+      leds_(hal, config.settings.led_level),
+      // FR-31's headless learn. Constructed with the SAME timings the channels
+      // use, so "what counts as an AUX1 press" matches "what counts as a wheel
+      // press" -- one debounce definition in the firmware.
+      wizard_(hal, &buzzer_, &leds_, Aux1ProfileDefault(), timings) {}
 
 // The bindings a channel's buttons actually have, which is what makes the
 // gesture resolve adaptive (spec 6.6). Scanned from the config rather than
@@ -222,8 +253,124 @@ void SystemOrchestrator::Tick(uint64_t now_ms) {
     for (uint8_t i = 0; i < channel_count_; ++i) {
         ServiceChannel(i, now_ms);
     }
+    // FR-31: after the channels, so a learn commit is applied before the next
+    // tick classifies against the new profile.
+    ServiceLearn(now_ms);
     buzzer_.Update(now_ms);
     leds_.Update(now_ms);
+}
+
+/*
+ * FR-31's headless learn: enter and leave on an AUX1 hold, drive the wizard, and
+ * persist what it commits.
+ *
+ * **Why the hold is detected here from a raw ADC read rather than by the
+ * wizard's own classifier.** The hold must be recognized while a learn is
+ * RUNNING (it is the exit gesture), and the wizard's classifier is busy counting
+ * selection presses at that moment. Two consumers of one debounced signal would
+ * each have to know the other's phase; a plain threshold on the raw reading has
+ * exactly one job and cannot disagree with itself.
+ *
+ * **The threshold is the wizard's own AUX1 press window**, taken from the profile
+ * rather than written again, for the same reason: a second definition of "AUX1 is
+ * held" is a second answer.
+ */
+void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
+    if (hal_ == nullptr) return;
+
+    const int aux_mv = hal_->adc_read_mv(hal_->ctx, ADC_CH_AUX1);
+    const bool aux_pressed = (aux_mv >= 0) && (aux_mv < Aux1PressedMaxMv());
+
+    // The rising edge starts the hold clock; any release clears it. A hold that
+    // survives to kEnterHoldMs TOGGLES the wizard, which is what lets the same
+    // gesture both enter and leave (spec 7.4 step 5).
+    if (aux_pressed) {
+        if (!aux_holding_) {
+            aux_holding_ = true;
+            aux_hold_ms_ = now_ms;
+        } else if (aux_hold_latch_) {
+            // The hold already fired once and is still being held. Nothing here:
+            // a continuous hold must toggle exactly once. Without this latch, the
+            // hold clock keeps running, so a user who holds AUX1 a little long
+            // would exit the learn they just entered -- and the second hold would
+            // land on the freshly-reset aux_was_pressed_ and register as a
+            // selection press.
+        } else if ((now_ms - aux_hold_ms_) >= LearnWizard::kEnterHoldMs) {
+            // Consume the edge. The LATCH, not this flag, is what prevents a
+            // second toggle: the flag is cleared so the next release re-arms.
+            aux_hold_latch_ = true;
+            if (wizard_.Active()) {
+                wizard_.Exit(now_ms);
+            } else {
+                // The learn's idle reference is captured HERE, on entry, because
+                // spec 3.4 wants the idle AS MEASURED AT LEARN TIME. During the
+                // prompt the user is holding the wheel button, so the live reading
+                // is the pressed level and cannot serve -- and the previously
+                // STORED idle is exactly what a re-learn is meant to correct.
+                const int live = hal_->adc_read_mv(
+                    hal_->ctx, (learn_channel_ == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
+                learn_idle_mv_ = (live > 0)
+                                     ? live
+                                     : IdleReferenceMv(static_cast<uint8_t>(learn_channel_));
+                wizard_.Enter(now_ms, /*aux_held=*/true);
+            }
+        }
+    } else {
+        aux_holding_ = false;
+        aux_hold_latch_ = false;
+    }
+
+    if (wizard_.Active()) {
+        // A learn with no usable idle reference cannot measure anything: the
+        // press detector would compare a reading against zero and call every
+        // level "pressed", then commit a window computed from a fabricated
+        // denominator. Refusing is the same direction FR-12 takes.
+        if (learn_idle_mv_ > 0) {
+            wizard_.Tick(learn_channel_, now_ms, learn_idle_mv_, kTempNotMeasuredTenths);
+        }
+    }
+
+    if (wizard_.ConsumeCommitted()) {
+        learned_channel_ = learn_channel_;
+        learned_profile_ = wizard_.Profile();
+        ApplyLearnedProfile(learn_channel_, learned_profile_);
+    }
+    if (wizard_.ConsumeExited()) {
+        // The wizard drove the LEDs for its prompts; hand them back so the normal
+        // grammars resume rather than leaving a stale solid LED2 behind.
+        leds_.Set2(Led2Pattern::kOff);
+    }
+}
+
+void SystemOrchestrator::ApplyLearnedProfile(int channel, const LadderProfile &profile) {
+    if (channel < 0 || channel >= kMaxChannels) return;
+    if (channel >= channel_count_) return;
+
+    // The profile carries its own idle reference: the wizard measured every
+    // centre against the idle captured at learn time, so it is already correct
+    // here and must not be re-derived from the current reading.
+    config_.channels[channel].ladder = profile;
+
+    // Rebuild the classifier so the new windows take effect immediately. Without
+    // this the device would keep classifying against the OLD profile until the
+    // next boot, and the button the user just taught would do nothing -- with
+    // perfectly correct-looking feedback, which is the worst version of the bug.
+    channels_[channel].classifier = PressClassifier(profile, timings_);
+    channels_[channel].gestures.Reset();
+    channels_[channel].reader.Reset();
+
+    // Bindings name buttons by ID, so a learned button is only reachable if the
+    // channel's binding set is rebuilt against the new profile. `BindingsFor`
+    // reads the config, so it is called AFTER the profile is stored.
+    channels_[channel].bindings = BindingsFor(static_cast<uint8_t>(channel));
+
+    // Persist. The wizard cannot: it holds no Config and no store. A null store
+    // means a bench build without NVS, where the learn is real but not durable --
+    // and that is reported rather than silently dropped.
+    if (store_ != nullptr) {
+        store_->Save(config_);
+    }
+    persisted_ = (store_ != nullptr);
 }
 
 void SystemOrchestrator::ReportGesture(uint8_t index, const GestureEvent &ev, int level_mv) {

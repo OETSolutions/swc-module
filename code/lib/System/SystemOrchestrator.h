@@ -9,7 +9,12 @@
 #include "Gesture/GestureStateMachine.h"
 #include "Gesture/PressClassifier.h"
 #include "HAL/IHAL.h"
+#include "Learning/LearnWizard.h"
 #include "Output/ServoLoop.h"
+
+// Forward-declared: the orchestrator only needs the POINTER, and including the
+// store would pull NVS into every host test that includes this header.
+class ConfigStore;
 
 /*
  * The main loop that ties the modules together.
@@ -38,6 +43,39 @@ public:
     // mode. This is the `V_KEY_idle` of spec 6.2 and the reference every
     // command is bounded against.
     int IdleKeyMv() const { return idle_key_mv_; }
+
+    /*
+     * The store a HEADLESS learn writes through (FR-31).
+     *
+     * Set by the link once, at start-up, because the learn wizard's whole point is
+     * that it works with **no app and no host** -- so the orchestrator cannot rely
+     * on a caller having a store to hand. A null store means a learn still runs
+     * and still beeps but does not persist, which is the honest degradation: the
+     * wizard's feedback is real, the save is not.
+     */
+    void SetStore(ConfigStore *store) { store_ = store; }
+
+    // True while the headless learn wizard is running (FR-31). The caller uses it
+    // to keep the normal feedback grammars from fighting the wizard's prompts.
+    bool LearnActive() const { return wizard_.Active(); }
+
+    /*
+     * Whether the last headless learn reached durable storage.
+     *
+     * Distinct from "the learn succeeded": the wizard can commit a real button
+     * with no store attached (a bench build without NVS), and reporting that as
+     * saved would be a lie the user discovers on the next boot.
+     */
+    bool LastLearnPersisted() const { return persisted_; }
+
+    /*
+     * The channel and slot the last headless learn committed, for the link's
+     * benefit (FR-29's reporting). Null when nothing has been committed yet.
+     */
+    const LadderProfile *LastLearnedProfile(int channel) const {
+        if (channel < 0 || channel >= kMaxChannels) return nullptr;
+        return (learned_channel_ == channel) ? &learned_profile_ : nullptr;
+    }
 
     // True once the safe idle state has been written (FR-13). Boot() sets it
     // before it does anything else, so a caller that observes it true knows the
@@ -182,6 +220,9 @@ private:
 
     void EstablishSafeIdle();
     void ServiceChannel(uint8_t index, uint64_t now_ms);
+    // FR-31: the headless learn wizard and the AUX1 hold that drives it.
+    void ServiceLearn(uint64_t now_ms);
+    void ApplyLearnedProfile(int channel, const LadderProfile &profile);
     // Spec 4.3's `event`. Called at the moment of recognition, from inside
     // ServiceChannel's resolution branch, because a gesture can complete on any
     // tick (a LONG fires when its threshold elapses, a SINGLE when its ambiguity
@@ -233,6 +274,36 @@ private:
     // link registers, and legal to leave null: the device runs without an app.
     GestureSink gesture_sink_ = nullptr;
     void       *gesture_sink_ctx_ = nullptr;
+
+    /*
+     * FR-31's headless learn, and the AUX1 hold that enters and leaves it.
+     *
+     * Everything here is what makes the device programmable with no phone: the
+     * wizard is driven by the poll loop, the AUX1 hold is detected on raw ADC
+     * reads (it must work even while a learn is running, so it cannot go through
+     * the wizard's own classifier), and a commit is written straight to NVS.
+     */
+    LearnWizard  wizard_;
+    ConfigStore *store_ = nullptr;
+    // The AUX1 level at the last tick, for the hold detector's edge.
+    uint64_t     aux_hold_ms_ = 0;
+    bool         aux_holding_ = false;
+    // Set when a hold has already toggled, cleared only on release. A continuous
+    // hold must toggle ONCE: `aux_holding_` alone would fire again on every tick
+    // past the threshold, and a user who held AUX1 a little long would exit the
+    // learn they had just entered.
+    bool         aux_hold_latch_ = false;
+    // The idle reference captured when a learn started (spec 3.4: the idle AS
+    // MEASURED AT LEARN TIME). Captured on entry, because during the prompt the
+    // user is holding the wheel button and the live reading is the pressed level.
+    int          learn_idle_mv_ = 0;
+    // Which channel a wizard learn is filling, and the last profile it committed
+    // -- kept so the link can report what the headless learn produced.
+    int          learn_channel_ = 0;
+    int          learned_channel_ = -1;
+    LadderProfile learned_profile_{};
+    // Whether the last commit reached NVS (see LastLearnPersisted).
+    bool         persisted_ = false;
 };
 
 #ifdef __cplusplus

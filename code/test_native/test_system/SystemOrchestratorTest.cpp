@@ -407,3 +407,236 @@ TEST(SystemOrchestrator, AnUnrecognizedPressReportsNothing) {
     EXPECT_TRUE(g_reported.empty())
         << "an unrecognized level must not be reported as a gesture on a button";
 }
+
+// --- FR-31: the headless learn, with no app and no host -----------------------
+//
+// This is the requirement that the adapter is USABLE and PROGRAMMABLE with
+// nothing plugged into USB: a user in a car may not have the head unit out of the
+// dash, so the double/long-press bindings must be teachable from AUX1 + buzzes
+// alone. The wizard class was fully implemented and TESTED, and nothing in the
+// firmware ever constructed or ticked it -- the same defect shape as ActionRunner
+// having no caller. So these tests assert the WIRING, not the wizard's internals
+// (test_native/test_learning already covers those).
+
+namespace {
+
+constexpr int kAuxReleasedMv = 3300;
+constexpr int kAuxPressedMv  = 100;
+
+// Hold AUX1 long enough to toggle the wizard, then release.
+void HoldAuxToToggle(SystemOrchestrator &o, MockHal &hal, int mv = kAuxPressedMv) {
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, mv);
+    PollFor(o, hal, LearnWizard::kEnterHoldMs + 100);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    PollFor(o, hal, 50);
+}
+
+// Press AUX1 n times, with pauses long enough to end the selection.
+void PressAux(SystemOrchestrator &o, MockHal &hal, int times) {
+    for (int i = 0; i < times; ++i) {
+        hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxPressedMv);
+        PollFor(o, hal, 60);
+        hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+        PollFor(o, hal, 60);
+    }
+    // The gap that ends selection and moves to the prompt.
+    PollFor(o, hal, LearnWizard::kSelectGapMs + 100);
+}
+
+}  // namespace
+
+TEST(SystemOrchestrator, ANullStoreStillRunsAHeadlessLearnButReportsItAsUnsaved) {
+    // A bench build with no NVS: the wizard's feedback is real, and the fact that
+    // nothing was persisted is REPORTED rather than assumed. Claiming "saved" here
+    // would be a lie the user discovers on the next boot.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    // Deliberately no SetStore.
+    EXPECT_FALSE(o.LastLearnPersisted());
+
+    HoldAuxToToggle(o, hal);
+    EXPECT_TRUE(o.LearnActive()) << "an AUX1 hold must enter the headless learn (FR-31)";
+}
+
+TEST(SystemOrchestrator, AUX1HoldTogglesTheHeadlessLearnBothWays) {
+    // The SAME gesture enters and leaves (spec 7.4 step 5), which is what lets a
+    // user finish programming and get back to driving without a phone.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    HoldAuxToToggle(o, hal);
+    ASSERT_TRUE(o.LearnActive());
+    HoldAuxToToggle(o, hal);
+    EXPECT_FALSE(o.LearnActive()) << "a second AUX1 hold must exit the learn";
+}
+
+TEST(SystemOrchestrator, AShortAUX1TouchDoesNotEnterTheLearn) {
+    // Spec 7.5 chose a deliberate 1.5 s hold precisely so a stray touch cannot
+    // start a learn in traffic. A tap must do nothing.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxPressedMv);
+    PollFor(o, hal, 200);          // well under kEnterHoldMs
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    PollFor(o, hal, 200);
+    EXPECT_FALSE(o.LearnActive());
+}
+
+TEST(SystemOrchestrator, AHeadlessLearnStoresAButtonAndItClassifiesImmediately) {
+    // The whole point: no app, no host, and the taught button WORKS afterwards.
+    // The apply step is load-bearing -- without rebuilding the classifier the
+    // device would keep using the old profile until the next boot, and the button
+    // the user just taught would do nothing with correct-looking feedback.
+    MockHal hal;
+    MockHal::Defaults d;
+    // An EMPTY ladder, so the learned button is the only one and cannot be
+    // rejected as too close to an existing window.
+    d.config.channels[0].ladder.count = 0;
+    d.config.channels[0].ladder.learned_idle_mv = 2835;
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // Enter, select slot 1, then hold the wheel button at 1430 mV.
+    HoldAuxToToggle(o, hal);
+    ASSERT_TRUE(o.LearnActive());
+    PressAux(o, hal, 1);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 400);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 200);
+
+    const LadderProfile *learned = o.LastLearnedProfile(0);
+    ASSERT_NE(learned, nullptr) << "the learn must have committed a button";
+    ASSERT_EQ(learned->count, 1);
+    // The centre is the mean of what was held, within the ladder's noise.
+    EXPECT_NEAR(learned->buttons[0].mv_center, 1430, 30);
+    EXPECT_TRUE(o.LastLearnPersisted()) << "a store was attached, so the learn must persist";
+
+    // Exit the wizard, then verify the taught button is CLASSIFIED now -- which
+    // is what "learned" means. It does NOT drive the output, and that is correct:
+    // a learned profile is a set of WINDOWS, and what a window DOES is a Binding.
+    // Asserting the output here would have been asserting that learn also binds,
+    // which it does not (spec 7.4's headless loop stores LadderButtons; the
+    // gesture-to-action table is the config's).
+    HoldAuxToToggle(o, hal);
+    g_reported.clear();
+    o.SetGestureSink(&RecordGesture, nullptr);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 700);
+
+    ASSERT_EQ(g_reported.size(), 1u)
+        << "the button taught headlessly must classify without a reboot";
+    // The id is GENERATED, because a headless learn has no app to name it.
+    EXPECT_EQ(std::string(g_reported[0].button_id), "swc1_bt1");
+    EXPECT_EQ(g_reported[0].gesture, Gesture::kSingle);
+}
+
+TEST(SystemOrchestrator, AHeadlessLearnedButtonDrivesTheOutputOnceABindingNamesIt) {
+    // The other half of the composition: the generated id is DETERMINISTIC
+    // ("swc1_bt1"), so a config can bind it in advance and a headless learn fills
+    // in the level. This is the shape that lets a user program the adapter with no
+    // app at all -- the levels are learned on the device, the actions come from
+    // the config.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.channels[0].ladder.count = 0;
+    d.config.channels[0].ladder.learned_idle_mv = 2835;
+    // Pre-bind the slot the wizard will generate, to SINGLE -> 2400 mV.
+    d.config.binding_count = 1;
+    std::strncpy(d.config.bindings[0].id, "b1", sizeof(d.config.bindings[0].id) - 1);
+    d.config.bindings[0].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    std::strncpy(d.config.bindings[0].button, "swc1_bt1",
+                 sizeof(d.config.bindings[0].button) - 1);
+    d.config.bindings[0].gesture = Gesture::kSingle;
+    d.config.bindings[0].enabled = true;
+    d.config.bindings[0].action_count = 1;
+    d.config.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    d.config.bindings[0].actions[0].key_mv = 2400;
+
+    // STORE the config, so Boot LOADS it and leaves pass-through mode. With no
+    // stored config the device runs FR-25's transparent pass-through, which
+    // bypasses the classifier and the gesture resolver entirely -- so the binding
+    // could never fire, and the test would be measuring the wrong mode.
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    HoldAuxToToggle(o, hal);
+    PressAux(o, hal, 1);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 400);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 200);
+    ASSERT_NE(o.LastLearnedProfile(0), nullptr);
+    HoldAuxToToggle(o, hal);   // leave the wizard
+
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+    // Sample WHILE the pulse is on the line. This binding is SINGLE with no
+    // DOUBLE and no LONG, so it resolves the moment the debounce elapses and the
+    // 200 ms pulse is over well before the press is released -- reading the DAC
+    // afterwards would see the release, not the key. (The neighbouring
+    // APressProduces... test can poll longer only because its button also binds
+    // LONG, so its SINGLE is delayed and the pulse is still on the line at the
+    // end of the window.)
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 120);
+    const int driven_code = hal.LastDacCode(DAC_CH_KEY1);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 400);
+    EXPECT_NE(driven_code, idle_code)
+        << "a bound button taught headlessly must drive the output without a reboot";
+}
+
+TEST(SystemOrchestrator, AHeadlessLearnWithNoUsableIdleReferenceDoesNotCommit) {
+    // With no idle reference the press detector would compare a reading against
+    // zero, call every level "pressed", and commit a window computed from a
+    // fabricated denominator. Refusing is the direction FR-12 takes for an
+    // unrecognised level: serve nothing rather than guess.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.channels[0].ladder.count = 0;
+    d.config.channels[0].ladder.learned_idle_mv = 0;   // no reference
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 0);              // and nothing live
+    o.Boot();
+
+    HoldAuxToToggle(o, hal);
+    PressAux(o, hal, 1);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 400);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 0);
+    PollFor(o, hal, 200);
+
+    EXPECT_EQ(o.LastLearnedProfile(0), nullptr)
+        << "with no idle reference, nothing may be committed";
+}

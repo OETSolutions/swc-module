@@ -47,7 +47,7 @@ LearnWizard::LearnWizard(IHAL *hal, BuzzerGrammar *buzzer, LedGrammar *leds,
     : hal_(hal), buzzer_(buzzer), leds_(leds),
       aux_(aux_profile, timings), aux_profile_(aux_profile) {}
 
-void LearnWizard::Enter(uint64_t now_ms) {
+void LearnWizard::Enter(uint64_t now_ms, bool aux_held) {
     state_ = State::kSelectButton;
     profile_ = LadderProfile{};   // a fresh learn, not an edit of the old one
     press_count_ = 0;
@@ -56,6 +56,7 @@ void LearnWizard::Enter(uint64_t now_ms) {
     last_press_ms_ = now_ms;
     beeps_owed_ = 0;
     aux_was_pressed_ = false;
+    aux_seen_idle_ = !aux_held;
     last_result_ = LearnReject::kNone;
     aux_.Reset();
 
@@ -72,17 +73,30 @@ void LearnWizard::Exit(uint64_t now_ms) {
                     // caller that may want a timed fade and to match Enter().
     state_ = State::kExit;
     beeps_owed_ = 0;
+    exited_ = true;
     if (buzzer_ != nullptr) buzzer_->Play(BuzzerPattern::kProgramExit);
     if (leds_ != nullptr) leds_->SetStat(LedStatPattern::kSolid);
 }
 
-void LearnWizard::Tick(int channel, uint64_t now_ms) {
+bool LearnWizard::ConsumeCommitted() {
+    const bool v = committed_;
+    committed_ = false;
+    return v;
+}
+
+bool LearnWizard::ConsumeExited() {
+    const bool v = exited_;
+    exited_ = false;
+    return v;
+}
+
+void LearnWizard::Tick(int channel, uint64_t now_ms, int idle_mv, int temp_tenths_c) {
     if (hal_ == nullptr) return;
 
     if (state_ == State::kSelectButton) {
         ServiceSelect(now_ms);
     } else if (state_ == State::kPrompt) {
-        ServicePrompt(channel, now_ms);
+        ServicePrompt(channel, now_ms, idle_mv, temp_tenths_c);
     }
     ServiceBeeps();
 }
@@ -94,7 +108,23 @@ void LearnWizard::ServiceSelect(uint64_t now_ms) {
     const ChannelLevel lvl = aux_.Update(mv, aux_profile_.learned_idle_mv, now_ms);
     const bool pressed = (lvl == ChannelLevel::kPressed);
 
-    if (pressed && !aux_was_pressed_) {
+    // Re-arm the gate on the RAW level, not on the classifier's latched one.
+    //
+    // This is the whole mechanism that keeps the ENTERING hold from being counted
+    // as the first selection press -- without it slot 1 is unreachable and the user
+    // asking for the first button gets the second. The classifier needs several
+    // ticks to latch and reports kIdle meanwhile, so a gate that waits for a
+    // classifier-level "not pressed" is satisfied by its own debounce delay and the
+    // hold is counted anyway. (Both alternatives were tried and measured, and both
+    // counted it.) A raw comparison against the profile's own window has no
+    // latency, and it lets the gate arm while AUX1 is genuinely released, so a
+    // programmatically-requested learn -- where no hold is in flight -- counts the
+    // user's first press normally.
+    if (mv >= (aux_profile_.buttons[0].mv_center + aux_profile_.buttons[0].mv_tolerance)) {
+        aux_seen_idle_ = true;
+    }
+
+    if (pressed && !aux_was_pressed_ && aux_seen_idle_) {
         ++press_count_;
         any_press_ = true;
         last_press_ms_ = now_ms;
@@ -118,11 +148,13 @@ void LearnWizard::ServiceSelect(uint64_t now_ms) {
     }
 }
 
-void LearnWizard::ServicePrompt(int channel, uint64_t now_ms) {
+void LearnWizard::ServicePrompt(int channel, uint64_t now_ms, int idle_mv, int temp_tenths_c) {
     const int level_mv = hal_->adc_read_mv(hal_->ctx, LevelChannelFor(channel));
-    const int idle_mv = 2835;   // nominal; a real caller passes the learned idle
-    const int rail_mv = 3300;   // spec 2.4: no rail sense channel exists
-    const int temp_tenths = 235;
+    // The RAIL during learn (spec 3.4's `learned_at_rail_mv`). There is no rail
+    // sense channel on this board (AdcChannel carries SWC1/SWC2/TEMP/AUX1-3/
+    // KEY_SENSE1-2 and none of them is +3V3), so this is the board's nominal rail
+    // and is recorded as such. It is deliberately NOT read from the HAL.
+    const int rail_mv = 3300;
 
     // WAIT for the user to actually press. Sampling on every tick rejected the
     // learn with "at_idle" before the user's hand was even on the button, which
@@ -140,7 +172,7 @@ void LearnWizard::ServicePrompt(int channel, uint64_t now_ms) {
 
     if (pressing) {
         session_.AddSample(level_mv, idle_mv, static_cast<MilliVolt>(rail_mv),
-                           static_cast<int16_t>(temp_tenths), now_ms);
+                           static_cast<int16_t>(temp_tenths_c), now_ms);
         // Keep sampling until the user lets go, or the safety cap fires.
         if ((now_ms - prompt_started_ms_) < kPromptMaxHoldMs) return;
     }
@@ -175,6 +207,16 @@ void LearnWizard::ServicePrompt(int channel, uint64_t now_ms) {
             profile_.buttons[profile_.count] = out;
             ++profile_.count;
         }
+        // The IDLE REFERENCE, and forgetting it is how the learned button ends up
+        // dead. A LadderProfile is useless without it: spec 6.3 normalizes every
+        // centre by the idle the button was measured at, and `LadderClassify`
+        // reports kFault rather than classifying when the reference is zero. So a
+        // profile whose buttons were filled but whose idle stayed at the
+        // default-constructed 0 would commit happily, beep LEARN_OK, and then
+        // classify nothing -- correct-looking feedback over a button that does not
+        // work. The session holds the idle it actually measured against.
+        profile_.learned_idle_mv = session_.LearnedIdleMv();
+        committed_ = true;   // the caller persists; see ConsumeCommitted()
         if (buzzer_ != nullptr) buzzer_->Play(BuzzerPattern::kLearnOk);
     } else {
         // A REAL rejection: say WHY (FR-29) rather than a generic failure.

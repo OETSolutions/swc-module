@@ -27,7 +27,7 @@ struct Rig {
     void Tick(int channel = 0) {
         buzzer.Update(t);
         leds.Update(t);
-        wiz.Tick(channel, t);
+        wiz.Tick(channel, t, kLevelIdleMv, 0);
         t += 5;
     }
     // Hold AUX1 released so the classifier sees a stable idle, then press it.

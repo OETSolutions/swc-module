@@ -53,7 +53,23 @@ public:
     // we have rather than wedging the wizard on a stuck input.
     static constexpr uint32_t kPromptMaxHoldMs = 5000;
 
-    void Enter(uint64_t now_ms);
+    /*
+     * Begin a learn.
+     *
+     * `aux_held` is true when the entry IS an AUX1 hold (spec 7.5's 1.5 s hold),
+     * and false when the learn was requested programmatically (the app asks for
+     * one; a test drives one).
+     *
+     * **It exists so the hold does not also count as the first selection press.**
+     * With the hold counted, slot 1 is unreachable: the user asks for the first
+     * button and gets the second. Two things are needed to exclude it and neither
+     * alone is enough. This flag covers the case where the next tick is already a
+     * press (nothing to detect), and the raw-level re-arm in ServiceSelect covers
+     * the release that follows a real hold. With only the re-arm, a
+     * programmatically-requested learn loses the user's first press; with only the
+     * flag, the hold is counted anyway. Both were tried and measured.
+     */
+    void Enter(uint64_t now_ms, bool aux_held = false);
     void Exit(uint64_t now_ms);
 
     bool Active() const { return state_ != State::kIdle && state_ != State::kExit; }
@@ -61,7 +77,25 @@ public:
 
     // One tick. Reads AUX1 and the channel being learned from the HAL, so the
     // host tests drive it purely through MockHal's ADC values and clock.
-    void Tick(int channel, uint64_t now_ms);
+    //
+    // `idle_mv` is the channel's LIVE idle reference and is a parameter rather
+    // than a hardcoded nominal: spec 6.3 normalizes every learned centre by the
+    // idle it was measured at, so a sample recorded against a guess would store a
+    // window that is wrong by the ratio of the two. It is also what "at idle"
+    // means for the press detector below -- with a pinned 2835, a wheel whose
+    // rail had moved would read as permanently pressed or permanently idle.
+    void Tick(int channel, uint64_t now_ms, int idle_mv, int temp_tenths_c);
+
+    // True for exactly one tick after a successful commit filled Profile(), then
+    // cleared. The CALLER persists: this class holds no Config and no store, so
+    // it cannot write NVS and must not pretend to. A boolean returned only while
+    // the fact is new is what lets the caller save once per learned button rather
+    // than on every tick of the prompt.
+    bool ConsumeCommitted();
+
+    // True for exactly one tick after Exit(), then cleared. The caller uses it to
+    // leave the wizard alone and hand the LEDs back to the normal grammars.
+    bool ConsumeExited();
 
     // How many AUX1 presses have been counted toward the selection.
     int PressCount() const { return press_count_; }
@@ -77,7 +111,7 @@ public:
 
 private:
     void ServiceSelect(uint64_t now_ms);
-    void ServicePrompt(int channel, uint64_t now_ms);
+    void ServicePrompt(int channel, uint64_t now_ms, int idle_mv, int temp_tenths_c);
     // Re-Play the beep sequence the current press count implies, one pulse at a
     // time, because Play() replaces rather than queues.
     void ServiceBeeps();
@@ -102,10 +136,18 @@ private:
     // previous one finishes.
     int beeps_owed_ = 0;
     bool aux_was_pressed_ = false;
+    // True once AUX1 has been observed released since Enter(), so the hold that
+    // entered the wizard cannot be counted as its first selection press.
+    bool aux_seen_idle_ = false;
 
     uint64_t prompt_started_ms_ = 0;
     // The prompt waits for a press before it starts sampling, so this tracks
     // whether the user has actually pressed yet.
     bool     prompt_pressed_ = false;
     LearnReject last_result_ = LearnReject::kNone;
+    // One-tick flags, cleared by the matching Consume*(). A flag rather than a
+    // callback because the wizard is constructed with no knowledge of the caller
+    // (it needs only a HAL, a buzzer and LEDs), so it cannot call back into one.
+    bool     committed_ = false;
+    bool     exited_ = false;
 };

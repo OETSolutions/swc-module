@@ -243,20 +243,57 @@ TEST(CommandRouter, AProtocolVersionMismatchIsRefusedExplicitly) {
 }
 
 TEST(CommandRouter, AnInvalidConfigIsRejectedAndTheOldOneSurvives) {
+    // FR-26: "an invalid config is rejected with a nack, leaving the previous
+    // config intact". The assertion has to be about the PREVIOUS config, so this
+    // stores a distinctive one first.
+    //
+    // An earlier version of this test accepted `kLoaded || kNoConfig` for the
+    // post-state, which proves nothing: a rejected config that WIPED storage would
+    // have satisfied it. A test whose passing branch includes "the data is gone"
+    // cannot detect the loss of data.
     MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
     CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
     cap.Attach(r);
-    // A config whose debounce is zero: invalid.
-    const char *bad =
-        "{\"schema_version\":1,\"device_id\":\"X\","
-        "\"settings\":{\"debounce_ms\":0},\"channels\":[]}";
-    SendConfigChunked(r, /*seq=*/2, bad);
+
+    Config original = MockHalDefaultsConfig();
+    original.settings.timings.long_press_ms = 900;   // distinctive, so survival is visible
+    ASSERT_TRUE(store.Save(original)) << "the test needs a previous config to protect";
+
+    // The config must DECODE and then FAIL VALIDATION, or this test exercises the
+    // decode path instead -- which is what three earlier versions of it did. The
+    // encoder refuses to emit an invalid config (ConfigEncodeBlob validates too),
+    // so the invalid value has to be PATCHED into the wire bytes after encoding,
+    // exactly as a buggy or hostile app could send it.
+    //
+    // `long_press_ms <= double_press_off_ms` is the right kind of invalid: it is a
+    // CROSS-FIELD rule that only ConfigValidate applies, while the decoder reads
+    // the number without complaint. A single-field violation (debounce_ms = 0,
+    // say) is caught earlier by the decoder itself, so it never reaches validation.
+    const std::string good = EncodeConfig(MockHalDefaultsConfig());
+    const std::string needle = "\"long_press_ms\":750";
+    const size_t pos = good.find(needle);
+    ASSERT_NE(pos, std::string::npos) << "the fixture's long_press_ms must be findable: " << good;
+    std::string invalid_json = good;
+    invalid_json.replace(pos, needle.size(), "\"long_press_ms\":500");
+    SendConfigChunked(r, /*seq=*/2, invalid_json);
     ASSERT_TRUE(HasType(cap, "nack"));
-    // The stored config must still load (or still be absent -- never corrupt).
-    Config out{};
+    // The ERROR CODE matters, and it is `decode`, not `invalid`. `ConfigDecodeJson`
+    // validates the config it builds, so an invalid config is refused inside the
+    // decode and never reaches a separate validation step -- three earlier versions
+    // of this test asserted "invalid" and could not have passed for the right
+    // reason. Asserting the code pins the ordering AND tells the app author which
+    // message is real.
+    EXPECT_NE(cap.lines.back().find("\"decode\""), std::string::npos) << cap.lines.back();
+    EXPECT_EQ(cap.lines.back().find("save_failed"), std::string::npos)
+        << "an invalid config must not be reported as a write failure -- that would "
+           "send the user looking for an NVS problem instead of a bad field";
+
     ConfigStore s2(&hal.InterfaceRef());
-    const ConfigLoadResult lr = s2.Load(&out);
-    EXPECT_TRUE(lr == ConfigLoadResult::kLoaded || lr == ConfigLoadResult::kNoConfig);
+    Config out{};
+    ASSERT_EQ(s2.Load(&out), ConfigLoadResult::kLoaded)
+        << "a refused config must not have destroyed the stored one";
+    EXPECT_EQ(out.settings.timings.long_press_ms, 900u)
+        << "and the stored config must be the ORIGINAL, not a default or a partial write";
 }
 
 TEST(CommandRouter, AValidConfigIsAckedAndPersisted) {

@@ -402,11 +402,18 @@ void CommandRouter::HandleConfigEnd(const cJSON *root, uint32_t for_seq) {
         ResetRun();
         return;
     }
-    if (!ConfigValidate(c)) {
-        Nack(for_seq, "invalid", "config failed validation");
-        ResetRun();
-        return;
-    }
+    // No separate `ConfigValidate` here, and that is deliberate rather than an
+    // omission. `ConfigDecodeJson` ends by validating the config it just built, so
+    // by this point the check has already run; a second call would be a branch that
+    // can never be taken, which reads as protection that is not there. (It was
+    // there -- and a test asserting the "invalid" nack could not fail, because the
+    // decode above rejects first with "decode". The test now asserts the code that
+    // actually comes back.)
+    //
+    // The order still matters and is preserved: nothing is written until both the
+    // staged bytes and the decoded result are known good, and `Save` re-validates
+    // on its own way in (`ConfigEncodeBlob` refuses an invalid config), so a config
+    // that somehow got past the decode cannot be persisted.
     if (store_ == nullptr || !store_->Save(c)) {
         // The OLD config is untouched by a failed Save, which is the point of the
         // A/B slots. Report the failure rather than acking a config that is not

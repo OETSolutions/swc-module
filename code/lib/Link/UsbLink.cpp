@@ -203,6 +203,12 @@ void UsbLinkService()
     // The router emits at most one deferred frame per call (a large config reply
     // is chunked), so calling both keeps a reply moving without a burst that the
     // transport's two-frame buffer would drop.
-    if (g_router != nullptr) g_router->Process();
+    if (g_router != nullptr) {
+        // Time-based frames first (spec 4.4's 2 s status). `Process()` is also
+        // called from host tests that never advance a clock, which is why the
+        // periodic status is driven here rather than from `Process()`.
+        g_router->Tick();
+        g_router->Process();
+    }
     g_cdc.ServiceTx();
 }

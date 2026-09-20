@@ -211,6 +211,62 @@ TEST(CommandRouter, PingIsAnsweredWithStatusCarryingForSeq) {
         << "the reply's own seq must be the firmware's counter, not the peer's";
 }
 
+TEST(CommandRouter, TheFirmwareSendsAPeriodicStatusWhileConnected) {
+    // Spec 4.4: "Firmware sends `status` every 2 s when connected." The method
+    // that does it had NO caller -- the device emitted a status only in reply to
+    // `ping`/`status_get` -- so the keepalive §4.4 promises was never sent and a
+    // quiet app saw nothing until it asked. This drives the poll-loop tick.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    // A frame proves the peer exists; the periodic status is armed from here.
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    const size_t after_ping = cap.lines.size();   // the ping reply
+
+    // The first tick only seeds the clock, so no status yet.
+    r.Tick();
+    EXPECT_EQ(cap.lines.size(), after_ping) << "no status before one period elapses";
+
+    // Just short of the period: still nothing.
+    hal.AdvanceMs(1999);
+    r.Tick();
+    EXPECT_EQ(cap.lines.size(), after_ping) << "1999 ms is not yet 2 s";
+
+    // At the period boundary: exactly one status.
+    hal.AdvanceMs(1);
+    r.Tick();
+    ASSERT_EQ(cap.lines.size(), after_ping + 1u);
+    EXPECT_NE(cap.lines.back().find("\"type\":\"status\""), std::string::npos)
+        << "the periodic frame is a `status`";
+}
+
+TEST(CommandRouter, APeriodicStatusNeedsAConnectedLink) {
+    // With no peer, a periodic status would fill the small TX buffer with frames
+    // nothing drains, and the buffer would then refuse a real reply.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    hal.AdvanceMs(10000);
+    r.Tick();
+    EXPECT_TRUE(cap.lines.empty()) << "no peer, so no periodic status";
+}
+
+TEST(CommandRouter, DisconnectingStopsThePeriodicStatus) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    r.OnConnected();                 // emits hello, opens a config reply run
+    r.OnDisconnected();
+    const size_t after = cap.lines.size();
+
+    hal.AdvanceMs(10000);
+    r.Tick();
+    EXPECT_EQ(cap.lines.size(), after) << "a disconnected link sends no status";
+}
+
 TEST(CommandRouter, AnUnknownCommandTypeIsNackedNotIgnored) {
     MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
     CommandRouter r(&hal.InterfaceRef(), nullptr, &store);

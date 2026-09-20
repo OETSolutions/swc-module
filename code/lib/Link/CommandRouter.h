@@ -82,8 +82,18 @@ public:
     // buffer cannot overflow and no single call blocks the poll loop.
     void Process();
 
-    // Periodic status (spec 4.4: every 2 s while connected).
-    void SendStatus();
+    /*
+     * Drive the time-based frames. Called once per poll-loop tick by the device
+     * link (`UsbLinkService`), because `Process()` is called from tests that do
+     * not advance a clock.
+     *
+     * This is the ONLY caller of `SendStatus()` -- spec 4.4 requires the firmware
+     * to send `status` every 2 s while connected, and before this existed the
+     * method had no caller at all: the device emitted a status only in reply to
+     * `ping`/`status_get`, so the keepalive §4.4 promises was never sent and a
+     * quiet app saw nothing until it asked.
+     */
+    void Tick();
 
     // The app must not outrun the head unit's key recognition.
     static constexpr uint32_t kDefaultTestKeyHoldMs = 200;
@@ -114,6 +124,9 @@ private:
     void HandleMaintenanceExit(uint32_t for_seq);
     // Replies to `ping`/`status` request and to `hello`.
     void ReplyStatus(uint32_t for_seq);
+    // Spec 4.4's periodic status. Private: it is an implementation of `Tick()`,
+    // not part of the router's surface.
+    void SendStatus();
     void BeginConfigReplyRun();
 
     // A nack names the failing check, because "config is corrupt" is not
@@ -164,6 +177,19 @@ private:
     // known at connect, so the first frame establishes the baseline; without
     // this every first frame looks like a gap and emits a spurious link_gap.
     bool     seen_any_ = false;
+
+    // --- periodic status (spec 4.4) ----------------------------------------
+    // The link is up: `OnConnected` sets this, `OnDisconnected`/`OnLine` clear
+    // it. The periodic status belongs to a CONNECTED link, so a window with no
+    // peer does not broadcast into a FIFO nobody reads.
+    bool     connected_ = false;
+    // Whether the periodic-status clock has been seeded. A SEPARATE flag, not
+    // `last_status_ms_ == 0`: the HAL clock legitimately reads 0 at boot, so a
+    // zero sentinel would re-seed every tick at time 0 and the status would never
+    // fire (caught by the test, not by inspection).
+    bool     status_clock_seeded_ = false;
+    uint64_t last_status_ms_ = 0;
+    static constexpr uint64_t kStatusPeriodMs = 2000;   // spec 4.4
 
     // --- learn run (FR-5) ---------------------------------------------------
     // A learn run is an OPEN STREAM, not a request/response: the app sends

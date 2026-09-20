@@ -84,9 +84,16 @@ void CommandRouter::OnDisconnected() {
     // Reconnect is stateless (spec 4.4), so the peer's sequence baseline is
     // re-established by the next frame rather than remembered across a link drop.
     seen_any_ = false;
+    // No peer, so no periodic status: a status written now would sit in a FIFO
+    // nobody is draining.
+    connected_ = false;
 }
 
 void CommandRouter::OnConnected() {
+    connected_ = true;
+    // Seed the periodic-status clock so a status is not sent on the same tick as
+    // `hello`; the first periodic status lands one period after connect.
+    status_clock_seeded_ = false;
     // hello first (spec 4.5's version negotiation), then the config run so the
     // app can render immediately without asking.
     char body[192];
@@ -188,8 +195,32 @@ void CommandRouter::SendStatus() {
     ReplyStatus(seq_sent_);
 }
 
+void CommandRouter::Tick() {
+    if (hal_ == nullptr) return;
+    // The periodic status belongs to a CONNECTED link only (spec 4.4). Writing
+    // one with no peer would fill the TX buffer with frames nothing drains, and
+    // the buffer is small enough that it would then refuse a real reply.
+    if (!connected_) return;
+
+    const uint64_t now = hal_->now_ms(hal_->ctx);
+    if (!status_clock_seeded_) {
+        // First tick of a connection: seed the clock rather than sending, so
+        // `hello` and a periodic status do not arrive on the same tick.
+        status_clock_seeded_ = true;
+        last_status_ms_ = now;
+        return;
+    }
+    if (now - last_status_ms_ < kStatusPeriodMs) return;
+    last_status_ms_ = now;
+    SendStatus();
+}
+
 void CommandRouter::OnLine(const char *line, size_t len) {
     if (line == nullptr || len == 0) return;
+    // A frame from the peer proves a peer exists, so the periodic status is
+    // armed even if the transport never called `OnConnected` (a test may drive
+    // `OnLine` directly; the device path sets this in `OnConnected`).
+    connected_ = true;
     if (len > kNdjsonMaxFrame) {
         Nack(0, "bad_frame", "line exceeds the frame cap");
         return;

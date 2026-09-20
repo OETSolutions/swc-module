@@ -290,6 +290,7 @@ void SystemOrchestrator::Tick(uint64_t now_ms) {
     // FR-31: after the channels, so a learn commit is applied before the next
     // tick classifies against the new profile.
     ServiceLearn(now_ms);
+    UpdateLed2ForDrivingState();
     buzzer_.Update(now_ms);
     leds_.Update(now_ms);
 }
@@ -504,6 +505,57 @@ void SystemOrchestrator::RestatLeds() {
         return;
     }
     leds_.SetStat(usb_connected_ ? LedStatPattern::kSolid : LedStatPattern::kBreathe);
+}
+
+/*
+ * LED2, the ACTIVITY channel (spec 7.3): solid while a key is actually being
+ * presented, off otherwise.
+ *
+ * **This is the one LED2 state that is a real diagnostic, and it was
+ * unreachable.** Spec 7.3 says the user can see the adapter holding a key, "which
+ * distinguishes 'the adapter is doing something wrong' from 'the head unit is
+ * ignoring it'" -- but nothing ever set anything except `kOff`: the only `Set2`
+ * callers were the learn wizard. A user debugging a dead button had no way to
+ * tell a firmware that never drove the line from a radio that never listened.
+ *
+ * **Derived from the channels, not set at each driven/released site.** There are
+ * eight places that flip `key_driven`, and a `Set2` at each would be eight chances
+ * to miss one and leave the LED lying. Asking the state which channel is driving
+ * cannot disagree with the state.
+ *
+ * **It defers to the learn wizard, and to nothing else.** The wizard drives both
+ * LEDs as prompts, so the derivation must not fight it. Maintenance is
+ * deliberately NOT deferred to: the wizard is the only LED2 owner, and the
+ * maintenance indication is `LED_STAT`'s double-flash (spec §8.2), which this
+ * never touches. Deferring to maintenance as well was in the first version of this
+ * function and was wrong -- the symptom would have been a missing activity LED for
+ * the life of a maintenance window, which nothing would have caught.
+ *
+ * **Be precise about what this guard buys, because during the learn's PROMPT
+ * phase it is belt-and-braces, not load-bearing.** While `leds_` is in
+ * `kAlternate`, `LedGrammar::Update` makes LED2 the complement of `LED_STAT` and
+ * IGNORES `Set2` entirely -- so a `Set2(kSolid)` there has no effect whether this
+ * guard exists or not. The guard still earns its place for the window between the
+ * wizard leaving `kAlternate` and `ConsumeExited` handing the LEDs back, where a
+ * call here WOULD land. I tried four ways to write a test that fails when this
+ * guard is deleted and could not, which is the honest reason this comment says
+ * "belt-and-braces" instead of pointing at a test.
+ */
+void SystemOrchestrator::UpdateLed2ForDrivingState() {
+    if (wizard_.Active()) return;
+
+    bool any_driving = false;
+    for (uint8_t i = 0; i < channel_count_; ++i) {
+        if (channels_[i].key_driven) {
+            any_driving = true;
+            break;
+        }
+    }
+    const Led2Pattern want = any_driving ? Led2Pattern::kSolid : Led2Pattern::kOff;
+    if (want != led2_driving_) {
+        led2_driving_ = want;
+        leds_.Set2(want);
+    }
 }
 
 void SystemOrchestrator::Identify() {

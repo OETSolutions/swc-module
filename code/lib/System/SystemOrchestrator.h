@@ -379,6 +379,12 @@ private:
     void       *gesture_sink_ctx_ = nullptr;
     bool        usb_connected_ = false;
     bool        faulted_ = false;
+    // The LED2 pattern the driving-state derivation last chose. Kept so `Tick`
+    // only calls `Set2` on a CHANGE: `Set2` restarts the pattern's phase clock,
+    // so re-setting the same value every tick would hold every LED2 pattern at
+    // its first step forever.
+    Led2Pattern led2_driving_ = Led2Pattern::kOff;
+    void UpdateLed2ForDrivingState();
     LogSink     log_sink_ = nullptr;
     void       *log_sink_ctx_ = nullptr;
     void RestatLeds();

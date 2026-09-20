@@ -1137,3 +1137,166 @@ TEST(SystemOrchestrator, AnInEnvelopeKeyProducesNoWarning) {
     PollFor(o, hal, 700);
     EXPECT_TRUE(logs.lines.empty()) << "an in-envelope key needs no warning";
 }
+
+// --- LED2, the activity channel (spec 7.3) ----------------------------------
+
+namespace {
+// LED2 while a key is driven: one rising edge then held, versus none at all.
+int CountLed2Edges(MockHal &hal, SystemOrchestrator &o, uint32_t total_ms) {
+    int on = 0;
+    bool prev = false;
+    for (uint32_t t = 0; t < total_ms; t += 5) {
+        o.Tick(hal.NowMs());
+        const bool now = hal.GpioRead(GPIO_LED2);
+        if (now && !prev) ++on;
+        prev = now;
+        hal.AdvanceMs(5);
+    }
+    return on;
+}
+}  // namespace
+
+TEST(SystemOrchestrator, LED2ShowsTheLineIsDrivenThenReturnsOff) {
+    // Spec 7.3: "the user can see that the adapter is holding a key, which
+    // distinguishes 'the adapter is doing something wrong' from 'the head unit is
+    // ignoring it'." That diagnostic was unreachable -- the only Set2 callers
+    // were the learn wizard, so LED2 sat dark through every press.
+    //
+    // The drive lands LATE: a SINGLE resolves on release, after the 500 ms double
+    // window, and is then held for send_duration_ms (200). So the release poll is
+    // what must be watched, not the press.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+
+    // Idle first: the derivation must not light LED2 just because the device runs.
+    EXPECT_EQ(CountLed2Edges(hal, o, 200), 0) << "an idle device must not show activity";
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);                       // press
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);    // release; SINGLE resolves inside
+    EXPECT_GT(CountLed2Edges(hal, o, 700), 0)
+        << "the driven KEY line must be visible on LED2";
+}
+
+TEST(SystemOrchestrator, LED2DoesNotLatchOnAfterThePulseEnds) {
+    // The other half: a released key must not leave the activity LED lit, or the
+    // diagnostic inverts -- the user would see "holding a key" on a device that is
+    // not, and would go looking for a fault that is not there.
+    //
+    // The settle is LONGER than the pulse plus the double window on purpose. An
+    // earlier version of this test started measuring 700 ms after release, which
+    // is exactly when the pulse ends, so it counted the tail of the drive as a
+    // rising edge and failed against correct code.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 1200);      // past the double window AND the drive pulse
+
+    EXPECT_EQ(CountLed2Edges(hal, o, 500), 0)
+        << "a released key must leave LED2 off, not latched on";
+    EXPECT_FALSE(hal.GpioRead(GPIO_LED2)) << "and the line must be off, not merely steady";
+}
+
+TEST(SystemOrchestrator, AnUnrecognizedPressShowsNoActivity) {
+    // FR-12 again, from the LED's side: an unrecognised press drives nothing, so
+    // LED2 must stay dark. If it lit, the LED would report activity for a press
+    // that never reached the radio -- the opposite of its purpose, and it would
+    // send the user hunting for a radio problem that is really a learned-window
+    // problem.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2400);   // in range, in no window
+    PollFor(o, hal, 200);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    EXPECT_EQ(CountLed2Edges(hal, o, 700), 0)
+        << "nothing was driven, so there is no activity to show";
+}
+
+TEST(SystemOrchestrator, ALearnLED2IsTheComplementOfLedStatNotActivity) {
+    // What the user watching a learn actually sees, pinned so it cannot drift.
+    //
+    // Spec 7.3 makes "alternating with LED2" a property of the PAIR: while
+    // LED_STAT alternates, LED2 is its complement and `Set2` is ignored outright.
+    // That is why a learn looks like an alternating pair rather than a state LED
+    // plus an activity LED, and it is worth a test because it is the one place
+    // where the activity derivation is legitimately overridden.
+    //
+    // (I could not write a test that fails when the wizard guard in
+    // `UpdateLed2ForDrivingState` is removed: during the prompt phase the
+    // alternate override already swallows any `Set2`, so the guard is
+    // belt-and-braces there. This test pins the behaviour that actually decides
+    // what the LEDs show.)
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.channels[0].ladder.count = 0;
+    d.config.channels[0].ladder.learned_idle_mv = 2835;
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    HoldAuxToToggle(o, hal);
+    ASSERT_TRUE(o.LearnActive());
+
+    // Sample both LEDs together. Three assertions, and the THIRD is the one that
+    // matters: "never both on, never both off" is satisfied by a plain solid
+    // LED_STAT too, so on its own it does not prove alternation. Requiring LED2 to
+    // be ON for part of the window is what separates `kAlternate` (LED2 is the
+    // complement, so it lights) from any non-alternating pattern (LED2 stays off).
+    int both_on = 0, neither = 0, stat_on = 0, led2_on = 0, samples = 0;
+    for (uint32_t t = 0; t < 1200; t += 5) {
+        o.Tick(hal.NowMs());
+        const bool stat = hal.GpioRead(GPIO_LED_STAT);
+        const bool led2 = hal.GpioRead(GPIO_LED2);
+        if (stat && led2) ++both_on;
+        if (!stat && !led2) ++neither;
+        if (stat) ++stat_on;
+        if (led2) ++led2_on;
+        ++samples;
+        hal.AdvanceMs(5);
+    }
+    EXPECT_GT(samples, 0);
+    EXPECT_EQ(both_on, 0) << "the pair must alternate, so both are never lit at once";
+    EXPECT_EQ(neither, 0) << "and one of the two must always be lit during a learn";
+    EXPECT_GT(stat_on, 0) << "LED_STAT must light for part of the cycle";
+    EXPECT_GT(led2_on, 0)
+        << "LED2 must light too -- that is what makes this an ALTERNATION rather "
+           "than a solid state LED with a dark activity LED";
+}
+
+TEST(SystemOrchestrator, PROBE_LEARN_LED2) {
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.channel_count = 1;
+    d.config.binding_count = 0;
+    hal.ClearNvs();
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    printf("PROBE pass_through=%d\n", (int)o.PassThroughActive());
+    HoldAuxToToggle(o, hal);
+    printf("PROBE learn=%d\n", (int)o.LearnActive());
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    for (int i = 0; i < 30; ++i) {
+        o.Tick(hal.NowMs()); hal.AdvanceMs(5);
+        printf("  t=%3d LED2=%d writes=%d\n", i*5,
+               (int)hal.GpioRead(GPIO_LED2), hal.GpioWriteCount(GPIO_LED2));
+    }
+}

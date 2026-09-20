@@ -109,6 +109,28 @@ static int HalAdcReadMv(void *ctx, AdcChannel ch)
         // indistinguishable from a real measurement.
         return -1;
     }
+    // The per-chip eFuse curve, applied as the spec's §2.3 requires: via
+    // `adc_cali_raw_to_voltage()` on the handle created at init. This call was
+    // MISSING -- the handle was created and then ignored, and every reading went
+    // through `AdcRawToMilliVolts`, which `AdcCalibrationSelect` populates with
+    // the SAME straight line whether or not the eFuse was available. So the
+    // factory calibration was computed at boot and discarded, and the device
+    // reported `cali_degraded == false` while using the degraded line.
+    //
+    // The fallback is the linear curve, and only when the eFuse is genuinely
+    // absent (spec 3.2: `ESP_ERR_NOT_SUPPORTED` on blank-eFuse batches). The two
+    // paths are now genuinely different, which is what `CalibrationSource`
+    // promised and did not deliver.
+    if (g_state.cali != NULL) {
+        int mv = 0;
+        if (adc_cali_raw_to_voltage(g_state.cali, raw, &mv) == ESP_OK) {
+            return mv;
+        }
+        // A conversion failure on a live handle falls back to the line rather
+        // than returning -1: the reading is usable and dropping it would look
+        // like a bus fault. Logged once per call site is too noisy, so it is not
+        // logged here -- the init-time path already reports the degraded source.
+    }
     return AdcRawToMilliVolts(g_state.curve, (uint16_t)raw);
 }
 

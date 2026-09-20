@@ -29,6 +29,28 @@ App partition is **1920 KB (1,966,080 bytes)** per slot; the scaffolding image
 occupies 10.96 % of one slot. **Note the slot is 1920 KB, not the 1952 KB the
 spec §9.2 states** — see "Defect 2" below.
 
+## size-after-tasks-1-14b: the real number
+
+`size-after-tasks-1-14b: text=218361, data=71716, bss=531253, dec=821330 (0xc8852) bytes — firmware.elf, pio run -e esp32s3 -t size, 2026-09-19`
+
+`firmware.bin` is **290,045 bytes** — 14.8 % of the 1,966,080-byte slot. This
+supersedes the scaffolding figure above as the comparison baseline: Tasks 1–14b
+are implemented (HAL, orchestrator, gesture, config, NDJSON, feedback, EspHal)
+and this build *does* link them, which the scaffolding build did not.
+
+**Read this number carefully, because it proved to be a trap.** The step from
+215,085 → 289,789 bytes was the FIRST evidence that `lib/` had finally been
+compiled into the image (Defect 44): an eleven-task build had previously weighed
+exactly what a one-task build weighed, because IDF's component model was never
+told that `lib/` existed and the linker had nothing to link. A budget gate cannot
+detect that class of failure at all — it is an upper bound, and "no code" is
+always under it. The size moving is a symptom; the check that means something is
+that the object files exist and are referenced.
+
+Two `text` measurements disagree (218,361 here vs. 290,045 total image) because
+the size tool reports `.bin` size separately from ELF `.text`. Use the `.bin`
+figure for the CI budget gate, which is what actually has to fit in the slot.
+
 ## Verification targets
 
 - `pio run -e esp32s3 -t size` → prints the table above. **Works.**

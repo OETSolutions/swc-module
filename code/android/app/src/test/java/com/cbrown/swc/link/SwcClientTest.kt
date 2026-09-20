@@ -44,6 +44,8 @@ class SwcClientTest {
         }
         override val incoming: Flow<ByteArray> = flow
         override fun close() {}
+        /** How many collectors are attached, so a test can wait for a real subscriber. */
+        val subscribers: Int get() = flow.subscriptionCount.value
         suspend fun emit(text: String) = flow.emit(text.toByteArray())
     }
 
@@ -389,6 +391,13 @@ class SwcClientTest {
         t.autoAck = true
         val client = SwcClient(t)
         val reader = Thread { runBlocking { client.run() } }.apply { isDaemon = true; start() }
+        // Wait until the client has actually SUBSCRIBED before racing. `incoming` is
+        // a SharedFlow with no replay, so an ack emitted before the reader attaches is
+        // dropped -- and a dropped ack looks exactly like a collision, which made an
+        // earlier version of this test flaky under a loaded build.
+        val deadline = System.currentTimeMillis() + 5_000
+        while (t.subscribers < 1 && System.currentTimeMillis() < deadline) Thread.sleep(1)
+        assertEquals("the client reader never subscribed", 1, t.subscribers)
 
         repeat(30) {
             val gate = java.util.concurrent.CyclicBarrier(racers)

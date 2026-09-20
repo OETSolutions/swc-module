@@ -263,6 +263,10 @@ void CommandRouter::OnLine(const char *line, size_t len) {
         HandleLearnStop(root, h.seq);
     } else if (strcmp(h.type, "learn_commit") == 0) {
         HandleLearnCommit(root, h.seq);
+    } else if (strcmp(h.type, "maintenance_enter") == 0) {
+        HandleMaintenanceEnter(h.seq);
+    } else if (strcmp(h.type, "maintenance_exit") == 0) {
+        HandleMaintenanceExit(h.seq);
     } else if (strcmp(h.type, "time_sync") == 0) {
         // Accepted and acked: the firmware has no RTC and no wall-clock use, so
         // storing it would be a field nothing reads. Acking is honest -- the
@@ -272,9 +276,9 @@ void CommandRouter::OnLine(const char *line, size_t len) {
         snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(h.seq));
         Emit("ack", body);
     } else {
-        // ota_* and maintenance_* belong to later tasks. They are KNOWN
-        // commands (so they are not "unknown_type"), but this build cannot yet
-        // execute them, and saying that is better than a silent no-op.
+        // ota_* belong to a later task. They are KNOWN commands (so they are not
+        // "unknown_type"), but this build cannot yet execute them, and saying that
+        // is better than a silent no-op.
         Nack(h.seq, "not_implemented", h.type);
     }
 
@@ -480,6 +484,41 @@ void CommandRouter::HandleTestKey(const cJSON *root, uint32_t for_seq) {
         Nack(for_seq, "out_of_range", "key_mv is outside the output envelope");
         return;
     }
+    char body[64];
+    snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
+    Emit("ack", body);
+}
+
+/*
+ * Spec 8.2's USB triggers. The WINDOW is the orchestrator's; the radio that the
+ * window exists for is device-only work in the maintenance translation units, so
+ * what this does is open or close the state and acknowledge.
+ *
+ * It goes through the orchestrator rather than reaching for a MaintenanceMode of
+ * its own: a second instance would have its own idea of whether the window is
+ * open, and the AUX1 path and the USB path could then disagree about the same
+ * device. (The same reasoning as the single ConfigStore.)
+ */
+void CommandRouter::HandleMaintenanceEnter(uint32_t for_seq) {
+    if (sys_ == nullptr) {
+        Nack(for_seq, "unavailable", "no orchestrator");
+        return;
+    }
+    sys_->EnterMaintenance(MaintenanceTrigger::kUsbCommand, hal_->now_ms(hal_->ctx));
+    char body[64];
+    snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
+    Emit("ack", body);
+}
+
+void CommandRouter::HandleMaintenanceExit(uint32_t for_seq) {
+    if (sys_ == nullptr) {
+        Nack(for_seq, "unavailable", "no orchestrator");
+        return;
+    }
+    // Idempotent: exiting a closed window is not an error, because the app may
+    // exit after the 5-minute timeout already closed it and a nack there would
+    // read as a failed command.
+    sys_->ExitMaintenance();
     char body[64];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
     Emit("ack", body);

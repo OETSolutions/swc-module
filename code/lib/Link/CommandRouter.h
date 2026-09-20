@@ -95,6 +95,10 @@ private:
     void HandleLearnStart(const cJSON *root, uint32_t for_seq);
     void HandleLearnStop(const cJSON *root, uint32_t for_seq);
     void HandleLearnCommit(const cJSON *root, uint32_t for_seq);
+    // FR-33: the two USB maintenance triggers. The window itself is the
+    // orchestrator's; the radio is device-only work elsewhere.
+    void HandleMaintenanceEnter(uint32_t for_seq);
+    void HandleMaintenanceExit(uint32_t for_seq);
     // Replies to `ping`/`status` request and to `hello`.
     void ReplyStatus(uint32_t for_seq);
     void BeginConfigReplyRun();

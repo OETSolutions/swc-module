@@ -640,3 +640,132 @@ TEST(SystemOrchestrator, AHeadlessLearnWithNoUsableIdleReferenceDoesNotCommit) {
     EXPECT_EQ(o.LastLearnedProfile(0), nullptr)
         << "with no idle reference, nothing may be committed";
 }
+
+// --- FR-33: maintenance from AUX1, the no-app fallback ------------------------
+//
+// Spec 8.2 nests the two holdings: 1.5 s is PROGRAMMING, 3 s is MAINTENANCE, the
+// shorter a subset of the longer "so holding too long to program escalates
+// cleanly into maintenance rather than into an undefined state". That nesting is
+// the whole reason this can be tested at all: the escalation has to survive the
+// programming hold having ALREADY fired at 1.5 s.
+
+namespace {
+
+// Hold AUX1 for `ms` from a clean release.
+void HoldAuxFor(SystemOrchestrator &o, MockHal &hal, uint32_t ms) {
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxPressedMv);
+    PollFor(o, hal, ms);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    PollFor(o, hal, 60);
+}
+
+}  // namespace
+
+TEST(SystemOrchestrator, ASustainedAUX1HoldEntersMaintenanceWithNoApp) {
+    // FR-33's no-app fallback. The user may not have the head unit out of the
+    // dash, so reaching the setup page cannot require a phone.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    ASSERT_FALSE(o.MaintenanceActive());
+
+    HoldAuxFor(o, hal, SystemOrchestrator::kMaintenanceHoldMs + 150);
+    EXPECT_TRUE(o.MaintenanceActive()) << "a 3 s AUX1 hold must open the maintenance window";
+    EXPECT_EQ(o.MaintenanceTriggeredBy(), MaintenanceTrigger::kAux1Hold);
+}
+
+TEST(SystemOrchestrator, AProgrammingHoldEscalatesIntoMaintenanceRatherThanUndefinedState) {
+    // Spec 8.2's nesting, which is the part that is easy to get wrong: by 3 s the
+    // 1.5 s programming hold has ALREADY toggled the wizard, so the maintenance
+    // entry has to fire on its own latch and leave the wizard. Without that, a
+    // long hold enters programming and then exits it again, and the user who
+    // wanted maintenance gets neither.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    HoldAuxFor(o, hal, SystemOrchestrator::kMaintenanceHoldMs + 150);
+    EXPECT_TRUE(o.MaintenanceActive());
+    EXPECT_FALSE(o.LearnActive())
+        << "escalating to maintenance must not leave a learn running behind it";
+}
+
+TEST(SystemOrchestrator, TheProgrammingHoldAloneDoesNotOpenMaintenance) {
+    // The two gestures must stay distinguishable: a user programming a button
+    // must not find themselves in the setup page.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    HoldAuxFor(o, hal, LearnWizard::kEnterHoldMs + 100);   // 1.5 s only
+    EXPECT_FALSE(o.MaintenanceActive());
+    EXPECT_TRUE(o.LearnActive()) << "1.5 s is the programming hold";
+}
+
+TEST(SystemOrchestrator, MaintenanceTimesOutAndDoesNotStrandTheDevice) {
+    // FR-38: a device stuck unable to serve input because someone opened a web
+    // page is unacceptable. The window is bounded at 5 minutes of inactivity.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    o.EnterMaintenance(MaintenanceTrigger::kUsbCommand, hal.NowMs());
+    ASSERT_TRUE(o.MaintenanceActive());
+
+    // Poll for just under the window, then past it.
+    PollFor(o, hal, 299000);
+    EXPECT_TRUE(o.MaintenanceActive()) << "the window must not close early";
+    PollFor(o, hal, 2000);
+    EXPECT_FALSE(o.MaintenanceActive()) << "5 minutes of inactivity must close the window";
+}
+
+TEST(SystemOrchestrator, PressesStillWorkWhileMaintenanceIsOpen) {
+    // FR-38's stated reason for a bounded window: "a device unable to serve input
+    // is unacceptable". That only means something if maintenance is NOT exclusive,
+    // so this asserts the steering wheel keeps working while the radio is up.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+    o.EnterMaintenance(MaintenanceTrigger::kUsbCommand, hal.NowMs());
+    ASSERT_TRUE(o.MaintenanceActive());
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 700);
+    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "the steering wheel must keep working while maintenance is open";
+}
+
+TEST(SystemOrchestrator, NoteMaintenanceActivityKeepsAWorkingUserInTheWindow) {
+    // A user typing a PoP or working in the web UI must not be kicked out
+    // mid-task, which is what the activity clock is for.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    o.EnterMaintenance(MaintenanceTrigger::kUsbCommand, hal.NowMs());
+
+    for (int i = 0; i < 5; ++i) {
+        PollFor(o, hal, 200000);                       // 200 s, under the window
+        o.NoteMaintenanceActivity(hal.NowMs());
+    }
+    EXPECT_TRUE(o.MaintenanceActive())
+        << "repeated activity must keep the window open past the original 5 minutes";
+}

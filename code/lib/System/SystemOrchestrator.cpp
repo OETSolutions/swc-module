@@ -28,6 +28,11 @@ constexpr int kPassThroughPressDeltaMv = 300;
 constexpr int kKeyEnvelopeLowMv  = kOutputFloorMv;    // 1800
 constexpr int kKeyEnvelopeHighMv = kOutputCeilingMv;  // 5200
 
+// The maintenance hold is `SystemOrchestrator::kMaintenanceHoldMs` (the class
+// declares it, so a test or caller names the same number). It lives there rather
+// than here because the nesting with the programming hold is part of the AUX1
+// gesture's contract, and the maintenance class has no idea AUX1 exists.
+
 /*
  * The top of AUX1's press window, in millivolts (1700 with the default profile).
  *
@@ -65,7 +70,11 @@ SystemOrchestrator::SystemOrchestrator(IHAL *hal, const Config &config,
       // FR-31's headless learn. Constructed with the SAME timings the channels
       // use, so "what counts as an AUX1 press" matches "what counts as a wheel
       // press" -- one debounce definition in the firmware.
-      wizard_(hal, &buzzer_, &leds_, Aux1ProfileDefault(), timings) {}
+      wizard_(hal, &buzzer_, &leds_, Aux1ProfileDefault(), timings),
+      // Spec 8.2's 5-minute inactivity window. A config may carry a different
+      // one; this default exists so a bare device still has a BOUNDED window
+      // rather than an unbounded one.
+      maintenance_(hal, 300000) {}
 
 // The bindings a channel's buttons actually have, which is what makes the
 // gesture resolve adaptive (spec 6.6). Scanned from the config rather than
@@ -288,14 +297,30 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
         if (!aux_holding_) {
             aux_holding_ = true;
             aux_hold_ms_ = now_ms;
-        } else if (aux_hold_latch_) {
-            // The hold already fired once and is still being held. Nothing here:
-            // a continuous hold must toggle exactly once. Without this latch, the
-            // hold clock keeps running, so a user who holds AUX1 a little long
-            // would exit the learn they just entered -- and the second hold would
-            // land on the freshly-reset aux_was_pressed_ and register as a
-            // selection press.
-        } else if ((now_ms - aux_hold_ms_) >= LearnWizard::kEnterHoldMs) {
+        } else if ((now_ms - aux_hold_ms_) >= kMaintenanceHoldMs && !maint_fired_latch_) {
+            // Checked FIRST, and that ordering is load-bearing: the 1.5 s tier
+            // below sets `aux_hold_latch_`, so a separate "already fired" branch
+            // ahead of this one would swallow every tick after the programming
+            // hold and the 3 s tier would be UNREACHABLE -- the escalation spec
+            // 8.2 requires would silently never happen. (It did not, until
+            // measured.) The two tiers are one escalation, so they share one
+            // latch-checked chain rather than each guarding itself.
+            // Spec 8.2 nests the two holdings: 1.5 s is PROGRAMMING and 3 s is
+            // MAINTENANCE, the shorter a subset of the longer, so holding too long
+            // to program escalates cleanly into maintenance rather than into an
+            // undefined state. By 3 s the programming hold has already toggled the
+            // wizard, so this must fire on its own latch and leave the wizard
+            // alone -- otherwise a long hold would enter programming and then
+            // immediately exit it again.
+            maint_fired_latch_ = true;
+            if (wizard_.Active()) {
+                // Leave the learn first: a user who over-held is trying to reach
+                // maintenance, not to abandon a half-finished programming session
+                // in a state they cannot see.
+                wizard_.Exit(now_ms);
+            }
+            maintenance_.Enter(MaintenanceTrigger::kAux1Hold, now_ms);
+        } else if ((now_ms - aux_hold_ms_) >= LearnWizard::kEnterHoldMs && !aux_hold_latch_) {
             // Consume the edge. The LATCH, not this flag, is what prevents a
             // second toggle: the flag is cleared so the next release re-arms.
             aux_hold_latch_ = true;
@@ -318,7 +343,13 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
     } else {
         aux_holding_ = false;
         aux_hold_latch_ = false;
+        maint_fired_latch_ = false;
     }
+
+    // FR-38: the window closes on its own after 5 minutes of inactivity, so a
+    // device left unable to serve input because someone opened a web page cannot
+    // happen. Update() is what performs the close.
+    maintenance_.Update(now_ms);
 
     if (wizard_.Active()) {
         // A learn with no usable idle reference cannot measure anything: the

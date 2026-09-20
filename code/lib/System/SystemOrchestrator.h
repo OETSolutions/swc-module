@@ -10,6 +10,7 @@
 #include "Gesture/PressClassifier.h"
 #include "HAL/IHAL.h"
 #include "Learning/LearnWizard.h"
+#include "Maintenance/MaintenanceMode.h"
 #include "Output/ServoLoop.h"
 
 // Forward-declared: the orchestrator only needs the POINTER, and including the
@@ -58,6 +59,37 @@ public:
     // True while the headless learn wizard is running (FR-31). The caller uses it
     // to keep the normal feedback grammars from fighting the wizard's prompts.
     bool LearnActive() const { return wizard_.Active(); }
+
+    /*
+     * FR-33's maintenance window: the only state in which the radio exists.
+     *
+     * The decision lives here and the radio does NOT: `MaintenanceMode` is pure
+     * state, and the NimBLE/wifi_provisioning/web-server work is device-only and
+     * lives in the maintenance-only translation units. `maintenance_ == active_`
+     * on every tick, so a caller can poll it and bring the radio up or tear it
+     * down exactly once per transition.
+     *
+     * It is NOT exclusive: the orchestrator keeps ticking, so a button press still
+     * works while the setup page is open. FR-38's bounded window exists because a
+     * device unable to serve input is unacceptable, and that would be pointless if
+     * maintenance stopped serving input.
+     */
+    /*
+     * Spec 8.2's maintenance hold: 3 s, deliberately longer than the 1.5 s
+     * programming hold so the two gestures cannot be confused. Public because it
+     * is the contract a caller or a test reasons about, and a second copy of the
+     * number elsewhere is a second answer to "how long is a maintenance hold".
+     */
+    static constexpr uint32_t kMaintenanceHoldMs = 3000;
+
+    bool MaintenanceActive() const { return maintenance_.Active(); }
+    MaintenanceTrigger MaintenanceTriggeredBy() const { return maintenance_.Trigger(); }
+    void EnterMaintenance(MaintenanceTrigger t, uint64_t now_ms) {
+        maintenance_.Enter(t, now_ms);
+    }
+    void ExitMaintenance() { maintenance_.Exit(); }
+    // Bumps the activity clock, so a user typing a PoP is not kicked out mid-task.
+    void NoteMaintenanceActivity(uint64_t now_ms) { maintenance_.NoteActivity(now_ms); }
 
     /*
      * Whether the last headless learn reached durable storage.
@@ -300,6 +332,18 @@ private:
     // Which channel a wizard learn is filling, and the last profile it committed
     // -- kept so the link can report what the headless learn produced.
     int          learn_channel_ = 0;
+    /*
+     * FR-33's maintenance window, and the sustained-AUX1 hold that opens it.
+     *
+     * Spec 8.2 nests the two holdings deliberately: 1.5 s is PROGRAMMING and 3 s
+     * is MAINTENANCE, the shorter a subset of the longer, so holding too long to
+     * program escalates cleanly into maintenance rather than into an undefined
+     * state. `maint_fired_latch_` is what makes the escalation one-way: the
+     * programming hold has already toggled the wizard by 3 s, and the maintenance
+     * entry must not be lost to it.
+     */
+    MaintenanceMode  maintenance_;
+    bool             maint_fired_latch_ = false;
     int          learned_channel_ = -1;
     LadderProfile learned_profile_{};
     // Whether the last commit reached NVS (see LastLearnPersisted).

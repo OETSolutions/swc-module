@@ -384,12 +384,22 @@ TEST(SystemOrchestrator, NoReportedEventWithoutASink) {
     EXPECT_TRUE(o.SafeIdleEstablished());
 }
 
-TEST(SystemOrchestrator, AnUnrecognizedPressReportsNothing) {
-    // Spec 4.3: an `event` is only emitted for a press that matched a learned
-    // window, because FR-12 forbids guessing. A level between windows is the
-    // device saying it does not know, and there is then no button to name and no
-    // gesture to report -- so the link stays silent rather than naming a button
-    // the device did not actually classify.
+TEST(SystemOrchestrator, AnUnrecognizedPressIsReportedWithANullButton) {
+    // FR-12, and the spec says it three times (§6.3, §7.2, and the FR table): a
+    // press that matches no learned window is reported as `event{button: null}`
+    // and beeps `KEY_UNKNOWN`. It is NEVER guessed at.
+    //
+    // **An earlier version of this test asserted the opposite** -- that nothing at
+    // all is reported -- because the §4.3 note it was written from said so. That
+    // note was wrong: it contradicted FR-12 and two other spec sections, and the
+    // firmware matched the note rather than the requirement. A test written from a
+    // bad reading of the spec enshrines the bug, which is exactly what happened
+    // here.
+    //
+    // Reporting matters because it is the ONLY way a user can see, from the app,
+    // that the device is receiving a press it does not recognise. Staying silent
+    // leaves them with a live ladder that never moves while the device is in fact
+    // seeing every press.
     g_reported.clear();
     MockHal hal;
     auto o = MakeOrch(hal);
@@ -397,15 +407,61 @@ TEST(SystemOrchestrator, AnUnrecognizedPressReportsNothing) {
     o.Boot();
     o.SetGestureSink(&RecordGesture, nullptr);
 
-    // 3000 mV is above every learned window (the lowest centre is 1430 with a
-    // 120 mV half-width) and off idle (2835), so it classifies as kUnknown.
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3000);
+    // 2400 mV is inside the ladder's RANGE but inside no learned window, which is
+    // the only thing FR-12 is about. At the fixture's 2835 mV learned idle the
+    // ratio is 846 permille: above `next`'s window (718-794) and below the idle
+    // band (which starts at 970), so it classifies as kUnknown.
+    //
+    // The value matters and an earlier version of this test got it wrong: 3000 mV
+    // is ratio 1058, which is ABOVE the reference and therefore a kFault, not an
+    // unknown. It took the fault path, reported nothing, and the test failed for a
+    // reason that had nothing to do with FR-12. An out-of-range reading is a
+    // different requirement (spec 6.8's "ladder out of range" row).
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2400);
     PollFor(o, hal, 100);
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
     PollFor(o, hal, 700);
 
-    EXPECT_TRUE(g_reported.empty())
-        << "an unrecognized level must not be reported as a gesture on a button";
+    ASSERT_EQ(g_reported.size(), 1u)
+        << "an unrecognized press must be reported once, not silently dropped";
+    EXPECT_EQ(g_reported[0].button_id, nullptr)
+        << "there is no button to name, and naming one would be the guess FR-12 forbids";
+    EXPECT_EQ(g_reported[0].gesture, Gesture::kNone);
+    EXPECT_GT(g_reported[0].level_mv, 0) << "the reading is still reported, so the app can see it";
+}
+
+TEST(SystemOrchestrator, AnUnrecognizedPressDoesNotDriveTheOutput) {
+    // FR-12's other half: never guessed at. The report is diagnostic, not a key --
+    // driving an output for an unrecognised level would reach the radio as a
+    // command nobody asked for.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2400);   // ratio 846: in range, in no window
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 700);
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "an unrecognized level must never drive the KEY line";
+}
+
+TEST(SystemOrchestrator, AnUnrecognizedPressIsNotReportedRepeatedlyWhileHeld) {
+    // One report per press. A held unrecognised level would otherwise emit an event
+    // on every poll tick -- 100/s -- which is both a flooded link and a live view
+    // that cannot be read.
+    g_reported.clear();
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    o.SetGestureSink(&RecordGesture, nullptr);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2400);   // ratio 846: in range, in no window
+    PollFor(o, hal, 500);          // held for 50 ticks
+    EXPECT_EQ(g_reported.size(), 1u) << "a held unrecognized level reports once, not per tick";
 }
 
 // --- FR-31: the headless learn, with no app and no host -----------------------

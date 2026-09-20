@@ -543,6 +543,34 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     const bool fired = cs.gestures.Update(level, cs.classifier.ButtonIndex(), now_ms, &ev,
                                           cs.bindings);
 
+    // FR-12, stated in the spec three times (§6.3, §7.2, and the FR table): a press
+    // that matches no learned window is reported as `event{button: null}` and beeps
+    // KEY_UNKNOWN, and is NEVER guessed at.
+    //
+    // `GestureStateMachine` treats kUnknown as not-pressed, so no gesture can fire
+    // for it -- which is the "never guessed" half, and correct. But that also means
+    // nothing else in this function sees it, so before this branch existed the
+    // device ignored an unrecognised press COMPLETELY: no event, no beep, nothing.
+    // The user's own button silently did nothing, with no way to tell that from a
+    // broken adapter.
+    //
+    // Reported once per press (the latch), because a held level is unrecognised on
+    // every tick and would otherwise flood the link at 100 events/s.
+    if (level == ChannelLevel::kUnknown) {
+        if (!cs.unknown_reported) {
+            cs.unknown_reported = true;
+            if (gesture_sink_ != nullptr) {
+                // A null id is the whole point: naming a button here would be the
+                // guess FR-12 forbids, and no binding can match a null.
+                const GestureEventRecord rec{index, nullptr, Gesture::kNone, level_mv, now_ms};
+                gesture_sink_(gesture_sink_ctx_, rec);
+            }
+            buzzer_.Play(BuzzerPattern::kKeyUnknown);
+        }
+    } else {
+        cs.unknown_reported = false;
+    }
+
     // A fault, or a lost head unit, releases in the same tick. Everything in
     // flight is discarded: a half-recognised gesture must not reach the radio.
     if (level == ChannelLevel::kFault || rail_fault) {

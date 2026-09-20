@@ -27,6 +27,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
+import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
@@ -174,21 +175,28 @@ class AppViewModel(
             Frames.EVENT -> {
                 // `button` is the learned ID, which is what ties the event to the
                 // button the view draws. An index here would need re-deriving.
-                val id = frame.fields["button"]?.jsonPrimitive?.content
+                // It is deliberately read as a nullable: FR-12 reports an
+                // unrecognised press as `button: null`, and treating a null as
+                // "nothing to do" would leave the live ladder frozen at its last
+                // value while the device is in fact seeing every press.
+                val id = frame.fields["button"]
+                    ?.takeIf { it !is JsonNull }
+                    ?.jsonPrimitive?.content
                 val level = frame.fields["level_mv"]?.jsonPrimitive?.intOrNull
                 val gesture = frame.fields["gesture"]?.jsonPrimitive?.content
-                if (id != null && level != null) {
+                if (gesture != null && level != null) {
                     _ladder.value = _ladder.value.copy(
                         liveMv = level,
                         channelName = channelNameFor(frame.fields["channel"]?.jsonPrimitive?.intOrNull),
-                        lastGesture = gesture?.let { Gesture.fromWireName(it) ?: Gesture.NONE },
+                        lastGesture = Gesture.fromWireName(gesture) ?: Gesture.NONE,
                         lastGestureButton = id,
                     )
                     // Spec 3.6: an app-side kind is the APP's job, and the firmware
                     // has already released the line rather than hold a key with no
                     // action behind it. Resolving here is what makes an app-side
-                    // binding do anything at all.
-                    if (gesture != null) runAppSideAction(id, gesture)
+                    // binding do anything at all. Skipped for a null button: no
+                    // binding can name a button that was not recognised.
+                    if (id != null && gesture != "NONE") runAppSideAction(id, gesture)
                 }
             }
 

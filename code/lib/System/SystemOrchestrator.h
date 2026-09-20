@@ -175,9 +175,12 @@ public:
     /*
      * Spec 4.3's `event`: one recognized gesture, reported to the link.
      *
-     * **`button` is the learned id, not an index.** The app's bindings grid and
-     * its live ladder are both keyed by the id, so sending an index would force
-     * every consumer to re-derive a mapping that the device already has.
+     * **`button` is the learned id, or NULL when no window matched** (FR-12). The
+     * app's bindings grid and its live ladder are both keyed by the id, so sending
+     * an index would force every consumer to re-derive a mapping the device already
+     * has. A null is not an omission: it is the device saying "a press happened and
+     * I did not recognise the level", which is the only way the app can show a user
+     * that their button is mis-learned rather than broken.
      *
      * **There is no `confidence`.** Confidence (spec 3.4) is a learned-BUTTON
      * quality score earned at learn time; the press classifier answers "which
@@ -248,6 +251,12 @@ private:
         GestureBindings     bindings;
         bool                key_driven = false;    // a pulse is currently on the line
         uint64_t            key_released_at_ms = 0;
+        // FR-12: one report and one KEY_UNKNOWN beep per unrecognised press, not
+        // one per poll tick. A held level is unrecognised on every tick, so
+        // without this latch a held press would emit 100 events/s and play a
+        // continuous beep. Cleared when the level returns to idle or a real
+        // button, so the next unrecognised press reports again.
+        bool                unknown_reported = false;
     };
 
     void EstablishSafeIdle();

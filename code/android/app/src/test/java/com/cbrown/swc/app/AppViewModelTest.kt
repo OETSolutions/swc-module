@@ -375,6 +375,50 @@ class AppViewModelTest {
         assertTrue("and it is not an app-side failure", vm.actionOutcomes.value.isEmpty())
     }
 
+    @Test
+    fun `an unrecognized press still moves the live ladder, with no button highlighted`() = runTest {
+        // FR-12: the device reports a press it cannot recognise as
+        // `event{button: null}`. Treating a null button as "nothing to do" is the
+        // tempting simplification and it is wrong twice over: the ladder would
+        // freeze at its last value while the device is in fact seeing every press,
+        // and the user's only symptom would be "the app is stuck", which points at
+        // the app rather than at the mis-learned button.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(frame("event", "channel" to "0", "button" to "null",
+            "gesture" to "\"NONE\"", "t_ms" to "77", "level_mv" to "2400"))
+        advanceUntilIdle()
+
+        assertEquals("the reading is reported even with no button", 2400, vm.ladder.value.liveMv)
+        assertEquals(Gesture.NONE, vm.ladder.value.lastGesture)
+        assertNull("no button may be highlighted for an unrecognised press",
+            vm.ladder.value.lastGestureButton)
+    }
+
+    @Test
+    fun `an unrecognized press runs no app-side action`() = runTest {
+        // There is no button, so there is no (button, gesture) pair to resolve. A
+        // lookup with a null key must not fall through to some default action --
+        // the radio doing something the driver did not ask for is the exact
+        // failure FR-12 is written to prevent.
+        val t = FakeTransport()
+        val ran = mutableListOf<String>()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope(),
+            runAppAction = { kind, target, _ -> ran += "$kind:$target"; ActionOutcome.Ran })
+        started(vm)
+        configRun(sampleConfig()).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        t.emit(frame("event", "channel" to "0", "button" to "null",
+            "gesture" to "\"NONE\"", "t_ms" to "10", "level_mv" to "2400"))
+        advanceUntilIdle()
+
+        assertTrue("an unrecognised press must run nothing", ran.isEmpty())
+        assertTrue("and it is not an app-side failure", vm.actionOutcomes.value.isEmpty())
+    }
+
     // --- helpers -----------------------------------------------------------
 
     private fun crcOf(data: ByteArray): Long {

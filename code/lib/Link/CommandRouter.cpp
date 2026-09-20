@@ -590,23 +590,40 @@ void CommandRouter::EmitGesture(const SystemOrchestrator::GestureEventRecord &ev
         case Gesture::kSingle: g = "SINGLE"; break;
         case Gesture::kDouble: g = "DOUBLE"; break;
         case Gesture::kLong:   g = "LONG";   break;
-        case Gesture::kNone:   return;   // nothing recognized, nothing to report
+        case Gesture::kNone:   g = "NONE";   break;
     }
     char body[192];
-    // The id reaches BOTH a JSON string and a `%s`, so it is bounded and its
-    // quoting is stripped by hand. `kLadderIdLen` is 16, so 31 bytes of any
-    // hostile value survive into `id`; escaping it here would cost a
-    // JSON-escape routine for a field the config codec already validates.
-    char id[kLadderIdLen];
-    size_t n = 0;
-    while (n + 1 < sizeof(id) && ev.button_id[n] != '\0') {
-        id[n] = (ev.button_id[n] == '"' || ev.button_id[n] == '\\') ? '_' : ev.button_id[n];
-        ++n;
+    char button[2 + kLadderIdLen];
+    if (ev.button_id == nullptr) {
+        // FR-12: an unrecognised press is reported with a JSON null, not an empty
+        // string and not a guessed id. A frame that named a button here would be
+        // the guess FR-12 forbids, and it would make the app highlight a button
+        // the driver never touched.
+        button[0] = 'n'; button[1] = 'u'; button[2] = 'l'; button[3] = 'l';
+        button[4] = '\0';
+    } else {
+        // The id reaches BOTH a JSON string and a `%s`, so it is bounded and its
+        // quoting is stripped by hand. `kLadderIdLen` is 16, so 31 bytes of any
+        // hostile value survive into `id`; escaping it here would cost a
+        // JSON-escape routine for a field the config codec already validates.
+        size_t n = 0;
+        while (n + 1 < kLadderIdLen && ev.button_id[n] != '\0') {
+            const char c = ev.button_id[n];
+            button[n] = (c == '"' || c == '\\') ? '_' : c;
+            ++n;
+        }
+        button[n] = '\0';
+        button[n + 1] = '\0';
+        // Re-quote in place: shift right to make room for the opening quote.
+        const size_t len = n;
+        for (size_t i = len + 1; i > 0; --i) button[i] = button[i - 1];
+        button[0] = '"';
+        button[len + 1] = '"';
+        button[len + 2] = '\0';
     }
-    id[n] = '\0';
     snprintf(body, sizeof(body),
-             "\"channel\":%u,\"button\":\"%s\",\"gesture\":\"%s\",\"t_ms\":%llu,\"level_mv\":%d",
-             static_cast<unsigned>(ev.channel_index), id, g,
+             "\"channel\":%u,\"button\":%s,\"gesture\":\"%s\",\"t_ms\":%llu,\"level_mv\":%d",
+             static_cast<unsigned>(ev.channel_index), button, g,
              static_cast<unsigned long long>(ev.at_ms), ev.level_mv);
     Emit("event", body);
 }

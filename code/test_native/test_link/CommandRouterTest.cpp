@@ -570,3 +570,103 @@ TEST(CommandRouter, DisconnectDiscardsAHalfReceivedRun) {
     ASSERT_TRUE(HasType(cap, "nack"));
     EXPECT_NE(cap.lines.back().find("no_run"), std::string::npos);
 }
+
+// --- EmitGesture: the `event` frame's rendering (spec 4.3, FR-12) -----------
+//
+// These exist because the null case had NO test at all, and the code crashed on
+// it: the id was copied into a local buffer with `ev.button_id[n]`, which is a
+// null dereference the moment FR-12 reports an unrecognised press. Nothing in
+// the suite drove `EmitGesture`, so a device that segfaulted on the first
+// unlearned press would have passed every test here.
+
+TEST(CommandRouter, AGestureRendersTheLearnedButtonIdAsAQuotedString) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    SystemOrchestrator::GestureEventRecord ev{};
+    ev.channel_index = 0;
+    ev.button_id = "vol_up";
+    ev.gesture = Gesture::kSingle;
+    ev.level_mv = 1430;
+    ev.at_ms = 1234;
+    r.EmitGesture(ev);
+    ASSERT_EQ(cap.lines.size(), 1u);
+    const std::string &l = cap.lines[0];
+    EXPECT_NE(l.find("\"type\":\"event\""), std::string::npos);
+    EXPECT_NE(l.find("\"button\":\"vol_up\""), std::string::npos)
+        << "the app matches this against Binding.button, so it must be the quoted id";
+    EXPECT_NE(l.find("\"gesture\":\"SINGLE\""), std::string::npos);
+    EXPECT_NE(l.find("\"level_mv\":1430"), std::string::npos);
+    EXPECT_LT(l.size(), kNdjsonMaxFrame);
+}
+
+TEST(CommandRouter, AnUnrecognizedPressRendersANullButtonAndNotAQuotePair) {
+    // FR-12: `event{button: null}`. JSON null, not `""` -- an empty string is a
+    // button named "", which the app would render as a real (if blank) button,
+    // and a named id would be the guess FR-12 forbids.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    SystemOrchestrator::GestureEventRecord ev{};
+    ev.channel_index = 0;
+    ev.button_id = nullptr;
+    ev.gesture = Gesture::kNone;
+    ev.level_mv = 2400;
+    ev.at_ms = 99;
+    r.EmitGesture(ev);
+    ASSERT_EQ(cap.lines.size(), 1u)
+        << "an unrecognised press is reported; suppressing it hides the press from the app";
+    const std::string &l = cap.lines[0];
+    EXPECT_NE(l.find("\"button\":null"), std::string::npos) << l;
+    EXPECT_EQ(l.find("\"button\":\"\""), std::string::npos)
+        << "an empty string would render as a button with a blank name";
+    EXPECT_NE(l.find("\"gesture\":\"NONE\""), std::string::npos) << l;
+    EXPECT_NE(l.find("\"level_mv\":2400"), std::string::npos)
+        << "the level is the whole diagnostic value of the frame";
+}
+
+TEST(CommandRouter, AHostileButtonIdCannotBreakTheJsonOrOverrunTheBuffer) {
+    // The id reaches both a JSON string and a `%s`. A quote would terminate the
+    // string early and a backslash would escape the closing quote, so both are
+    // replaced; the length is bounded by kLadderIdLen whatever the config holds.
+    //
+    // The calibration frame is what makes this a real check: a quote count is only
+    // meaningful against a frame known to be well formed, so the same record is
+    // emitted twice and the counts compared. A hostile quote leaking through adds
+    // exactly two quotes, which the comparison catches without hardcoding the
+    // envelope's shape.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    SystemOrchestrator::GestureEventRecord good{};
+    good.button_id = "vol_up";
+    good.gesture = Gesture::kLong;
+    r.EmitGesture(good);
+
+    const std::string hostile = std::string("\"\\").append(200, 'a');
+    SystemOrchestrator::GestureEventRecord bad{};
+    bad.button_id = hostile.c_str();
+    bad.gesture = Gesture::kLong;
+    r.EmitGesture(bad);
+
+    ASSERT_EQ(cap.lines.size(), 2u);
+    const std::string &cal = cap.lines[0];
+    const std::string &l = cap.lines[1];
+
+    EXPECT_NE(l.find("\"button\":\"__aaa"), std::string::npos)
+        << "the quote and backslash must both become '_', keeping the JSON parseable";
+    EXPECT_LT(l.size(), kNdjsonMaxFrame) << "a 200-byte id must be truncated, not emitted";
+
+    auto quotes = [](const std::string &s) {
+        size_t n = 0;
+        for (char c : s) if (c == '"') ++n;
+        return n;
+    };
+    EXPECT_EQ(quotes(l), quotes(cal))
+        << "a leaked hostile quote would add a pair of quotes:" << l;
+    EXPECT_EQ(l.find("\\"), std::string::npos)
+        << "a raw backslash would escape the closing quote and desync the parser";
+    EXPECT_EQ(l.find("button\":null"), std::string::npos)
+        << "a non-null id must never be reported as an unrecognised press";
+}

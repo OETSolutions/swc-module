@@ -796,14 +796,20 @@ percentage that corresponds to nothing the device measured. An app that wants
 the button's learn quality reads it from the button in the config, which is
 where it is actually stored.
 
-**`button` is the learned id** of the classified button (e.g. `"vol_up"`), not a
-numeric index: the id is what the app's bindings grid and the ladder view are
-both keyed by, so sending the index would force every consumer to re-derive the
-mapping. A press that matches no learned window is **not** an `event` at all.
-Spec §6.3's `kUnknown` is the device saying it did not recognize the level, and
-FR-12 forbids guessing in that case; there is no button to name and no gesture to
-report, so the device stays silent on the link and plays its unknown-key feedback
-locally. The `event` stream therefore carries only recognized presses.
+**`button` is the learned id** of the classified button (e.g. `"vol_up"`), or
+**null** for a press that matched no learned window. The id is what the app's
+bindings grid and the ladder view are both keyed by, so sending an index would
+force every consumer to re-derive the mapping.
+
+**An unrecognised press IS reported, with `button: null` and `gesture: "NONE"`**
+(FR-12, §6.3, §7.2). The device is not guessing — it is saying "a press happened
+and I did not recognise the level", which is the most useful thing it can tell
+the app and the only way a user can diagnose a mis-learned button from the app.
+Nothing acts on it: no binding can name a button that does not exist, so the
+firmware emits the event and plays `KEY_UNKNOWN`, and the app's live view shows a
+reading that matched nothing. Suppressing the frame instead would leave the user
+staring at a live ladder that never moves while the device is in fact seeing every
+press, which is the opposite of the screen's diagnostic purpose.
 
 ### 4.4 Keepalive, disconnect and reconnect
 

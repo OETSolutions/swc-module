@@ -19,6 +19,7 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -451,6 +452,47 @@ class AppViewModelTest {
         assertEquals(20, vm.link.value.logs.size)
         assertTrue("the NEWEST are the useful ones", vm.link.value.logs.last().contains("line 49"))
     }
+
+    @Test
+    fun `an app-side kind this build cannot run is reported as unimplemented, not as a bad binding`() =
+        runTest {
+            // KEYCODE, MEDIA, VOLUME and SYSTEM are the APP's to execute per spec
+            // 3.6, and ActionRunner implements none of them. The bindings screen
+            // offers every kind in the generated enum, so a user can bind one and
+            // will see nothing happen. The message matters: "not an app-side action"
+            // would tell them to go fix a binding that is already correct, whereas
+            // "not implemented yet" is the true reason.
+            val t = FakeTransport()
+            val ran = mutableListOf<String>()
+            val vm = AppViewModel(
+                SwcClient(t),
+                scope = vmScope(),
+                runAppAction = { kind, _, _ -> ran += kind; ActionOutcome.NotImplemented(kind) },
+            )
+            started(vm)
+
+            val c = sampleConfig().let { cfg ->
+                cfg.copy(bindings = cfg.bindings + com.oetsolutions.swc.model.Binding(
+                    "b9", com.oetsolutions.swc.model.BindingChannel.SWC1, "next",
+                    com.oetsolutions.swc.model.Gesture.SINGLE, true,
+                    listOf(com.oetsolutions.swc.model.Action(
+                        com.oetsolutions.swc.contract.ActionKind.KEYCODE, "KEYCODE_MEDIA_NEXT", "")),
+                ))
+            }
+            configRun(c).forEach { t.emit(it) }
+            advanceUntilIdle()
+
+            t.emit(frame("event", "channel" to "0", "button" to "\"next\"",
+                "gesture" to "\"SINGLE\"", "t_ms" to "10", "level_mv" to "2145"))
+            advanceUntilIdle()
+
+            assertEquals("the app must attempt it, not skip it", listOf("KEYCODE"), ran)
+            val msg = vm.actionOutcomes.value.single()
+            assertTrue("the message must say it is unimplemented, not mis-bound: $msg",
+                msg.contains("not implement"))
+            assertFalse("and must NOT claim the binding is not app-side: $msg",
+                msg.contains("not an app-side action"))
+        }
 
     // --- helpers -----------------------------------------------------------
 

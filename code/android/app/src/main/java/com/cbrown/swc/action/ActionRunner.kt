@@ -32,13 +32,39 @@ sealed interface ActionOutcome {
     /** The system blocked the launch. */
     data class Blocked(val reason: String) : ActionOutcome
 
-    /** The action kind is not one the app executes. */
+    /** The action kind is not one the app executes (an `OUT_` or `BUZZ`). */
     data class NotAppSide(val kind: String) : ActionOutcome
+
+    /**
+     * The kind IS app-side per spec §3.6, but this build does not implement it.
+     *
+     * **Distinct from [NotAppSide] on purpose.** `KEYCODE`, `MEDIA`, `VOLUME` and
+     * `SYSTEM` are all the app's to execute, so reporting them as "not an app-side
+     * action" contradicts the spec and sends the user to change a binding that is
+     * correctly configured. Saying "not implemented in this build" is the honest
+     * version, and it is the difference between "your binding is wrong" and "this
+     * app cannot do that yet".
+     */
+    data class NotImplemented(val kind: String) : ActionOutcome
 }
 
 /**
- * Runs the app-side action kinds: `APP_LAUNCH`, `APP_INTENT`, `KEYCODE`, and the
- * escape hatch `APP_RAW`.
+ * Runs the app-side action kinds this build implements: `APP_LAUNCH`, `APP_INTENT`
+ * and the escape hatch `APP_RAW`.
+ *
+ * **Spec §3.6 gives the app FOUR more — `KEYCODE`, `MEDIA`, `VOLUME` and `SYSTEM` —
+ * and this class does not implement them.** An earlier version of this comment
+ * claimed it ran `KEYCODE`, which it never did: the `when` below had no branch for
+ * it, so binding a button to a keycode produced `NotAppSide` and the user was told
+ * their (valid) binding was not an app-side action. The claim is removed and the
+ * gap is now reported as [ActionOutcome.NotImplemented].
+ *
+ * The bindings screen offers every kind in the generated `ActionKind` enum, so all
+ * seven are selectable today. A user can therefore bind one that will not run, and
+ * will see the "not implemented" message rather than silence. Implementing the rest
+ * is gated on the target head unit's privileges — see the spec's open item on the
+ * Android environment — because key injection and screen control need root, an
+ * accessibility service or a system-app install.
  *
  * **This is the module Android 15's background-activity-launch (BAL) hardening
  * applies to** (spec 3.6): since the app must launch activities from a background
@@ -63,6 +89,11 @@ class ActionRunner(private val context: Context) {
             "APP_LAUNCH" -> launchPackage(target)
             "APP_INTENT" -> sendIntent(target, payload)
             "APP_RAW" -> sendIntent(target, payload)
+            // App-side per spec 3.6, not implemented here. Named individually so the
+            // intent is visible: these are not "unknown", they are "not yet".
+            "KEYCODE", "MEDIA", "VOLUME", "SYSTEM" -> ActionOutcome.NotImplemented(kind)
+            // The firmware's half (OUT_*, NONE, BUZZ). Reaching here means the caller
+            // dispatched an action it should have skipped.
             else -> ActionOutcome.NotAppSide(kind)
         }
     }

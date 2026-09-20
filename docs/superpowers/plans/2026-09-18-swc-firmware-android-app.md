@@ -7288,7 +7288,10 @@ have the head unit out of the dash.
 **Files:**
 - Create: `code/lib/Learning/LearnSession.h`
 - Create: `code/lib/Learning/LearnSession.cpp`
+- Create: `code/lib/Learning/LearnWizard.h`
+- Create: `code/lib/Learning/LearnWizard.cpp`
 - Create: `code/test_native/test_learning/LearnSessionTest.cpp`
+- Create: `code/test_native/test_learning/LearnWizardTest.cpp`
 - Create: `code/test_native/test_learning/test_main.cpp` — required; copy Task 2's
   four-line `main()`.
 
@@ -7525,7 +7528,13 @@ passes.
 | `confidence` | 0–100, from the spread relative to the tolerance |
 | `id`, `name` | **untouched** — the caller's; learn cannot invent a slug |
 
-`LearnedIdleMv()` returns the idle reference recorded at `Start` (FR-30).
+`LearnedIdleMv()` returns the idle reference recorded during sampling (FR-30) —
+NOT one captured at `Start`. `Start` is handed the channel's EXISTING profile,
+which on a fresh learn is empty, so its `learned_idle_mv` is zero; the live idle
+is the `idle_mv` every `AddSample` carries, and that is what this test asserts.
+(This task's prose said "recorded at `Start`" while its own test asserted the
+sampled value — prose and test disagreed, and the test was the one that matched
+the fixture.)
 
 **The tolerance is the gap midpoint, not a multiple of the spread.** An earlier
 revision said `max(spread * 2, 8)` in permille, which is the opposite of spec
@@ -7547,26 +7556,60 @@ The AUX1 press counting uses the **same** `PressClassifier` (Task 6) with a
 ladder profile of one button at the AUX threshold, so there is one debounce
 implementation, not two.
 
+**Three things about this wizard are load-bearing, and each was wrong in the
+first implementation:**
+
+1. **The AUX profile's press level is near ZERO, not mid-rail.**
+   `Aux1ProfileDefault()` is declared in `LearnWizard.h` next to the class,
+   because the caller and the wizard must agree on the threshold. A steering-wheel
+   LADDER button pulls down to a mid-rail level; an AUX switch on `J5` pulls to
+   GROUND. Same classifier, opposite ends of the range — putting the centre at
+   1200 mV made every real press read as a release.
+2. **The prompt waits for a press before it samples.** Spec §7.4's step 3 (prompt)
+   and step 4 (the user holds the button) are two different moments. Sampling from
+   the moment the prompt appears hits the at-idle gate within a few ticks and
+   rejects the learn before the user has done anything — blaming them for a press
+   they have not made.
+3. **It commits on RELEASE, and does NOT sample the release reading.** That
+   reading is the level travelling back to idle; folding it into the spread puts
+   the whole press-to-idle swing into the noise measurement and fails every learn
+   with `kTooNoisy`. Committing on release is also what makes a LONG press
+   learnable: the user holds, the level is steady, and letting go is the gesture's
+   natural end. `kPromptMaxHoldMs` commits a stuck input too, so a wedged line
+   cannot hang the wizard.
+
 Test it in `code/test_native/test_learning/LearnWizardTest.cpp`: drive `MockHal`'s
-AUX1 ADC and the clock, and assert the buzzer pattern sequence and that a full
-two-button learn completes with no link present.
+AUX1 ADC and the clock, and assert that a full two-button learn completes with no
+link present, that a stray hold with no presses selects nothing, and that a second
+learn adds rather than clobbers the first.
+
+**Device-only hazard:** `snprintf` into a 16-byte field trips
+`-Werror=format-truncation` on the xtensa compiler (it cannot prove an `int` stays
+short) even though macOS accepts it. Format into a 32-byte local and copy with an
+explicit bound. The host toolchain is more permissive here than the device one, so
+this class of error is invisible until the device build.
 
 Run: `cd code && pio test -e native -f '*test_learning'`
-Expected: PASS.
+Expected: PASS — 36 tests green (14 `LearnSession` + 22 `LearnWizard`).
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add code/lib/Learning/LearnSession.h code/lib/Learning/LearnSession.cpp \
+        code/lib/Learning/LearnWizard.h code/lib/Learning/LearnWizard.cpp \
         code/test_native/test_learning/LearnSessionTest.cpp \
+        code/test_native/test_learning/LearnWizardTest.cpp \
         code/test_native/test_learning/test_main.cpp
 git commit -m "Add learn mode with distinct rejection reasons and a headless wizard
 
 Commit checks too-few, out-of-range, at-idle, too-noisy and too-close in that
-order so the user gets the most actionable reason. Each has its own wire string,
-because a blind user holding a steering-wheel button cannot act on a generic
-failure. Tolerance is derived from the measured spread, capped so it cannot
-swallow a neighbour. The AUX1 wizard reuses the same press classifier."
+order so the user gets the most actionable reason, and out-of-range readings
+still count toward the minimum so the reason is not masked as too_few. Each
+rejection has its own wire string, because a blind user holding a steering-wheel
+button cannot act on a generic failure. Tolerance is the midpoint of the gap to
+the nearest neighbour, capped and floored, not a multiple of the spread. The AUX1
+wizard reuses the same press classifier, waits for a press before sampling, and
+commits on release."
 ```
 
 ---

@@ -1,0 +1,84 @@
+#pragma once
+
+#include <stdint.h>
+
+#include "Analog/LadderDecode.h"
+
+/*
+ * Learn mode (FR-28..FR-31): measure a button's level on a steering-wheel ladder
+ * and turn it into a LadderButton.
+ *
+ * **The session fills six of LadderButton's eight fields, not two.** Spec 3.4
+ * defines eight, and learn is the only source of `mv_center`, `mv_tolerance`,
+ * `learned_at_rail_mv`, `temp_c_at_learn`, `sample_count` and `confidence`.
+ * `id` and `name` are the CALLER's -- a slug and a display label are not facts
+ * about a voltage, and learn cannot invent them.
+ *
+ * **Host-testable by construction**: no IHAL, no clock of its own. Samples and
+ * the timestamp arrive as arguments, so a whole learn run is exercised in
+ * microseconds with no hardware.
+ */
+
+enum class LearnReject {
+    kNone = 0,            // committed
+    kTooFewSamples,       // not enough samples, or too short a span
+    kOutOfRange,          // a sample above the calibrated ADC ceiling
+    kAtIdle,              // the button was never pressed
+    kTooNoisy,            // the level wandered further than classification can tolerate
+    kTooCloseToExisting,  // indistinguishable from a button already learned
+};
+
+// The wire string for a rejection. FR-29 requires the reason to be specific:
+// "it didn't work" is not actionable for a user holding a button one-handed.
+const char *LearnRejectReason(LearnReject r);
+
+class LearnSession {
+public:
+    // `existing` is the channel's current profile, so an overlapping learn can be
+    // refused. `channel` is recorded for the caller's benefit only.
+    void Start(int channel, const LadderProfile &existing);
+
+    // One reading. `level_mv` is the calibrated ladder level and `idle_mv` the
+    // live idle reference; `rail_mv` is spec 3.4's "+3V3 rail measured during
+    // learn" and is a PARAMETER because this board has no rail sense channel
+    // (AdcChannel has SWC1/SWC2/TEMP/AUX1-3/KEY_SENSE1-2 and none is the rail).
+    // `temp_tenths_c` comes from ADC_CH_TEMP -- the NTC on the ladder.
+    void AddSample(int level_mv, int idle_mv, MilliVolt rail_mv, int16_t temp_tenths_c,
+                   uint64_t now_ms);
+
+    // Runs the gates and, on success, fills the six fields learn owns. `out`'s
+    // id/name are left EXACTLY as the caller set them.
+    LearnReject Commit(LadderButton *out);
+
+    int SampleCount() const { return sample_count_; }
+    MilliVolt LearnedIdleMv() const { return learned_idle_mv_; }
+    int Channel() const { return channel_; }
+
+    // The tolerance cap (spec 3.4). Exposed because it is a design constant a
+    // caller may legitimately override for a bench sweep, and because a test
+    // asserting the cap should name the same number the code uses.
+    static constexpr int kMaxToleranceMv = 120;
+
+private:
+    // Gates 1 and 2 need different sample sets: the COUNT gate counts every
+    // AddSample call, while the statistics (mean, spread) use only in-range
+    // readings. With one counter, 30 implausible readings would fail the count
+    // gate and report "hold the button longer" when nothing the user does can
+    // help. Two counters, deliberately.
+    int      sample_count_ = 0;       // every AddSample
+    int      in_range_count_ = 0;     // the ones the statistics used
+    int64_t  sum_mv_ = 0;
+    int      min_mv_ = 0;
+    int      max_mv_ = 0;
+    bool     out_of_range_seen_ = false;
+    uint64_t first_ms_ = 0;
+    uint64_t last_ms_ = 0;
+    bool     have_sample_ = false;
+
+    MilliVolt learned_idle_mv_ = 0;
+    MilliVolt rail_mv_ = 0;
+    int16_t   temp_tenths_c_ = 0;
+    int       channel_ = 0;
+
+    LadderProfile existing_{};
+};

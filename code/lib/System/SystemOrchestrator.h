@@ -83,3 +83,37 @@ private:
     int            idle_key_mv_ = 0;
     bool           safe_idle_established_ = false;
 };
+
+#ifdef __cplusplus
+extern "C" {
+#else
+/* C sees only an opaque handle; the class definition above is C++-only. Guarded
+ * so the C++ build does not redeclare the class it already defined. */
+typedef struct SystemOrchestrator SystemOrchestrator;
+#endif
+
+// C-linkage entry points so `src/main.c` can drive the orchestrator without
+// becoming a C++ translation unit. `main.c` is C because ESP-IDF's app_main is
+// a C entry point and the IDF headers it needs are C.
+//
+// The orchestrator is heap-allocated rather than static because Config is large
+// (it carries 32 bindings, spec 3.5) and a file-scope instance would sit in .bss
+// for the whole run. One allocation at boot, freed never -- the device runs
+// until it is reset, and a null return is reported rather than ignored.
+
+// Loads the config and establishes the safe idle output (FR-13). Returns null if
+// the allocation fails, which the caller must treat as a fatal boot fault: a
+// device that cannot reach its safe idle must not pretend to be running.
+SystemOrchestrator *SystemOrchestratorCreate(IHAL *hal);
+
+// One poll tick. Safe to call on a null orchestrator (does nothing), so the
+// caller's loop needs no null check of its own.
+void SystemOrchestratorTick(SystemOrchestrator *sys, uint64_t now_ms);
+
+// True once the safe idle state has been written (FR-13).
+bool SystemOrchestratorSafeIdle(const SystemOrchestrator *sys);
+
+#ifdef __cplusplus
+}
+#endif
+

@@ -1,0 +1,97 @@
+#include <stdio.h>
+
+#include "esp_chip_info.h"
+#include "esp_flash.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
+#include "HAL/EspHal.h"
+#include "System/SystemOrchestrator.h"
+
+static const char *TAG = "swc-boot";
+
+// The poll cadence. 10 ms is what the gesture tests assume: LONG must fire
+// within one tick of its 750 ms threshold (spec 11's FR-10 test), and the
+// double-press boundary is asserted at 499/500 ms, so a coarser poll would make
+// those thresholds unreachable.
+#define SWC_POLL_MS 10
+
+// Board identity is asserted BEFORE anything else runs, because every budget and
+// every pin in this firmware assumes it. A wrong board fails loudly here instead
+// of as a mysterious analog fault later.
+static bool VerifyBoard(void)
+{
+    esp_chip_info_t chip;
+    esp_chip_info(&chip);
+
+    uint32_t flash_size = 0;
+    ESP_ERROR_CHECK(esp_flash_get_size(NULL, &flash_size));
+
+    ESP_LOGI(TAG, "chip=%s cores=%d rev=v%d.%d", CONFIG_IDF_TARGET, chip.cores,
+             chip.revision / 100, chip.revision % 100);
+    ESP_LOGI(TAG, "flash=%" PRIu32 " bytes idf=%s", flash_size, esp_get_idf_version());
+
+    if (flash_size != 4 * 1024 * 1024) {
+        ESP_LOGE(TAG, "flash is %" PRIu32 " bytes, build assumes %d", flash_size,
+                 4 * 1024 * 1024);
+        return false;
+    }
+    if (chip.cores != 2) {
+        ESP_LOGE(TAG, "expected 2 cores for ESP32-S3, got %d", chip.cores);
+        return false;
+    }
+    return true;
+}
+
+// IDF's startup (freertos/app_startup.c) is C and calls `app_main` by that exact
+// symbol, so it must have C linkage. Without this guard the C++ definition
+// mangles to `_Z8app_mainv` and the link fails with
+// "undefined reference to `app_main`".
+extern "C" void app_main(void)
+{
+    if (!VerifyBoard()) {
+        // A board that does not match the build must not drive the KEY line at
+        // all. Halt rather than loop: a wrong board is a bench condition.
+        abort();
+    }
+
+    IHAL *hal = EspHalInit();
+    if (hal == NULL) {
+        // The DAC or ADC did not come up, so the output cannot be reached or its
+        // state cannot be read. Do NOT proceed to serve presses (spec 6.8: never
+        // drive a guessed code). Reboot after a delay so a transient bus fault
+        // recovers, which is what the maintainer will expect at the bench.
+        ESP_LOGE(TAG, "HAL init failed; not serving output. Rebooting in 5s.");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
+    }
+
+    if (EspHalCalibrationIsDegraded()) {
+        // Reported, not silent (spec 3.2). The orchestrator also plays
+        // BOOT_DEGRADED for this class of condition.
+        ESP_LOGW(TAG, "ADC calibration degraded: linear approximation in use");
+    }
+
+    // Create establishes the safe idle output before returning (FR-13), which is
+    // why the link is started only after this call and never before it.
+    SystemOrchestrator *sys = SystemOrchestratorCreate(hal);
+    if (sys == NULL) {
+        ESP_LOGE(TAG, "orchestrator alloc failed; cannot reach safe idle. Rebooting.");
+        vTaskDelay(pdMS_TO_TICKS(5000));
+        esp_restart();
+    }
+    if (!SystemOrchestratorSafeIdle(sys)) {
+        ESP_LOGE(TAG, "safe idle NOT established -- output state is unverified");
+    }
+
+    // The USB link belongs here (Task 16). Nothing above depends on it, which is
+    // what makes FR-42 structural: the device serves presses with no app, no
+    // host and no radio attached.
+
+    for (;;) {
+        SystemOrchestratorTick(sys, hal->now_ms(hal->ctx));
+        vTaskDelay(pdMS_TO_TICKS(SWC_POLL_MS));
+    }
+}

@@ -5889,14 +5889,31 @@ it is the only part that cannot be tested on the host.
 
 **Files:**
 - Create: `code/lib/HAL/EspHal.h`
-- Create: `code/lib/HAL/EspHal.c`
+- Create: `code/lib/HAL/EspHal.cpp` — **C++, not `.c`** (see below)
 - Create: `code/lib/HAL/PinMap.h`
-- Modify: `code/src/main.c` (wire it up)
+- Create: `code/lib/CMakeLists.txt` — **the component that makes any of `lib/`
+  build for the device at all** (see Defect 44)
+- Modify: `code/CMakeLists.txt` — register `lib/` via `EXTRA_COMPONENT_DIRS`
+- Modify: `code/src/CMakeLists.txt` — `REQUIRES lib`
+- Modify: `code/src/main.c` → **rename to `code/src/main.cpp`** (see below)
 - Create: `code/test/test_hw/TestEspHal.c` (Unity, on device)
+- Create: `code/test/test_hw/test_main.c` — the Unity runner (see Defect 46)
+- Create: `code/test/test_hw/unity_config_out.c` — Unity output plumbing
+- Create: `code/test/unity_config.h` — the `TEST` macro Unity does not ship
+- Modify: `code/platformio.ini` — exclude `EspHal.cpp` from the host build
 
 **Interfaces:**
-- Consumes: `IHAL` (Task 2)
-- Produces: `IHAL *EspHalInit(void)`; `PinMap.h` constants
+- Consumes: `IHAL` (Task 2), `AdcCalibration` (Task 4)
+- Produces: `IHAL *EspHalInit(void)`; `bool EspHalCalibrationIsDegraded(void)`;
+  `PinMap.h` constants
+
+**Two files are C++ and that is forced, not preferred.** `EspHal` consumes Task
+4's `AdcCalibration`, whose header uses `constexpr` and `enum class`, so a C
+translation unit cannot include it — and re-implementing the raw→mV conversion in
+C would be a second home for the fallback rule. `main.cpp` follows because it
+includes `System/SystemOrchestrator.h`. The IDF driver headers are all
+`extern "C"`-guarded, so C++ sees both worlds. `app_main` must therefore be
+declared `extern "C"` or the link fails with `undefined reference to app_main`.
 
 - [ ] **Step 1: Write `lib/HAL/PinMap.h`**
 
@@ -6021,21 +6038,29 @@ Key requirements, each a specific ESP-IDF choice:
 
 - [ ] **Step 4: Wire it into `main.c`**
 
-```c
+```cpp
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "HAL/EspHal.h"
 #include "System/SystemOrchestrator.h"
 
-void app_main(void)
+// C linkage: IDF's startup (freertos/app_startup.c) calls `app_main` by that
+// exact symbol. As a C++ definition it mangles to `_Z8app_mainv` and the link
+// fails with "undefined reference to `app_main`".
+extern "C" void app_main(void)
 {
     IHAL *hal = EspHalInit();
-    SystemOrchestrator *sys = SystemOrchestratorCreate(hal);   /* loads config */
-    SystemOrchestratorBoot(sys);                               /* safe idle FIRST */
+    if (hal == NULL) { vTaskDelay(pdMS_TO_TICKS(5000)); esp_restart(); }
 
-    // Only now is the link started (Task 16). Nothing above this line depends
-    // on it, which is what lets the device work with no head unit attached.
-    UsbLinkStart(hal, sys);
+    // Create loads the config AND establishes the safe idle output (FR-13), so
+    // there is no separate Boot() call. Nothing below depends on a link, which
+    // is what makes FR-42 structural.
+    SystemOrchestrator *sys = SystemOrchestratorCreate(hal);
+    if (sys == NULL) { vTaskDelay(pdMS_TO_TICKS(5000)); esp_restart(); }
+
+    // The USB link belongs HERE (Task 16, the `UsbCdc` task). It is deliberately
+    // not called yet: an earlier revision of this step called `UsbLinkStart`,
+    // which no task in this plan ever defines -- see Defect 45.
 
     for (;;) {
         SystemOrchestratorTick(sys, hal->now_ms(hal->ctx));
@@ -6044,8 +6069,9 @@ void app_main(void)
 }
 ```
 
-Add `SystemOrchestratorCreate` / `...Boot` / `...Tick` C-linkage wrappers in
-`SystemOrchestrator.h` so `main.c` can stay C.
+The C-linkage wrappers live in `SystemOrchestrator.{h,cpp}` and are
+`SystemOrchestratorCreate` / `SystemOrchestratorTick` / `SystemOrchestratorSafeIdle`.
+`Create` does the load-and-boot in one call, so `main` cannot forget the ordering.
 
 - [ ] **Step 5: Build and run the on-device tests**
 
@@ -6061,16 +6087,26 @@ Expected: app ≤ **1920 KB**. Record the new number next to Task 1's baseline.
 - [ ] **Step 7: Commit**
 
 ```bash
-git add code/lib/HAL/EspHal.h code/lib/HAL/EspHal.c code/lib/HAL/PinMap.h \
-        code/src/main.c code/src/CMakeLists.txt code/test/test_hw/TestEspHal.c \
-        code/lib/System/SystemOrchestrator.h
+git add code/lib/HAL/EspHal.h code/lib/HAL/EspHal.cpp code/lib/HAL/PinMap.h \
+        code/lib/CMakeLists.txt code/CMakeLists.txt code/src/CMakeLists.txt \
+        code/src/main.cpp code/platformio.ini \
+        code/lib/System/SystemOrchestrator.h code/lib/System/SystemOrchestrator.cpp \
+        code/test/unity_config.h code/test/test_hw/TestEspHal.c \
+        code/test/test_hw/test_main.c code/test/test_hw/unity_config_out.c \
+        code/.gitignore
 git commit -m "Add the ESP32-S3 HAL implementation and wire up main
 
 ADC uses the curve-fit calibration scheme at 12dB attenuation (the 2.9V ceiling
 this board's divider assumes); a read error returns -1 rather than a fabricated
 zero, because zero is a legal reading. One time source feeds both now_ms and
 now_us so the host tests' semantics hold on device. main establishes safe idle
-before the link starts."
+before the link starts.
+
+The CMake changes are the load-bearing part: lib/ was never registered as an IDF
+component, so the device build compiled ONLY src/ and linked none of the eleven
+tasks below it. It built clean and produced a valid image the whole time -- the
+give-away was that the binary weighed exactly its bare-main baseline. See
+lib/CMakeLists.txt."
 ```
 
 ---

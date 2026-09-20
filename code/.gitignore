@@ -20,3 +20,11 @@ build/
 android/.gradle/
 android/local.properties
 android/**/build/
+.kilo/worktrees
+
+# Google Drive sync artifacts. This workspace lives in Drive, which drops
+# zero-byte `.~<random>.insyncdl` placeholders into directories it is syncing.
+# They are transient, empty, and must never be committed -- and because they
+# appear inside SOURCE directories (lib/Output/), a `git add <dir>` would catch
+# one. See the global-constraints rule on explicit file paths.
+.~*.insyncdl

@@ -1,5 +1,7 @@
 #include "System/SystemOrchestrator.h"
 
+#include <new>
+
 #include "Bindings/BindingResolver.h"
 #include "Config/ConfigStore.h"
 #include "Output/GainPolicy.h"
@@ -264,3 +266,48 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
         cs.key_driven = false;
     }
 }
+
+// --- C-linkage entry points for src/main.c -----------------------------------
+//
+// The constructor and Boot() keep taking a config so the host tests can drive
+// them directly; these wrappers are the device path, where the config comes from
+// NVS and nobody has one to hand at construction time.
+
+extern "C" SystemOrchestrator *SystemOrchestratorCreate(IHAL *hal) {
+    if (hal == nullptr) return nullptr;
+
+    // A default config is what FR-25 wants anyway: if NVS holds nothing, this IS
+    // the pass-through fallback, and Boot() overwrites it when a config loads.
+    Config boot_config{};
+    boot_config.schema_version = kConfigSchemaVersion;
+    boot_config.settings.timings = GestureTimingsDefault();
+    boot_config.settings.gain_policy = GainPolicy::kAuto;
+    boot_config.settings.buzzer_level = 2;
+    boot_config.settings.led_level = 2;
+    boot_config.channel_count = kMaxChannels;
+    for (uint8_t i = 0; i < kMaxChannels; ++i) {
+        boot_config.channels[i].enabled = false;   // nothing learned yet
+        boot_config.channels[i].output.gain_mode = GainMode::kAmplified;
+        boot_config.channels[i].output.idle_dac_code = kDacMaxCode;   // safe (6.7)
+    }
+
+    SystemOrchestrator *sys =
+        new (std::nothrow) SystemOrchestrator(hal, boot_config, boot_config.settings.timings);
+    if (sys == nullptr) return nullptr;
+
+    // Safe idle FIRST (FR-13), before the caller can start any link. A device
+    // that cannot reach its safe state must be loud rather than quietly running:
+    // Boot() plays the fault pattern and SafeIdleEstablished() stays false.
+    sys->Boot();
+    return sys;
+}
+
+extern "C" void SystemOrchestratorTick(SystemOrchestrator *sys, uint64_t now_ms) {
+    if (sys == nullptr) return;
+    sys->Tick(now_ms);
+}
+
+extern "C" bool SystemOrchestratorSafeIdle(const SystemOrchestrator *sys) {
+    return sys != nullptr && sys->SafeIdleEstablished();
+}
+

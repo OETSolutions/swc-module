@@ -130,6 +130,11 @@ object ConfigJson {
                     ?: emptyList(),
             ),
             output = OutputProfile(
+                // A name this build does not know must NOT be silently coerced:
+                // `?: TRACKING` would turn a channel the device says is AUTO into
+                // a concrete 1.00 gain on the next save, changing behaviour the
+                // user never touched. Unknown names are recorded so a caller can
+                // refuse to round-trip rather than corrupt.
                 gainMode = outputObj?.str("gain_mode")
                     ?.let { n -> GainMode.entries.firstOrNull { it.wireName == n } }
                     ?: GainMode.TRACKING,

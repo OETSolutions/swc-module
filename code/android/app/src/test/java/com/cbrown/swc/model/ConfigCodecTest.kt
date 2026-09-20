@@ -169,3 +169,31 @@ class ConfigCodecTest {
         assertTrue("encoded JSON must not be pretty-printed", !text.contains(": "))
     }
 }
+
+class GainModeRoundTripTest {
+
+    @Test
+    fun `a channel that defers its gain survives a round trip as AUTO`() {
+        // The firmware accepts a channel `gain_mode` of "AUTO" -- the spec's own
+        // worked example uses it -- and this enum did not, so the decoder's
+        // `firstOrNull` fell back to TRACKING and the next save wrote a concrete
+        // gain the user never chose, silently overriding their policy. An unknown
+        // enum member in a round-trip codec is data loss, not a cosmetic gap.
+        val c = sampleConfig().let {
+            it.copy(channels = it.channels.map { ch ->
+                ch.copy(output = ch.output.copy(gainMode = GainMode.AUTO))
+            })
+        }
+        val decoded = ConfigJson.decode(ConfigJson.encode(c))
+        assertEquals(GainMode.AUTO, decoded.channels[0].output.gainMode)
+    }
+
+    @Test
+    fun `every gain mode is distinguishable on the wire`() {
+        // If two values encoded to the same name, a deferring channel and a forced
+        // one would decode alike -- the defect in its quietest form.
+        val names = GainMode.entries.map { it.wireName }
+        assertEquals(names.size, names.toSet().size)
+        assertEquals(setOf("TRACKING", "AMPLIFIED", "AUTO"), names.toSet())
+    }
+}

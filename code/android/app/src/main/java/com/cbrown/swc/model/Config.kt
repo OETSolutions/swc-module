@@ -51,10 +51,22 @@ enum class Gesture(val wireName: String) {
     }
 }
 
+/**
+ * A channel's gain, or [AUTO] to defer to `settings.gain_policy` (spec 6.2).
+ *
+ * **`AUTO` must be here even though it is not a gain.** The firmware's decoder
+ * accepts a channel `gain_mode` of "AUTO" — the spec's own worked example uses it
+ * — and this enum did not, so a config the device considers legal came back to the
+ * app as a name nothing matched. The decoder's `firstOrNull` then fell back to
+ * TRACKING and the next save wrote a CONCRETE gain the user never chose, silently
+ * overriding their policy. An unknown enum member is a data-loss bug in a
+ * round-trip codec, not a cosmetic gap.
+ */
 @Serializable
 enum class GainMode(val wireName: String) {
     @SerialName("TRACKING") TRACKING("TRACKING"),
-    @SerialName("AMPLIFIED") AMPLIFIED("AMPLIFIED");
+    @SerialName("AMPLIFIED") AMPLIFIED("AMPLIFIED"),
+    @SerialName("AUTO") AUTO("AUTO");
 }
 
 @Serializable

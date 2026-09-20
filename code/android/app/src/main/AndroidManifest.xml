@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The SWC adapter app.
+
+  `android.hardware.usb.host` is REQUIRED, not optional: the app talks to the
+  device only over USB, so on a host-mode-less device it can do nothing at all.
+  Declaring it required keeps the app off those devices entirely rather than
+  installing it and failing at the first connect.
+
+  There is deliberately NO `INTERNET` permission here. WiFi is the firmware's
+  maintenance path (spec 8), not the app's: the app writes an OTA image over USB,
+  and the device fetches its own manifest. Granting INTERNET speculatively would
+  be a permission for a feature that does not exist.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-feature
+        android:name="android.hardware.usb.host"
+        android:required="true" />
+
+    <application
+        android:label="SWC"
+        android:allowBackup="false"
+        android:supportsRtl="true" />
+
+</manifest>

@@ -49,3 +49,14 @@ android/**/build/
 # depend on whatever the registry serves that day.
 managed_components/
 
+
+# --- Android / Gradle -------------------------------------------------------
+# The Gradle WRAPPER is committed deliberately (gradlew, gradlew.bat,
+# gradle/wrapper/*) -- it is what pins the Gradle version for every checkout, and
+# a build script that only works with "whatever gradle you have" is not
+# reproducible.
+.local/
+.kotlin/
+# The fixture EmitFixtureTest writes. It is a build output that exists to be fed
+# to tools/crosscheck_config.sh, not a source file.
+android/app/build/

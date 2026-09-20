@@ -1,0 +1,266 @@
+#include "System/SystemOrchestrator.h"
+
+#include "Bindings/BindingResolver.h"
+#include "Config/ConfigStore.h"
+#include "Output/GainPolicy.h"
+
+namespace {
+
+// The sense divider is an exact divide-by-2 (spec 2.3), so the KEY line is twice
+// the sense reading. This appears in three places (gain selection, the trim
+// loop, and here) and is a property of R54/R55, not a tuning value.
+constexpr int kSenseDividerRatio = 2;
+
+// Spec 6.2 step 2: a KEY idle outside this envelope means no head unit at all.
+constexpr int kKeyEnvelopeLowMv  = kOutputFloorMv;    // 1800
+constexpr int kKeyEnvelopeHighMv = kOutputCeilingMv;  // 5200
+
+}  // namespace
+
+SystemOrchestrator::SystemOrchestrator(IHAL *hal, const Config &config,
+                                       const GestureTimings &timings)
+    : hal_(hal), config_(config), timings_(timings),
+      buzzer_(hal, config.settings.buzzer_level),
+      leds_(hal, config.settings.led_level) {}
+
+// The bindings a channel's buttons actually have, which is what makes the
+// gesture resolve adaptive (spec 6.6). Scanned from the config rather than
+// assumed: a button binding only SINGLE must not inherit the double-press
+// window's latency, and a button with no LONG must never emit one.
+GestureBindings SystemOrchestrator::BindingsFor(uint8_t channel_index) const {
+    GestureBindings out;
+    out.has_double = false;
+    out.has_long = false;
+    if (channel_index >= config_.channel_count) return out;
+    if (config_.binding_count > kMaxBindings) return out;
+
+    const uint8_t as_swc = (channel_index == 0)
+                               ? static_cast<uint8_t>(BindingChannel::kSwc1)
+                               : static_cast<uint8_t>(BindingChannel::kSwc2);
+    for (uint8_t i = 0; i < config_.binding_count; ++i) {
+        const Binding &b = config_.bindings[i];
+        if (!b.enabled) continue;
+        if (b.channel != as_swc && b.channel != static_cast<uint8_t>(BindingChannel::kAny)) {
+            continue;
+        }
+        if (b.gesture == Gesture::kDouble) out.has_double = true;
+        if (b.gesture == Gesture::kLong) out.has_long = true;
+    }
+    return out;
+}
+
+void SystemOrchestrator::EstablishSafeIdle() {
+    // Step 1 of spec 6.1: the DAC is already safe from its EEPROM (full-scale
+    // signal, gain channels powered down), and the firmware's job is to VERIFY
+    // and then hold that state before anything else runs (FR-13).
+    //
+    // A channel that is disabled still gets the idle write. A channel the user
+    // turned off must not leave its KEY line in an unknown state, and the cost
+    // of writing it is one I2C transaction at boot.
+    const uint8_t n = (config_.channel_count <= kMaxChannels) ? config_.channel_count
+                                                              : kMaxChannels;
+    int first_idle_key_mv = 0;
+
+    for (uint8_t i = 0; i < n; ++i) {
+        const DacChannel key_ch = (i == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
+        const DacChannel adj_ch = (i == 0) ? DAC_CH_ADJ1 : DAC_CH_ADJ2;
+
+        // Measure the head unit's idle before choosing gain: V_KEY_idle is twice
+        // the sense reading (spec 6.2 step 1). With no head unit the sense pin
+        // floats and the reading is outside the envelope, which resolves to the
+        // amplified default -- the safe direction (spec 6.2's asymmetry).
+        const int sense_mv = hal_->adc_read_mv(hal_->ctx,
+                                               (i == 0) ? ADC_CH_KEY_SENSE1 : ADC_CH_KEY_SENSE2);
+        const int measured_key_idle_mv = sense_mv * kSenseDividerRatio;
+        const bool no_head_unit = (measured_key_idle_mv < kKeyEnvelopeLowMv) ||
+                                  (measured_key_idle_mv > kKeyEnvelopeHighMv);
+        const int for_gain = no_head_unit ? 0 : measured_key_idle_mv;
+
+        const GainMode mode = GainPolicySelect(config_.channels[i].output.gain_mode ==
+                                                       GainMode::kTracking
+                                                   ? GainPolicy::kForceTracking
+                                                   : (config_.channels[i].output.gain_mode ==
+                                                              GainMode::kAmplified
+                                                          ? GainPolicy::kForceAmplified
+                                                          : config_.settings.gain_policy),
+                                               for_gain);
+        gain_mode_[i] = mode;
+
+        // Gain 1.82 needs V_ADJ at 0 V, which is the 1 kohm pulldown power-down
+        // mode; gain 1.00 needs V_ADJ tracking the signal channel (spec 2.3).
+        hal_->dac_power_mode(hal_->ctx, adj_ch,
+                             (mode == GainMode::kAmplified) ? DAC_POWER_GND_1K
+                                                            : DAC_POWER_NORMAL);
+
+        uint16_t idle_code = config_.channels[i].output.idle_dac_code;
+        // Release is "command ABOVE the head unit's idle voltage" (FR-16), so
+        // the idle code must actually reach above the measured line. A code that
+        // only just fails to do that would leave Q4 conducting, which is a key
+        // held down -- the hazard of spec 6.7. Full scale is the spec default.
+        if (idle_code < kDacMaxCode && measured_key_idle_mv > 0) {
+            const int idle_reachable_mv = GainPolicyKeyMvForCode(mode, idle_code);
+            if (idle_reachable_mv <= measured_key_idle_mv) idle_code = kDacMaxCode;
+        }
+
+        idle_code_[i] = idle_code;
+        hal_->dac_set_code(hal_->ctx, key_ch, idle_code);
+        if (i == 0) first_idle_key_mv = GainPolicyKeyMvForCode(mode, idle_code);
+    }
+
+    idle_key_mv_ = first_idle_key_mv;
+    // Set BEFORE the state machines are constructed, so anything that observes
+    // SafeIdleEstablished() knows the output is already safe (FR-13).
+    safe_idle_established_ = true;
+}
+
+void SystemOrchestrator::Boot() {
+    // 1. Load the config. `kNoConfig` is not a failure -- FR-25 makes an
+    //    unconfigured device a transparent pass-through, so the device works
+    //    before it is ever configured.
+    ConfigStore store(hal_);
+    Config loaded{};
+    const ConfigLoadResult result = store.Load(&loaded);
+
+    if (result == ConfigLoadResult::kLoaded || result == ConfigLoadResult::kRecoveredFromBackup) {
+        config_ = loaded;
+        buzzer_ = BuzzerGrammar(hal_, config_.settings.buzzer_level);
+        leds_ = LedGrammar(hal_, config_.settings.led_level);
+    } else if (result == ConfigLoadResult::kFellBackToDefaults) {
+        // Spec 6.8: a corrupt config falls back to defaults AND says so loudly.
+        // The defaults keep the output safe, which is the part that matters.
+        buzzer_ = BuzzerGrammar(hal_, config_.settings.buzzer_level);
+        leds_ = LedGrammar(hal_, config_.settings.led_level);
+    }
+    // kNoConfig leaves config_ as supplied (the caller's defaults) -- the
+    // pass-through case. Nothing here starts a link, so "no config" cannot
+    // become "no steering wheel".
+
+    // 2. Establish safe idle. This is BEFORE anything else that could accept a
+    //    command (FR-13), and before the per-channel state exists.
+    EstablishSafeIdle();
+
+    // 3. Now the per-channel state.
+    channel_count_ = (config_.channel_count <= kMaxChannels) ? config_.channel_count
+                                                             : kMaxChannels;
+    for (uint8_t i = 0; i < channel_count_; ++i) {
+        ChannelState &cs = channels_[i];
+        cs.classifier = PressClassifier(config_.channels[i].ladder, timings_);
+        cs.gestures = GestureStateMachine(timings_);
+        cs.servo = ServoLoop(ServoConfigDefault());
+        cs.bindings = BindingsFor(i);
+        cs.key_driven = false;
+        cs.key_released_at_ms = 0;
+        // The trim loop is present but DISABLED in v1: spec 6.5 says open-loop
+        // command with the loop off until its gain is measured on hardware, and
+        // running a software loop against the hardware integrator is how you
+        // build an oscillator.
+    }
+
+    // 4. Feedback for the load result. A recovered backup is degraded (the user
+    //    should know their newest config was lost); a fallback is an error.
+    if (result == ConfigLoadResult::kFellBackToDefaults) {
+        buzzer_.Play(BuzzerPattern::kFaultConfig);
+    } else if (result == ConfigLoadResult::kRecoveredFromBackup) {
+        buzzer_.Play(BuzzerPattern::kBootDegraded);
+    } else {
+        buzzer_.Play(BuzzerPattern::kBootOk);
+    }
+
+    // 5. USB/BLE would be brought up here (Tasks 16/18). Nothing in this class
+    //    starts them, which is what makes FR-42 structural rather than a promise.
+}
+
+void SystemOrchestrator::Tick(uint64_t now_ms) {
+    for (uint8_t i = 0; i < channel_count_; ++i) {
+        ServiceChannel(i, now_ms);
+    }
+    buzzer_.Update(now_ms);
+    leds_.Update(now_ms);
+}
+
+void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
+    ChannelState &cs = channels_[index];
+    const ChannelConfig &cc = config_.channels[index];
+
+    const DacChannel key_ch = (index == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
+
+    // Read the ladder. The idle reference is the LEARNED idle, not the live
+    // reading: it is the ratio denominator, so it must stay pinned to the rail
+    // the button centres were measured at (spec 6.3/LadderProfile). The live
+    // rail health is a separate check on the KEY sense pin, below.
+    const int level_mv = hal_->adc_read_mv(hal_->ctx,
+                                           (index == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
+    const int idle_ref = cc.ladder.learned_idle_mv;
+    const ChannelLevel level = cs.classifier.Update(level_mv, idle_ref, now_ms);
+
+    // The head unit's own idle, live. Outside the envelope the head unit has
+    // gone (spec 6.8, VBUS off / rail collapse) and the KEY line must be
+    // released rather than held -- FR-39's phantom-key hazard.
+    const int sense_mv = hal_->adc_read_mv(hal_->ctx,
+                                           (index == 0) ? ADC_CH_KEY_SENSE1 : ADC_CH_KEY_SENSE2);
+    const int key_idle_now_mv = sense_mv * kSenseDividerRatio;
+    const bool rail_fault = (key_idle_now_mv < kKeyEnvelopeLowMv) ||
+                            (key_idle_now_mv > kKeyEnvelopeHighMv);
+
+    GestureEvent ev{};
+    const bool fired = cs.gestures.Update(level, cs.classifier.ButtonIndex(), now_ms, &ev,
+                                          cs.bindings);
+
+    // A fault, or a lost head unit, releases in the same tick. Everything in
+    // flight is discarded: a half-recognised gesture must not reach the radio.
+    if (level == ChannelLevel::kFault || rail_fault) {
+        if (cs.key_driven) {
+            cs.servo.Target(gain_mode_[index], GainPolicyKeyMvForCode(gain_mode_[index],
+                                                                      idle_code_[index]));
+            hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
+            cs.key_driven = false;
+        }
+        cs.gestures.Reset();
+        return;
+    }
+
+    if (fired) {
+        const ResolvedAction resolved = BindingResolve(config_, index, ev);
+        if (resolved.found) {
+            const Action &a = resolved.action;
+            if (a.kind == ActionKind::kOutVoltage && a.key_mv != 0) {
+                // The action names the voltage directly (spec 3.6) -- there is
+                // no head-unit model here and no resistance to convert. One
+                // bounded pulse, held for the recognition time, then released:
+                // the head unit sees a single key event, not a held line.
+                cs.servo.Target(gain_mode_[index], a.key_mv);
+                cs.servo.Update(sense_mv);
+                hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());
+                cs.key_driven = true;
+                cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
+            } else {
+                // Not a level (an OUT_RELEASE, a NONE, or an app-side action this
+                // firmware does not execute). Release rather than hold: a stale
+                // key with no action behind it is the phantom-key hazard.
+                if (cs.key_driven) {
+                    hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
+                    cs.key_driven = false;
+                }
+            }
+            buzzer_.Play(BuzzerPattern::kKeyAccepted);
+        } else {
+            // FR-12: an unlearned press is never guessed at. The failure mode of
+            // a wrong guess is the radio doing something the driver did not ask
+            // for, which is worse than doing nothing.
+            if (cs.key_driven) {
+                hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
+                cs.key_driven = false;
+            }
+            buzzer_.Play(BuzzerPattern::kKeyUnknown);
+        }
+    }
+
+    // End the pulse once the recognition time has elapsed. Checked every tick,
+    // so a press that is never released cannot leave the line driven.
+    if (cs.key_driven && now_ms >= cs.key_released_at_ms) {
+        cs.servo.Target(gain_mode_[index], GainPolicyKeyMvForCode(gain_mode_[index],
+                                                                  idle_code_[index]));
+        hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
+        cs.key_driven = false;
+    }
+}

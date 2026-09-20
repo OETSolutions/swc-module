@@ -843,7 +843,7 @@ used in the RFC 2119 sense. Each requirement is stated so that it is
 | --- | --- |
 | FR-13 | Before serving any user input, the firmware MUST establish a **safe idle output** — see §6.7. This is the first thing that happens after boot, ahead of USB, BLE or WiFi. |
 | FR-14 | The firmware MUST select gain mode per channel from `gain_policy` (§6.2), defaulting to `AUTO` (measure the head unit, decide). |
-| FR-15 | The firmware MUST command a key value by writing the DAC code for the bound action, and MUST hold it for the press duration, then release. |
+| FR-15 | The firmware MUST command a key value by writing the DAC code for the bound action **once the gesture has resolved**, and MUST hold it for the press duration (`send_duration_ms`), then release. The output MUST NOT be driven while the gesture is still undecided (§6.6). |
 | FR-16 | The firmware MUST implement release as "command above the head unit's idle voltage", which turns the sink FET off and returns the line to high impedance. |
 | FR-17 | The firmware MUST apply temperature compensation to the learned windows when `temp_comp_enabled` is set (§6.4). |
 | FR-18 | The firmware MUST validate any DAC code against the current gain mode's ceiling before writing it, and clamp with a logged warning rather than driving an out-of-range value. |
@@ -1187,6 +1187,47 @@ against a guess.
   raw samples ─► filter ─► classify ─► gesture ─┬─► LOCAL action (binding)  ── FIRST, always
                                                 └─► USB `event` report       ── SECOND, best-effort
 ```
+
+**The head unit is gesture-blind, and that is the whole reason this device
+exists.** Its SWC input reads a voltage and recognizes key windows. It has no
+concept of a "double press" or a "long press" — those are *ours*, computed from
+the ladder switch being closed for a particular duration. So the adapter's job is
+not to forward a press; it is to **convert a gesture into one clean, gesture-blind
+key event**:
+
+| wheel input (the head unit cannot see it) | what the head unit receives |
+| --- | --- |
+| tap | one pulse at key A's voltage |
+| double tap | one pulse at key **B**'s voltage — a *different* command |
+| hold | one pulse at key **C**'s voltage, or a USB command to the app (§3.6) |
+
+Three rules follow, and they are normative:
+
+1. **The output is not driven until the gesture resolves.** Because a button's
+   `DOUBLE` and `LONG` bindings normally name *different* voltages, driving key A
+   at press time and key B at resolution would make the head unit act twice — a
+   phantom press, which is the hazard §6.7 exists to prevent. The delay is not a
+   latency compromise; it is what makes the conversion unambiguous.
+2. **Every drive is a bounded pulse**, held for `send_duration_ms` and then
+   released. A gesture becomes *one key event*, never a held line. `LONG` is
+   **not** a held key: a long press is only the ladder switch closed past the
+   threshold, and what the head unit is given is a single pulse of the level that
+   the `LONG` binding names.
+3. **How long the resolve takes is per button, and is derived from that button's
+   own bindings** — the adaptive rule:
+
+   | the button binds | the wait before driving |
+   | --- | --- |
+   | neither `DOUBLE` nor `LONG` | none — drive as soon as the press is classified |
+   | `LONG` only | until release, or until the long threshold passes |
+   | `DOUBLE` (with or without `LONG`) | until the double-press window closes after release |
+
+   A button that binds only `SINGLE` has no ambiguity to resolve and must not
+   inherit the double-press window's latency. This is a per-button property, not a
+   per-device one.
+
+`SINGLE` is therefore not "delayed by design" — it is delayed by exactly the
+ambiguity that its button actually has, and no more.
 
 **The local action runs first and unconditionally.** The app is an *enhancer*,
 not a dependency. If the USB link is down, the app has crashed, or the head unit

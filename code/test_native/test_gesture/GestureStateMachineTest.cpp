@@ -12,6 +12,19 @@ GestureEvent Feed(GestureStateMachine &sm, ChannelLevel level, uint8_t button,
     }
     return last;
 }
+
+// The same, for a button whose bindings constrain the resolve (spec 6.6).
+GestureEvent Feed(GestureStateMachine &sm, ChannelLevel level, uint8_t button,
+                  uint64_t &now, uint32_t hold_ms, const GestureBindings &bindings,
+                  uint32_t step_ms = 10) {
+    GestureEvent fired{};
+    GestureEvent last{};
+    for (uint32_t elapsed = 0; elapsed < hold_ms; elapsed += step_ms) {
+        if (sm.Update(level, button, now, &fired, bindings)) last = fired;
+        now += step_ms;
+    }
+    return last;
+}
 }  // namespace
 
 TEST(Gesture, ShortPressEmitsSingleOnlyAfterTheDoubleWindowCloses) {
@@ -163,4 +176,78 @@ TEST(Gesture, FaultResetsAnyInFlightGesture) {
     GestureEvent ev{};
     const bool fired = sm.Update(ChannelLevel::kIdle, 0, now, &ev);
     EXPECT_FALSE(fired) << "a pending single must be dropped when the channel faults";
+}
+
+// --- The adaptive resolve (spec 6.6) -----------------------------------------
+//
+// The head unit is gesture-blind, so a button that binds only SINGLE has no
+// ambiguity to resolve and must not inherit the double-press window's latency.
+
+TEST(Gesture, AButtonBindingNeitherDoubleNorLongResolvesAtThePress) {
+    GestureStateMachine sm(GestureTimingsDefault());
+    const GestureBindings single_only{/*has_double=*/false, /*has_long=*/false};
+    uint64_t now = 1000;
+    GestureEvent ev{};
+    // The very first pressed sample must emit -- no window, no release.
+    for (int i = 0; i < 5 && ev.gesture == Gesture::kNone; ++i) {
+        sm.Update(ChannelLevel::kPressed, 0, now, &ev, single_only);
+        now += 10;
+    }
+    EXPECT_EQ(ev.gesture, Gesture::kSingle) << "no ambiguity means no wait";
+}
+
+TEST(Gesture, AButtonBindingOnlyLongResolvesOnReleaseWithoutTheDoubleWindow) {
+    GestureStateMachine sm(GestureTimingsDefault());
+    const GestureBindings long_only{/*has_double=*/false, /*has_long=*/true};
+    uint64_t now = 1000;
+    GestureEvent ev{};
+    for (int i = 0; i < 10; ++i) { sm.Update(ChannelLevel::kPressed, 0, now, &ev, long_only); now += 10; }
+    EXPECT_EQ(ev.gesture, Gesture::kNone) << "held under the threshold: nothing yet";
+
+    // Release. LONG was the only alternative and the threshold was never
+    // reached, so the release itself is the resolution -- it must not wait out
+    // the 500 ms double-press window, which nothing on this button can use.
+    ASSERT_TRUE(sm.Update(ChannelLevel::kIdle, 0, now, &ev, long_only));
+    EXPECT_EQ(ev.gesture, Gesture::kSingle);
+}
+
+TEST(Gesture, AButtonBindingOnlyLongStillFiresLongAtTheThreshold) {
+    GestureStateMachine sm(GestureTimingsDefault());
+    const GestureBindings long_only{/*has_double=*/false, /*has_long=*/true};
+    uint64_t now = 1000;
+    GestureEvent ev{};
+    for (uint32_t elapsed = 0; elapsed < 760 && ev.gesture == Gesture::kNone; elapsed += 10) {
+        sm.Update(ChannelLevel::kPressed, 0, now, &ev, long_only);
+        now += 10;
+    }
+    EXPECT_EQ(ev.gesture, Gesture::kLong);
+}
+
+TEST(Gesture, AButtonBindingDoubleWaitsOutTheWindowEvenWithNoLong) {
+    GestureStateMachine sm(GestureTimingsDefault());
+    const GestureBindings double_only{/*has_double=*/true, /*has_long=*/false};
+    uint64_t now = 1000;
+    GestureEvent ev = Feed(sm, ChannelLevel::kPressed, 0, now, 100, double_only);
+    EXPECT_EQ(ev.gesture, Gesture::kNone) << "the double is still possible";
+    // Within the window: still nothing, because the second press could come.
+    ev = Feed(sm, ChannelLevel::kIdle, 0, now, 400, double_only);
+    EXPECT_EQ(ev.gesture, Gesture::kNone) << "inside the window the answer is not known";
+    ev = Feed(sm, ChannelLevel::kIdle, 0, now, 200, double_only);
+    EXPECT_EQ(ev.gesture, Gesture::kSingle);
+}
+
+TEST(Gesture, ANoLongButtonDoesNotFireLongEvenAfterTheThreshold) {
+    // has_long=false means this button's LONG slot is unbound, so a hold must not
+    // produce a LONG -- there would be nothing to run. The press simply continues
+    // until release, where it resolves as a SINGLE.
+    GestureStateMachine sm(GestureTimingsDefault());
+    const GestureBindings no_long{/*has_double=*/false, /*has_long=*/false};
+    uint64_t now = 1000;
+    GestureEvent ev{};
+    for (uint32_t elapsed = 0; elapsed < 2000; elapsed += 10) {
+        sm.Update(ChannelLevel::kPressed, 0, now, &ev, no_long);
+        now += 10;
+    }
+    EXPECT_EQ(ev.gesture, Gesture::kSingle) << "already resolved at the press";
+    EXPECT_NE(ev.gesture, Gesture::kLong) << "an unbound LONG must never fire";
 }

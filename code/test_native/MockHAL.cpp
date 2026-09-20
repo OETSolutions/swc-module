@@ -1,5 +1,62 @@
 #include "MockHAL.h"
 
+MockHal::Defaults::Defaults() : config{}, timings(GestureTimingsDefault()) {
+    config.schema_version = kConfigSchemaVersion;
+    std::strncpy(config.device_id, "SWC-0001", sizeof(config.device_id) - 1);
+    config.settings.timings = timings;
+    config.settings.gain_policy = GainPolicy::kAuto;
+    config.settings.buzzer_level = 2;
+    config.settings.led_level = 2;
+    config.settings.maintenance_timeout_ms = 300000;
+    config.channel_count = 1;
+
+    ChannelConfig &ch = config.channels[0];
+    ch.enabled = true;
+    std::strncpy(ch.name, "SWC1", sizeof(ch.name) - 1);
+    // Spec 3.7's worked example. `learned_idle_mv` is the normalization
+    // reference, so the button levels are the values measured AT that idle.
+    ch.ladder.learned_idle_mv = 2835;
+    ch.ladder.count = 3;
+    ch.ladder.buttons[0] = {"vol_up", "Volume Up",   1430, 120, 3300, 235, 200, 98};
+    ch.ladder.buttons[1] = {"vol_dn", "Volume Down", 1785, 120, 3300, 235, 200, 97};
+    ch.ladder.buttons[2] = {"next",   "Next Track",  2145, 110, 3300, 235, 200, 99};
+    ch.output.gain_mode = GainMode::kAmplified;
+    ch.output.idle_dac_code = 4095;   // full scale is the safe state (spec 6.7)
+
+    // vol_up SINGLE drives the output; its LONG releases. `next` DOUBLE is the
+    // app's extra function, which is the product's core case (spec 3.5/3.6).
+    config.binding_count = 3;
+    Binding &b1 = config.bindings[0];
+    std::strncpy(b1.id, "b1", sizeof(b1.id) - 1);
+    b1.channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    std::strncpy(b1.button, "vol_up", sizeof(b1.button) - 1);
+    b1.gesture = Gesture::kSingle;
+    b1.enabled = true;
+    b1.action_count = 1;
+    b1.actions[0].kind = ActionKind::kOutVoltage;
+    b1.actions[0].key_mv = 2400;   // spec 3.7's b1
+
+    Binding &b2 = config.bindings[1];
+    std::strncpy(b2.id, "b2", sizeof(b2.id) - 1);
+    b2.channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    std::strncpy(b2.button, "vol_up", sizeof(b2.button) - 1);
+    b2.gesture = Gesture::kLong;
+    b2.enabled = true;
+    b2.action_count = 1;
+    b2.actions[0].kind = ActionKind::kOutRelease;
+
+    Binding &b3 = config.bindings[2];
+    std::strncpy(b3.id, "b3", sizeof(b3.id) - 1);
+    b3.channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    std::strncpy(b3.button, "next", sizeof(b3.button) - 1);
+    b3.gesture = Gesture::kDouble;
+    b3.enabled = true;
+    b3.action_count = 1;
+    b3.actions[0].kind = ActionKind::kAppIntent;
+    std::strncpy(b3.actions[0].target, "com.oetsolutions.swc.ACTION_NAVIGATE",
+                 sizeof(b3.actions[0].target) - 1);
+}
+
 MockHal::MockHal() {
     iface_.adc_read_mv    = &MockHal::AdcReadMvThunk;
     iface_.dac_set_code   = &MockHal::DacSetCodeThunk;

@@ -18,7 +18,8 @@ void GestureStateMachine::Emit(Gesture g, uint64_t now_ms, GestureEvent *out) {
 }
 
 bool GestureStateMachine::Update(ChannelLevel level, uint8_t button_index,
-                                 uint64_t now_ms, GestureEvent *out) {
+                                 uint64_t now_ms, GestureEvent *out,
+                                 const GestureBindings &bindings) {
     // A fault clears everything in flight: whatever was half-recognised is no
     // longer trustworthy, and a wrong guess reaches the radio.
     if (level == ChannelLevel::kFault) {
@@ -44,12 +45,21 @@ bool GestureStateMachine::Update(ChannelLevel level, uint8_t button_index,
                 Emit(Gesture::kDouble, now_ms, out);
                 long_fired_ = true;  // sentinel: this press must not emit SINGLE
                 emitted = true;
+            } else if (!bindings.has_double && !bindings.has_long) {
+                // No ambiguity to resolve (spec 6.6): nothing this button binds
+                // could differ from a SINGLE, so the press IS the single. Making
+                // it wait out the double-press window would add ~500 ms of lag to
+                // the commonest gesture in the product for no reason.
+                Emit(Gesture::kSingle, now_ms, out);
+                long_fired_ = true;  // sentinel: this press is spent
+                emitted = true;
             }
         }
         // FR-10: LONG fires at the threshold, not on release. A held button must
         // act immediately -- waiting for the finger to lift is the difference
         // between "responsive" and "broken" to a driver.
-        if (!long_fired_ && (now_ms - press_started_ms_) >= timings_.long_press_ms) {
+        if (!long_fired_ && bindings.has_long &&
+            (now_ms - press_started_ms_) >= timings_.long_press_ms) {
             long_fired_ = true;
             Emit(Gesture::kLong, now_ms, out);
             return true;
@@ -61,7 +71,7 @@ bool GestureStateMachine::Update(ChannelLevel level, uint8_t button_index,
     if (pressed_) {
         const uint64_t held = now_ms - press_started_ms_;
         pressed_ = false;
-        if (!long_fired_ && held >= timings_.long_press_ms) {
+        if (!long_fired_ && bindings.has_long && held >= timings_.long_press_ms) {
             // Reaching here means the threshold elapsed but no Update() was
             // called while it elapsed (e.g. a 100ms poll). Fire it now, so LONG
             // is never lost.
@@ -78,9 +88,16 @@ bool GestureStateMachine::Update(ChannelLevel level, uint8_t button_index,
                 Emit(Gesture::kDouble, now_ms, out);
                 return true;
             }
-            pending_single_ = true;
-            awaiting_second_ = true;
-            released_at_ms_ = now_ms;
+            if (bindings.has_double) {
+                pending_single_ = true;
+                awaiting_second_ = true;
+                released_at_ms_ = now_ms;
+            } else {
+                // LONG-but-not-DOUBLE: the release is the resolution. Only the
+                // threshold was in question, and it was not reached.
+                Emit(Gesture::kSingle, now_ms, out);
+                return true;
+            }
         }
         return false;
     }

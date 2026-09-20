@@ -59,7 +59,12 @@ attic
 old
 __pycache__
 scratch.txt
-output
+# Gerber/export output directories. Anchored to the ROOT and slash-suffixed on
+# purpose: a bare `output` matches case-insensitively (core.ignorecase=true) and
+# would also match `code/lib/Output/`, which is a SOURCE directory. The existing
+# files there are already tracked so they survived, but any NEW file would be
+# silently ignored -- a work-loss trap that only shows up when someone adds one.
+/output/
 jlcpcb
 *.log
 *.FCBak

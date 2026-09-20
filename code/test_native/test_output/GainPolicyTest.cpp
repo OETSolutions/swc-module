@@ -20,6 +20,28 @@ TEST(GainPolicy, AutoPicksTrackingWhenTheHeadUnitIdleIsLow) {
     EXPECT_EQ(GainPolicySelect(GainPolicy::kAuto, 1900), GainMode::kTracking);
 }
 
+TEST(GainPolicy, AutoPicksAmplifiedForAHeadUnitIdlingAboveTheGuardBand) {
+    // Spec 6.2 step 4: V_KEY_idle >= 3.4V is the 5V range, gain 1.82. The
+    // asymmetry is the safety argument -- the only dangerous error is
+    // OVER-ranging a 3V head unit, so gain 1.00 is taken only on positive
+    // evidence of a 3V line, and everything above the guard floor is amplified.
+    //
+    // An earlier revision of GainPolicySelect returned Tracking for everything
+    // outside the band, which put this side backwards: a 5V head unit idling at
+    // 4.98V was driven at 1.00. These two cases are why that could not be
+    // caught -- the old test asserted only at and below the band's ceiling, so
+    // the entire high side was unasserted.
+    EXPECT_EQ(GainPolicySelect(GainPolicy::kAuto, 3480), GainMode::kAmplified);
+    EXPECT_EQ(GainPolicySelect(GainPolicy::kAuto, 4980), GainMode::kAmplified);
+    EXPECT_EQ(GainPolicySelect(GainPolicy::kAuto, 5200), GainMode::kAmplified);
+}
+
+TEST(GainPolicy, AutoPicksAmplifiedWhenThereIsNoMeasurementAtAll) {
+    // The default-to-amplified rule (spec 6.2): 0 means nothing was measured,
+    // and the safe answer is still 1.82 rather than 1.00.
+    EXPECT_EQ(GainPolicySelect(GainPolicy::kAuto, 0), GainMode::kAmplified);
+}
+
 TEST(GainPolicy, ForcedModesOverrideAuto) {
     EXPECT_EQ(GainPolicySelect(GainPolicy::kForceTracking, 3000), GainMode::kTracking);
     EXPECT_EQ(GainPolicySelect(GainPolicy::kForceAmplified, 1900), GainMode::kAmplified);

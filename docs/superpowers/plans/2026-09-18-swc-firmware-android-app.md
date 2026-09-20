@@ -402,8 +402,7 @@ typedef enum { GAIN_MODE_AMPLIFIED, GAIN_MODE_TRACKING } GainMode;
 
 **Default to 1.82 whenever the measurement is absent or ambiguous.** The only
 dangerous error is over-ranging a 3 V head unit; under-ranging a 5 V unit merely
-wastes range (spec §6.2's asymmetry argument). Gain is **re-evaluated**, not
-latched — on `/VBUS_VALID` transitions and periodically while idle.
+wastes range (spec §6.2's asymmetry argument). Gain is **re-evaluated**, notlatched — on `/VBUS_VALID` transitions and periodically while idle.
 
 **Command targets must stay within `[min_ladder, V_KEY_idle − 0.20 V]`.**
 
@@ -2216,7 +2215,17 @@ to the DAC is the fault mode this task exists to prevent.
   - `enum class GainMode { kTracking, kAmplified }` (1.00 / 1.82)
   - `enum class GainPolicy { kAuto, kForceTracking, kForceAmplified }`
   - `struct GainDecision { GainMode mode; uint16_t dac_code; bool clamped; }`
-  - `GainMode GainPolicySelect(GainPolicy policy, int measured_idle_key_mv)`
+  - `GainMode GainPolicySelect(GainPolicy policy, int measured_idle_key_mv)` —
+    **two-sided**: `< kGuardLowMv` → `kTracking`, everything else (guard band,
+    above the band, and an absent/zero measurement) → `kAmplified`. The guard
+    band is not a third branch; "ambiguous" and "unmeasured" both take the 1.82
+    default, which is the spec §6.2 asymmetry. `kGuardHighMv` is therefore a
+    logging/display boundary, not a branch point.
+    **Test above the band too.** An earlier revision returned `kTracking` for
+    everything outside the band — the high side backwards, so a 5 V head unit
+    idling at 4.98 V was driven at 1.00. The test passed because it asserted only
+    at and below the band's ceiling: the entire high side was unasserted, so the
+    branch could not fail.
   - `GainDecision GainPolicyCodeForTarget(GainMode mode, int target_key_mv)`
   - `int GainPolicyKeyMvForCode(GainMode mode, uint16_t code)` — the inverse, used
     by the trim loop and by the tests
@@ -2472,7 +2481,11 @@ parameter, so the whole grammar is testable with no sleeps.
   - `class PressClassifier { ChannelLevel Update(int level_mv, int idle_mv, uint64_t now_ms); ChannelLevel Level() const; uint8_t ButtonIndex() const; void Reset(); }`
   - `enum class Gesture { kNone, kSingle, kDouble, kLong }`
   - `struct GestureEvent { Gesture gesture; uint8_t button_index; uint64_t at_ms; }`
-  - `class GestureStateMachine` with `bool Update(ChannelLevel level, uint8_t button_index, uint64_t now_ms, GestureEvent *out)`
+  - `struct GestureBindings { bool has_double = true; bool has_long = true; }` — which
+    gestures a *button's* bindings cover, so the resolve can be adaptive (§6.6).
+    The `true`/`true` defaults are the conservative assumption and keep this
+    task's tests passing unchanged when Task 13 adds the parameter.
+  - `class GestureStateMachine` with `bool Update(ChannelLevel level, uint8_t button_index, uint64_t now_ms, GestureEvent *out, const GestureBindings &bindings = {})`
 
 - [ ] **Step 1: Write the failing classifier test**
 
@@ -5703,14 +5716,20 @@ TEST(SystemOrchestrator, TheTwoChannelsAreServedIndependently) {
 TEST(SystemOrchestrator, TickIsCheapEnoughToRunAtThePollCadence) {
     MockHal hal;
     auto o = MakeOrch(hal);
-    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2500);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2490);
     o.Boot();
+    // Let BOOT_OK (60/60 x1, spec 7.2) finish BEFORE taking the count. The test
+    // is named for the idle ticks; measuring across the boot announcement would
+    // be asserting on the boot feedback instead, and an earlier revision of this
+    // test failed for exactly that reason.
+    for (uint64_t t = 0; t < 300; t += 10) { o.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    const int before = hal.BuzzerOnCount();
     // No assertion on wall time (that is meaningless on the host); the point is
     // that Tick does no I/O beyond the HAL calls already counted, and allocates
     // nothing. Repeated ticking must not grow any counter without cause.
-    const int before = hal.BuzzerOnCount();
-    for (uint64_t t = 0; t < 100; t += 10) { o.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    for (uint64_t t = 0; t < 500; t += 10) { o.Tick(hal.NowMs()); hal.AdvanceMs(10); }
     EXPECT_EQ(hal.BuzzerOnCount(), before) << "idle ticks must be silent";
+    EXPECT_FALSE(hal.BuzzerIsOn()) << "and must leave the line off";
 }
 ```
 
@@ -5726,20 +5745,42 @@ requirement, not an implementation detail):
 
 1. Load the config via `ConfigStore`. `kNoConfig` → pass-through mode (FR-25).
 2. **Establish safe idle**: select gain via `GainPolicySelect`, drive
-   `DAC_CH_ADJ1`/`DAC_CH_ADJ2` into `kGnd1k` in amplified mode, and write
+   `DAC_CH_ADJ1`/`DAC_CH_ADJ2` into `DAC_POWER_GND_1K` in amplified mode, and write
    `DAC_CH_KEYn` to its idle code. Set `safe_idle_established_ = true`. **This
    happens before steps 3+** — FR-13, and `SafeIdleEstablished` is what the
    tests assert.
 3. Construct the per-channel `PressClassifier`, `GestureStateMachine`,
-   `ServoLoop`.
+   `ServoLoop`, and the button's `GestureBindings` (see Step 3b).
 4. Play `kBootOk` / `kBootDegraded` / `kBootError` per the load result.
 5. Only now would USB/BLE be considered (Task 16/18) — nothing here starts them.
 
-`Tick(now)` per channel: read `adc_read_mv(SWCn)` and `adc_read_mv(TEMP)`;
+`Tick(now)` per channel: read `adc_read_mv(SWCn)` and `adc_read_mv(KEY_SENSEn)`;
 `PressClassifier::Update`; feed the result to `GestureStateMachine::Update`; on a
 gesture, `BindingResolve(config_, ch, event)`. **A found `kOutVoltage` action
 carries the target level directly** — `key_mv` is the voltage the head unit reads
 as a key, so the tick hands it straight to `ServoLoop::Target(mode, key_mv)`.
+
+**Step 3b — the tick drives a PULSE, and it waits for the resolve.** Spec §6.6
+is normative here and an earlier revision of this task got it wrong by asserting
+the output changes *at press time*. The head unit is gesture-blind: it cannot
+tell a double from a single, so the adapter's job is to convert a gesture into
+**one pulse at the voltage that gesture's binding names**. Two consequences:
+
+- **Nothing is driven while the gesture is undecided.** `vol_up` binds SINGLE (a
+  2400 mV output) *and* LONG; driving the SINGLE level at press time and again
+  when the LONG resolves would make the head unit act twice.
+- **Every drive is bounded.** Write the code, then return to `idle_code_` after
+  `send_duration_ms`. A gesture is one key event, never a held line.
+
+`GestureStateMachine::Update` takes a `GestureBindings` (whether this button
+binds DOUBLE and LONG) so the wait is **per button**: a button binding only
+SINGLE has no ambiguity and resolves at the press, while one binding DOUBLE waits
+out the window. The defaults are `true`/`true`, which is what keeps Task 6's
+committed tests passing unchanged.
+
+The fault path must release: a `kFault` level, or a KEY idle outside the
+1.80–5.20 V envelope (§6.2 step 2 — the head unit has gone), returns the channel
+to `idle_code_` and resets the gesture machine **in the same tick**.
 
 The firmware never converts a resistance and has no model of the head unit to do
 it with: spec §6.5 calls the head unit's pull-up *unknown* ("plausibly 1 k–100 k"),
@@ -5776,6 +5817,22 @@ channel's ladder is **`learned_idle_mv` 2835** with **`vol_up` at `mv_center`
 spec §3.7 defaults; **they are not arbitrary** — a press pulls the input *down*
 from idle (§6.3), so every button's `mv_center` is *below* `learned_idle_mv`.
 
+**The fixture needs all three buttons and both gestures, not one binding.** Task
+6's tests already exercise `vol_up` at 1430, `vol_dn` at 1785 and `next` at 2145,
+and the adaptive resolve (§6.6) can only be exercised by a button that binds a
+`LONG` or a `DOUBLE` — a fixture with a lone SINGLE binding would make every
+press resolve immediately and the per-button wait untestable. So `Defaults`
+carries `vol_up`/`vol_dn`/`next` with `vol_up` SINGLE → `OUT_VOLTAGE(2400)`,
+`vol_up` LONG → `OUT_RELEASE`, and `next` DOUBLE → an `APP_INTENT` (the product's
+core case, §3.5).
+
+**`MockHalDefaultsConfig()` (Task 15) and `MockHal::Defaults` (Task 13) are the
+same fixture.** Task 15's row in the preflight scan flagged the two as
+conflicting declarations; they are reconciled by making `Defaults` a *struct*
+whose `config` member is the valid config, and having `MockHalDefaultsConfig()`
+return `Defaults{}.config`. One definition, two spellings — the pattern this
+project keeps having to enforce.
+
 **A button id is an opaque string compared exactly** — the `button` field of a
 binding must equal a `LadderButton.id` character for character, and there is no
 case folding. Task 13's default config uses spec §3.7's spelling (`vol_up`,
@@ -5789,7 +5846,10 @@ action field would have resolved to nothing.
 - [ ] **Step 4: Run the tests**
 
 Run: `cd code && pio test -e native -f '*test_system'`
-Expected: PASS — 8 tests green.
+Expected: PASS — **9 tests green** (the 8 above plus
+`TheOutputIsNotDrivenWhileTheGestureIsUndecided`, which pins §6.6's first rule).
+Also run `pio test -e native` — this task changes committed Task 5, 6 and 4
+sources, so the whole suite must stay green.
 
 - [ ] **Step 5: Commit**
 
@@ -5797,13 +5857,27 @@ Expected: PASS — 8 tests green.
 git add code/lib/System/SystemOrchestrator.h code/lib/System/SystemOrchestrator.cpp \
         code/test_native/test_system/SystemOrchestratorTest.cpp \
         code/test_native/test_system/test_main.cpp \
-        code/test_native/MockHAL.h code/test_native/MockHAL.cpp
+        code/test_native/MockHAL.h code/test_native/MockHAL.cpp \
+        code/lib/Gesture/GestureStateMachine.h code/lib/Gesture/GestureStateMachine.cpp \
+        code/test_native/test_gesture/GestureStateMachineTest.cpp \
+        code/lib/Output/GainPolicy.cpp code/test_native/test_output/GainPolicyTest.cpp
 git commit -m "Add the system orchestrator with safe idle ahead of everything
 
 Boot drives the output to its safe idle before any link work, which is FR-13 and
 the reason a mid-update reset cannot leave a phantom key driven. A fault during
-a press releases the key in the same tick. All eight tests run with no USB, no
-app and no radio, because that is the normal in-car case."
+a press releases the key in the same tick. All nine tests run with no USB, no
+app and no radio, because that is the normal in-car case.
+
+The tick converts a gesture into ONE bounded pulse rather than driving at press
+time (spec 6.6): the head unit is gesture-blind, so a press whose button binds
+LONG or DOUBLE stays undecided until it resolves, and the wait is per button.
+GestureStateMachine::Update takes that as a GestureBindings argument, defaulting
+to the old conservative behaviour so Task 6's tests are untouched.
+
+Also fixes GainPolicySelect, which returned Tracking for every measurement ABOVE
+the guard band -- the high side of spec 6.2 step 4 backwards, so a 5V head unit
+idling at 4.98V was driven at gain 1.00. The old test asserted nothing above the
+band, so the branch could not fail."
 ```
 
 ---

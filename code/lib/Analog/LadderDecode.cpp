@@ -31,6 +31,13 @@ ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int i
 
     // FR-30: a 3V3 sag to <=20% of the learned idle is a rail fault. Checked
     // before anything else, because at that level every ratio is garbage.
+    //
+    // This tests the REFERENCE only. It deliberately does not test the reading:
+    // a button near the ladder's common produces a legitimately low voltage
+    // (spec 6.3 consequence 2), so a low reading is a press, not a fault. The
+    // collapsed reading that matters is caught upstream by the output-envelope
+    // check (spec 6.2 step 2), which is a different measurement on a different
+    // pin and is where the orchestrator detects a rail collapse.
     if (profile.learned_idle_mv > 0 &&
         idle_mv < (profile.learned_idle_mv * kRailHealthFloorPermille) / 1000) {
         return out;                                                    // reference collapsed

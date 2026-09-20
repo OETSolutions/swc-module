@@ -34,13 +34,27 @@ GainMode GainPolicySelect(GainPolicy policy, int measured_idle_key_mv) {
         default:
             break;
     }
-    // Inside the guard band the head unit's bias is close enough to our amplified
-    // envelope that 1.82 gives the widest usable span; outside it we must match
-    // the line rather than fight it. Defaulting to amplified is deliberate -- it
-    // is the mode the learned ladder was captured against.
-    return (measured_idle_key_mv >= kGuardLowMv && measured_idle_key_mv <= kGuardHighMv)
-               ? GainMode::kAmplified
-               : GainMode::kTracking;
+    // Spec 6.2 is a TWO-SIDED rule, and the two sides are not symmetric:
+    //   V_KEY_idle <  2.6 V -> 3 V range, gain 1.00  (Tracking)
+    //   V_KEY_idle >= 2.6 V -> 5 V range, gain 1.82  (Amplified), guard band
+    //                          included
+    // An earlier revision returned Tracking for everything outside the guard
+    // band, which put the HIGH side backwards: a 5 V head unit idling at 4.98 V
+    // was tracked at gain 1.00 instead of driven at 1.82, wasting most of the
+    // output span. The spec's own asymmetry is the reason the split is at
+    // kGuardLowMv rather than around the band: gain 1.00 is safe only as a
+    // response to POSITIVE evidence that the line is a 3 V one, because the sole
+    // dangerous error is over-ranging a 3 V head unit. Everything else --
+    // including the ambiguous band -- defaults to 1.82, which works for 3-5 V
+    // units at ~2.5 mV of DAC-referred error.
+    //
+    // A measurement of 0 is ABSENT, not low: no head unit was detected, so there
+    // is no evidence of a 3 V line and the default applies. Testing the value
+    // without this case would treat "unmeasured" as "definitely 3 V", which is
+    // the one direction the spec says is dangerous.
+    if (measured_idle_key_mv <= 0) return GainMode::kAmplified;
+    return (measured_idle_key_mv < kGuardLowMv) ? GainMode::kTracking
+                                                : GainMode::kAmplified;
 }
 
 int GainPolicyKeyMvForCode(GainMode mode, uint16_t code) {

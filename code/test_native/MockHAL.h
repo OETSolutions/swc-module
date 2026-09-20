@@ -6,6 +6,8 @@
 #include <string>
 #include <vector>
 
+#include "Config/ConfigModel.h"
+#include "Gesture/PressClassifier.h"   // GestureTimings, GestureTimingsDefault
 #include "HAL/IHAL.h"
 
 /*
@@ -14,6 +16,21 @@
  */
 class MockHal {
 public:
+    // A valid one-channel config and the default timings, so a test that needs
+    // "a working device" writes two lines instead of thirty. The ladder is spec
+    // 3.7's worked example: idle 2835 mV, `vol_up` SINGLE -> a 2400 mV output.
+    //
+    // A press pulls the input DOWN from idle (spec 6.3), so the button's
+    // `mv_center` (1430) is BELOW `learned_idle_mv` (2835). That is not an
+    // arbitrary pair -- inverting it would make the fixture physically
+    // impossible and every classification test would pass for the wrong reason.
+    struct Defaults {
+        Config         config;
+        GestureTimings timings;
+
+        Defaults();
+    };
+
     MockHal();
 
     IHAL &InterfaceRef() { return iface_; }   // every later task's tests take &hal.InterfaceRef()

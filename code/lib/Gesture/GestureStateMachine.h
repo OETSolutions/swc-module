@@ -13,21 +13,48 @@ struct GestureEvent {
 };
 
 /*
+ * Which gestures a button's bindings actually cover (spec 6.6).
+ *
+ * This is what makes the resolve ADAPTIVE. A button that binds neither DOUBLE
+ * nor LONG has no ambiguity to wait out: the press is already a SINGLE the
+ * moment it is classified, and delaying it by the double-press window would add
+ * ~500 ms of lag to the commonest gesture in the product for no reason. A button
+ * that DOES bind one of them must wait, because the two bindings name different
+ * output voltages and driving an early guess would make the head unit act twice.
+ *
+ * Defaults to `true`/`true`: the conservative assumption is that a button could
+ * mean anything, which is also the behaviour every unconstrained caller had
+ * before this parameter existed.
+ */
+struct GestureBindings {
+    bool has_double = true;
+    bool has_long = true;
+};
+
+/*
  * Presses to gestures. Deterministic and clock-injected (FR-8): every timing
  * decision comes from the now_ms argument, so the whole grammar is exercised
  * with no sleeps.
  *
- * SINGLE is necessarily delayed by the double-press window -- it cannot be
- * emitted until we know a second press is not coming. LONG is not delayed: it
- * fires the moment the threshold elapses, because a held button must act
- * immediately rather than on release (FR-10).
+ * SINGLE is delayed only by the ambiguity its button actually has (spec 6.6):
+ *   - no DOUBLE, no LONG bound -> emitted at the press, immediately
+ *   - LONG bound               -> waits for the threshold (LONG) or release
+ *                                 (SINGLE)
+ *   - DOUBLE bound             -> waits out the double-press window after
+ *                                 release before settling on SINGLE
+ *
+ * LONG is not delayed: it fires the moment the threshold elapses, because a held
+ * button must act immediately rather than on release (FR-10). It is also what
+ * the head unit is given as a single pulse -- a long press is not a held key,
+ * it is a different command (spec 6.6).
  */
 class GestureStateMachine {
 public:
     explicit GestureStateMachine(const GestureTimings &timings);
 
     // Returns true and fills *out when a gesture completed. out may be null.
-    bool Update(ChannelLevel level, uint8_t button_index, uint64_t now_ms, GestureEvent *out);
+    bool Update(ChannelLevel level, uint8_t button_index, uint64_t now_ms,
+                GestureEvent *out, const GestureBindings &bindings = {});
 
     void Reset();
 

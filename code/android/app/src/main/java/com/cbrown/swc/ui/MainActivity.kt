@@ -169,6 +169,10 @@ private fun AppScaffold(
                 Screen.UPDATE -> UpdateScreen(
                     state = update,
                     onCheck = onCheck,
+                    // Both paths are unimplemented and the screen disables those
+                    // buttons, so these callbacks cannot fire. Left as explicit
+                    // no-ops rather than wired to something that would pretend to
+                    // start an update.
                     onPushOverUsb = {},
                     onUpdateOverWifi = {},
                 )

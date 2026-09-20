@@ -88,11 +88,16 @@ fun UpdateScreen(
         Button(onClick = onCheck, enabled = !state.inProgress, modifier = Modifier.testTag("check-updates")) {
             Text(if (state.inProgress) "Checking…" else "Check for updates")
         }
-        OutlinedButton(onClick = onPushOverUsb, enabled = !state.inProgress) {
-            Text("Push a file over USB")
+        // The two update paths are DISABLED because neither is implemented: the USB
+        // push needs the `ota_*` frames (the firmware answers `not_implemented`) and
+        // the WiFi path opens the device's own maintenance page, which does not
+        // exist yet. A button that looks live and does nothing is indistinguishable
+        // from a button that is broken, so the state is shown rather than implied.
+        OutlinedButton(onClick = onPushOverUsb, enabled = false) {
+            Text("Push a file over USB (not yet)")
         }
-        OutlinedButton(onClick = onUpdateOverWifi, enabled = !state.inProgress) {
-            Text("Update over WiFi")
+        OutlinedButton(onClick = onUpdateOverWifi, enabled = false) {
+            Text("Update over WiFi (not yet)")
         }
 
         Card(

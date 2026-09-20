@@ -1,6 +1,7 @@
 package com.oetsolutions.swc.ui
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
 import androidx.compose.ui.test.onNodeWithText
@@ -86,5 +87,36 @@ class LadderScreenTest {
         composeRule.onNodeWithText(
             "This channel has no learned rail yet. Learn a button first."
         ).assertIsDisplayed()
+    }
+}
+
+@RunWith(RobolectricTestRunner::class)
+@Config(sdk = [34])
+class UpdateScreenHonestyTest {
+
+    @get:Rule
+    val rule = createComposeRule()
+
+    private fun show(state: UpdateUiState) {
+        rule.setContent {
+            UpdateScreen(state = state, onCheck = {}, onPushOverUsb = {}, onUpdateOverWifi = {})
+        }
+    }
+
+    @Test
+    fun `the two update paths are visibly unavailable, not silently inert`() {
+        // Both are unimplemented: the USB path needs the `ota_*` frames the firmware
+        // answers with `not_implemented`, and the WiFi path opens a maintenance page
+        // that does not exist. A live-looking button that does nothing cannot be
+        // told from a broken one, so the screen says so.
+        show(UpdateUiState())
+        rule.onNodeWithText("Push a file over USB (not yet)").assertIsNotEnabled()
+        rule.onNodeWithText("Update over WiFi (not yet)").assertIsNotEnabled()
+    }
+
+    @Test
+    fun `an unchecked build says so instead of claiming to be current`() {
+        show(UpdateUiState(status = UpdateStatus.Unknown))
+        rule.onNodeWithText("Not checked yet").assertExists()
     }
 }

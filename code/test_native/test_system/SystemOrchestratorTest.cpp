@@ -173,6 +173,10 @@ TEST(SystemOrchestrator, TheTwoChannelsAreServedIndependently) {
     MockHal::Defaults d;
     d.config.channel_count = 2;
     d.config.channels[1] = d.config.channels[0];
+    // Persisted like MakeOrch: FR-9 is about the two classifiers, and it must be
+    // the classifiers that are compared rather than two pass-through mappings.
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
     SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE2, kSenseFor5vHeadUnit);
@@ -701,6 +705,13 @@ TEST(SystemOrchestrator, AHeadlessLearnWithNoUsableIdleReferenceDoesNotCommit) {
     MockHal::Defaults d;
     d.config.channels[0].ladder.count = 0;
     d.config.channels[0].ladder.learned_idle_mv = 0;   // no reference
+    // PERSISTED, so the device is CONFIGURED and the wizard is reached normally.
+    // With an empty NVS this test took the kNoConfig path instead: pass-through
+    // failed for want of a reference and the learn was then entered with
+    // learn_idle_mv_ still 0 -- a different condition that happened to produce the
+    // same "did not commit" answer, so the test could not tell the two apart.
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
     SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
     hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
@@ -992,4 +1003,70 @@ TEST(SystemOrchestrator, AConnectedHostDoesNotRepaintOverAFault) {
     o.SetUsbConnected(true);
     EXPECT_GT(CountStatEdges(hal, o, 1000), 4)
         << "a faulted device must not show the healthy solid pattern just because a host attached";
+}
+
+// --- FR-18: an out-of-envelope key is clamped AND warned about ---------------
+
+namespace {
+struct LogCapture {
+    std::vector<std::string> lines;
+    static void Sink(void *ctx, const char *level, const char *msg) {
+        static_cast<LogCapture *>(ctx)->lines.push_back(std::string(level) + ": " + msg);
+    }
+};
+}  // namespace
+
+TEST(SystemOrchestrator, AnOutOfEnvelopeKeyIsClampedAndTheClampIsWarnedAbout) {
+    // FR-18: "validate any DAC code against the current gain mode's ceiling before
+    // writing it, and clamp with a logged warning". The clamp existed; the warning
+    // did not, because nothing in the firmware emitted a `log` frame at all. The
+    // frame type was in the contract with no producer.
+    //
+    // A binding with an absurd key_mv is the trigger. ConfigValidate only rejects
+    // key_mv == 0, so an out-of-envelope value reaches the drive path and must be
+    // handled there.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.bindings[0].button[0] = '\0';   // no binding matches, so bind directly
+    // vol_up SINGLE -> a key far above the 5200 mV ceiling.
+    std::strncpy(d.config.bindings[0].button, "vol_up", sizeof(d.config.bindings[0].button) - 1);
+    d.config.bindings[0].gesture = Gesture::kSingle;
+    d.config.bindings[0].action_count = 1;
+    d.config.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    d.config.bindings[0].actions[0].key_mv = 9000;   // above kOutputCeilingMv
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    LogCapture logs;
+    o.SetLogSink(&LogCapture::Sink, &logs);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 700);
+
+    ASSERT_EQ(logs.lines.size(), 1u) << "the clamp must be warned about, not silent";
+    EXPECT_NE(logs.lines[0].find("WARN"), std::string::npos);
+    EXPECT_NE(logs.lines[0].find("9000"), std::string::npos)
+        << "the warning must name the value that was clamped";
+}
+
+TEST(SystemOrchestrator, AnInEnvelopeKeyProducesNoWarning) {
+    // The inverse: a warning on every press would be noise, and noise is how a
+    // real warning gets ignored. The fixture's own binding is inside the envelope.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    LogCapture logs;
+    o.SetLogSink(&LogCapture::Sink, &logs);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 700);
+    EXPECT_TRUE(logs.lines.empty()) << "an in-envelope key needs no warning";
 }

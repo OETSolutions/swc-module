@@ -42,6 +42,13 @@ void GestureSinkThunk(void *ctx, const SystemOrchestrator::GestureEventRecord &e
     if (router != nullptr) router->EmitGesture(ev);
 }
 
+// FR-18's clamp warning reaches the app's log view through here.
+void LogSinkThunk(void *ctx, const char *level, const char *msg)
+{
+    auto *r = static_cast<CommandRouter *>(ctx);
+    if (r != nullptr) r->EmitLog(level, msg);
+}
+
 // TinyUSB hands us the bytes the host sent. They go straight into the transport's
 // assembler, which calls the sink once per COMPLETE frame -- so neither this
 // callback nor the router ever sees a partial line.
@@ -143,6 +150,11 @@ void UsbLinkStart(IHAL *hal, SystemOrchestrator *sys)
     // unconditionally: the sink checks its own null router, and a device with a
     // failed USB install simply never has a host to emit to.
     if (sys != nullptr) sys->SetGestureSink(&GestureSinkThunk, &router);
+
+    // The same shape as the gesture sink, and for the same reason: FR-18's clamp
+    // warning is produced inside the poll loop, so it needs a sink rather than a
+    // reply. A device with no host simply has no one to log to (spec 6.6).
+    if (sys != nullptr) sys->SetLogSink(&LogSinkThunk, &router);
 
     tinyusb_config_t tusb_cfg = {};
     tusb_cfg.port = TINYUSB_PORT_FULL_SPEED_0;

@@ -1,6 +1,7 @@
 #include "System/SystemOrchestrator.h"
 
 #include <new>
+#include <cstdio>
 
 #include "Bindings/BindingResolver.h"
 #include "Config/ConfigDefaults.h"
@@ -632,6 +633,27 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                 // no head-unit model here and no resistance to convert. One
                 // bounded pulse, held for the recognition time, then released:
                 // the head unit sees a single key event, not a held line.
+                //
+                // FR-18: a key_mv outside the gain mode's envelope is VALIDATED and
+                // CLAMPED, with a warning -- never driven out of range. The clamp
+                // itself lives in GainPolicyCodeForTarget (both the floor and the
+                // ceiling, then a second clamp to the DAC's range); what was missing
+                // was the warning. The action is clamped rather than refused because
+                // the alternative is a press that silently does nothing, and a
+                // clamped level still reaches the radio as a key.
+                //
+                // The comparison is against `GainDecision::clamped` rather than a
+                // second copy of the envelope bounds, so the envelope has one
+                // definition and this cannot drift from the clamp it reports on.
+                const GainDecision decision = GainPolicyCodeForTarget(gain_mode_[index], a.key_mv);
+                if (decision.clamped) {
+                    char msg[128];
+                    snprintf(msg, sizeof(msg),
+                             "key_mv %d clamped to DAC code %u in gain mode %d",
+                             a.key_mv, static_cast<unsigned>(decision.dac_code),
+                             static_cast<int>(gain_mode_[index]));
+                    if (log_sink_ != nullptr) log_sink_(log_sink_ctx_, "WARN", msg);
+                }
                 cs.servo.Target(gain_mode_[index], a.key_mv);
                 cs.servo.Update(sense_mv);
                 hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());

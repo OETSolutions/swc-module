@@ -64,6 +64,19 @@ public:
      */
     void EmitGesture(const SystemOrchestrator::GestureEventRecord &ev);
 
+    /*
+     * Emit a `log` frame (spec 4.3).
+     *
+     * **This is the frame three requirements needed and nothing emitted.** It sat
+     * in the contract with an "optional, gated by a settings flag" note and no
+     * producer, so FR-18's "clamp with a logged warning" and the config-fault row
+     * of spec 6.8 had a specified destination and no writer. The severity is
+     * carried as a WORD, not a number, for the same reason `gesture` is: the app
+     * matches on it, and two spellings of "warn" is a lookup that misses with no
+     * error anywhere.
+     */
+    void EmitLog(const char *level, const char *msg);
+
     // Emit anything deferred. A config reply larger than the frame cap is
     // emitted ONE CHUNK PER CALL rather than in a burst, so the transport's TX
     // buffer cannot overflow and no single call blocks the poll loop.

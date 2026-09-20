@@ -267,6 +267,21 @@ public:
 
     bool Faulted() const { return faulted_; }
 
+    /*
+     * A diagnostic line for the app's log view (spec 4.3's `log` frame).
+     *
+     * A sink rather than a return value because the events that need reporting
+     * happen deep inside the poll loop, where there is no caller to return to.
+     * Null is legal and means "nobody is listening" -- the device is fully
+     * functional with no app (spec 6.6), so a diagnostic that cannot be delivered
+     * is dropped rather than buffered.
+     */
+    using LogSink = void (*)(void *ctx, const char *level, const char *msg);
+    void SetLogSink(LogSink sink, void *ctx) {
+        log_sink_ = sink;
+        log_sink_ctx_ = ctx;
+    }
+
 private:
     struct ChannelState {
         // Both of these take their profile/timings at construction and have no
@@ -357,6 +372,8 @@ private:
     void       *gesture_sink_ctx_ = nullptr;
     bool        usb_connected_ = false;
     bool        faulted_ = false;
+    LogSink     log_sink_ = nullptr;
+    void       *log_sink_ctx_ = nullptr;
     void RestatLeds();
 
     /*

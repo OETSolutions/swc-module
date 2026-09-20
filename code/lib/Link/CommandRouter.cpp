@@ -580,6 +580,32 @@ void CommandRouter::EmitLadderSample() {
     Emit("ladder_sample", body);
 }
 
+void CommandRouter::EmitLog(const char *level, const char *msg) {
+    if (level == nullptr || msg == nullptr) return;
+    char body[kNdjsonMaxFrame / 2];
+    // Both strings are bounded copies with their JSON quoting stripped by hand,
+    // the same treatment `EmitGesture` gives the button id and for the same
+    // reason: escaping costs a routine, and these are values this firmware
+    // generates rather than values a peer sends.
+    char lv[17], ms[161];
+    size_t n = 0;
+    while (n + 1 < sizeof(lv) && level[n] != '\0') {
+        const char c = level[n];
+        lv[n] = (c == '"' || c == '\\') ? '_' : c;
+        ++n;
+    }
+    lv[n] = '\0';
+    n = 0;
+    while (n + 1 < sizeof(ms) && msg[n] != '\0') {
+        const char c = msg[n];
+        ms[n] = (c == '"' || c == '\\') ? '_' : c;
+        ++n;
+    }
+    ms[n] = '\0';
+    snprintf(body, sizeof(body), "\"level\":\"%s\",\"msg\":\"%s\"", lv, ms);
+    Emit("log", body);
+}
+
 void CommandRouter::EmitGesture(const SystemOrchestrator::GestureEventRecord &ev) {
     // The wire spelling is the CONFIG codec's, deliberately: the app matches this
     // gesture name against `Binding.gesture`, which is encoded by the same table.

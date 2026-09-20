@@ -670,3 +670,62 @@ TEST(CommandRouter, AHostileButtonIdCannotBreakTheJsonOrOverrunTheBuffer) {
     EXPECT_EQ(l.find("button\":null"), std::string::npos)
         << "a non-null id must never be reported as an unrecognised press";
 }
+
+// --- the `log` frame (spec 4.3) ---------------------------------------------
+//
+// The frame type was in the contract from the start and nothing ever emitted one,
+// so FR-18's "clamp with a logged warning" had a specified destination and no
+// writer. These assert the rendering, and the escaping that keeps a message from
+// breaking the JSON.
+
+TEST(CommandRouter, ALogFrameCarriesALevelAndAMessage) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    r.EmitLog("WARN", "key_mv 9000 clamped");
+    ASSERT_EQ(cap.lines.size(), 1u);
+    const std::string &l = cap.lines[0];
+    EXPECT_NE(l.find("\"type\":\"log\""), std::string::npos);
+    EXPECT_NE(l.find("\"level\":\"WARN\""), std::string::npos);
+    EXPECT_NE(l.find("\"msg\":\"key_mv 9000 clamped\""), std::string::npos);
+    EXPECT_LT(l.size(), kNdjsonMaxFrame);
+}
+
+TEST(CommandRouter, ALogMessageCannotBreakTheJson) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    r.EmitLog("WARN", "a \"quoted\" and \\escaped message");
+    ASSERT_EQ(cap.lines.size(), 1u);
+    // BY VALUE, not a reference: the second EmitLog below pushes onto
+    // `cap.lines`, and a vector reallocation would leave a reference dangling.
+    // (It did -- the first version of this test compared quote counts through a
+    // dangling reference and read zero.)
+    const std::string hostile_line = cap.lines[0];
+    EXPECT_EQ(hostile_line.find("\\\""), std::string::npos) << hostile_line;
+    // Exactly the envelope's own quote pairs, as in the hostile-button test: a
+    // leaked quote would add a pair, which the comparison catches without
+    // hardcoding the frame's shape.
+    auto quotes = [](const std::string &s) {
+        size_t n = 0;
+        for (char c : s) if (c == '"') ++n;
+        return n;
+    };
+    r.EmitLog("WARN", "plain");
+    ASSERT_EQ(cap.lines.size(), 2u);
+    EXPECT_EQ(quotes(hostile_line), quotes(cap.lines[1]))
+        << "a leaked quote would add a pair:" << hostile_line;
+}
+
+TEST(CommandRouter, AnOversizedLogMessageIsTruncatedNotOverrun) {
+    // The message is bounded so it can never overflow the body buffer, whatever a
+    // caller passes. A truncated log line is worth more than a corrupt frame.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string huge(2000, 'x');
+    r.EmitLog("WARN", huge.c_str());
+    ASSERT_EQ(cap.lines.size(), 1u);
+    EXPECT_LT(cap.lines[0].size(), kNdjsonMaxFrame);
+    EXPECT_NE(cap.lines[0].find("\"type\":\"log\""), std::string::npos);
+}

@@ -428,7 +428,7 @@ class AppViewModel(
     }
 
     private fun withEdits(config: Config): Config {
-        val channel = config.channels.firstOrNull() ?: return config
+        if (config.channels.isEmpty()) return config
         // Rebuild the binding list: keep every binding whose pair was NOT edited,
         // then add one per edited pair that has an action.
         val kept = config.bindings.filter { b ->
@@ -448,10 +448,12 @@ class AppViewModel(
                 actions = listOf(action),
             )
         }
-        return config.copy(
-            channels = listOf(channel),
-            bindings = kept + added,
-        )
+        // The CHANNELS are carried through untouched. This function edits
+        // bindings, and a binding names its own channel, so the two are
+        // independent -- trimming the list to `firstOrNull()` here would send
+        // back a config whose SWC2 channel is gone, replacing the device's
+        // learned second ladder with nothing on every save.
+        return config.copy(bindings = kept + added)
     }
 
     /**

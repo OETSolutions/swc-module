@@ -263,6 +263,40 @@ class AppViewModelTest {
     }
 
     @Test
+    fun `a save preserves every channel the device reported`() = runTest {
+        // The board is two-channel (FR-9) and `ConfigDefault` enables both, so a
+        // real device answers `config_get` with two `ChannelConfig`s. A save that
+        // rebuilt the config around `channels.firstOrNull()` would send back only
+        // SWC1 -- replacing the device's whole SWC2 ladder (its learned idle and
+        // every button centre) with nothing, silently, while telling the user the
+        // edit was saved.
+        val t = FakeTransport()
+        var saved: com.oetsolutions.swc.model.Config? = null
+        val vm = AppViewModel(SwcClient(t), scope = vmScope(), saveConfig = { c -> saved = c; true })
+        started(vm)
+
+        val base = sampleConfig()
+        val second = base.channels[0].copy(
+            name = "SWC2",
+            ladder = base.channels[0].ladder.copy(learnedIdleMv = 2801),
+        )
+        val c = base.copy(channels = base.channels + second)
+        configRun(c).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        val cell = vm.bindings.value.cells.first { it.buttonId == "next" && it.gesture == "SINGLE" }
+        vm.editBinding(cell, com.oetsolutions.swc.model.Action(ActionKind.OUT_VOLTAGE, keyMv = 2000))
+        advanceUntilIdle()
+        vm.save()
+        advanceUntilIdle()
+
+        assertNotNull(saved)
+        assertEquals("both channels must survive the save", 2, saved!!.channels.size)
+        assertEquals("SWC2's learned ladder must not be dropped",
+            2801, saved!!.channels[1].ladder.learnedIdleMv)
+    }
+
+    @Test
     fun `a refused save is reported and the pending edit is retained`() = runTest {
         // The failure path, and it matters more than the success one: `setConfig`
         // refuses to adopt the local model on a nack precisely so the app never

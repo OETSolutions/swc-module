@@ -21,6 +21,41 @@
     <application
         android:label="SWC"
         android:allowBackup="false"
-        android:supportsRtl="true" />
+        android:supportsRtl="true">
+
+        <!--
+          The launcher activity, declared here rather than left to convention.
+
+          Its ABSENCE was a real defect: the APK installed fine and `am start`
+          failed with "Activity class com.oetsolutions.swc.MainActivity does not exist",
+          so the app could never be opened at all. No JVM test could see it,
+          because Robolectric calls the composables directly and never goes
+          through the manifest; neither could `assembleDebug`, which does not
+          check launchability. Running it on an emulator is what found it.
+
+          No `android:exported` on an <activity> is an install-time error from
+          Android 12 on; `true` is correct here because a launcher activity must
+          be startable from outside the app.
+
+          The name is `.ui.MainActivity`, NOT `.MainActivity`. A leading dot
+          expands against the application ID (com.oetsolutions.swc), but the class
+          lives in the `ui` sub-package with the screens it hosts. Declaring the
+          short form names a class that does not exist: it installs, then dies
+          at launch with ClassNotFoundException. `LauncherActivityTest` now
+          resolves this string to a real class so the two cannot drift again.
+        -->
+        <activity
+            android:name=".ui.MainActivity"
+            android:exported="true"
+            android:label="SWC"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:launchMode="singleTask">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+    </application>
 
 </manifest>

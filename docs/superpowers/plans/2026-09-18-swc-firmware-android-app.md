@@ -8485,31 +8485,70 @@ Expected: FAIL — `contract_schema` not found.
 - `ACTION_KINDS` — a list of `ActionKind(name, ordinal, c_enum, needs_target)`,
   spec §3.6's eleven kinds **in `ConfigModel.h`'s declaration order**, so
   `ordinal` is redundant with the list position and the test above asserts that;
+- `PARAM_KEYS` — per-kind the two JSON keys the firmware's `kParamKeys`
+  (`ConfigCodec.cpp`) writes for the struct's generic `target`/`payload` slots;
 - `FRAMES` — a list of `Frame(name, direction, fields)`.
 
-`needs_target` is the same fact as `ConfigModel.h`'s `ActionIsWellFormed`, stated
+`needs_target` is the same fact as `ConfigModel.h`'s **`ActionTakesPayload`**
+(not `ActionIsWellFormed`, which calls it — see the correction below), stated
 once here for the app's benefit so the app can grey out an empty field. It is
 **not** a stored flag — spec §3.6 makes it a property of the kind, and an earlier
 revision's per-action `takes_payload` bool is deleted for exactly that reason.
+
+**Correction 1 — `ActionKind` is `k`-prefixed, so `name` and `c_enum` are
+different strings.** `ConfigModel.h` declares `enum class ActionKind : uint8_t {
+kNone, kOutVoltage, … }`. The schema's `name` (the wire form, `OUT_VOLTAGE`) and
+the firmware's enumerator (`kOutVoltage`) are **deliberately different**: the wire
+has no `k` (spec §3.7). Two assertions are therefore needed, not one — `c_enum`
+against `ConfigModel.h`'s declaration order and `name` against
+`ConfigCodec.cpp`'s `kActionKindNames` wire table. Comparing `name` to the enum
+directly (as an earlier revision of Step 1 did) cannot pass, which is how this was
+found.
+
+**Correction 2 — `config_begin` / `config_chunk` / `config_end` are `both`, not
+`app2fw`.** The router EMITS all three to carry the `config_get` reply
+(`CommandRouter::BeginConfigReplyRun`); the chunked transport of spec §4.2
+carries a config in both directions. A one-directional model here describes a
+protocol where the firmware answers a request the app cannot parse.
+
+**Correction 3 — `link_gap` and `maintenance_enter`/`maintenance_exit` were
+missing from spec §4.3**, and the spec has been corrected (the frame table is
+where events and commands are enumerated). `link_gap` is emitted by the router on
+a `seq` gap; the maintenance pair is spec §8.2's primary trigger.
 
 The generators emit:
 
 - `swc_contract.h` — `#define SWC_PROTOCOL_VERSION`, an `SwcActionKind` C enum
   whose **enumerator order is `ActionKind`'s**, a `SWC_ACTION_KIND_<NAME>` string
-  `#define` per kind (the wire form — spec §3.7), and the frame type strings as
-  `#define`s. There is no `SWC_ACTION_<NAME>` numeric macro, because there is no
-  action id.
-- `Contract.kt` — `enum class ActionKind { NONE, OUT_VOLTAGE, OUT_RELEASE, … }`
-  with a `wireName` property per entry, and the frame names, so the app references
-  symbols rather than string literals. There is no `ActionIds` object.
+  `#define` per kind (the wire form — spec §3.7), `SWC_ACTION_PARAM_*` /
+  `SWC_ACTION_PAYLOAD_*` (the two string slots, §3.6), `SWC_ACTION_NEEDS_PARAM_*`,
+  and the frame type strings as `#define`s. There is no `SWC_ACTION_<NAME>` numeric
+  macro, because there is no action id.
+- `Contract.kt` — `enum class ActionKind` with `wireName`, `paramKey`,
+  `payloadKey` and `needsParam` per entry, plus `Frames` and `PROTOCOL_VERSION`,
+  so the app references symbols rather than string literals. There is no
+  `ActionIds` object.
 
-Both generators are deterministic (sorted iteration, no timestamps) so the
-checked-in-vs-generated comparison is meaningful.
+Both generators are deterministic (fixed iteration order, no timestamps, no
+absolute paths) so the checked-in-vs-generated comparison is meaningful.
 
 - [ ] **Step 4: Run the tests**
 
-Run: `cd code/tools && python3 -m pytest test_gen_contract.py -v`
-Expected: PASS — 7 tests green.
+Run: `cd code/tools && uvx pytest test_gen_contract.py -v`
+Expected: PASS — **19 tests green** (the plan originally said 7; the rest are the
+second-home assertions, the router cross-checks, the determinism check, and the
+compile gate below).
+
+`python3 -m pytest` fails on this machine: Homebrew's Python 3.14 is
+PEP-668-managed and has no pytest. `uvx pytest` works and needs no install.
+
+**Also required, and not in the original Step 1: the generated header must be
+COMPILED.** Nothing includes `contract/swc_contract.h` until the Android work and
+the `src/` wiring land, so a syntax error in the generated output ships silently —
+the text comparison cannot see it and the device build never reads the file. The
+suite therefore compiles the header directly, as **both C and C++** (the consumer's
+language is not fixed: `src/` is C, `lib/` is C++), and runs the result. Same
+principle as the device build's "prove the object exists" check.
 
 - [ ] **Step 5: Commit**
 
@@ -8517,15 +8556,30 @@ Expected: PASS — 7 tests green.
 git add code/tools/gen_contract.py code/tools/gen_contract_kotlin.py \
         code/tools/contract_schema.py code/tools/test_gen_contract.py \
         code/contract/swc_contract.h \
-        code/android/app/src/main/java/com/oetsolutions/swc/contract/Contract.kt
+        code/android/app/src/main/java/com/oetsolutions/swc/contract/Contract.kt \
+        docs/superpowers/specs/2026-09-18-swc-firmware-android-app-design.md
 git commit -m "Generate the wire contract for firmware and app from one schema
 
 The contract carries the frame vocabulary and the action-kind enum. It carries no
 action-id table, because spec 3.6 defines none and forbids the generator from
 synthesizing one. The wire carries the kind NAME (spec 3.7); the ordinal is
 internal to each side, so the firmware header owns the numbering and a test
-parses that header to assert the generated order still matches."
+parses that header to assert the generated order still matches.
+
+The spec's frame table gained link_gap and the maintenance pair, which the router
+already emits and accepts but 4.3 never listed."
 ```
+
+The spec is staged here because this task corrected it: `link_gap` (emitted by the
+router) and `maintenance_enter`/`maintenance_exit` (accepted by the router) were
+absent from §4.3's frame table. Spec-first — the table is fixed before the contract
+encodes it.
+
+**Known gap carried forward:** the Kotlin half is *not* compile-checked. There is
+no `kotlinc` on this machine and no Gradle project yet (`android/app/` contains
+only `Contract.kt`). Task 20 creates the Gradle project and must add a Kotlin
+compile gate there; `ActionKind.fromWireName` uses `entries`, which needs Kotlin
+1.9+.
 
 ---
 

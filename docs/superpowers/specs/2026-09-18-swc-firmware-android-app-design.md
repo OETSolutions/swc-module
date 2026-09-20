@@ -759,11 +759,13 @@ An interrupted run is discarded wholesale — a partial config is never applied.
 | FW → App | `ack` | `for_seq`, `ok`, `err` | Every command is acked |
 | FW → App | `nack` | `for_seq`, `err`, `detail` | Explicit failure, with a machine-readable code |
 | FW → App | `log` | `level`, `msg` | Optional, gated by a settings flag |
+| FW → App | `link_gap` | `channel`, `button`, `gesture`, `expected_seq`, `got_seq` | An inbound frame's `seq` skipped ahead, so a frame was lost. Fire-and-forget, like `event` |
 | App → FW | `config_get` | — | Request the whole config (replied as a chunked run, §4.2) |
 | App → FW | `config_begin` / `config_chunk` / `config_end` | total_len+crc32; offset+data; sha256 | The chunked transport that carries **both** `config_get` and `config_set` (§4.2) |
 | App → FW | `config_patch` | `path`, `value` | Single-field change, cheaper and less racy — fits one line |
 | App → FW | `learn_start` / `learn_stop` | `channel`, `button_id` | Drive the learn wizard (§6.4) |
 | App → FW | `learn_commit` | `channel`, `button_id`, `name` | Accept the streamed samples as this button |
+| App → FW | `maintenance_enter` / `maintenance_exit` | — | Enter/leave maintenance mode (§8.2) |
 | App → FW | `test_key` | `channel`, `key_mv`, `hold_ms` | Bench/production test of the output stage |
 | App → FW | `identify` | `pattern` | Flash LEDs / buzz, so the user knows *which* unit |
 | App → FW | `reboot` | `boot_target` (`app`/`bootloader`) | |

@@ -88,6 +88,15 @@ public:
         return static_cast<int>(config_.channels[channel_index].ladder.learned_idle_mv);
     }
 
+    /*
+     * True while the device is serving spec 6.9's transparent pass-through: it
+     * booted with no config AND has a usable ladder reference.
+     *
+     * Public because it is the observable state of FR-25: a test asserts it, and
+     * the link's status frame reports whether the device is configured.
+     */
+    bool PassThroughActive() const { return pass_through_; }
+
     // A channel's active gain mode, after the boot-time policy decision.
     GainMode ChannelGainMode(uint8_t channel_index) const {
         return (channel_index < kMaxChannels) ? gain_mode_[channel_index] : GainMode::kAmplified;
@@ -139,6 +148,29 @@ private:
     GainMode       gain_mode_[kMaxChannels] = {};
     int            idle_key_mv_ = 0;
     bool           safe_idle_established_ = false;
+
+    /*
+     * FR-25's transparent pass-through (spec 6.9).
+     *
+     * True when the device booted with NO stored config. There is then no learned
+     * ladder, so classification against learned windows cannot work -- but the
+     * wheel must still do something (spec 6.9: a config-loss event degrades to
+     * "the steering wheel works like stock" rather than to "does nothing").
+     *
+     * The mapping is by RATIO, not by voltage. The wheel's ladder and the head
+     * unit's need not have the same resistances, so copying the incoming
+     * millivolts would land on the wrong key; reproducing the incoming RATIO
+     * against the head unit's own auto-detected idle is ladder-independent, which
+     * is the same normalization spec 6.3 already uses for the configured case.
+     */
+    bool pass_through_ = false;
+    // The WHEEL's live idle: the ratio numerator's denominator, and the only
+    // reference available with no config to pin one to.
+    int  pass_through_idle_mv_ = 0;
+    // The HEAD UNIT's measured idle (spec 6.2 step 1), which the pass-through
+    // ratio is applied TO. Distinct from `pass_through_idle_mv_`: those are two
+    // different ladders, and conflating them maps every press to the wrong key.
+    int  head_unit_idle_mv_ = 0;
 };
 
 #ifdef __cplusplus

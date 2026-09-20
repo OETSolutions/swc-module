@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include "Config/ConfigStore.h"
 #include "MockHAL.h"
 
 namespace {
@@ -187,4 +188,133 @@ TEST(SystemOrchestrator, TickIsCheapEnoughToRunAtThePollCadence) {
     PollFor(o, hal, 500);
     EXPECT_EQ(hal.BuzzerOnCount(), before) << "idle ticks must be silent";
     EXPECT_FALSE(hal.BuzzerIsOn()) << "and must leave the line off";
+}
+
+// --- FR-25: the transparent pass-through (spec 6.9) -------------------------
+//
+// With no stored config there are no learned windows, so classification against
+// learned buttons cannot work -- but the wheel must still do something. These
+// tests drive the no-config path by leaving MockHal's NVS EMPTY, which is what
+// makes ConfigStore report kNoConfig (it is not the same as a corrupt config).
+
+namespace {
+
+// An orchestrator whose ConfigStore is empty, so Boot() selects pass-through.
+// The config is still supplied because it carries the timings and the channel
+// count; what makes this the pass-through case is the empty NVS.
+SystemOrchestrator MakeUnconfigured(MockHal &hal) {
+    MockHal::Defaults d;
+    d.config.channel_count = 1;
+    d.config.binding_count = 0;
+    hal.ClearNvs();
+    return SystemOrchestrator(&hal.InterfaceRef(), d.config, d.timings);
+}
+
+}  // namespace
+
+TEST(SystemOrchestrator, WithNoConfigTheDeviceEntersPassThrough) {
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);          // the wheel at idle
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+
+    EXPECT_TRUE(o.PassThroughActive())
+        << "an unconfigured device must serve the wheel (FR-25), not sit inert";
+    // Safe idle still comes first (FR-13): pass-through changes WHAT is served,
+    // never the ordering that makes the output safe before anything acts on it.
+    EXPECT_TRUE(o.SafeIdleEstablished());
+}
+
+TEST(SystemOrchestrator, APressWithNoConfigDrivesAKeyMappedByRatio) {
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);          // idle, the reference
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    // The wheel's button at 1430 mV: 1430/2835 = 504 permille. Mapped onto the
+    // head unit's own idle (4980 mV) that is ~2510 mV -- NOT 1430, and that is
+    // the point: the wheel's ladder and the head unit's need not match, so
+    // copying the millivolts would land on the wrong key.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+
+    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "a press with no config must still drive the KEY line";
+    // The driven level must be ABOVE the output floor: a literal voltage copy
+    // would ask for 1430 mV and be clamped to 1800 mV, which is a different key
+    // on the head unit. Comparing codes is exact here because the gain mode is
+    // known (kSenseFor5vHeadUnit selects 1.82).
+    EXPECT_GT(hal.LastDacCode(DAC_CH_KEY1),
+              GainPolicyCodeForTarget(o.ChannelGainMode(0), kOutputFloorMv).dac_code)
+        << "the mapped level must be above the output floor, not clamped to it";
+}
+
+TEST(SystemOrchestrator, ReleasingThePressWithNoConfigReturnsToIdle) {
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);   // released
+    PollFor(o, hal, 400);
+
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "releasing must return to idle; a held key is the phantom-key hazard";
+}
+
+TEST(SystemOrchestrator, WithNoLadderReferencePassThroughIsDisabledRatherThanGuessed) {
+    // A dead or unreadable ladder gives no denominator, and a guessed one would
+    // map every press to a voltage nothing defined. Serving nothing is the safe
+    // direction.
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, -1);     // the HAL's error code
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+
+    EXPECT_FALSE(o.PassThroughActive())
+        << "no reference means no pass-through, not a fabricated one";
+    EXPECT_TRUE(o.SafeIdleEstablished()) << "and the safe idle must still hold";
+}
+
+TEST(SystemOrchestrator, AConfiguredDeviceDoesNotUsePassThrough) {
+    // The inverse, and the more dangerous direction: a CONFIGURED device must
+    // classify against its learned windows. If pass-through were ever left on, a
+    // configured device would silently ignore every binding it has -- the wheel
+    // would "work" while doing the wrong thing.
+    MockHal hal;
+    MockHal::Defaults d;   // carries spec 3.7's worked ladder
+    // ACTUALLY STORE a config: an empty NVS reports kNoConfig, and `MakeOrch`
+    // leaves it empty, so a test written with MakeOrch would assert the opposite
+    // of what it intends. (It did.)
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config)) << "the fixture must persist for this test to mean anything";
+
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+
+    EXPECT_FALSE(o.PassThroughActive())
+        << "a stored config means learned-window classification, not pass-through";
+}
+
+TEST(SystemOrchestrator, NoConfigAtAllStillMarksSafeIdleBeforePassThrough) {
+    // FR-13 vs FR-25: pass-through changes WHAT is served, never WHEN the output
+    // becomes safe. A watchdog reset mid-transfer must not leave a phantom key
+    // driven, and that guarantee cannot depend on whether a config was stored.
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    EXPECT_TRUE(o.SafeIdleEstablished());
+    EXPECT_TRUE(o.PassThroughActive());
 }

@@ -14,6 +14,16 @@ namespace {
 // loop, and here) and is a property of R54/R55, not a tuning value.
 constexpr int kSenseDividerRatio = 2;
 
+/*
+ * How far off idle the wheel must move before pass-through calls it a press.
+ *
+ * Deliberately generous: pass-through has no learned window to compare against,
+ * so the only question it can answer is "is this clearly not idle". A small
+ * threshold would fire on the ladder's noise floor; a large one would miss a
+ * button whose level is close to idle.
+ */
+constexpr int kPassThroughPressDeltaMv = 300;
+
 // Spec 6.2 step 2: a KEY idle outside this envelope means no head unit at all.
 constexpr int kKeyEnvelopeLowMv  = kOutputFloorMv;    // 1800
 constexpr int kKeyEnvelopeHighMv = kOutputCeilingMv;  // 5200
@@ -78,6 +88,10 @@ void SystemOrchestrator::EstablishSafeIdle() {
         const bool no_head_unit = (measured_key_idle_mv < kKeyEnvelopeLowMv) ||
                                   (measured_key_idle_mv > kKeyEnvelopeHighMv);
         const int for_gain = no_head_unit ? 0 : measured_key_idle_mv;
+        // Remembered for FR-25's pass-through: the ratio is taken against the
+        // HEAD UNIT's own idle, not against the output's safe-idle code (which is
+        // full scale, 5200 mV, and would push every mapped level to the ceiling).
+        if (i == 0) head_unit_idle_mv_ = no_head_unit ? 0 : measured_key_idle_mv;
 
         const GainMode mode = GainPolicySelect(config_.channels[i].output.gain_mode ==
                                                        GainMode::kTracking
@@ -137,10 +151,37 @@ void SystemOrchestrator::Boot() {
     // kNoConfig leaves config_ as supplied (the caller's defaults) -- the
     // pass-through case. Nothing here starts a link, so "no config" cannot
     // become "no steering wheel".
+    //
+    // FR-25 / spec 6.9: mark it and auto-detect the reference the wheel will be
+    // measured against. With no config there is no LEARNED idle, so the live
+    // reading is the only one available -- and a live reading is exactly what
+    // spec 6.3's ratio normalization needs.
+    pass_through_ = (result == ConfigLoadResult::kNoConfig);
 
     // 2. Establish safe idle. This is BEFORE anything else that could accept a
     //    command (FR-13), and before the per-channel state exists.
     EstablishSafeIdle();
+
+    if (pass_through_) {
+        // Channel 0's live ladder reading is the pass-through reference. Read it
+        // AFTER safe idle so the KEY line is already released and cannot be
+        // pulling the ladder; a reference taken while the output was driving
+        // would be a level the user is not holding.
+        const int live = hal_->adc_read_mv(hal_->ctx, ADC_CH_SWC1);
+        pass_through_idle_mv_ = (live > 0) ? live : 0;
+        if (pass_through_idle_mv_ <= 0) {
+            // No usable reference: the ladder is unpowered or unreadable. Pass-
+            // through is then impossible, and guessing a denominator would map
+            // every press to a voltage nothing defined. Serve nothing rather than
+            // drive a fabricated key.
+            //
+            // No logging here on purpose: this file is HOST-compiled (the native
+            // suite runs it), so it cannot call esp_log. The state is observable
+            // through PassThroughActive(), which is what a test and the link
+            // status both read.
+            pass_through_ = false;
+        }
+    }
 
     // 3. Now the per-channel state.
     channel_count_ = (config_.channel_count <= kMaxChannels) ? config_.channel_count
@@ -246,6 +287,46 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     const int key_idle_now_mv = sense_mv * kSenseDividerRatio;
     const bool rail_fault = (key_idle_now_mv < kKeyEnvelopeLowMv) ||
                             (key_idle_now_mv > kKeyEnvelopeHighMv);
+
+    // FR-25 / spec 6.9: with no config there are no learned windows to classify
+    // against, so the press is detected by the ratio moving off idle and mapped
+    // onto the head unit's own idle. This runs BEFORE the classifier, because
+    // the classifier's windows do not exist in this mode.
+    //
+    // The ratio is the same quantity spec 6.3 normalizes by -- level/idle x 1000
+    // -- so a wheel whose idle is 2835 mV and whose button sits at 1430 mV asks
+    // for 504 permille of the head unit's idle. The wheel's and the head unit's
+    // resistances need not match, and this mapping does not care.
+    if (pass_through_) {
+        const int idle = pass_through_idle_mv_;
+        // Off idle by more than the classifier's own idle band means a press.
+        // Reusing the same band keeps one definition of "at idle" in the system.
+        const bool pressed = (idle - level_mv) > kPassThroughPressDeltaMv;
+        if (pressed && !cs.key_driven && head_unit_idle_mv_ > 0) {
+            // The head unit's OWN idle is the denominator: the wheel asks for a
+            // fraction of a full-scale ladder position, and that fraction is then
+            // applied to the head unit's range. Using the output's safe-idle code
+            // instead would scale against 5200 mV and push low buttons into the
+            // clamp, which is the wrong key rather than a quieter one.
+            const MilliVolt target = static_cast<MilliVolt>(
+                (static_cast<long>(head_unit_idle_mv_) * level_mv) / idle);
+            cs.servo.Target(gain_mode_[index], target);
+            cs.servo.Update(sense_mv);
+            hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());
+            cs.key_driven = true;
+            // Held for the recognition time, then released: the head unit must see
+            // ONE key event, not a line held down (spec 6.6 -- it is
+            // gesture-blind, so a held line is a different thing to it).
+            cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
+        } else if (!pressed && cs.key_driven) {
+            hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
+            cs.key_driven = false;
+        }
+        // No gesture state machine, no bindings, no buzzer pattern: there is
+        // nothing configured to resolve against, and inventing feedback for an
+        // event the user did not bind would be noise.
+        return;
+    }
 
     GestureEvent ev{};
     const bool fired = cs.gestures.Update(level, cs.classifier.ButtonIndex(), now_ms, &ev,

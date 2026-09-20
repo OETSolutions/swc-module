@@ -290,6 +290,17 @@ not be in the first cut.
 
 ### 3.4 Learned ladder
 
+**`source` is a NUMBER, and it is a raw ADC channel index, not a name.** The
+worked example below writes `"source": 0` and that is literal: both codecs
+(`ConfigCodec` and the app's `ConfigJson`) encode and decode it as an integer, and
+`0` is `ADC_CH_SWC1`. This paragraph exists because the example previously wrote
+`"source": "LADDER_3V3"`, which **no codec accepts** — decoding that form fails
+outright, so the spec's own example config was undecodable for a second,
+independent reason beyond the `gain_mode` one. Nothing reads `source` at runtime
+today; it is carried for round-trip fidelity and reserved for a future
+source-selection feature, so a name would have been a vocabulary invented for a
+consumer that does not exist.
+
 The critical insight: **the ladder is a series chain whose common is tied to GND,
 and each button shunts a different point in that chain to common, so each button
 produces a distinct divider ratio against the +3V3 pull-up.** The absolute pin
@@ -519,7 +530,7 @@ out:
       "id": "SWC1",
       "enabled": true,
       "ladder": {
-        "source": "LADDER_3V3",
+        "source": 0,
         "idle_mv": 2835,
         "buttons": [
           { "id": "vol_up",   "name": "Volume Up",   "mv_center": 1430, "mv_tolerance": 120,

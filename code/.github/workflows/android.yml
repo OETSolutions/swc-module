@@ -31,7 +31,13 @@ jobs:
       - uses: actions/setup-java@v4
         with:
           distribution: temurin
-          # 17, matching `compileOptions`. JDK 21+ fails AGP 9's toolchain check.
+          # 17, matching `compileOptions`. Two independent reasons, both observed:
+          # JDK 21+ fails AGP 9's toolchain check, and Robolectric 4.14.1 cannot
+          # read JDK 25's class file major version 69 -- under a JDK 25 `java` the
+          # whole JVM suite fails at setup with "Unsupported class file major
+          # version 69" on tests that have nothing to do with the change, so the
+          # gate silently depends on whichever JDK is first on PATH. Locally:
+          # JAVA_HOME=/Library/Java/JavaVirtualMachines/temurin-17.jdk/Contents/Home
           java-version: "17"
 
       - uses: actions/setup-python@v5

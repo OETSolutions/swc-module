@@ -8876,6 +8876,110 @@ not one generic error."
 
 ---
 
+### Task 21b: Compose the app — the transport, the join, and a check that it runs
+
+**Added after the fact, and the reason is worth recording.** Tasks 20, 21 and 22
+built the model and client, the screens, and the CI gates. **No task joined them.**
+`SwcClient` was referenced only by its own test, `ActionRunner` by nothing, and
+`AppRoot` rendered all four screens against default state with no-op callbacks.
+Every test passed, the APK installed, and the app could not talk to the device or
+take a user action. A missing task is invisible to a plan-level "no gaps" review,
+because the plan's own list has no hole in it — the hole is what is absent from
+the list. It was found by running the app on an emulator.
+
+**Files:**
+- Create: `code/android/app/src/main/java/com/oetsolutions/swc/link/UsbSerialTransport.kt`
+- Create: `code/android/app/src/main/java/com/oetsolutions/swc/link/LinkProblem.kt`
+- Create: `code/android/app/src/main/java/com/oetsolutions/swc/app/AppViewModel.kt`
+- Create: `code/android/app/src/test/java/com/oetsolutions/swc/app/AppViewModelTest.kt`
+- Modify: `code/android/app/src/main/java/com/oetsolutions/swc/ui/MainActivity.kt`
+
+- [x] **Step 1: The real transport** — `UsbSerialTransport : SwcTransport`
+
+Android's USB host API directly, **not** `usb-serial-for-android`. That library is
+JitPack-only (`repo1.maven.org/.../mik3y/` returns 404) and this project declares
+no JitPack repository, so the specified dependency could never resolve. It also
+solves a different problem: it drives UART-bridge chips (FTDI, CP210x, CH34x),
+whereas the firmware is a **native CDC ACM** device that Android speaks through
+`UsbDeviceConnection`.
+
+Select by interface class (`USB_CLASS_CDC_DATA`), not VID/PID: Espressif's IDs are
+shared across every ESP32 board that enumerates as CDC, and the protocol version
+check is the one place device identity should be decided.
+
+**DTR must be asserted with a raw `SET_CONTROL_LINE_STATE` control transfer**
+(`0x21, 0x22`, wValue bit 0). Android has no `setDtr`, and the firmware waits for
+DTR before it sends `hello` — so getting this wrong is silent: the port opens,
+nothing errors, and no frame ever arrives.
+
+- [x] **Step 2: The join** — `AppViewModel`
+
+Owns link status, the live reading, the bindings grid and the update status, and
+is the only place the client and the screens meet. Its rules:
+
+- An `event` sets the live reading and the reported gesture. Outside a learn run
+  this is the ONLY frame carrying a level, so without it the live view is blank.
+- A config reply populates the ladder AND the grid: one cell per button×gesture,
+  with the config's own binding on the pairs it binds.
+- `setConfig` adopts the local model only on a **non-nacked** reply, so a rejected
+  config never becomes what the app displays.
+- The **transport's** enumeration result is reported separately
+  (`reportOpenProblem`). Permission and wrong-device are known before any frame is
+  exchanged, so the four-state `LinkProblem` design is unreachable without it.
+- A problem is **replaced**, never merged with `?:`: a stale problem would tell the
+  user their cable is unplugged while the device is answering.
+
+- [x] **Step 3: `LinkProblem` moves `ui` → `link`**
+
+It is produced by the transport and the client and consumed by a screen. Keeping
+it in `ui` made a USB driver import a screen package.
+
+- [x] **Step 4: The JVM test**
+
+`AppViewModelTest` drives a fake transport through the whole state machine.
+
+**The harness is non-obvious and was measured, not guessed.** The view model's
+collectors must be launched in a scope on the test scheduler that is *not* parented
+to the test's job:
+
+```kotlin
+private fun TestScope.vmScope() = CoroutineScope(StandardTestDispatcher(testScheduler))
+```
+
+`scope = this` makes `runTest` fail with "active child jobs" after the assertions
+have passed. `backgroundScope` makes the collectors never subscribe at all
+(`SharedFlow.subscriptionCount` stays 0), so every emitted frame goes nowhere.
+
+**A config fixture must chunk at 512 bytes.** Emitting the whole 1409-byte config
+as one `config_chunk` base64s to 1940 characters, over the 1024-byte line cap; the
+client rejects it as malformed, which reads as a client bug until measured.
+
+- [x] **Step 5: Run the app on the emulator**
+
+There is no substitute for this step, and it is the step that found the defect.
+Two bugs in this task's own code were reachable ONLY here:
+
+1. `Column(verticalScroll)` around the screens crashes the app on the Bindings tab:
+   `BindingScreen` scrolls with a `LazyColumn`, and a `LazyColumn` under an
+   infinite max-height constraint is refused by Compose. Each screen owns its own
+   scrolling; the grid takes `weight(1f)` so Save stays pinned.
+2. The stale-problem bug in step 2 above.
+
+```bash
+adb install -r app/build/outputs/apk/debug/app-debug.apk
+adb shell am start -n com.oetsolutions.swc/.ui.MainActivity
+adb shell pidof com.oetsolutions.swc        # a dead process == a crash, not a slow start
+adb logcat -d | grep -A20 "FATAL EXCEPTION"
+```
+
+**JDK 17, not the ambient java.** Robolectric 4.14.1 cannot read JDK 25's class
+file major version 69, and the suite fails on the committed state under it. The CI
+workflow pins the JDK; a committed `org.gradle.java.home` would be machine-specific.
+
+- [x] **Step 6: Commit**
+
+---
+
 ### Task 22: CI gates
 
 Every gate in spec §10.5, enforced on every push.

@@ -1,0 +1,78 @@
+# Android app gates.
+#
+# A single job, and the absence of a second one is a deliberate decision worth
+# stating: **there is no emulator job, because there are no instrumented tests.**
+#
+# The plan specified `connectedDebugAndroidTest` with
+# `reactivecircus/android-emulator-runner`. That test -- "the live ladder view
+# marks the button the device currently classifies" -- guards the screen's entire
+# diagnostic value, and requiring an emulator would have made it a gate that runs
+# nowhere: not in CI without the runner, not on a machine without an AVD, and not
+# before the boards arrive. It runs under **Robolectric on the JVM** instead
+# (`app/src/test/java/com/oetsolutions/swc/ui/LadderScreenTest.kt`), using the same
+# Compose semantics assertions. It is verified to FAIL when the match marking is
+# broken, so it is a real gate rather than a passing decoration.
+#
+# What would need a real device is USB enumeration and the
+# `startActivity`-from-background behaviour of Android 15's BAL hardening. Those
+# are NOT tested here and are NOT silently skipped: they are listed in the task
+# report as bring-up items that require hardware (spec 12.2).
+
+name: android
+
+on: [push, pull_request]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          # 17, matching `compileOptions`. JDK 21+ fails AGP 9's toolchain check.
+          java-version: "17"
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - uses: android-actions/setup-android@v3
+
+      # The app's sources include the GENERATED contract, which is checked in --
+      # so this is a staleness check, not a build step. Regenerating here and
+      # diffing catches the case where someone edited the firmware's enum and
+      # regenerated only one of the two files.
+      - name: Contract is in sync
+        run: |
+          cd code/tools
+          python3 gen_contract_kotlin.py
+          if ! git diff --exit-code -- ../android/app/src/main/java/com/oetsolutions/swc/contract; then
+            echo "::error::Contract.kt is stale. Run code/tools/gen_contract_kotlin.py and commit."
+            exit 1
+          fi
+
+      - uses: gradle/actions/setup-gradle@v4
+
+      # compileSdk 36 must be an INSTALLED platform. `setup-android` puts
+      # `sdkmanager` on PATH, so this uses it directly rather than guessing at a
+      # cmdline-tools path (an earlier revision of this file globbed
+      # `$ANDROID_HOME/cmdlinetools/*/bin/sdkmanager`, which does not exist).
+      - name: Install the compile SDK
+        run: yes | sdkmanager --install "platforms;android-36"
+
+      - name: JVM tests (includes the Compose UI test under Robolectric)
+        working-directory: code/android
+        run: ./gradlew --no-daemon :app:testDebugUnitTest
+
+      - name: Assemble the debug APK
+        working-directory: code/android
+        run: ./gradlew --no-daemon :app:assembleDebug
+
+      - name: Upload the APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: swc-app-debug
+          path: code/android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error

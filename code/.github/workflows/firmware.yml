@@ -1,0 +1,82 @@
+# Firmware gates (spec 10.5).
+#
+# Three jobs, and each one guards a failure that has actually happened in this
+# project rather than a hypothetical:
+#
+#   host-tests        the 263-test native suite. Every defect found so far was
+#                     reproduced by one of these first.
+#   contract-sync     regenerates the contract and FAILS if the checked-in files
+#                     differ. A stale generated header compiles fine on both
+#                     sides while meaning different things -- the defect class
+#                     this project has hit most often.
+#   build-and-size    builds for the real target and enforces the app slot.
+#                     R-1 from spec 12.2: a BLE+WiFi+OTA image that outgrows the
+#                     slot is discovered here on day one, not the week the boards
+#                     arrive.
+#
+# The toolchain is NOT a plain `pio run`. This project forces the pioarduino fork
+# (stock PlatformIO publishes no IDF 5.x), and the first build must fetch the
+# managed component from src/idf_component.yml.
+
+name: firmware
+
+on: [push, pull_request]
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Pinned, because the native suite's cJSON comes from a git pin and a
+      # floating PlatformIO has moved LDF behaviour under this project before.
+      - run: pip install "platformio==6.1.18"
+      - name: Native unit tests
+        working-directory: code
+        run: pio test -e native
+
+      # The contract generators are pure Python and need no toolchain, so this
+      # job is the right place for them. Running the suite as well as the
+      # generators is deliberate: the suite is what asserts the generated header
+      # still matches the firmware's own enum and codec tables, which regenerating
+      # alone would not catch.
+      - run: pip install pytest
+      - name: Contract tests
+        working-directory: code/tools
+        run: python3 -m pytest test_gen_contract.py -q
+      - name: Fail if the generated contract drifted
+        run: |
+          if ! git diff --exit-code -- code/contract code/android/app/src/main/java/com/oetsolutions/swc/contract; then
+            echo "::error::The generated contract is stale. Run code/tools/gen_contract*.py and commit."
+            exit 1
+          fi
+
+  build-and-size-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "platformio==6.1.18"
+
+      # The IDF build needs the component manager, which PlatformIO does not
+      # install. Without it the build fails before compiling anything, with an
+      # error that names neither the package nor the manifest.
+      - name: Install the IDF component manager
+        run: python3 -m ensurepip --upgrade && pip install 'idf-component-manager~=2.2'
+
+      - name: Build for the real target
+        working-directory: code
+        env:
+          # The version is compiled in, so a CI build with unset vars would fail
+          # on -Werror. CI is not a release, and the artifact is only measured.
+          SWC_FW_VERSION: 0.0.0-ci
+          SWC_GIT_SHA: ${{ github.sha }}
+        run: pio run -e esp32s3
+
+      - name: Size gate (spec 10.5, R-1)
+        working-directory: code
+        run: python3 tools/check_size.py

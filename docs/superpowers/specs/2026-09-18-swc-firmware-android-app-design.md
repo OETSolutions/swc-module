@@ -1645,10 +1645,10 @@ Entry is explicit and multi-modal, so it works with or without the app:
 
 | Trigger | Notes |
 | --- | --- |
-| USB command `maintenance_enter` | Primary, from the Android app |
-| Config flag on next boot | For a user who wants it up immediately after flashing |
-| **AUX1 held ≥ 3 s** | The no-app fallback — deliberately longer than the 1.5 s programming hold so the two gestures cannot be confused |
-| Reset-reason + no-config | First-ever boot with no config offers provisioning |
+| USB command `maintenance_enter` | Primary, from the Android app. **Wired** |
+| **AUX1 held ≥ 3 s** | The no-app fallback — deliberately longer than the 1.5 s programming hold so the two gestures cannot be confused. **Wired** |
+| Config flag on next boot | For a user who wants it up immediately after flashing. **Not reachable in this build: no setting carries the flag** (N-13) |
+| Reset-reason + no-config | First-ever boot with no config offers provisioning. **Not reachable in this build: nothing reads the reset reason** (N-13) |
 
 The BOOT button is **not** a maintenance trigger: it is recessed behind a Ø5 lid
 hole and is a strapping pin, so a hold-at-power-on would mean ROM download mode,
@@ -2422,7 +2422,7 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-30 | Rail-renormalization test | N | A button learned at 3.3 V classifies correctly at 3.14 V and 3.47 V (±5 % regulator tolerance); the ratio `n` is unchanged across that sweep. A **separate** fault test asserts that a 3V3 sag to ≤20 % of the learned value is reported as a rail fault, not as idle. **Note:** this is a *+3V3* sweep, not the 11–14.8 V vehicle-rail sweep an earlier revision specified — no vehicle-rail term exists in the transfer function (§6.3). |
 | FR-31 | Headless-learn test | D + B | A full learn completes with no USB host attached, driven by AUX1 + buzzes |
 | FR-32 | Radio-absent test | D + B | In normal mode, current draw and heap show WiFi/BLE never initialized |
-| FR-33 | Maintenance-entry tests | N + D | Each of the three triggers enters maintenance; each exits correctly |
+| FR-33 | Maintenance-entry tests | N + D | Of §8.2's triggers, the two that need no radio are wired and tested — the USB command and the 3 s AUX1 hold. The other two are **not**: `kConfigFlag` has no setting to read and `kNoConfigAtBoot` needs a reset-reason source, and neither trigger is reachable in this build (N-13) |
 | FR-34 | Provisioning test | D + A | The **real Espressif provisioning app** completes provisioning against this device |
 | FR-35 | Dual-path update tests | D + B | A file update and a git-release update each succeed over WiFi **and** over USB |
 | FR-36 | Checksum-refusal test | N + D | A corrupted image is refused; the device keeps running the old image |
@@ -2459,6 +2459,7 @@ ordered board and are called out in §12 as the critical path.
 | N-10 | **A ladder or rail fault has no audible indication.** Spec 7.2's `FAULT_*` patterns each name a subsystem (`FAULT_DAC` is the I2C/DAC path, `FAULT_CONFIG` a corrupt config) and none fits an out-of-range ladder or a collapsed rail, so the firmware blinks `LED_STAT` and stays silent. A user with `led_level` set to 0 therefore gets no fault indication at all. Needs either a `FAULT_INPUT` pattern or an explicit decision that an unlit-LED fault is acceptable | Before the board arrives | No |
 | N-11 | **Four of the seven app-side action kinds are not implemented:** `KEYCODE`, `MEDIA`, `VOLUME`, `SYSTEM` (spec §3.6). `ActionRunner` runs `APP_LAUNCH`, `APP_INTENT` and `APP_RAW`; the bindings screen offers every kind in the generated enum, so a user can bind one and will see "not implemented in this build" rather than nothing. Key injection and screen control need root, an accessibility service or a system-app install — see N-6 | Before Android work | Yes, for those four kinds |
 | N-12 | **The app's release check (spec §9.5) does not exist.** §9.5 gives the app the check over its own connection because the ESP32 may have no WiFi in the car; the app has no manifest client and no `INTERNET` permission, so `checkForUpdates` has nothing to compare against. It now reports that it cannot check, rather than claiming the device is current. Needs `INTERNET` plus a pinned-CA TLS fetch of `version_manifest.json` and a semver compare — the firmware-side `ReleaseCheck` is the reference | Before Android work | No — the device can check over WiFi, so the feature exists one path down |
+| N-13 | **Two of §8.2's four maintenance triggers are unreachable.** The USB command and the 3 s AUX1 hold are wired and tested. The **config flag on next boot** needs a `DeviceSettings` field that does not exist, so nothing can set it; the **reset-reason + no-config** trigger needs a reset-reason source, which `IHAL` does not expose either. Both `MaintenanceTrigger::kConfigFlag` and `kNoConfigAtBoot` are therefore defined and tested in isolation but never produced by the device. A user whose car has no WiFi and no working AUX1 has no way into the window | Before the board arrives | No — the primary trigger works from the app, and the AUX1 hold is the documented no-app fallback, so one of the two no-tool paths is live |
 
 ### 12.2 Risks, ranked by expected damage
 

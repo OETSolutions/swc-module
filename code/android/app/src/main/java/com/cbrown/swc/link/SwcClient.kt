@@ -289,6 +289,26 @@ class SwcClient(private val transport: SwcTransport) {
         return _config.value
     }
 
+    /**
+     * Ask the device to enter maintenance mode (spec §8.2).
+     *
+     * Spec §8.2 lists four entry triggers and calls this one "**primary**, from the
+     * Android app" — so the app is the intended way to get there, and it could not
+     * do it. The frame type, the trigger enum and the link-problem message that
+     * explains maintenance mode all existed; the sender did not, which is the same
+     * shape as `ActionRunner` before it got a caller.
+     *
+     * Maintenance is what turns on WiFi and BLE, so the device can then be reached
+     * at its provisioning page and can check for updates over its own connection.
+     * Without this, a user whose car has no WiFi has no way in from the app.
+     */
+    suspend fun enterMaintenance(timeoutMs: Long = 5_000): AckResult =
+        request(Frames.MAINTENANCE_ENTER, timeoutMs)
+
+    /** Leave maintenance mode (spec §8.2). */
+    suspend fun exitMaintenance(timeoutMs: Long = 5_000): AckResult =
+        request(Frames.MAINTENANCE_EXIT, timeoutMs)
+
     /** Send a frame of [type] and wait for the reply carrying its `for_seq`. */
     private suspend fun request(
         type: String,

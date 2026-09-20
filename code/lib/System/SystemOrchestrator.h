@@ -261,7 +261,12 @@ public:
     void ReportFault() {
         if (faulted_) return;
         faulted_ = true;
-        leds_.SetStat(LedStatPattern::kBlink);
+        // Through RestatLeds, not a bare SetStat, so the precedence lives in one
+        // place: fault beats maintenance beats normal. A fault raised while a
+        // maintenance window is open would otherwise be painted over by the
+        // window's double-flash, and the fault indication is the one that must
+        // never be hidden.
+        RestatLeds();
         // **No buzzer, deliberately.** Spec 7.2's fault patterns each name a
         // SUBSYSTEM -- `FAULT_DAC` is the I2C/DAC path, `FAULT_CONFIG` is a
         // corrupt config -- and a collapsed rail or an open ladder input is
@@ -407,6 +412,22 @@ private:
     // past the threshold, and a user who held AUX1 a little long would exit the
     // learn they had just entered.
     bool         aux_hold_latch_ = false;
+    /*
+     * The maintenance state the LED_STAT pattern was last restated for.
+     *
+     * The maintenance window opens from THREE places that are not `RestatLeds`
+     * callers -- the USB command, the AUX1 hold and the boot-time config flag or
+     * no-config offer -- and closes on its own 5-minute timeout inside
+     * `maintenance_.Update`. Rather than make every one of those call `RestatLeds`
+     * and then miss the timeout, `Tick` compares this to `maintenance_.Active()`
+     * and restates on the edge. That single comparison is what keeps the
+     * double-flash honest for a path nobody remembered to wire.
+     *
+     * A transition check, not an every-tick restate: `SetStat` restarts the
+     * pattern's phase clock, so re-setting the same pattern each tick would hold
+     * the double-flash on its first step and never complete a burst.
+     */
+    bool         maintenance_led_state_ = false;
     // The idle reference captured when a learn started (spec 3.4: the idle AS
     // MEASURED AT LEARN TIME). Captured on entry, because during the prompt the
     // user is holding the wheel button and the live reading is the pressed level.

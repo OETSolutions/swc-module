@@ -48,6 +48,11 @@ class SwcClientTest {
     private fun kotlinx.coroutines.test.TestScope.startClient(client: SwcClient) =
         launch { client.run() }.also { advanceUntilIdle() }
 
+    /** The `seq` a request put on the wire, so a reply can name it in `for_seq`. */
+    private fun seqOf(wire: String): String =
+        Regex("\"seq\":(\\d+)").find(wire)?.groupValues?.get(1)
+            ?: error("no seq in $wire")
+
     @Test
     fun `config round trips through the codec unchanged`() {
         val c = sampleConfig()
@@ -240,4 +245,55 @@ class SwcClientTest {
     private fun sha256ForTest(data: ByteArray): String =
         java.security.MessageDigest.getInstance("SHA-256")
             .digest(data).joinToString("") { "%02x".format(it) }
+
+    @Test
+    fun `entering maintenance sends the frame the firmware actually implements`() = runTest {
+        // Spec §8.2 calls `maintenance_enter` the "primary, from the Android app"
+        // trigger, and the app had no way to send it: the frame constant, the
+        // trigger enum and the explanatory link message all existed, but no sender
+        // did. Maintenance is what turns on WiFi, so without this the app cannot
+        // get a device onto its provisioning page at all.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        advanceUntilIdle()
+
+        val call = launch { client.enterMaintenance() }
+        advanceUntilIdle()
+
+        // The request must be the real frame type, with the envelope the firmware's
+        // dispatcher keys on.
+        val sent = t.written.last()
+        assertTrue("must send maintenance_enter: $sent", sent.contains("\"type\":\"maintenance_enter\""))
+        assertTrue("must carry a seq the reply can name", sent.contains("\"seq\":"))
+
+        // And it must complete on the ack the firmware sends, not time out.
+        t.emit("{\"v\":1,\"seq\":99,\"type\":\"ack\",\"for_seq\":${seqOf(sent)},\"ok\":true}\n")
+        advanceUntilIdle()
+        assertTrue("the ack must resolve the call", call.isCompleted)
+
+        job.cancel()
+    }
+
+    @Test
+    fun `leaving maintenance sends its own frame, distinctly from entering`() = runTest {
+        // The two must not be the same call: exiting a closed window is idempotent
+        // on the firmware, entering one is not, and swapping them would leave a user
+        // unable to get out of maintenance from the app.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        advanceUntilIdle()
+
+        val call = launch { client.exitMaintenance() }
+        advanceUntilIdle()
+        val sent = t.written.last()
+        assertTrue("must send maintenance_exit, not _enter: $sent",
+            sent.contains("\"type\":\"maintenance_exit\""))
+
+        t.emit("{\"v\":1,\"seq\":99,\"type\":\"ack\",\"for_seq\":${seqOf(sent)},\"ok\":true}\n")
+        advanceUntilIdle()
+        assertTrue(call.isCompleted)
+        job.cancel()
+    }
 }

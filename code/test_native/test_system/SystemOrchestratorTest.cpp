@@ -1072,6 +1072,250 @@ TEST(SystemOrchestrator, AConnectedHostDoesNotRepaintOverAFault) {
         << "a faulted device must not show the healthy solid pattern just because a host attached";
 }
 
+// --- FR-33/8.2: a maintenance window is visible on LED_STAT ------------------
+//
+// The constants (`kAuxPressedMv`/`kAuxReleasedMv`) and `HoldAuxToToggle` helpers
+// are defined in the learn-wiring block above. A 3 s hold necessarily passes
+// through the 1.5 s programming tier, so this reuses the same helper.
+
+namespace {
+// Rising edges on LED_STAT: the existing `CountStatEdges` above. A double-flash
+// is a BURST (two rises then a long gap), so it and the 5 Hz fault blink are both
+// "many edges" -- which is why counting alone does not identify either and the
+// pairing assertion in the first test below is what pins the pattern.
+}  // namespace
+
+TEST(SystemOrchestrator, AMaintenanceWindowDoubleFlashesLedStat) {
+    // Spec 8.2: "On exit ... `LED_STAT` stops the maintenance double-flash."
+    // That sentence presumes something STARTED one, and nothing did: the
+    // `kDoubleFlash` pattern existed and was tested in isolation, but no
+    // maintenance code path ever selected it, so a user who opened the window by
+    // any of its four triggers had no indication they were in it -- and the one
+    // state that explains "why is my wheel not responding" looked identical to a
+    // healthy device with no host.
+    //
+    // Entered by the 3 s AUX1 hold, which is the no-app trigger and therefore
+    // the one that must be visible on the device alone.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    o.Boot();
+    ASSERT_TRUE(o.SafeIdleEstablished());
+
+    // 3.2 s, past spec 8.2's 3 s maintenance tier.
+    HoldAuxToToggle(o, hal, kAuxPressedMv);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxPressedMv);
+    PollFor(o, hal, 3200);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    ASSERT_TRUE(o.MaintenanceActive())
+        << "the 3 s hold is spec 8.2's maintenance trigger";
+
+    // The window is open, so the indication is wired. Re-enter at a KNOWN tick
+    // before measuring the cadence: `SetStat` restarts the pattern's phase, so the
+    // burst's alignment otherwise depends on when the hold happened to cross 3 s,
+    // and a test that counts rises from an arbitrary phase is a test that passes
+    // or fails on its own setup. (It did: the first version of this test asserted
+    // four rises and got five.)
+    o.ExitMaintenance();
+    o.Tick(hal.NowMs());
+    hal.AdvanceMs(10);
+    o.EnterMaintenance(MaintenanceTrigger::kUsbCommand, hal.NowMs());
+    o.Tick(hal.NowMs());
+    hal.AdvanceMs(10);
+
+    // Sample the pairs. The pattern is 100 on / 100 off / 100 on / 600 off, so
+    // from an aligned start over 1.8 s (two periods) there are exactly four rises
+    // and the gaps between them are 200, 700, 200.
+    std::vector<int> rises_ms;
+    bool prev = false;
+    const uint64_t start = hal.NowMs();
+    while (hal.NowMs() - start < 1800) {
+        o.Tick(hal.NowMs());
+        const bool now = hal.GpioRead(GPIO_LED_STAT);
+        if (now && !prev) rises_ms.push_back(static_cast<int>(hal.NowMs() - start));
+        prev = now;
+        hal.AdvanceMs(5);
+    }
+
+    // The signature is the GAP CADENCE, not the rise count: the pattern's period
+    // is 900 ms, so 1.8 s legitimately holds five rises and asserting an exact
+    // count would just be re-deriving the sample boundary. What no other pattern
+    // produces is alternating short and long gaps -- a pair of quick flashes, then
+    // a pause. 5 Hz blink would give ~10 evenly spaced gaps of ~100 ms, and
+    // breathing one gap of ~1000 ms.
+    ASSERT_GE(rises_ms.size(), 4u) << "at least a pair, twice";
+    for (size_t i = 0; i + 1 < rises_ms.size(); ++i) {
+        const int gap = rises_ms[i + 1] - rises_ms[i];
+        if (i % 2 == 0) {
+            EXPECT_LT(gap, 400) << "gap " << i << " is within a pair, so it is short";
+        } else {
+            EXPECT_GT(gap, 500) << "gap " << i << " separates the pairs, so it is long";
+        }
+    }
+}
+
+TEST(SystemOrchestrator, LeavingMaintenanceStopsTheDoubleFlash) {
+    // The other half of spec 8.2's sentence. Without this the lamp would keep
+    // flashing after the window closed, which reads as a fault and would send a
+    // user looking for a hardware problem that does not exist.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    o.Boot();
+    o.SetUsbConnected(true);
+
+    HoldAuxToToggle(o, hal, kAuxPressedMv);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxPressedMv);
+    PollFor(o, hal, 3200);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    ASSERT_TRUE(o.MaintenanceActive());
+
+    // Establish what is being stopped: without this the test would pass on a
+    // device that never flashed at all, which is the defect it exists to catch.
+    EXPECT_GT(CountStatEdges(hal, o, 1000), 1)
+        << "the window is open, so it must be flashing before we close it";
+
+    o.ExitMaintenance();
+    o.Tick(hal.NowMs());
+    hal.AdvanceMs(10);
+    // A connected host resumes SOLID: exactly one rise however long it is watched.
+    EXPECT_EQ(CountStatEdges(hal, o, 2000), 1)
+        << "the window is closed, so the healthy solid pattern must resume";
+}
+
+TEST(SystemOrchestrator, TheMaintenanceTimeoutClosesTheWindowAndItsIndication) {
+    // FR-38's 5-minute timeout is the one exit with no caller to notify, so the
+    // LED must be restated from the tick rather than from the entry/exit sites.
+    // A device whose radio window expired while still double-flashing would tell
+    // the user to look at a state it is no longer in.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    o.Boot();
+    o.SetUsbConnected(true);
+
+    HoldAuxToToggle(o, hal, kAuxPressedMv);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxPressedMv);
+    PollFor(o, hal, 3200);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    ASSERT_TRUE(o.MaintenanceActive());
+
+    // Past the 5-minute window, in one jump: `ShouldTimeout` is a comparison on
+    // elapsed time, so the intermediate ticks carry no information.
+    hal.AdvanceMs(300001);
+    o.Tick(hal.NowMs());
+    hal.AdvanceMs(10);
+    EXPECT_FALSE(o.MaintenanceActive()) << "the window must close on its own";
+    EXPECT_EQ(CountStatEdges(hal, o, 2000), 1)
+        << "and the indication must go with it";
+}
+
+TEST(SystemOrchestrator, AFaultOutranksAMaintenanceWindowOnLedStat) {
+    // Precedence has to be stated rather than inherited: "is this thing OK?" has
+    // one right answer, and a device that is both faulted and in maintenance is
+    // not. Without the ordering in RestatLeds, whichever call landed last would
+    // win, and the fault could be hidden by a radio window.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    o.Boot();
+    ASSERT_TRUE(o.SafeIdleEstablished());
+
+    HoldAuxToToggle(o, hal, kAuxPressedMv);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxPressedMv);
+    PollFor(o, hal, 3200);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    ASSERT_TRUE(o.MaintenanceActive());
+
+    // Now collapse the ladder while the window is open.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3000);
+    PollFor(o, hal, 200);
+    ASSERT_TRUE(o.Faulted());
+
+    // Fault blink is 5 Hz: far more rises than the double-flash's two-per-second.
+    EXPECT_GT(CountStatEdges(hal, o, 1000), 4)
+        << "the fault must win over the maintenance double-flash";
+}
+
+TEST(SystemOrchestrator, AFaultArrivingDuringAMaintenanceWindowStillBlinks) {
+    // The precedence has to hold in the direction nobody wires: a fault is
+    // detected inside ServiceChannel, and the only other repaint is
+    // SetUsbConnected, which a maintenance window never calls. So a ladder that
+    // collapses while the window is open -- a real possibility, since maintenance
+    // still serves presses (FR-38) -- would leave the lamp double-flashing and its
+    // continuous fault indication unseen. (Measured: with the guard removed and
+    // ReportFault left as a bare SetStat, the suite was green.)
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    ASSERT_TRUE(o.SafeIdleEstablished());
+
+    HoldAuxToToggle(o, hal, kAuxPressedMv);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxPressedMv);
+    PollFor(o, hal, 3200);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    ASSERT_TRUE(o.MaintenanceActive());
+
+    // Collapse the ladder while the window is open. No SetUsbConnected, no exit:
+    // the tick's restate is the only thing that can repaint here.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3000);
+    PollFor(o, hal, 200);
+    ASSERT_TRUE(o.Faulted());
+    ASSERT_TRUE(o.MaintenanceActive()) << "the window is still open";
+
+    // Over 2 s the 5 Hz fault blink (100/100) gives ~10 rises and the
+    // double-flash (a 900 ms period holding 2 rises) gives ~5 -- so >6 separates
+    // them without depending on a single pattern boundary.
+    EXPECT_GT(CountStatEdges(hal, o, 2000), 6)
+        << "the fault must repaint even though the window is open";
+}
+
+TEST(SystemOrchestrator, MaintenanceDoesNotPaintOverALearnThatOwnsTheLeds) {
+    // The wizard is the LED owner from Enter until ConsumeExited hands back, and a
+    // maintenance window opened underneath it must not steal LED_STAT. The two
+    // triggers collide on purpose here: a 3 s AUX1 hold on top of a learn leaves
+    // the wizard (`ServiceLearn` exits it first), but the USB path does not, so an
+    // app cannot know to avoid it. Painting over the wizard would leave a
+    // half-programmed user staring at a double-flash with no prompt.
+    //
+    // The discriminator is the PAIR, not the rate: while LED_STAT is `kAlternate`
+    // it owns LED2 and the two are complements, so exactly one is lit at every
+    // instant. A double-flash on LED_STAT with LED2 left off (which is what
+    // `Enter` sets, and `kSelectButton` never touches) breaks that invariant --
+    // and unlike a rise count it does not depend on the two periods being far
+    // apart, which at 500 ms and 900 ms they are not.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // 1.5 s: the programming hold. The wizard is in kSelectButton, owning LED_STAT
+    // as `kAlternate`.
+    HoldAuxFor(o, hal, LearnWizard::kEnterHoldMs + 100);
+    ASSERT_TRUE(o.LearnActive());
+
+    o.EnterMaintenance(MaintenanceTrigger::kUsbCommand, hal.NowMs());
+    ASSERT_TRUE(o.MaintenanceActive());
+
+    int both_same = 0;
+    for (uint32_t t = 0; t < 2000; t += 5) {
+        o.Tick(hal.NowMs());
+        if (hal.GpioRead(GPIO_LED_STAT) == hal.GpioRead(GPIO_LED2)) ++both_same;
+        hal.AdvanceMs(5);
+    }
+    EXPECT_EQ(both_same, 0)
+        << "the wizard still owns the LEDs, so they must stay complementary";
+}
+
 // --- FR-18: an out-of-envelope key is clamped AND warned about ---------------
 
 namespace {

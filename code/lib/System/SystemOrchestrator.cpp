@@ -377,6 +377,30 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
     // happen. Update() is what performs the close.
     maintenance_.Update(now_ms);
 
+    // Restate the LEDs when the maintenance window opens or closes, whatever
+    // opened or closed it. `Update` above performs the timeout close, which is the
+    // one transition with no caller to notify -- so the indication cannot be driven
+    // from the entry/exit sites alone.
+    //
+    // There is deliberately NO `faulted_` term here: the fault-outranks-maintenance
+    // ordering lives in `RestatLeds` and nowhere else, so asking about the fault a
+    // second time would be a second answer to the same question. A fault that
+    // arrives during an open window repaints through `ReportFault`'s own
+    // `RestatLeds` call, from the channel loop that runs before this.
+    //
+    // DEFERRED while the learn wizard is active: entering maintenance by a 3 s
+    // AUX1 hold exits a running learn first, and the wizard's own `Exit` sets
+    // LED_STAT solid as its handback. Restating in the same tick would overwrite
+    // that with the double-flash. The wizard is the LED owner until it hands back.
+    const bool want_maint_led = maintenance_.Active();
+    if (wizard_.Active()) {
+        // Hold the state flag back so the deferred transition still fires later.
+        maintenance_led_state_ = !want_maint_led;
+    } else if (want_maint_led != maintenance_led_state_) {
+        maintenance_led_state_ = want_maint_led;
+        RestatLeds();
+    }
+
     if (wizard_.Active()) {
         // A learn with no usable idle reference cannot measure anything: the
         // press detector would compare a reading against zero and call every
@@ -502,6 +526,15 @@ bool SystemOrchestrator::TestDriveKeyMv(uint8_t channel_index, int key_mv, uint3
 void SystemOrchestrator::RestatLeds() {
     if (faulted_) {
         leds_.SetStat(LedStatPattern::kBlink);
+        return;
+    }
+    // Maintenance's window is shown as a double-flash (spec 8.2: "LED_STAT stops
+    // the maintenance double-flash" on exit, which presumes it started one).
+    // Ranked below the fault, because a device that is both faulted and in
+    // maintenance is NOT OK, and above the link states, because a maintenance
+    // window is a deliberate state the user opened and can otherwise not see.
+    if (maintenance_.Active()) {
+        leds_.SetStat(LedStatPattern::kDoubleFlash);
         return;
     }
     leds_.SetStat(usb_connected_ ? LedStatPattern::kSolid : LedStatPattern::kBreathe);

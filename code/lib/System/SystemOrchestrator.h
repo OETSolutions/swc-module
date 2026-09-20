@@ -262,7 +262,14 @@ public:
         if (faulted_) return;
         faulted_ = true;
         leds_.SetStat(LedStatPattern::kBlink);
-        buzzer_.Play(BuzzerPattern::kFaultDac);
+        // **No buzzer, deliberately.** Spec 7.2's fault patterns each name a
+        // SUBSYSTEM -- `FAULT_DAC` is the I2C/DAC path, `FAULT_CONFIG` is a
+        // corrupt config -- and a collapsed rail or an open ladder input is
+        // neither. Playing `FAULT_DAC` here would tell the user to look at the
+        // wrong part of the board, which is worse than saying nothing, and the
+        // spec defines no pattern for a wiring fault. Spec 7.3 makes the LED the
+        // continuously-readable fault channel, and this indication latches, so it
+        // is still blinking whenever anyone looks. See open item N-10.
     }
 
     bool Faulted() const { return faulted_; }

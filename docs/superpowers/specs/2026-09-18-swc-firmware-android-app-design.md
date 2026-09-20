@@ -1312,7 +1312,7 @@ high command, not a low one,* because the output only sinks.
 | Config from newer schema | `schema_version` check | Defaults; report clearly, do not attempt to interpret |
 | Head unit disappears (VBUS off) | `/VBUS_VALID` | Release the KEY line immediately; report `vbus_present: false`; keep classifying |
 | USB link drops | 10 s silence | Keep serving local bindings; report nothing (there is no one to report to) |
-| Ladder out of range | Range check | Report `UNKNOWN`, emit no gesture, do not guess. A reading **above the idle reference** is the out-of-range case (a short to 12 V): the channel goes `kFault`, the KEY line releases, and `LED_STAT` latches `blink` (FR-4) |
+| Ladder out of range | Range check | Report `UNKNOWN`, emit no gesture, do not guess. A reading **above the idle reference** is the out-of-range case (a short to 12 V): the channel goes `kFault`, the KEY line releases, and `LED_STAT` latches `blink` (FR-4). The indication is LED-only — no `FAULT_*` pattern names this subsystem (N-10) |
 | Rail collapse | Rail measurement | Report out-of-range; do not classify against a stale rail |
 | OTA image bad | SHA-256 mismatch | **Do not commit**; keep running the current image; report the failure |
 | OTA image boots then faults | No health confirmation | Roll back to the previous slot (§9.4) |
@@ -2374,7 +2374,7 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-1 | Non-blocking acquisition test | N + D | Under a 20 ms injected USB stall, ADC sample cadence stays within 5 % of nominal |
 | FR-2 | `CalibrationCurve` + ADC linearity | N + D | Curve-fit error ≤ 25 mV over 0–2.9 V; a fixed-linear-scale implementation fails this |
 | FR-3 | Filter settling test | N | Step response settles in < `debounce_ms`, and a 20 ms press is not attenuated below the detection threshold |
-| FR-4 | Fault-injection tests | N + D | Open input, short-to-rail and rail collapse each yield `FAULT_*`, never a button classification |
+| FR-4 | Fault-injection tests | N + D | Open input and a short-to-rail each release the KEY line and latch `LED_STAT` blink rather than classifying as a button. **Not** a `FAULT_*` buzzer: no such pattern names this subsystem (N-10) |
 | FR-5 | Live-sample stream test | N + D | During learn, ≥ 20 samples/s reach the link with bounded latency |
 | FR-6 | Classification + hysteresis test | N | A level inside the window's outer edge twice in a row does not re-trigger; each learned button classifies across the **+3V3** tolerance band (3.14–3.47 V, §6.3), and an idle-adjacent button — the worst case for separation, per §6.3 consequence 2 — still resolves |
 | FR-7 | Gesture tests | N | Each of SINGLE/DOUBLE/LONG fires exactly once for its stimulus |
@@ -2437,6 +2437,7 @@ ordered board and are called out in §12 as the critical path.
 | N-7 | **Long-term availability of the DOIT module.** It was chosen for JLCPCB Economic eligibility; if it goes away, the fallback changes the board JSON and possibly the pin map | Not urgent | No |
 | N-8 | **The first `pio run -e esp32s3` against pioarduino 55.03.311.** The platform/IDF pairing is verified from the published manifests, but the ESP-IDF branch of this fork has not been exercised on this machine yet — the Arduino branch has | **First task** | **Yes** — if it does not build, the framework decision is reopened |
 | N-9 | **FR-17's temperature compensation is not implemented.** `temp_c_at_learn` and `temp_comp_enabled` are recorded, but there is no coefficient field, no correction function, and no test. Needs a measured drift coefficient from a bring-up session, then a field plus the correction applied to the learned windows | After a bring-up measurement | No — v1 is correct without it, since an uncompensated ladder is the status quo |
+| N-10 | **A ladder or rail fault has no audible indication.** Spec 7.2's `FAULT_*` patterns each name a subsystem (`FAULT_DAC` is the I2C/DAC path, `FAULT_CONFIG` a corrupt config) and none fits an out-of-range ladder or a collapsed rail, so the firmware blinks `LED_STAT` and stays silent. A user with `led_level` set to 0 therefore gets no fault indication at all. Needs either a `FAULT_INPUT` pattern or an explicit decision that an unlit-LED fault is acceptable | Before the board arrives | No |
 
 ### 12.2 Risks, ranked by expected damage
 

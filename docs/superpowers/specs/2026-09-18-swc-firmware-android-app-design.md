@@ -2371,11 +2371,11 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 
 | FR | Verified by | Location | The assertion that actually decides it |
 | --- | --- | --- | --- |
-| FR-1 | Non-blocking acquisition test | N + D | Under a 20 ms injected USB stall, ADC sample cadence stays within 5 % of nominal |
+| FR-1 | Non-blocking acquisition test | N + **B** | **N:** idle ticks are silent and cheap, and no HAL call in the poll path blocks (the HAL seam takes no locks and the CDC write is a FIFO push that returns the count accepted). **B:** the cadence under a real 20 ms host stall — an earlier revision of this row claimed a host test with injected stalls, and no such test exists |
 | FR-2 | `CalibrationCurve` + ADC linearity | N + **D** | **N:** endpoints map exactly, monotonic across the full raw range, never above the 2.9 V ceiling for this attenuation, midscale within 25 mV of half-scale, and a blank eFuse falls back to the linear curve *and reports which source it used*. **D (not yet run):** the curve-fit *accuracy* against a bench reference — it needs the real eFuse, so it cannot be a host test, and an earlier revision of this row claimed a host test for it |
 | FR-3 | Filter settling test | N | Step response settles in < `debounce_ms`, and a 20 ms press is not attenuated below the detection threshold |
 | FR-4 | Fault-injection tests | N + D | Open input and a short-to-rail each release the KEY line and latch `LED_STAT` blink rather than classifying as a button. **Not** a `FAULT_*` buzzer: no such pattern names this subsystem (N-10) |
-| FR-5 | Live-sample stream test | N + D | During learn, ≥ 20 samples/s reach the link with bounded latency |
+| FR-5 | Live-sample stream test | N + **D** | **N:** `ladder_sample` is emitted while a learn run is open and stops when it closes, and the frame carries the run's channel. **D (not yet run):** the ≥ 20 samples/s cadence and its latency — that is a property of the poll loop's real rate, which the host clock cannot show |
 | FR-6 | Classification + hysteresis test | N | A level inside the window's outer edge twice in a row does not re-trigger; each learned button classifies across the **+3V3** tolerance band (3.14–3.47 V, §6.3), and an idle-adjacent button — the worst case for separation, per §6.3 consequence 2 — still resolves |
 | FR-7 | Gesture tests | N | Each of SINGLE/DOUBLE/LONG fires exactly once for its stimulus |
 | FR-8 | Injected-clock suite | N | The entire §3.4 gesture set runs with zero wall-clock sleeps |
@@ -2383,13 +2383,13 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-10 | Long-press timing test | N | `LONG` fires at 750 ms ± 1 tick, **before** release |
 | FR-11 | Gesture-exclusivity tests | N | LONG emits no SINGLE; DOUBLE's second press emits no SINGLE |
 | FR-12 | Unlearned-press test | N + B | A never-learned level yields `event{button:null}` + `KEY_UNKNOWN`, never a guess |
-| FR-13 | Boot-sequence test | N + D + B | Safe idle is measured on the output **before** USB enumerates |
-| FR-14 | Gain-policy tests | N + D | AUTO picks 1.82 vs 1.00 per §6.2; a forced mode is honoured |
-| FR-15 | Output-command test | N | Correct DAC code written, held for `press_ms`, then released |
-| FR-16 | Release-state test | D + B | After release, the KEY line measures high-Z and the head unit sees its own idle |
+| FR-13 | Boot-sequence test | N + **D** + B | **N:** `SafeIdleEstablished()` is true immediately after `Boot()` and the DAC has been written before anything else runs (the tests assert this on every construction, including the pass-through and no-config paths). **D:** the same ordering measured on the real output pin before USB enumerates |
+| FR-14 | Gain-policy tests | N | `GainPolicySelect` implements AUTO per §6.2's two-sided rule — a 3 V line measures low and takes gain 1.00, 5 V takes 1.82, the ambiguous guard band and an **absent** measurement both default to 1.82 (the safe direction) — and a forced mode is honoured. `Boot` passes the measured idle into it per channel |
+| FR-15 | Output-command test | N | The bound action's key is driven **only after the gesture resolves** (`TheOutputIsNotDrivenWhileTheGestureIsUndecided`), and the line returns to the idle code afterwards. The **hold duration** is a property of the injected clock, asserted by the gesture tests, not by a wall-clock measurement here |
+| FR-16 | Release-state test | N + **D** | **N:** release writes a code **above** the head unit's measured idle — if the configured idle code cannot reach above it, the firmware substitutes full scale rather than leaving Q4 conducting. **D:** that the resulting line is genuinely high-Z and the head unit sees its own idle |
 | FR-17 | Temp-comp test | — | **Absent.** The traceability row claimed a test for a correction that does not exist; a coefficient must be measured before either can be written (N-9) |
 | FR-18 | Clamp test | N | An over-ceiling code is clamped and logged; an out-of-envelope write never reaches the DAC |
-| FR-19 | Trim-loop tests | N + B | Converges within the bound, zero overshoot beyond spec, and no ADC-noise injection into the output |
+| FR-19 | Trim-loop tests | N (+ B when enabled) | **N:** converges on a 3 % gain error within the code budget, never moves more than `max_step` per update, stops inside the deadband, does not oscillate when handed a measured overshoot, and respects the total code budget. **The loop is DISABLED in v1** (spec §6.5: open-loop until its gain is measured on hardware), so these prove the implementation and not the running system; enabling it and confirming no ADC-noise injection is a bring-up step |
 | FR-20 | Grammar tests | N + D + B | Every pattern in §7.1/§7.3 produces the documented drive sequence |
 | FR-21 | Feedback-nonblocking test | N + D | A key press during an in-flight buzzer pattern is still served on time |
 | FR-22 | Level-setting tests | N | Each level, including fully-off, suppresses the right classes and nothing else |

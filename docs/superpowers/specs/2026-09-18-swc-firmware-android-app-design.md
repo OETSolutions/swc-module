@@ -508,36 +508,34 @@ out:
 {
   "schema_version": 1,
   "device_id": "swc-a1b2c3",
-  "device": {
-    "name": "SWC Adapter",
-    "hostname": "swc-adapter",
-    "settings": {
-      "single_press_ms": 0,
-      "double_press_gap_ms": 500,
-      "long_press_ms": 750,
-      "long_repeat_ms": 250,
-      "debounce_ms": 25,
-      "release_margin_mv": 900,
-      "gain_policy": "AUTO",
-      "temp_comp_enabled": true,
-      "buzzer_level": "NORMAL",
-      "led_level": "NORMAL",
-      "usb_protocol_version": 1
-    }
+  "updated_at_ms": 1700000000000,
+  "settings": {
+    "debounce_ms": 25,
+    "double_press_off_ms": 500,
+    "long_press_ms": 750,
+    "send_duration_ms": 200,
+    "gain_policy": "AUTO",
+    "buzzer_level": 2,
+    "led_level": 2,
+    "temp_comp_enabled": true,
+    "maintenance_timeout_ms": 300000
   },
+  "aux": [
+    { "id": "aux1", "source": 1, "mv_center": 100, "mv_tolerance": 1600 }
+  ],
   "channels": [
     {
-      "id": "SWC1",
+      "name": "SWC1",
       "enabled": true,
       "ladder": {
         "source": 0,
         "idle_mv": 2835,
         "buttons": [
-          { "id": "vol_up",   "name": "Volume Up",   "mv_center": 1430, "mv_tolerance": 120,
+          { "id": "vol_up", "name": "Volume Up", "mv_center": 1430, "mv_tolerance": 120,
             "learned_at_rail_mv": 3300, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.98 },
-          { "id": "vol_dn",   "name": "Volume Down", "mv_center": 1785, "mv_tolerance": 120,
+          { "id": "vol_dn", "name": "Volume Down", "mv_center": 1785, "mv_tolerance": 120,
             "learned_at_rail_mv": 3300, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.97 },
-          { "id": "next",     "name": "Next Track",  "mv_center": 2145, "mv_tolerance": 110,
+          { "id": "next", "name": "Next Track", "mv_center": 2145, "mv_tolerance": 110,
             "learned_at_rail_mv": 3300, "temp_c_at_learn": 23.5, "sample_count": 200, "confidence": 0.99 }
         ]
       },
@@ -555,21 +553,31 @@ out:
       "enabled": true, "actions": [ { "kind": "OUT_RELEASE" } ] },
 
     { "id": "b3", "channel": "SWC1", "button": "next", "gesture": "DOUBLE",
-      "enabled": true, "actions": [
-        { "kind": "APP_LAUNCH", "package": "com.spotify.music" }
-      ] },
+      "enabled": true, "actions": [ { "kind": "APP_LAUNCH", "package": "com.spotify.music" } ] },
 
     { "id": "b4", "channel": "SWC1", "button": "next", "gesture": "LONG",
       "enabled": true, "actions": [
         { "kind": "APP_INTENT",
           "action": "com.oetsolutions.swc.ACTION_NAVIGATE",
-          "data": "geo:40.7608,-111.8910?q=Home",
-          "extras": { "started_by": "swc", "profile": "daily" },
-          "flags": ["FLAG_ACTIVITY_NEW_TASK"] }
+          "data": "geo:40.7608,-111.8910?q=Home" }
       ] }
   ]
 }
 ```
+
+**This example is decoder-verified, and it was not before.** `tools/check_spec_example.py`
+decodes it with the firmware's own decoder as part of CI. An earlier revision of
+this block described a config **no codec would accept**, in six independent ways:
+settings were nested under a `device` object the codec has no field for (spec
+§3.1's entity map has no such node); five settings names (`single_press_ms`,
+`double_press_gap_ms`, `long_repeat_ms`, `release_margin_mv`,
+`usb_protocol_version`) appear nowhere in the code; the feedback levels were
+written `"NORMAL"` where the codec's enum is numeric; `updated_at_ms` was missing
+and is required (`aux` was missing too, but that one is optional — checked, since
+the difference matters to anyone reading this as a template); the channel was
+keyed `id` where the codec writes `name`; and `b4` still carried `extras`/`flags`,
+which §3.6 had already removed as over-budget. The example is the spec's most concrete assertion about
+the wire, so a stale one is worse than none: it is what a reader copies.
 
 ### 3.8 Persistence, versioning and migration
 

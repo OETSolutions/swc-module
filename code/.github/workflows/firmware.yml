@@ -53,6 +53,14 @@ jobs:
             exit 1
           fi
 
+      # The spec's worked example is its most concrete assertion about the wire,
+      # and it is what a reader copies into a config. It had drifted from the
+      # codecs in six ways at once, which nothing caught, so it is decoded here
+      # with the firmware's own decoder rather than trusted.
+      - name: The spec's worked example still decodes
+        working-directory: code
+        run: python3 tools/check_spec_example.py
+
   build-and-size-gate:
     runs-on: ubuntu-latest
     steps:

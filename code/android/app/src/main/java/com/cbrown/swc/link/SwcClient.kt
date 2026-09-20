@@ -16,6 +16,7 @@ import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.intOrNull
+import kotlinx.serialization.json.longOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 
@@ -67,6 +68,78 @@ class SwcClient(private val transport: SwcTransport) {
 
     /** Replies awaiting a matching `for_seq`. */
     private val awaiting = HashMap<Int, CompletableDeferred<Frame>>()
+
+    // --- inbound chunked config run (spec 4.2) -----------------------------
+    //
+    // The firmware sends a config as `config_begin` (total_len, crc32), N x
+    // `config_chunk` (offset, data_b64) and `config_end` (sha256) -- there is NO
+    // `config` field carrying the whole thing. An earlier version of this class
+    // looked for exactly that, so a real reply assembled nothing and the app would
+    // have shown a stale config forever while every test passed, because the tests
+    // only exercised the frame types the client did not need.
+    //
+    // `offset` is the byte offset of the chunk's first DECODED byte and each chunk
+    // decodes independently, so placement is exact rather than append-order
+    // dependent -- a retransmitted chunk lands in the right place.
+    private var inbound: ByteArray? = null
+    private var inboundLen = 0
+    private var inboundCrc = 0L
+
+    private fun beginInboundConfig(frame: Frame) {
+        val total = frame.fields["total_len"]?.jsonPrimitive?.intOrNull ?: 0
+        inboundCrc = frame.fields["crc32"]?.jsonPrimitive?.longOrNull ?: 0L
+        // Bounded by the protocol's own maximum, not by the peer's claim: a
+        // `total_len` from the wire is an allocation size chosen by the other end.
+        inbound = if (total in 1..kWireConfigMaxBytes) ByteArray(total) else null
+        inboundLen = 0
+        if (inbound == null) {
+            _state.value = LinkState.Failed("device offered a ${total}-byte config")
+        }
+    }
+
+    private fun acceptInboundChunk(frame: Frame) {
+        val buf = inbound ?: return
+        val offset = frame.fields["offset"]?.jsonPrimitive?.intOrNull ?: return
+        val b64 = frame.fields["data_b64"]?.jsonPrimitive?.content ?: return
+        val bytes = try {
+            base64Decode(b64)
+        } catch (e: Exception) {
+            _state.value = LinkState.Failed("chunk was not valid base64")
+            inbound = null
+            return
+        }
+        if (offset < 0 || offset + bytes.size > buf.size) {
+            _state.value = LinkState.Failed("chunk ran past the declared length")
+            inbound = null
+            return
+        }
+        bytes.copyInto(buf, offset)
+        inboundLen += bytes.size
+    }
+
+    private fun endInboundConfig(frame: Frame) {
+        val buf = inbound
+        inbound = null
+        if (buf == null || inboundLen != buf.size) {
+            _state.value = LinkState.Failed("config run ended early")
+            return
+        }
+        // The run carries a crc32 at the start and a sha256 at the end. Both are
+        // checked, because a truncated-then-completed transfer is exactly the case
+        // that produces a config the device is NOT running while looking plausible.
+        if (crc32(buf) != inboundCrc) {
+            _state.value = LinkState.Failed("config failed its crc32 check")
+            return
+        }
+        val want = frame.fields["sha256"]?.jsonPrimitive?.content ?: ""
+        if (want.isNotEmpty() && sha256Hex(buf) != want) {
+            _state.value = LinkState.Failed("config failed its sha256 check")
+            return
+        }
+        // Applied only now, on a verified run. Adopting the bytes earlier would let
+        // a torn transfer become what the app believes the device holds.
+        _config.value = ConfigJson.decode(buf.toString(Charsets.UTF_8))
+    }
 
     /** Feed everything the transport delivers. Call this from a collector on [SwcTransport.incoming]. */
     suspend fun run(): Nothing {
@@ -125,14 +198,9 @@ class SwcClient(private val transport: SwcTransport) {
                     _state.value = LinkState.VersionMismatch(firmware = version, app = PROTOCOL_VERSION)
                 }
             }
-            Frames.CONFIG_END -> {
-                // The chunked run completed; the assembled JSON is what the device
-                // has stored. Applied only on success, which is what keeps the local
-                // model from claiming a config the device rejected.
-                frame.fields["config"]?.jsonPrimitive?.content?.let { body ->
-                    _config.value = ConfigJson.decode(body)
-                }
-            }
+            Frames.CONFIG_BEGIN -> beginInboundConfig(frame)
+            Frames.CONFIG_CHUNK -> acceptInboundChunk(frame)
+            Frames.CONFIG_END -> endInboundConfig(frame)
         }
 
         val forSeq = frame.fields["for_seq"]?.jsonPrimitive?.intOrNull
@@ -272,6 +340,13 @@ class SwcClient(private val transport: SwcTransport) {
          * silently exceed the cap and be dropped by the device's reader.
          */
         const val CHUNK_BYTES = 512
+
+        /**
+         * The largest config the wire can carry, from `ConfigMaxSerializedSize()`
+         * (22,407 B in the firmware, spec 3.5). Used to bound the inbound buffer so
+         * a peer's `total_len` cannot choose an allocation size.
+         */
+        const val kWireConfigMaxBytes = 22_407
     }
 }
 
@@ -319,5 +394,23 @@ private fun sha256Hex(data: ByteArray): String {
     return md.digest(data).joinToString("") { "%02x".format(it) }
 }
 
+/*
+ * `java.util.Base64`, NOT `android.util.Base64`.
+ *
+ * The Android one is a stub that returns null in a plain JVM unit test, so using
+ * it would make this class need Robolectric to test -- while its whole design
+ * claim is that the transport seam makes it testable on the JVM with no Android
+ * at all. It failed exactly that way: every inbound-config test saw a null decode.
+ *
+ * `java.util.Base64` needs API 26, which is this app's minSdk, so nothing is
+ * given up. It also emits standard, unwrapped base64, which is what the
+ * firmware's decoder expects.
+ */
+
+/** Encode a chunk for `config_chunk` / `ota_chunk`. */
 private fun base64(data: ByteArray): String =
-    android.util.Base64.encodeToString(data, android.util.Base64.NO_WRAP)
+    java.util.Base64.getEncoder().encodeToString(data)
+
+/** Decode the firmware's base64. Throws on malformed input, which the caller reports. */
+private fun base64Decode(s: String): ByteArray =
+    java.util.Base64.getDecoder().decode(s)

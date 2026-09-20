@@ -141,4 +141,103 @@ class SwcClientTest {
         assertTrue("expected a local refusal, got $result", result is AckResult.Nacked)
         assertTrue(t.written.isEmpty())
     }
+    // ---------------------------------------------------------------- inbound config
+    //
+    // These cover the seam that let a real bug through: the client looked for a
+    // `config` field on `config_end`, which the firmware never sends. It carried
+    // the whole assembled config in one frame. Every test passed because none of
+    // them fed the client the frames it actually receives.
+
+    /** Build the device's three frame types for a config body. */
+    private fun configRun(body: String): List<String> {
+        val bytes = body.toByteArray()
+        val crc = crc32ForTest(bytes)
+        val out = mutableListOf<String>()
+        out += "{\"v\":1,\"seq\":1,\"type\":\"config_begin\"," +
+            "\"total_len\":${bytes.size},\"crc32\":$crc}"
+        var off = 0
+        while (off < bytes.size) {
+            val end = minOf(off + 512, bytes.size)
+            val chunk = java.util.Base64.getEncoder()
+                .encodeToString(bytes.copyOfRange(off, end))
+            out += "{\"v\":1,\"seq\":2,\"type\":\"config_chunk\"," +
+                "\"offset\":$off,\"data_b64\":\"$chunk\"}"
+            off = end
+        }
+        out += "{\"v\":1,\"seq\":3,\"type\":\"config_end\",\"sha256\":\"${sha256ForTest(bytes)}\"}"
+        return out
+    }
+
+    @Test
+    fun `a chunked config reply is assembled into the local model`() = runTest {
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        val body = com.oetsolutions.swc.model.ConfigJson.encode(sampleConfig())
+        configRun(body).forEach { t.emit(it + "\n") }
+        advanceUntilIdle()
+        assertEquals("swc-a1b2c3", client.config.value.deviceId)
+        assertEquals(sampleConfig(), client.config.value)
+        job.cancel()
+    }
+
+    @Test
+    fun `a config whose sha256 does not match is not adopted`() = runTest {
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        val body = com.oetsolutions.swc.model.ConfigJson.encode(sampleConfig())
+        // Same frames, digest replaced. The bytes are intact and parse fine, so a
+        // client that skipped the digest would adopt them -- which is the whole
+        // reason the run carries one.
+        configRun(body).dropLast(1).forEach { t.emit(it + "\n") }
+        t.emit("{\"v\":1,\"seq\":3,\"type\":\"config_end\",\"sha256\":\"deadbeef\"}\n")
+        advanceUntilIdle()
+        assertEquals("", client.config.value.deviceId)
+        assertTrue(client.state.value is LinkState.Failed)
+        job.cancel()
+    }
+
+    @Test
+    fun `a config run that ends early is reported rather than half-applied`() = runTest {
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        val body = com.oetsolutions.swc.model.ConfigJson.encode(sampleConfig())
+        val frames = configRun(body)
+        // Begin and end, but skip the chunks between them.
+        t.emit(frames.first() + "\n")
+        t.emit(frames.last() + "\n")
+        advanceUntilIdle()
+        assertEquals("", client.config.value.deviceId)
+        assertTrue(client.state.value is LinkState.Failed)
+        job.cancel()
+    }
+
+    @Test
+    fun `a reply waiting on for_seq times out rather than hanging forever`() = runTest {
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        // Nothing is ever emitted. The request must give up, because a UI that
+        // awaits forever is a spinner with no exit.
+        val result = client.setConfig(sampleConfig(), timeoutMs = 100)
+        assertTrue("expected a timeout, got $result", result is AckResult.Timeout)
+        job.cancel()
+    }
+
+    private fun crc32ForTest(data: ByteArray): Long {
+        var crc = 0xFFFFFFFFL
+        for (b in data) {
+            crc = crc xor (b.toLong() and 0xFF)
+            for (i in 0 until 8) {
+                crc = if (crc and 1L != 0L) (crc ushr 1) xor 0xEDB88320L else crc ushr 1
+            }
+        }
+        return (crc xor 0xFFFFFFFFL) and 0xFFFFFFFFL
+    }
+
+    private fun sha256ForTest(data: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(data).joinToString("") { "%02x".format(it) }
 }

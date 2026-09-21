@@ -9,7 +9,6 @@ void GestureStateMachine::Reset() {
     released_at_ms_ = 0;
     long_fired_ = false;
     awaiting_second_ = false;
-    pending_single_ = false;
 }
 
 void GestureStateMachine::Emit(Gesture g, uint64_t now_ms, GestureEvent *out) {
@@ -45,7 +44,6 @@ bool GestureStateMachine::Update(ChannelLevel level, uint8_t button_index,
             if (awaiting_second_ && button_index == prev_button) {
                 // Second press of the SAME button inside the window: the DOUBLE.
                 awaiting_second_ = false;
-                pending_single_ = false;
                 Emit(Gesture::kDouble, now_ms, out);
                 long_fired_ = true;  // sentinel: this press must not emit SINGLE
                 emitted = true;
@@ -59,7 +57,6 @@ bool GestureStateMachine::Update(ChannelLevel level, uint8_t button_index,
                 // hazard spec 6.7/FR-12 exist to prevent, so the first press must
                 // resolve as its own SINGLE and the new press start fresh.
                 awaiting_second_ = false;
-                pending_single_ = false;
                 // Emit the FIRST button's SINGLE (Emit reads `button_`), then
                 // adopt the new button for the press now beginning.
                 button_ = prev_button;
@@ -107,12 +104,10 @@ bool GestureStateMachine::Update(ChannelLevel level, uint8_t button_index,
             // second press of one that was already emitted.
             if (awaiting_second_) {
                 awaiting_second_ = false;
-                pending_single_ = false;
                 Emit(Gesture::kDouble, now_ms, out);
                 return true;
             }
             if (bindings.has_double) {
-                pending_single_ = true;
                 awaiting_second_ = true;
                 released_at_ms_ = now_ms;
             } else {
@@ -128,12 +123,8 @@ bool GestureStateMachine::Update(ChannelLevel level, uint8_t button_index,
     // Idle.
     if (awaiting_second_ && now_ms - released_at_ms_ >= timings_.double_press_off_ms) {
         awaiting_second_ = false;
-        pending_single_ = false;
         Emit(Gesture::kSingle, now_ms, out);
         return true;
-    }
-    if (pending_single_ && !awaiting_second_) {
-        pending_single_ = false;
     }
     return false;
 }

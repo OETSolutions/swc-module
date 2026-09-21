@@ -80,5 +80,4 @@ private:
     uint64_t       released_at_ms_ = 0;
     bool           long_fired_ = false;
     bool           awaiting_second_ = false;   // first press seen, inside double window
-    bool           pending_single_ = false;
 };

@@ -97,9 +97,31 @@ void CommandRouter::Emit(const char *type, const char *body_fields) {
 }
 
 void CommandRouter::Nack(uint32_t for_seq, const char *err, const char *detail) {
+    // `detail` is often a PEER-SUPPLIED string echoed back (`h.type` for an
+    // unknown type, `path` for an unknown patch path, `pattern` for an unknown
+    // identify pattern), so it is copied with its JSON quoting -- and any control
+    // byte -- replaced by `_`, and BOUNDED.
+    //
+    // Both halves are load-bearing. An embedded `"` closed the detail string
+    // early: measured, a frame whose `type` carried a quote produced
+    // `..."detail":"bo"gus"}` -- a nack that no longer parses as JSON, so the app
+    // lost the error it was being sent and saw only a malformed line. And an
+    // unbounded `%s` of a long value let `snprintf` cut the body mid-string,
+    // which is invalid JSON for the same reason. This is the sanitisation
+    // `EmitLog` and `EmitGesture` already apply to their peer-facing strings; the
+    // nack path simply omitted it. `err` is a static literal at every call site,
+    // so only `detail` needs this.
+    char det[192];
+    size_t n = 0;
+    while (n + 1 < sizeof(det) && detail != nullptr && detail[n] != '\0') {
+        const char c = detail[n];
+        det[n] = (c == '"' || c == '\\' || static_cast<unsigned char>(c) < 0x20u) ? '_' : c;
+        ++n;
+    }
+    det[n] = '\0';
     char body[256];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"err\":\"%s\",\"detail\":\"%s\"",
-             static_cast<unsigned>(for_seq), err, detail ? detail : "");
+             static_cast<unsigned>(for_seq), err, det);
     Emit("nack", body);
 }
 

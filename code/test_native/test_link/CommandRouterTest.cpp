@@ -308,6 +308,48 @@ TEST(CommandRouter, AnUnknownCommandTypeIsNackedNotIgnored) {
     EXPECT_NE(cap.lines[0].find("unknown_type"), std::string::npos);
 }
 
+// The nack's `detail` echoes a PEER-SUPPLIED string for three errors (an unknown
+// `type`, an unknown patch `path`, an unknown identify `pattern`). It was placed
+// into the JSON body with a bare `%s`, so a value containing a quote -- or one
+// long enough that snprintf cut the body -- produced a nack that no longer parses
+// as JSON, and the app lost the error it was being sent and saw only a malformed
+// line. The body must survive a hostile value and stay a coherent frame.
+TEST(CommandRouter, ANackDetailIsEscapedSoAHostileValueCannotBreakTheFrame) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    // A `type` carrying a quote and injected structure. The envelope parser
+    // accepts it (it is a well-formed string value) and the unknown-type path
+    // echoes it back.
+    const std::string evil = "{\"v\":1,\"seq\":9,\"type\":\"bo\\\"gus\"}";
+    r.OnLine(evil.c_str(), evil.size());
+    ASSERT_TRUE(HasType(cap, "nack"));
+
+    // The emitted line must parse as a frame, and its echoed detail must not have
+    // opened a second JSON member.
+    FrameHeader h{};
+    EXPECT_TRUE(NdjsonParseEnvelope(cap.lines[0].c_str(), &h))
+        << "an unescaped quote in `detail` would make the nack unparseable: " << cap.lines[0];
+    EXPECT_EQ(h.type, std::string("nack"));
+    // `for_seq` is the frame being answered; it must still name seq 9 (the
+    // envelope's own seq is the router's outbound counter, a different number).
+    EXPECT_NE(cap.lines[0].find("\"for_seq\":9"), std::string::npos) << cap.lines[0];
+    EXPECT_EQ(cap.lines[0].find("\\\"gus"), std::string::npos)
+        << "the quote must be neutralised, not carried through";
+
+    // A pathologically long value must still yield a parseable, bounded frame --
+    // the body is cut by snprintf otherwise, which is invalid JSON for the same
+    // reason a raw quote is.
+    std::string big = "{\"v\":1,\"seq\":10,\"type\":\"";
+    big += std::string(600, 'X');
+    big += "\"}";
+    r.OnLine(big.c_str(), big.size());
+    FrameHeader h2{};
+    EXPECT_TRUE(NdjsonParseEnvelope(cap.lines.back().c_str(), &h2)) << cap.lines.back();
+    EXPECT_LT(cap.lines.back().size(), kNdjsonMaxFrame);
+}
+
 TEST(CommandRouter, AMalformedLineIsReportedRatherThanDropped) {
     MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
     CommandRouter r(&hal.InterfaceRef(), nullptr, &store);

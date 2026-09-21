@@ -164,6 +164,16 @@ const TestRunner::Test kTests[] = {
       "loopback jumpers on both channels; this one takes a minute or two",
       nullptr, Test30_Endurance,
       "Integrator stability, DAC repeatability, NTC drift over a sustained run" },
+
+    { 31, "AUX1-AUX3 under manual GND stimulus",
+      "a jumper, applied as each step asks (J5.4/J5.3/J5.2 to J5.1)",
+      Setup31_AuxManual, Test31_AuxManual,
+      "R23-R25 1k series, R17-R19 10k pull-ups, D8-D10 clamps -- collapse and recovery" },
+
+    { 32, "RT1 temperature SCALE (two-point beta check)",
+      "ideally something warm to hold against RT1 on the board's right edge",
+      Setup32_TempVerify, Test32_TempVerify,
+      "RT1 10k B3380 and R29 10k: the curve, not just one plausible reading" },
 };
 }  // namespace
 

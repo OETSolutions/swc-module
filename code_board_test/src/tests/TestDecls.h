@@ -37,6 +37,7 @@ TestRunner::Outcome Test14_ServoLoopback1();
 TestRunner::Outcome Test15_ServoLoopback2();
 TestRunner::Outcome Test16_LadderInputs();
 TestRunner::Outcome Test17_AuxInputs();
+TestRunner::Outcome Test31_AuxManual();
 TestRunner::Outcome Test18_Temperature();
 TestRunner::Outcome Test19_Buzzer();
 TestRunner::Outcome Test20_Leds();
@@ -51,5 +52,6 @@ TestRunner::Outcome Test27_GesturePassthrough();
 TestRunner::Outcome Test28_FullPassthrough();
 TestRunner::Outcome Test29_ContinuityMap();
 TestRunner::Outcome Test30_Endurance();
+TestRunner::Outcome Test32_TempVerify();
 
 }  // namespace SwcTests

@@ -87,12 +87,15 @@ static void handleRoot()
     h += "</div>";
 
     h += "<h2>Actions</h2><div>";
-    h += "<button class=all onclick=\"fetch('/runall').then(refresh)\">Run all 30</button>";
-    h += "<button class=sum onclick=\"fetch('/summary').then(refresh)\">Summary</button>";
-    h += "<button class=sum onclick=\"fetch('/clear').then(refresh)\">Clear log</button>";
+    h += "<button class=all id=bAll onclick=\"runAll()\">Run all 30</button>";
+    h += "<button class=sum onclick=\"fetch('/summary').catch(()=>{})\">Summary</button>";
+    h += "<button class=sum onclick=\"fetch('/clear').catch(()=>{})\">Clear log</button>";
     h += "<a class=b href='/log'>Log only</a>";
     h += "<a class=b href='/identify'>Identify (blink + beep)</a>";
     h += "</div>";
+    // A live status line. The page cannot be told "running" by the server (the
+    // server is busy running the test), so the browser tracks it itself.
+    h += "<div id=st class=m style='min-height:1.2em'></div>";
 
     h += "<h2>Tests</h2><table><tr><th>#</th><th>Test</th><th>Needs</th>"
          "<th>Result</th><th>Detail</th></tr>";
@@ -103,10 +106,15 @@ static void handleRoot()
         const TestRunner::Outcome &o = TestRunner::LastOutcome(i);
 
         h += "<tr><td>" + String(t->number) + "</td>";
-        h += "<td><a href='/run?n=" + String(t->number) + "'>" + String(t->title) + "</a>";
+        // A button, not a link: a link would navigate (and reload) instead of
+        // scheduling, which is the bug this replaces.
+        h += "<td><button style='text-align:left' onclick='runTest(" +
+             String(t->number) + ")'>" + String(t->title) + "</button>";
         h += "<div class=m>" + String(t->covers ? t->covers : "") + "</div></td>";
         h += "<td class=m>" + String(t->needs ? t->needs : "") + "</td>";
-        h += "<td class=" + statusClass(o.result) + ">" + TestRunner::ResultName(o.result);
+        const bool is_running = (TestRunner::RunningIndex() == (int)i);
+        h += "<td class=" + (is_running ? String("WARN") : statusClass(o.result)) + ">" +
+             (is_running ? String("RUNNING") : String(TestRunner::ResultName(o.result)));
         if (o.duration_ms) h += "<div class=m>" + String(o.duration_ms) + " ms</div>";
         h += "</td>";
         h += "<td>" + String(o.summary) + "</td></tr>";
@@ -148,11 +156,37 @@ static void handleRoot()
     }
     h += "</pre>";
 
-    h += "<script>function refresh(){location.reload()}";
-    h += "function poll(){fetch('/log?raw=1').then(r=>r.text()).then(t=>{"
-         "const e=document.getElementById('l');if(e.textContent!==t)e.textContent=t;})"
-         ".catch(()=>{}).then(()=>setTimeout(poll,2000))}";
-    h += "setTimeout(poll,2000)</script>";
+    // THE CLICK MUST NOT RELOAD. A test runs synchronously inside loop(), so while
+    // one is running the HTTP server does not answer at all -- a reload issued right
+    // after the click hangs for the whole test (9 s for test 20, 12 s for test 22)
+    // and the browser shows a blank page. That is what "clicking does nothing"
+    // looked like: the test WAS running, the page just could not see it.
+    //
+    // So the click only SCHEDULES the test (which the server does answer, with a 303)
+    // and then the poller watches the log. When the RESULT count grows, the test has
+    // finished and the page reloads ONCE to redraw the table.
+    h += "<script>";
+    h += "var resultCount=-1, running=null, base=null;";
+    h += "function setStatus(s){document.getElementById('st').textContent=s}";
+    h += "function lockButtons(on){document.querySelectorAll('button')"
+         ".forEach(b=>{if(b.id!='bAll'||!on)b.disabled=on})}";
+    h += "function runTest(n){if(running!==null)return;running=n;base=resultCount;"
+         "setStatus('Test '+n+' requested - running... (long tests take up to ~15 s)');"
+         "lockButtons(true);"
+         "fetch('/run?n='+n).catch(()=>{});}";
+    h += "function runAll(){if(running!==null)return;running='all';base=resultCount;"
+         "setStatus('All 30 requested - running... this takes about 2 minutes');"
+         "lockButtons(true);fetch('/runall').catch(()=>{});}";
+    h += "function poll(){fetch('/log?raw=1',{cache:'no-store'})"
+         ".then(r=>r.text()).then(t=>{"
+         "const e=document.getElementById('l');if(e.textContent!==t)e.textContent=t;"
+         "var c=(t.match(/^RESULT /gm)||[]).length;"
+         "if(resultCount<0){resultCount=c;}"
+         "else if(running!==null&&c>base){running=null;setStatus('done - reloading');"
+         "lockButtons(false);location.reload();return;}"
+         "}).catch(()=>{setStatus('working... (the server is busy running the test)')})"
+         ".then(()=>setTimeout(poll,1500))}";
+    h += "setTimeout(poll,800)</script>";
     h += "</body></html>";
 
     s_http.send(200, "text/html; charset=utf-8", h);
@@ -190,19 +224,45 @@ static void handleRun()
             if (t && t->number == n) { s_web_requested = (int)i; break; }
         }
     }
-    // Running the test inside the HTTP handler would block the response for as
-    // long as the test takes (test 30 runs for minutes). So the request just
-    // schedules it and redirects; loop() runs it and the page picks up the log.
+    // Run the test inside the handler, NOT deferred to loop().
+    //
+    // The deferred version (set a flag, redirect, let loop() pick it up) is what
+    // WEDGED THE SERVER: the 303 redirect left a client connection that the Arduino
+    // WebServer had not finished tearing down, and the test that then ran for nine
+    // seconds -- without a single handleClient() call -- left it in a state it never
+    // recovered from. HTTP stayed dead indefinitely after a web-triggered test, while
+    // the identical test run from the serial menu was fine. That asymmetry is what
+    // pointed at the handler.
+    //
+    // Running it here is safe because the HTTP response is only the redirect, and
+    // the page no longer depends on receiving it -- it fires the request and then
+    // watches the log. So a long test blocking this one connection is acceptable:
+    // the test is the thing the user asked for, and the page is already polling.
+    //
+    // The response is sent BEFORE the test runs, so the client is released first.
     s_http.sendHeader("Location", "/");
     s_http.send(303, "text/plain", "");
+    s_http.client().stop();   // release the socket now, before the long test
+
+    // Then run it. Anything loop() would have done, done here instead.
+    if (s_web_requested >= 0) {
+        Log::Printf("");
+        Log::Printf("(requested from the web UI)");
+        TestRunner::Run((size_t)s_web_requested);
+        s_web_requested = -1;
+    }
 }
 
 static void handleRunAll()
 {
-    // Same deferral as handleRun, for the same reason.
-    s_web_requested = -2;   // sentinel: run everything
+    // Same treatment as handleRun: respond, release the socket, then run.
     s_http.sendHeader("Location", "/");
     s_http.send(303, "text/plain", "");
+    s_http.client().stop();
+
+    Log::Printf("");
+    Log::Printf("(run all, requested from the web UI)");
+    TestRunner::RunAll();
 }
 
 static void handleSummary()
@@ -714,9 +774,26 @@ static bool ServiceWebRequest()
     return false;
 }
 
+// True once we have seen any input. The board cannot detect that a terminal
+// ATTACHED (USB-Serial-JTAG gives no such event -- DTR is not wired to the ROM
+// peripheral on this part), so the only reliable moment to greet a newly-attached
+// monitor is its first keystroke. Without this, opening `pio device monitor` on an
+// already-running board shows a blank screen until the user types something, which
+// reads as a dead board.
+static bool s_greeted = false;
+
 static void ServiceSerial()
 {
     if (!Serial.available()) return;
+
+    if (!s_greeted) {
+        s_greeted = true;
+        Log::Printf("");
+        Log::Printf("(a monitor just attached -- here is the menu; the board has been");
+        Log::Printf(" running since boot and any earlier output is not resent)");
+        PrintMenu();
+    }
+
     const int c = Serial.read();
 
     // Numbers are multi-character, so collect a line at a time for digits and
@@ -851,8 +928,15 @@ void Begin()
         delay(120);
     }
 
-    WebBegin();
+    // The menu FIRST, so a monitor attached at power-on sees it immediately. Doing
+    // the WiFi association first meant up to 15 s of silence on a board that was
+    // working perfectly, which looks identical to a hung one.
     PrintMenu();
+
+    WebBegin();
+
+    // And a final prompt, so the last thing on screen is what to do next.
+    Log::Printf("type a NUMBER (1-30), 'a' for all, or '?' for help");
 }
 
 void Loop()

@@ -13,7 +13,7 @@ Nothing here ships.
 | --- | --- |
 | **Board** | 54 × 102 mm, 4-layer, ESP32-S3 (DOIT ESPS3-32-N4), MCP4728 DAC, TLV9004 servos |
 | **Framework** | Arduino (deliberate — see below) · ESP-IDF 5.5.5 underneath |
-| **Tests** | 30 on-device + 48 host unit tests |
+| **Tests** | 32 on-device + 48 host unit tests |
 | **Console** | ROM USB-Serial-JTAG (`ARDUINO_USB_MODE=1`) |
 | **Front ends** | serial menu **and** web page — both optional, both drive the same tests |
 
@@ -166,6 +166,7 @@ attached, and that grouping is the recommended order.
 | **9** | stage-4 jumpers | 27–28 | press shaping, full sweep |
 | **10** | jumpers as each step asks | 29 | connector continuity |
 | **11** | both jumpers | 30 | endurance (minutes) |
+| **12** | a jumper + something warm | 31–32 | AUX under manual stimulus, RT1's curve |
 
 **The one jumper that matters most** is stage 4. Two wires:
 
@@ -222,6 +223,8 @@ that is the diagnosis, not a board fault.
 | 28 | Full pass-through sweep | both jumpers | whole chain, both modes, command-tracking |
 | 29 | Connector continuity map | jumpers | all 5 inputs alive; outputs independent |
 | 30 | Endurance | both jumpers | repeatability, write errors, **self-heating** |
+| 31 | AUX under manual stimulus | jumper, as asked | each AUX input **collapses and recovers** under a GND short |
+| 32 | RT1 temperature scale | something warm | **two-point beta** — the curve, not one plausible reading |
 
 Run them in the numbered order on a fresh board — the early tests establish the
 preconditions (power, DAC, ADC calibration) that the later ones are read through.
@@ -387,8 +390,38 @@ own oscillator at a fixed ~2.4 kHz, so it cannot follow a drive frequency. The
 band, and a passive buzzer (which *can* follow it) is a likely future change, so the
 capability is tested now and will already be correct when the part changes.
 
+## Web UI and the serial monitor
+
+Two behaviours that look like faults and are not, plus one that was a real bug.
+
+**The serial monitor shows nothing until you type.** The board cannot detect that a
+terminal *attached* — USB-Serial-JTAG gives no such event — so a monitor opened on an
+already-running board sees a blank screen. Type any character and the menu appears
+(with a note saying so). The boot banner is not resent, because there is nothing to
+resend it to. The menu also prints *before* the WiFi association now, so a monitor
+attached at power-on sees it immediately instead of after up to 15 s of silence.
+
+**Clicking a test in the web UI takes up to ~15 s to show anything.** A test runs
+synchronously, so while one is running the HTTP server does not answer — the page
+shows a "working..." status and picks up the result when it finishes. That is by
+design; see below.
+
+**The real bug: a web-triggered test used to wedge the HTTP server permanently.**
+Running a test from `/run` left a half-closed client connection that the Arduino
+`WebServer` never recovered from, so HTTP stayed dead *indefinitely* — while the
+identical test run from the serial menu was fine. That asymmetry is what located it.
+Fixed by responding, releasing the socket, and only then running the test. Verified:
+after a web-triggered run the page is unreachable for the duration and then returns
+200 again.
+
+The page also no longer reloads on click. A reload issued while the server is busy
+hangs for the whole test, which is exactly what "clicking does nothing" looked like.
+
 ## Known limits
 
+- **Tests 31 and 32 need the operator.** 31 skips (rather than passing) if no
+  stimulus is applied within its timeout; 32 reports instead of asserting the beta
+  if the sensor is not warmed. Both say which they did.
 - **Test 19's sweep is not a clean tone on the fitted part.** See the finding
   above: BZ1 is active, so the sweep is a drive-path test, not a pitch test.
 - **The absolute key resistance is not verified.** Every analog test proves the

@@ -21,4 +21,13 @@ const char *Setup08_AdcChannels();
 // still run, so this is a request rather than a requirement.
 const char *Setup23_IdleSafety();
 
+// Test 31 walks the operator through shorting each AUX input to GND in turn, so the
+// board can prove each one is a live analog path rather than a stuck node.
+const char *Setup31_AuxManual();
+
+// Test 32 has the operator confirm the RT1 reading against a known temperature, and
+// optionally hold the sensor to change it -- the only way to verify a thermistor's
+// SCALE without a calibrated chamber.
+const char *Setup32_TempVerify();
+
 }  // namespace SwcTests

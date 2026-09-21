@@ -14,6 +14,7 @@ namespace TestRunner {
 static Outcome s_current;
 static Outcome s_results[64];
 static size_t  s_result_count = 0;
+static int     s_running = -1;   // the test in flight, for the web page
 
 const char *ResultName(Result r)
 {
@@ -165,6 +166,8 @@ const Outcome &LastOutcome(size_t index)
     return s_results[index];
 }
 
+int RunningIndex() { return s_running; }
+
 Outcome Run(size_t index)
 {
     const Test *t = Get(index);
@@ -188,9 +191,11 @@ Outcome Run(size_t index)
     Log::Rule('-');
 
     Check::Init(&s_current);
+    s_running = (int)index;
     const uint32_t t0 = millis();
     s_current = t->body();
     s_current.duration_ms = millis() - t0;
+    s_running = -1;
 
     if (s_current.result == Result::kNotRun) {
         Check::Finish();

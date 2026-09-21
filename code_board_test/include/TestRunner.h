@@ -75,6 +75,12 @@ Outcome Blocked();
 const Outcome &LastOutcome(size_t index);
 void ResetOutcomes();
 
+// The index of the test currently running, or -1 when none is. The web page uses
+// this to show RUNNING: a test executes synchronously inside loop() for up to ~15 s,
+// during which the HTTP server cannot answer, so the page needs a way to render
+// "in flight" on the reload that follows.
+int RunningIndex();
+
 // Run every test in order. Returns the number that failed or errored.
 int RunAll();
 

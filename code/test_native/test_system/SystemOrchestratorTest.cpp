@@ -487,6 +487,50 @@ TEST(SystemOrchestrator, OneChannelWithoutAReferenceDoesNotDisableTheOtherChanne
         << "a dead sibling must not disable the healthy channel's pass-through";
 }
 
+// The HEAD UNIT's idle is per channel too (spec 6.2 samples `/SENSEn` per
+// channel), and it was kept only from channel 0. Channel 1's pass-through was
+// therefore DEAD whenever channel 0 had no head unit, and mapped onto the wrong
+// idle when the two head-unit inputs differed.
+TEST(SystemOrchestrator, ChannelOnesPassThroughUsesItsOwnHeadUnitIdle) {
+    MockHal hal;
+    auto o = MakeUnconfiguredTwoChannel(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_SWC2, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 300);    // 600 mV: NO head unit on ch0
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE2, kSenseFor5vHeadUnit);  // head unit on ch1
+    o.Boot();
+    ASSERT_TRUE(o.PassThroughActive()) << "channel 1 has a usable wheel reference";
+    const int idle1 = hal.LastDacCode(DAC_CH_KEY2);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC2, 1430);   // a real press on channel 1
+    PollFor(o, hal, 100);
+    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY2), idle1)
+        << "channel 1's pass-through must not depend on channel 0's head unit";
+}
+
+TEST(SystemOrchestrator, AChannelWithNoHeadUnitServesNothingWhileItsSiblingStillDoes) {
+    // The inverse: with no head unit on channel 1, channel 1 must drive nothing
+    // (a fabricated denominator lands on a key nothing defined) while channel 0
+    // still passes through.
+    MockHal hal;
+    auto o = MakeUnconfiguredTwoChannel(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_SWC2, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE2, 300);   // 600 mV: no head unit on ch1
+    o.Boot();
+    const int writes1 = hal.DacWriteCount(DAC_CH_KEY2);
+    const int idle0 = hal.LastDacCode(DAC_CH_KEY1);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC2, 1430);   // a press channel 1 cannot serve
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);   // a press channel 0 can
+    PollFor(o, hal, 100);
+    EXPECT_EQ(hal.DacWriteCount(DAC_CH_KEY2), writes1)
+        << "no head unit on this channel means it drives nothing, not a guessed key";
+    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle0)
+        << "and its healthy sibling still passes through";
+}
+
 TEST(SystemOrchestrator, AConfiguredDeviceDoesNotUsePassThrough) {
     // The inverse, and the more dangerous direction: a CONFIGURED device must
     // classify against its learned windows. If pass-through were ever left on, a

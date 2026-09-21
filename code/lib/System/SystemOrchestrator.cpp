@@ -160,7 +160,12 @@ void SystemOrchestrator::EstablishSafeIdle() {
         // Remembered for FR-25's pass-through: the ratio is taken against the
         // HEAD UNIT's own idle, not against the output's safe-idle code (which is
         // full scale, 5200 mV, and would push every mapped level to the ceiling).
-        if (i == 0) head_unit_idle_mv_ = no_head_unit ? 0 : measured_key_idle_mv;
+        // PER CHANNEL, like the wheel idle and the gain mode above it: spec 6.2
+        // samples `/SENSEn` per channel, and the two head-unit inputs are
+        // independent. Keeping only channel 0's made channel 1's pass-through
+        // dead whenever channel 0 had no head unit (and mapped onto the wrong
+        // idle when the two differed).
+        head_unit_idle_mv_[i] = no_head_unit ? 0 : measured_key_idle_mv;
 
         // A channel's own `gain_mode` overrides the device-wide policy, but only
         // when it names a CONCRETE gain. `kAuto` -- the value the spec's example
@@ -685,16 +690,18 @@ void SystemOrchestrator::ReleaseKey(uint8_t index) {
 bool SystemOrchestrator::PresentLevel(uint8_t index, int level_mv, int wheel_idle_mv,
                                       int sense_mv, uint64_t now_ms, DacChannel key_ch) {
     ChannelState &cs = channels_[index];
-    // With no head-unit idle there is nothing to map the ratio ONTO, and a
-    // fabricated denominator would land every press on a key nothing defined.
-    // Refuse rather than guess (spec 6.9's "disabled rather than guessed").
-    if (head_unit_idle_mv_ <= 0 || wheel_idle_mv <= 0) return false;
+    // This channel's own head-unit idle. With none there is nothing to map the
+    // ratio ONTO, and a fabricated denominator would land every press on a key
+    // nothing defined. Refuse rather than guess (spec 6.9's "disabled rather than
+    // guessed").
+    const int head_unit_idle_mv = head_unit_idle_mv_[index];
+    if (head_unit_idle_mv <= 0 || wheel_idle_mv <= 0) return false;
 
     // The mapping is by RATIO, not by voltage (spec 6.9): the wheel's ladder and
     // the head unit's need not have the same resistances, so copying the incoming
     // millivolts across would land on the wrong key.
     const MilliVolt target = static_cast<MilliVolt>(
-        (static_cast<long>(head_unit_idle_mv_) * level_mv) / wheel_idle_mv);
+        (static_cast<long>(head_unit_idle_mv) * level_mv) / wheel_idle_mv);
     cs.servo.Target(gain_mode_[index], target);
     cs.servo.Update(sense_mv);
     hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());
@@ -830,7 +837,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             const bool rising_edge = pressed && !cs.pass_through_pressed;
             cs.pass_through_pressed = pressed;
 
-            if (rising_edge && head_unit_idle_mv_ > 0) {
+            if (rising_edge && head_unit_idle_mv_[index] > 0) {
                 // The head unit's OWN idle is the denominator: the wheel asks for
                 // a fraction of a full-scale ladder position, and that fraction is
                 // then applied to the head unit's range. Using the output's

@@ -435,9 +435,10 @@ private:
     // The HEAD UNIT's measured idle (spec 6.2 step 1), which the pass-through
     // ratio is applied TO. The WHEEL's idle -- the ratio's denominator -- is
     // PER CHANNEL (`ChannelState::pass_through_idle_mv`), because each SWC input
-    // is its own wheel with its own idle. Those are two different ladders, and
-    // conflating either pair maps every press to the wrong key.
-    int  head_unit_idle_mv_ = 0;
+    // is its own wheel with its own idle. This is per channel too, for the same
+    // reason: spec 6.2 samples `/SENSEn` per channel, so two head-unit inputs
+    // have two idles. Conflating either pair maps every press to the wrong key.
+    int  head_unit_idle_mv_[kMaxChannels] = {};
 
     // Where a recognized gesture is reported (spec 4.3's `event`). Null until a
     // link registers, and legal to leave null: the device runs without an app.

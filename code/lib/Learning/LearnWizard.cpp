@@ -23,6 +23,17 @@ constexpr int kAuxPressedMv = 100;
 // is 110 mV wide).
 constexpr int kPromptPressDetectMv = 40;
 
+// The generated id for a slot: `swc<ch>_bt<slot>`, with `ch` and `slot` 1-based.
+//
+// ONE definition, because two places need it and they must agree exactly: the
+// generator (which names the button it stores) and the neighbour exclusion (which
+// must remove that same entry from the set the session checks against -- remove the
+// wrong one and re-learning a button is refused as too close to itself). Written
+// twice, a change to either would silently break the correction path.
+void FormatSlotId(char *buf, size_t n, int channel_index, int slot) {
+    snprintf(buf, n, "swc%d_bt%d", channel_index + 1, slot);
+}
+
 }  // namespace
 
 LadderProfile Aux1ProfileDefault() {
@@ -47,9 +58,22 @@ LearnWizard::LearnWizard(IHAL *hal, BuzzerGrammar *buzzer, LedGrammar *leds,
     : hal_(hal), buzzer_(buzzer), leds_(leds),
       aux_(aux_profile, timings), aux_profile_(aux_profile) {}
 
-void LearnWizard::Enter(uint64_t now_ms, bool aux_held) {
+void LearnWizard::Enter(uint64_t now_ms, bool aux_held, const LadderProfile *existing) {
     state_ = State::kSelectButton;
-    profile_ = LadderProfile{};   // a fresh learn, not an edit of the old one
+    // SEED from what the channel already has, rather than starting empty, because
+    // `Commit`'s profile is ASSIGNED over the channel's ladder by the caller -- so
+    // starting empty means a learn that adds nothing but also DELETES everything.
+    // Re-entering the wizard to re-measure one button used to wipe the rest
+    // (measured: three learned buttons became one). A null `existing` is the
+    // genuinely-empty case: a test driving a bare wizard, or a channel with no
+    // learned ladder yet.
+    profile_ = LadderProfile{};
+    if (existing != nullptr) {
+        const uint8_t n = (existing->count < kLadderMaxButtons) ? existing->count
+                                                                : kLadderMaxButtons;
+        for (uint8_t i = 0; i < n; ++i) profile_.buttons[i] = existing->buttons[i];
+        profile_.count = n;
+    }
     press_count_ = 0;
     selected_slot_ = 0;
     any_press_ = false;
@@ -102,6 +126,9 @@ bool LearnWizard::ConsumeExited() {
 
 void LearnWizard::Tick(int channel, uint64_t now_ms, int idle_mv, int temp_tenths_c) {
     if (hal_ == nullptr) return;
+    // Remembered so the id-based neighbour exclusion can build the id this learn
+    // is about to produce; `Tick` is the only place the channel arrives.
+    channel_ = channel;
 
     if (state_ == State::kSelectButton) {
         ServiceSelect(now_ms);
@@ -151,11 +178,51 @@ void LearnWizard::ServiceSelect(uint64_t now_ms) {
         selected_slot_ = press_count_;
         state_ = State::kPrompt;
         prompt_started_ms_ = now_ms;
-        session_.Start(selected_slot_ - 1, profile_);
+        session_.Start(NeighbourSetExcludingTheSlotBeingLearned());
         // Spec 7.4 step 3: LEARN_PROMPT, LEDs alternating.
         if (buzzer_ != nullptr) buzzer_->Play(BuzzerPattern::kLearnPrompt);
         if (leds_ != nullptr) leds_->SetStat(LedStatPattern::kAlternate);
     }
+}
+
+/*
+ * `profile_` minus the entry this learn is REPLACING, which is what the session
+ * needs as its neighbour set.
+ *
+ * The id is the key, and the id is this class's own vocabulary: it generates
+ * `swc<ch>_bt<slot>`, so it can compute the id it is about to produce and remove
+ * exactly that entry. Deciding by id rather than by array index is the part that
+ * matters, because `profile_` is seeded from the channel's ladder and an APP-made
+ * ladder uses app slugs in whatever order it likes -- index `slot - 1` is a
+ * different button than slot `slot` as soon as that happens.
+ *
+ * Without this, re-learning a button is refused: the session would see the old
+ * entry as a neighbour, and a re-measure lands inside the old window by
+ * definition, so every attempt to correct a button reports
+ * `too_close_to_existing` -- blaming the button for being too close to itself.
+ * The exclusion is by id and by BOTH possible spellings of the slot
+ * (0-based `bt0` and 1-based `bt<slot>`), so a profile produced by either
+ * convention has its entry removed.
+ */
+LadderProfile LearnWizard::NeighbourSetExcludingTheSlotBeingLearned() const {
+    LadderProfile out = profile_;
+    const int slot = selected_slot_ > 0 ? selected_slot_ : 1;
+
+    // The id `ServicePrompt` will generate for this slot, spelled the SAME way and
+    // in ONE place. Hedging across two conventions here would be a second home for
+    // the id format -- the defect this project keeps re-finding -- so it is worth
+    // being exact: the generator numbers slots from 1 (`slot 1 -> "swc1_bt1"`, the
+    // convention `SystemOrchestratorTest` already asserts).
+    char learning_id[32];
+    FormatSlotId(learning_id, sizeof(learning_id), channel_, slot);
+
+    uint8_t kept = 0;
+    for (uint8_t i = 0; i < out.count && i < kLadderMaxButtons; ++i) {
+        if (strcmp(profile_.buttons[i].id, learning_id) == 0) continue;
+        out.buttons[kept++] = profile_.buttons[i];
+    }
+    out.count = kept;
+    return out;
 }
 
 void LearnWizard::ServicePrompt(int channel, uint64_t now_ms, int idle_mv, int temp_tenths_c) {
@@ -177,7 +244,7 @@ void LearnWizard::ServicePrompt(int channel, uint64_t now_ms, int idle_mv, int t
         if (!pressing) return;          // still waiting for a press
         prompt_pressed_ = true;
         prompt_started_ms_ = now_ms;
-        session_.Start(selected_slot_ - 1, profile_);
+        session_.Start(NeighbourSetExcludingTheSlotBeingLearned());
     }
 
     if (pressing) {
@@ -201,7 +268,7 @@ void LearnWizard::ServicePrompt(int channel, uint64_t now_ms, int idle_mv, int t
     // complain: it cannot prove an `int` stays short, and neither can a reader.
     const int slot = selected_slot_ > 0 ? selected_slot_ : 1;
     char idbuf[32];
-    snprintf(idbuf, sizeof(idbuf), "swc%d_bt%d", channel + 1, slot);
+    FormatSlotId(idbuf, sizeof(idbuf), channel, slot);
     memset(out.id, 0, sizeof(out.id));
     memcpy(out.id, idbuf, strlen(idbuf) < sizeof(out.id) ? strlen(idbuf) : sizeof(out.id) - 1);
     char namebuf[32];
@@ -213,10 +280,31 @@ void LearnWizard::ServicePrompt(int channel, uint64_t now_ms, int idle_mv, int t
     const LearnReject r = session_.Commit(&out);
     last_result_ = r;
     if (r == LearnReject::kNone) {
-        if (profile_.count < kLadderMaxButtons) {
+        // REPLACE IN PLACE when this id is already on the profile, rather than
+        // appending a second button with the same id.
+        //
+        // Appending was reachable and wrong in two ways. `profile_` is seeded from
+        // the channel's ladder (see Enter), so re-measuring a button the channel
+        // already carries would add a duplicate; and within one session the slot
+        // menu can select the same slot twice. A duplicate id is not rejected
+        // anywhere -- `ConfigValidate` does not check it -- yet `BindingResolve`
+        // and `BindingsForButton` both find a binding by `strcmp` on the id, so two
+        // buttons sharing one id make "which window does this binding mean"
+        // ambiguous between two different voltages.
+        int target = -1;
+        for (uint8_t i = 0; i < profile_.count; ++i) {
+            if (strcmp(profile_.buttons[i].id, out.id) == 0) { target = i; break; }
+        }
+        if (target >= 0) {
+            profile_.buttons[target] = out;
+        } else if (profile_.count < kLadderMaxButtons) {
             profile_.buttons[profile_.count] = out;
             ++profile_.count;
         }
+        // At kLadderMaxButtons with no matching id there is no room to add: the
+        // learn is measured and reported (LEARN_OK) but not stored, rather than
+        // silently overwriting an existing button the user did not select.
+        //
         // The IDLE REFERENCE, and forgetting it is how the learned button ends up
         // dead. A LadderProfile is useless without it: spec 6.3 normalizes every
         // centre by the idle the button was measured at, and `LadderClassify`

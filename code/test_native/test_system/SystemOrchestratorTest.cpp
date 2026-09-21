@@ -2028,3 +2028,109 @@ TEST(SystemOrchestrator, ASuccessfulNvsWriteIsReportedAsPersisted) {
     ASSERT_NE(o.LastLearnedProfile(0), nullptr);
     EXPECT_TRUE(o.LastLearnPersisted()) << "a good write must report as durable";
 }
+
+// --- re-learning: a learn ADDS, it does not replace the ladder ----------------
+//
+// The learn's output is ASSIGNED over the channel's ladder
+// (`ApplyLearnedProfile`: `config_.channels[ch].ladder = profile`), so a session
+// that started from an empty profile DELETED every button the channel already had.
+// Measured before the fix: three learned buttons became one.
+
+TEST(SystemOrchestrator, ReLearningOneButtonKeepsTheChannelsOtherButtons) {
+    // The user's plausible action: learn three buttons, come back later to
+    // re-measure ONE of them. Before the fix the other two were destroyed, with
+    // LEARN_OK feedback and nothing reporting a loss.
+    MockHal hal;
+    hal.ClearNvs();
+    Config c = ConfigDefault();
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(c));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), c, c.settings.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // Session 1: learn three buttons on three slots.
+    HoldAuxToToggle(o, hal);
+    const int levels[3] = {1430, 1750, 2100};
+    for (int slot = 1; slot <= 3; ++slot) {
+        PressAux(o, hal, slot);
+        hal.SetAdcMilliVolts(ADC_CH_SWC1, levels[slot - 1]);
+        PollFor(o, hal, 400);
+        hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+        PollFor(o, hal, 300);
+    }
+    HoldAuxToToggle(o, hal);   // leave the wizard
+    ASSERT_NE(o.LastLearnedProfile(0), nullptr);
+    ASSERT_EQ(o.LastLearnedProfile(0)->count, 3)
+        << "three learns in one session must leave three buttons";
+
+    // Session 2: re-enter and re-learn slot 2 at a nearby level.
+    HoldAuxToToggle(o, hal);
+    PressAux(o, hal, 2);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1720);   // inside bt2's own old window
+    PollFor(o, hal, 400);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 300);
+    HoldAuxToToggle(o, hal);
+
+    const LadderProfile *p = o.LastLearnedProfile(0);
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(p->count, 3)
+        << "re-learning ONE button must not delete the channel's other buttons -- "
+           "the learn ADDS, it does not replace the ladder";
+    // And slot 2 is CORRECTED rather than refused: a re-measure lands inside the
+    // button's own old window by definition, so leaving that entry in the
+    // neighbour set would reject every attempt to fix a button.
+    EXPECT_NEAR(p->buttons[1].mv_center, 1720, 30)
+        << "the re-measured button must actually be updated, not left at its old "
+           "level by a too_close_to_existing refusal against itself";
+    // The other two survive at their original levels.
+    EXPECT_NEAR(p->buttons[0].mv_center, 1430, 30);
+    EXPECT_NEAR(p->buttons[2].mv_center, 2100, 30);
+}
+
+TEST(SystemOrchestrator, ReLearningTheSameSlotTwiceDoesNotDuplicateItsId) {
+    // Two buttons sharing one id is not rejected anywhere, yet `BindingResolve`
+    // and `BindingsForButton` both find a binding by `strcmp` on the id -- so a
+    // duplicate makes "which window does this binding mean" ambiguous between two
+    // different voltages. The second learn must REPLACE the entry in place.
+    MockHal hal;
+    hal.ClearNvs();
+    Config c = ConfigDefault();
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(c));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), c, c.settings.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    HoldAuxToToggle(o, hal);
+    for (int pass = 0; pass < 2; ++pass) {
+        PressAux(o, hal, 1);   // the SAME slot both times
+        hal.SetAdcMilliVolts(ADC_CH_SWC1, pass == 0 ? 1430 : 1750);
+        PollFor(o, hal, 400);
+        hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+        PollFor(o, hal, 300);
+    }
+
+    const LadderProfile *p = o.LastLearnedProfile(0);
+    ASSERT_NE(p, nullptr);
+    EXPECT_EQ(p->count, 1)
+        << "learning the same slot twice must correct it, not add a second button";
+    EXPECT_NEAR(p->buttons[0].mv_center, 1750, 30)
+        << "and the later measurement is the one that survives";
+    // No two entries may share an id.
+    for (uint8_t i = 0; i < p->count; ++i) {
+        for (uint8_t j = static_cast<uint8_t>(i + 1); j < p->count; ++j) {
+            EXPECT_STRNE(p->buttons[i].id, p->buttons[j].id)
+                << "two buttons with one id make the id an ambiguous key";
+        }
+    }
+}

@@ -385,7 +385,14 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
                 learn_idle_mv_ = (live > 0)
                                      ? live
                                      : IdleReferenceMv(static_cast<uint8_t>(learn_channel_));
-                wizard_.Enter(now_ms, /*aux_held=*/true);
+                // The channel's CURRENT ladder seeds the session. `Commit`'s
+                // profile replaces the channel's ladder wholesale, so a learn that
+                // did not start from the existing buttons would DELETE them: a user
+                // re-measuring one button would lose the rest. The wizard has no
+                // Config of its own, so the caller supplies it.
+                const bool ch_ok = (learn_channel_ >= 0) && (learn_channel_ < channel_count_);
+                wizard_.Enter(now_ms, /*aux_held=*/true,
+                              ch_ok ? &config_.channels[learn_channel_].ladder : nullptr);
             }
         }
     } else {

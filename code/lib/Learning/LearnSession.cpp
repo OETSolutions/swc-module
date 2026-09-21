@@ -43,8 +43,7 @@ const char *LearnRejectReason(LearnReject r) {
     return "unknown";
 }
 
-void LearnSession::Start(int channel, const LadderProfile &existing) {
-    channel_ = channel;
+void LearnSession::Start(const LadderProfile &existing) {
     existing_ = existing;
 
     sample_count_ = 0;

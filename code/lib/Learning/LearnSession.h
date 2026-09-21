@@ -34,9 +34,23 @@ const char *LearnRejectReason(LearnReject r);
 
 class LearnSession {
 public:
-    // `existing` is the channel's current profile, so an overlapping learn can be
-    // refused. `channel` is recorded for the caller's benefit only.
-    void Start(int channel, const LadderProfile &existing);
+    // `existing` is the set of buttons this learn must NOT collide with.
+    //
+    // **It is the channel's ladder MINUS the entry this learn is replacing**, and
+    // that subtraction is the CALLER's job because only the caller knows which
+    // entry that is. The wizard seeds its profile from the channel's whole ladder
+    // (otherwise a learn DELETES the channel's other buttons -- see
+    // LearnWizard::Enter), and it replaces an existing entry by matching the id it
+    // is about to generate. So the button being re-measured is in the neighbour
+    // set unless the wizard removes it, and re-learning that button would be
+    // refused as `too_close_to_existing` -- blaming it for being too close to
+    // ITSELF, since a re-measure lands within the old window by definition. That
+    // would make a button impossible to correct.
+    //
+    // This class deliberately knows nothing about ids: it compares VOLTAGES. The
+    // id is the wizard's vocabulary (it generates `swc1_bt2`), so the id-based
+    // decision stays there and this takes the already-adjusted set.
+    void Start(const LadderProfile &existing);
 
     // One reading. `level_mv` is the calibrated ladder level and `idle_mv` the
     // live idle reference; `rail_mv` is spec 3.4's "+3V3 rail measured during
@@ -52,7 +66,6 @@ public:
 
     int SampleCount() const { return sample_count_; }
     MilliVolt LearnedIdleMv() const { return learned_idle_mv_; }
-    int Channel() const { return channel_; }
 
     // The tolerance cap (spec 3.4). Exposed because it is a design constant a
     // caller may legitimately override for a bench sweep, and because a test
@@ -78,7 +91,6 @@ private:
     MilliVolt learned_idle_mv_ = 0;
     MilliVolt rail_mv_ = 0;
     int16_t   temp_tenths_c_ = 0;
-    int       channel_ = 0;
 
     LadderProfile existing_{};
 };

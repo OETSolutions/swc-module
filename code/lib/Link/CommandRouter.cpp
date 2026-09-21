@@ -720,9 +720,15 @@ void CommandRouter::HandleLearnStart(const cJSON *root, uint32_t for_seq) {
     learn_open_ = true;
     learn_channel_ = channel;
     learn_samples_ = 0;
-    // The session is seeded with the channel's CURRENT profile so a learn that
+    // The session is seeded with the channel's CURRENT ladder so a learn that
     // overlaps an existing button can be refused (LearnReject::kTooCloseToExisting)
     // rather than silently creating two windows that classify the same level.
+    //
+    // The app names the button it is re-learning (`button_id`), so that entry is
+    // removed from the neighbour set: the app path replaces a button too, and a
+    // re-measure lands within the old window by definition, so leaving it in would
+    // refuse the correction as "too close to itself". The wizard does the same
+    // subtraction by generating the id; here the id arrives from the host.
     LadderProfile existing{};
     if (store_ != nullptr) {
         Config cur{};
@@ -730,7 +736,15 @@ void CommandRouter::HandleLearnStart(const cJSON *root, uint32_t for_seq) {
             existing = cur.channels[channel].ladder;
         }
     }
-    session_.Start(channel, existing);
+    if (const cJSON *bid = Str(root, "button_id")) {
+        uint8_t kept = 0;
+        for (uint8_t i = 0; i < existing.count && i < kLadderMaxButtons; ++i) {
+            if (strcmp(existing.buttons[i].id, bid->valuestring) == 0) continue;
+            existing.buttons[kept++] = existing.buttons[i];
+        }
+        existing.count = kept;
+    }
+    session_.Start(existing);
 
     char body[64];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));

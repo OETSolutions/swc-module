@@ -34,7 +34,7 @@ void Feed(LearnSession &s, int mv, int idle, int n, uint64_t &t) {
 
 TEST(LearnSession, ASteadyLevelCommitsAndRecordsEverythingLearnIsTheSourceOf) {
     LearnSession s;
-    s.Start(0, LadderProfile{});
+    s.Start(LadderProfile{});
     uint64_t t = 1000;
     Feed(s, 1430, 2835, 30, t);
     LadderButton out{};
@@ -55,7 +55,7 @@ TEST(LearnSession, ASteadyLevelCommitsAndRecordsEverythingLearnIsTheSourceOf) {
 
 TEST(LearnSession, TheIdAndNameAreLeftToTheCallerNotInvented) {
     LearnSession s;
-    s.Start(0, LadderProfile{});
+    s.Start(LadderProfile{});
     uint64_t t = 1000;
     Feed(s, 1430, 2835, 30, t);
     LadderButton out{};
@@ -66,7 +66,7 @@ TEST(LearnSession, TheIdAndNameAreLeftToTheCallerNotInvented) {
 
 TEST(LearnSession, TooFewSamplesIsRejectedNotAcceptedFromOneReading) {
     LearnSession s;
-    s.Start(0, LadderProfile{});
+    s.Start(LadderProfile{});
     uint64_t t = 1000;
     Feed(s, 1430, 2835, 2, t);
     LadderButton out{};
@@ -75,7 +75,7 @@ TEST(LearnSession, TooFewSamplesIsRejectedNotAcceptedFromOneReading) {
 
 TEST(LearnSession, ANoisyLevelIsRejectedWithTheNoiseReason) {
     LearnSession s;
-    s.Start(0, LadderProfile{});
+    s.Start(LadderProfile{});
     uint64_t t = 1000;
     // A 550 mV swing at a 2835 mV idle is ~195 permille of wobble: far wider
     // than the classification tolerance.
@@ -89,7 +89,7 @@ TEST(LearnSession, ANoisyLevelIsRejectedWithTheNoiseReason) {
 
 TEST(LearnSession, ALevelAtIdleIsRejectedBecauseTheButtonWasNotPressed) {
     LearnSession s;
-    s.Start(0, LadderProfile{});
+    s.Start(LadderProfile{});
     uint64_t t = 1000;
     Feed(s, 2835, 2835, 30, t);
     LadderButton out{};
@@ -98,7 +98,7 @@ TEST(LearnSession, ALevelAtIdleIsRejectedBecauseTheButtonWasNotPressed) {
 
 TEST(LearnSession, ALevelWithinAnExistingButtonsToleranceIsRejectedAsAmbiguous) {
     LearnSession s;
-    s.Start(0, ExistingWith("vol_up", 1430, 120));
+    s.Start(ExistingWith("vol_up", 1430, 120));
     uint64_t t = 1000;
     Feed(s, 1450, 2835, 30, t);   // 511 permille, inside vol_up's window
     LadderButton out{};
@@ -107,7 +107,7 @@ TEST(LearnSession, ALevelWithinAnExistingButtonsToleranceIsRejectedAsAmbiguous) 
 
 TEST(LearnSession, ALevelAboveTheAdcCeilingIsRejectedAsOutOfRange) {
     LearnSession s;
-    s.Start(0, LadderProfile{});
+    s.Start(LadderProfile{});
     uint64_t t = 1000;
     // 3000 mV exceeds the 2900 mV calibrated ADC ceiling (spec 3.2), so this
     // cannot be a real reading from this hardware -- it is a wiring or
@@ -124,7 +124,7 @@ TEST(LearnSession, OutOfRangeSamplesStillCountTowardTheMinimumSoTheReasonIsActio
     // the COUNT gate and report "too_few_samples" -- telling the user to hold the
     // button longer when nothing they can do will help.
     LearnSession s;
-    s.Start(0, LadderProfile{});
+    s.Start(LadderProfile{});
     uint64_t t = 1000;
     Feed(s, 3200, 2835, 30, t);
     LadderButton out{};
@@ -155,7 +155,7 @@ TEST(LearnSession, ToleranceIsTheMidpointOfTheGapNotADoubleOfTheSpread) {
     LearnSession s;
     // A neighbour 200 mV below the level being learned, with a narrow window so
     // the gap (not the neighbour's tolerance) is what determines the answer.
-    s.Start(0, ExistingWith("other", 1230, 20));
+    s.Start(ExistingWith("other", 1230, 20));
     uint64_t t = 1000;
     // A 30 mV spread. A spread-derived tolerance would give 60 mV; the gap
     // midpoint is 100 mV. The two are far enough apart to tell apart.
@@ -173,7 +173,7 @@ TEST(LearnSession, ToleranceIsTheMidpointOfTheGapNotADoubleOfTheSpread) {
 
 TEST(LearnSession, ToleranceIsCappedWhenNoNeighbourIsNearby) {
     LearnSession s;
-    s.Start(0, LadderProfile{});   // nothing learned yet
+    s.Start(LadderProfile{});   // nothing learned yet
     uint64_t t = 1000;
     Feed(s, 1430, 2835, 30, t);
     LadderButton out{};
@@ -186,7 +186,7 @@ TEST(LearnSession, TheToleranceFloorCoversTheSpreadItWasMeasuredThrough) {
     // The spread's ONLY role is as a floor. A window narrower than the noise it
     // was measured through would reject the very button it describes.
     LearnSession s;
-    s.Start(0, LadderProfile{});
+    s.Start(LadderProfile{});
     uint64_t t = 1000;
     // A 60 mV spread, no neighbour: the 120 cap would otherwise govern and hide
     // whether the floor is applied at all. Force the floor by capping the gap.
@@ -203,7 +203,7 @@ TEST(LearnSession, ASecondLearnOnTheSameChannelDoesNotCommitOverItsOwnSibling) {
     // Learning `vol_dn` after `vol_up` must not refuse itself against the button
     // it is supposed to sit beside -- the check is against a DIFFERENT window.
     LearnSession s;
-    s.Start(0, ExistingWith("vol_up", 1430, 120));
+    s.Start(ExistingWith("vol_up", 1430, 120));
     uint64_t t = 1000;
     Feed(s, 1785, 2835, 30, t);   // 355 mV away: clearly a different button
     LadderButton out{};
@@ -213,7 +213,7 @@ TEST(LearnSession, ASecondLearnOnTheSameChannelDoesNotCommitOverItsOwnSibling) {
 
 TEST(LearnSession, AStartResetsStateSoOneSessionCannotLeakIntoTheNext) {
     LearnSession s;
-    s.Start(0, LadderProfile{});
+    s.Start(LadderProfile{});
     uint64_t t = 1000;
     Feed(s, 1430, 2835, 30, t);
     LadderButton out{};
@@ -222,7 +222,7 @@ TEST(LearnSession, AStartResetsStateSoOneSessionCannotLeakIntoTheNext) {
     // A fresh session with too few samples must start clean rather than counting
     // the previous run's samples.
     LearnSession s2;
-    s2.Start(0, LadderProfile{});
+    s2.Start(LadderProfile{});
     LadderButton out2{};
     EXPECT_EQ(s2.SampleCount(), 0);
     EXPECT_EQ(s2.Commit(&out2), LearnReject::kTooFewSamples)
@@ -246,7 +246,7 @@ TEST(LearnSession, AWindowThatWouldMakeTheProfileInvalidIsRefusedAtCommit) {
     // The numbers here are the measured case: an existing button at 1430 +/- 120,
     // a new one at 1560 with a 130 mV spread. The commit used to return kNone.
     LearnSession s;
-    s.Start(0, ExistingWith("vol_up", 1430, 120));
+    s.Start(ExistingWith("vol_up", 1430, 120));
     uint64_t t = 1000;
     for (int i = 0; i < 40; ++i) {
         // A 130 mV spread, alternating so min/max reach it. Under the 170 mV noise
@@ -269,7 +269,7 @@ TEST(LearnSession, EveryCommittedProfileIsAcceptedByTheConfigValidator) {
     for (int center = 1450; center <= 2100; center += 10) {
         for (int spread = 0; spread <= 180; spread += 10) {
             LearnSession s;
-            s.Start(0, ExistingWith("vol_up", 1430, 120));
+            s.Start(ExistingWith("vol_up", 1430, 120));
             uint64_t t = 1000;
             for (int i = 0; i < 40; ++i) {
                 const int mv = (i % 2 == 0) ? center - spread / 2 : center + spread / 2;

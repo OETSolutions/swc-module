@@ -68,8 +68,22 @@ public:
      * the release that follows a real hold. With only the re-arm, a
      * programmatically-requested learn loses the user's first press; with only the
      * flag, the hold is counted anyway. Both were tried and measured.
+     *
+     * `existing` is the channel's ladder as currently stored, and it SEEDS the
+     * session. Without it a learn is destructive rather than additive: `Commit`
+     * returns a profile containing only this session's buttons, and the caller
+     * ASSIGNS it over the channel's ladder, so re-entering the wizard to re-measure
+     * ONE button silently deletes every other button on that channel -- measured:
+     * three learned buttons became one. Passing the existing ladder also gives the
+     * session the right `existing_` set for the `too_close_to_existing` gate and
+     * for the tolerance's nearest-neighbour gap.
+     *
+     * Re-learning an id this ladder already carries REPLACES that entry in place,
+     * so a re-measure corrects the window instead of adding a second button with
+     * the same id (which nothing rejects, and which makes `BindingResolve`'s
+     * `strcmp` on the id ambiguous between two different levels).
      */
-    void Enter(uint64_t now_ms, bool aux_held = false);
+    void Enter(uint64_t now_ms, bool aux_held = false, const LadderProfile *existing = nullptr);
     void Exit(uint64_t now_ms);
 
     bool Active() const { return state_ != State::kIdle && state_ != State::kExit; }
@@ -102,7 +116,9 @@ public:
     // The 1-based button slot being selected.
     int SelectedSlot() const { return selected_slot_; }
 
-    // The profile being filled, and how many buttons it holds.
+    // The profile being filled, and how many buttons it holds. It is SEEDED from
+    // the channel's existing ladder on Enter (see `Enter` on `existing`), so it
+    // holds everything the channel already knows plus whatever this session adds.
     const LadderProfile &Profile() const { return profile_; }
     int ButtonCount() const { return profile_.count; }
 
@@ -116,6 +132,11 @@ private:
     // time, because Play() replaces rather than queues.
     void ServiceBeeps();
 
+    // `profile_` minus the entry this learn is replacing, by id. The session
+    // compares VOLTAGES and knows nothing about ids, so the id-based decision
+    // lives here -- see the definition for why it must.
+    LadderProfile NeighbourSetExcludingTheSlotBeingLearned() const;
+
     IHAL          *hal_;
     BuzzerGrammar *buzzer_;
     LedGrammar    *leds_;
@@ -126,6 +147,10 @@ private:
     State      state_ = State::kIdle;
     LadderProfile profile_{};
     LadderProfile aux_profile_{};
+
+    // The channel being learned, learned from `Tick`. Only used to spell the id
+    // pattern this class generates (`swc<ch>_bt<slot>`), never to index anything.
+    int      channel_ = 0;
 
     int      press_count_ = 0;
     int      selected_slot_ = 0;

@@ -553,11 +553,13 @@ class AppViewModelTest {
     fun `an edit is dropped when the button is on the OTHER channel's ladder, not this one`() =
         runTest {
             // `BindingResolve` looks the id up in `channels[channel_index].ladder`,
-            // so a binding whose channel's ladder does not hold the id is never
-            // found -- and `BindingNamesARealInput` refuses it, nacking the WHOLE
-            // save. The check must therefore be "on THIS channel's ladder", not "on
-            // SOME ladder": the two differ exactly when a button is re-learned onto
-            // one channel only, which is what a second-channel re-learn does. The
+            // so a binding whose channel's ladder does not hold the id never fires.
+            // The firmware would ACCEPT the save anyway -- `BindingNamesARealInput`
+            // checks whether the id is on ANY channel's ladder, not the named
+            // one -- so the binding would be silently DEAD on the device. The
+            // check must therefore be "on THIS channel's ladder", not "on SOME
+            // ladder": the two differ exactly when a button is re-learned onto one
+            // channel only, which is what a second-channel re-learn does. The
             // mutation that weakened the check to "on any ladder" survived every
             // other test in this file.
             val t = FakeTransport()

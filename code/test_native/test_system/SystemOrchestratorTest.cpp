@@ -100,6 +100,51 @@ TEST(SystemOrchestrator, BootDrivesTheAdjustChannelIntoTheOneKiloOhmPulldown) {
     EXPECT_EQ(hal.LastDacPowerMode(DAC_CH_ADJ1), DAC_POWER_GND_1K);
 }
 
+TEST(SystemOrchestrator, TrackingModeMirrorsTheSignalCodeOntoTheAdjustChannel) {
+    /*
+     * Spec 2.3 / DESIGN 4.4: gain 1.00 in tracking mode exists ONLY because
+     * `V_ADJ` tracks the signal channel's code -- `V_ADJ = V_DAC` cancels the
+     * `(R58/R61)` terms in `V_KEY = (1+R58/R61)*V_DAC - (R58/R61)*V_ADJ`.
+     *
+     * The gain-mode SELECTION writes the power mode, and that was all that was
+     * ever written: the ADJ channel's CODE was never set, so it stayed at its
+     * power-on value of 0 and the amplifier delivered 1.82x, not 1.00x. That is
+     * the OVER-RANGE direction spec 6.2 calls the only dangerous one -- a 3 V
+     * head unit commanded at nearly twice its intended level. The existing suite
+     * passed throughout, because no test read ADJ's code.
+     */
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.channels[0].output.gain_mode = GainMode::kTracking;   // concrete 3 V
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 1200);   // x2 = 2400 mV < 2600 -> 3 V
+    o.Boot();
+
+    ASSERT_EQ(o.ChannelGainMode(0), GainMode::kTracking);
+    ASSERT_EQ(hal.LastDacPowerMode(DAC_CH_ADJ1), DAC_POWER_NORMAL)
+        << "gain 1.00 needs V_ADJ live, not the pulldown";
+    // The mirror itself: the idle write must have put the SAME code on V_ADJ.
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_ADJ1), hal.LastDacCode(DAC_CH_KEY1))
+        << "tracking mode must drive V_ADJ = V_DAC, or the gain is 1.82 not 1.00";
+}
+
+TEST(SystemOrchestrator, AmplifiedModeLeavesTheAdjustChannelAtZero) {
+    // The other half, and the reason the mirror is conditioned on the mode: in
+    // amplified mode V_ADJ must stay in its 1 kohm power-down (0 V) so the
+    // 1.82 gain holds. Mirroring unconditionally would silently drop a 5 V head
+    // unit to gain 1.00 and lose most of the output span.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);   // 5 V line
+    o.Boot();
+    ASSERT_EQ(o.ChannelGainMode(0), GainMode::kAmplified);
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_ADJ1), 0)
+        << "amplified mode needs V_ADJ at 0 V (the 1k pulldown); mirroring would "
+           "defeat the 1.82 gain";
+}
+
 TEST(SystemOrchestrator, BootAppliesTheGainPolicyWhenTheChannelDefers) {
     /*
      * FR-14's AUTO rule, END TO END rather than at the unit.

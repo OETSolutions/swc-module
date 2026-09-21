@@ -12,7 +12,11 @@ import kotlinx.serialization.Serializable
  * worst case is 22,407 B and the partition holds 48,384 B — see ConfigModel.h's
  * note. The app must not accept a string the firmware cannot store, or the config
  * fails to save on the device after the user has already tapped Save. The limits
- * are enforced in [ConfigJson.encode], not merely documented.
+ * are CHECKED in [ConfigJson.problems], which [com.oetsolutions.swc.link.SwcClient.setConfig]
+ * runs before it sends anything — an earlier version of this comment named
+ * `ConfigJson.encode` as the enforcement point, and `encode` contains no width
+ * check at all: it would happily write an over-long target and leave the device
+ * to refuse the save.
  */
 
 const val K_MAX_CHANNELS = 2

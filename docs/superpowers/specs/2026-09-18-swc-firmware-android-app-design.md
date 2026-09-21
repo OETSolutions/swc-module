@@ -154,6 +154,17 @@ V_KEY = (1 + R58/R61)·V_DAC − (R58/R61)·V_ADJ
    | 5 V range | powered down (`PD1:PD0 = 01`) → defined 1 kΩ to GND | **1.82** |
    | 3 V range | normal, tracking the signal channel's code | **1.00** |
 
+   **"Tracking the signal channel's code" means `V_ADJ = V_DAC` on EVERY code
+   write, not just at gain selection.** Selecting the mode only sets the ADJ
+   channel's *power mode* (its code field is 0 in that write); the tracking
+   relationship is a property of the two channels carrying the *same code*, so
+   each KEY-line write must be paired with the matching ADJ write. Writing the
+   power mode alone leaves `V_ADJ = 0` and the amplifier delivering 1.82× — the
+   over-range direction §6.2 calls the only dangerous one — while every
+   power-mode assertion still reads correct. (Found 2026-09-22: the firmware
+   selected tracking mode and never wrote ADJ's code, so a 3 V head unit was
+   driven at 1.82× and no test noticed because none read ADJ's code.)
+
 2. **Releasing the KEY line needs no special mode.** `Q4` only sinks. To
    release, command a target *above* the head unit's own idle voltage; the servo
    drives the gate low, `Q4` turns off, and the line floats up through the head

@@ -348,8 +348,13 @@ class SwcClient(private val transport: SwcTransport) {
     }
 
     /**
-     * Ask the device to identify itself. Spec 4.5: `hello` carries `protocol_v`,
-     * which is what [state] keys the mismatch off.
+     * Ask the device to identify itself. Spec 4.5's `hello` is unsolicited-on-connect
+     * (the firmware emits it from its DTR callback), so this `ping` is a nudge, not
+     * the trigger; the firmware answers it with a `status`, not a `hello`.
+     *
+     * The version check is NOT here: [handle] keys [state]'s mismatch off the
+     * envelope `v`, which the firmware writes from the same `kNdjsonProtocolVersion`
+     * it puts in `hello.protocol_v`. `hello.protocol_v` itself is never read.
      */
     suspend fun connect() {
         send(Frames.PING)

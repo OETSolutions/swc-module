@@ -378,6 +378,20 @@ private:
     // key's voltage.
     void ReleaseKey(uint8_t index);
     /*
+     * Write a channel's signal DAC code, and in TRACKING mode mirror the SAME
+     * code onto its V_ADJ channel.
+     *
+     * Spec 2.3 / DESIGN 4.4: tracking mode has gain 1.00 because `V_ADJ` tracks
+     * the signal channel's code -- `V_ADJ = V_DAC` cancels the `(R58/R61)`
+     * terms. Amplified mode (1.82) is the opposite: `V_ADJ` sits in its defined
+     * 1 kohm power-down, contributing nothing. The gain-mode SELECTION writes
+     * the power mode; nothing else did, so tracking mode drove a live 1.82
+     * against a 3 V head unit -- the over-range direction spec 6.2 calls the
+     * only dangerous one. One write point, because every KEY code write must
+     * carry its V_ADJ with it or the two can disagree mid-pulse.
+     */
+    void DriveKeyCode(uint8_t index, uint16_t code);
+    /*
      * Present a ladder level on the head unit as ONE bounded pulse, by RATIO.
      *
      * This is spec 6.9's mapping, and it has two callers: the no-config
@@ -390,7 +404,7 @@ private:
      * FR-12 takes for an unrecognised level.
      */
     bool PresentLevel(uint8_t index, int level_mv, int wheel_idle_mv, int sense_mv,
-                      uint64_t now_ms, DacChannel key_ch);
+                      uint64_t now_ms);
     void ApplyLearnedProfile(int channel, const LadderProfile &profile);
     // Spec 4.3's `event`. Called at the moment of recognition, from inside
     // ServiceChannel's resolution branch, because a gesture can complete on any

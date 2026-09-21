@@ -632,11 +632,18 @@ class AppViewModel(
             // The button must be on the LADDER THE EDIT'S CHANNEL names -- not
             // merely on SOME ladder. `BindingResolve` looks the id up in
             // `channels[channel_index].ladder`, so a binding whose channel's ladder
-            // does not hold the id is never found. Checking "on any ladder" would
-            // pass an SWC2 edit of a button that exists only on SWC1, and the
-            // firmware's `BindingNamesARealInput` would then refuse the whole
-            // config. `vol_up` is on BOTH ladders (the common case), so the check
-            // must be per-channel or it drops a legitimate second-channel edit.
+            // does not hold the id is never found: an SWC2 edit of a button that
+            // exists only on SWC1 would be DEAD on the device.
+            //
+            // The firmware does NOT catch this -- `BindingNamesARealInput` accepts
+            // any id that is on ANY channel's ladder (ConfigCodec.cpp), so the save
+            // would SUCCEED and the binding would simply never fire. We drop the
+            // edit instead of writing a binding we know can never resolve. (Note
+            // the asymmetry with the STALE case below, where the id is on no ladder
+            // at all and the firmware genuinely does refuse.)
+            //
+            // `vol_up` is on BOTH ladders (the common case), so the check must be
+            // per-channel or it drops a legitimate second-channel edit.
             //
             // A button that is on NO ladder the config still has is a STALE edit:
             // its key came from a grid built against an earlier config, and a later

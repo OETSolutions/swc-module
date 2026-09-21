@@ -144,7 +144,6 @@ void SystemOrchestrator::EstablishSafeIdle() {
     int first_idle_key_mv = 0;
 
     for (uint8_t i = 0; i < n; ++i) {
-        const DacChannel key_ch = (i == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
         const DacChannel adj_ch = (i == 0) ? DAC_CH_ADJ1 : DAC_CH_ADJ2;
 
         // Measure the head unit's idle before choosing gain: V_KEY_idle is twice
@@ -199,7 +198,7 @@ void SystemOrchestrator::EstablishSafeIdle() {
         }
 
         idle_code_[i] = idle_code;
-        hal_->dac_set_code(hal_->ctx, key_ch, idle_code);
+        DriveKeyCode(i, idle_code);
         if (i == 0) first_idle_key_mv = GainPolicyKeyMvForCode(mode, idle_code);
     }
 
@@ -590,7 +589,6 @@ bool SystemOrchestrator::TestDriveKeyMv(uint8_t channel_index, int key_mv, uint3
     if (!safe_idle_established_) return false;
 
     ChannelState &cs = channels_[channel_index];
-    const DacChannel key_ch = (channel_index == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
 
     // Shares the servo with the action path, so what the bench measures is what
     // a real press produces -- a direct dac_set_code would bypass the trim loop
@@ -599,7 +597,7 @@ bool SystemOrchestrator::TestDriveKeyMv(uint8_t channel_index, int key_mv, uint3
     cs.servo.Update(hal_->adc_read_mv(hal_->ctx,
                                       (channel_index == 0) ? ADC_CH_KEY_SENSE1
                                                            : ADC_CH_KEY_SENSE2));
-    hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());
+    DriveKeyCode(channel_index, cs.servo.Code());
     cs.key_driven = true;
     // A test command has no gesture to resolve, so it drives immediately and
     // releases on the caller's hold time.
@@ -694,17 +692,31 @@ void SystemOrchestrator::Identify() {
 void SystemOrchestrator::ReleaseKey(uint8_t index) {
     ChannelState &cs = channels_[index];
     if (!cs.key_driven) return;
-    const DacChannel key_ch = (index == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
     // Re-point the servo at idle BEFORE writing, so a later `Update()` trims
     // toward idle rather than toward the key just released.
     cs.servo.Target(gain_mode_[index],
                     GainPolicyKeyMvForCode(gain_mode_[index], idle_code_[index]));
-    hal_->dac_set_code(hal_->ctx, key_ch, idle_code_[index]);
+    // Through `DriveKeyCode`, not a bare KEY write: in tracking mode the idle
+    // code must reach V_ADJ too, or the release leaves the 1.82 gain engaged and
+    // the "idle" command over-drives the 3 V line -- a held-key hazard (spec 6.7).
+    DriveKeyCode(index, idle_code_[index]);
     cs.key_driven = false;
 }
 
+void SystemOrchestrator::DriveKeyCode(uint8_t index, uint16_t code) {
+    const DacChannel key_ch = (index == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
+    hal_->dac_set_code(hal_->ctx, key_ch, code);
+    // Tracking mode needs V_ADJ == V_DAC (spec 2.3). Amplified mode already has
+    // the ADJ channel in its 1 kohm power-down (set once at gain selection), so
+    // mirroring there would defeat the 1.82 gain the mode exists for.
+    if (gain_mode_[index] == GainMode::kTracking) {
+        const DacChannel adj_ch = (index == 0) ? DAC_CH_ADJ1 : DAC_CH_ADJ2;
+        hal_->dac_set_code(hal_->ctx, adj_ch, code);
+    }
+}
+
 bool SystemOrchestrator::PresentLevel(uint8_t index, int level_mv, int wheel_idle_mv,
-                                      int sense_mv, uint64_t now_ms, DacChannel key_ch) {
+                                      int sense_mv, uint64_t now_ms) {
     ChannelState &cs = channels_[index];
     // This channel's own head-unit idle. With none there is nothing to map the
     // ratio ONTO, and a fabricated denominator would land every press on a key
@@ -720,7 +732,7 @@ bool SystemOrchestrator::PresentLevel(uint8_t index, int level_mv, int wheel_idl
         (static_cast<long>(head_unit_idle_mv) * level_mv) / wheel_idle_mv);
     cs.servo.Target(gain_mode_[index], target);
     cs.servo.Update(sense_mv);
-    hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());
+    DriveKeyCode(index, cs.servo.Code());
     cs.key_driven = true;
     // Held for the recognition time, then released: the head unit must see ONE
     // key event, not a line held down (spec 6.6 -- it is gesture-blind, so a held
@@ -732,8 +744,6 @@ bool SystemOrchestrator::PresentLevel(uint8_t index, int level_mv, int wheel_idl
 void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     ChannelState &cs = channels_[index];
     const ChannelConfig &cc = config_.channels[index];
-
-    const DacChannel key_ch = (index == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
 
     // Spec 3.4: `Channel.enabled` gates whether this channel's LEARNED LADDER is
     // classified -- "this channel has no learned ladder to compare against, do not
@@ -866,7 +876,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                 // safe-idle code instead would scale against 5200 mV and push low
                 // buttons into the clamp, which is the wrong key rather than a
                 // quieter one.
-                PresentLevel(index, level_mv, idle, sense_mv, now_ms, key_ch);
+                PresentLevel(index, level_mv, idle, sense_mv, now_ms);
             } else if (falling_edge) {
                 ReleaseKey(index);
             }
@@ -967,7 +977,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                     }
                     cs.servo.Target(gain_mode_[index], a.key_mv);
                     cs.servo.Update(sense_mv);
-                    hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());
+                    DriveKeyCode(index, cs.servo.Code());
                     cs.key_driven = true;
                     cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
                 } else {
@@ -1028,7 +1038,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                 const LadderProfile &ladder = config_.channels[index].ladder;
                 if (bi < ladder.count &&
                     PresentLevel(index, ladder.buttons[bi].mv_center, ladder.learned_idle_mv,
-                                 sense_mv, now_ms, key_ch)) {
+                                 sense_mv, now_ms)) {
                     buzzer_.Play(BuzzerPattern::kKeyAccepted);
                 } else {
                     // No usable head-unit idle (or no such button): there is nothing

@@ -109,6 +109,12 @@ bool NdjsonParseEnvelope(const char *line, FrameHeader *out) {
         // both silent corruptions, and both are reachable from a peer bug.
         if (vd < 0.0 || vd > 255.0) break;
         if (seqd < 0.0 || seqd > 4294967295.0) break;
+        // And refuse a fraction for the same reason: `seq = 1.9` would be cast to
+        // 1, so the frame is acknowledged as sequence 1 and the peer's own
+        // bookkeeping disagrees with the device's -- a silent renumber, which is
+        // the failure this function's required-`seq` rule above exists to avoid.
+        if (vd != static_cast<double>(static_cast<uint8_t>(vd))) break;
+        if (seqd != static_cast<double>(static_cast<uint32_t>(seqd))) break;
 
         FrameHeader h{};
         h.v = static_cast<uint8_t>(vd);

@@ -125,3 +125,23 @@ TEST(NdjsonReader, RecoversFromAnOverrunWithoutAnExplicitConsume) {
     EXPECT_EQ(res, NdjsonResult::kComplete);
     EXPECT_STREQ(r.Line(), "{\"v\":1,\"seq\":9,\"type\":\"ping\"}");
 }
+
+TEST(NdjsonEnvelope, RejectsAnOutOfRangeOrFractionalVersionAndSequence) {
+    // `(uint8_t)256.0` and `(uint32_t)-1.0` are silent corruptions, and so is a
+    // fraction: `seq = 1.9` casts to 1, so the frame is acked as sequence 1 and
+    // the device's bookkeeping silently disagrees with the peer's -- the same
+    // "renumber the peer's frames" failure that making `seq` REQUIRED exists to
+    // avoid.
+    FrameHeader h{};
+    EXPECT_FALSE(NdjsonParseEnvelope("{\"v\":256,\"seq\":1,\"type\":\"event\"}", &h));
+    EXPECT_FALSE(NdjsonParseEnvelope("{\"v\":-1,\"seq\":1,\"type\":\"event\"}", &h));
+    EXPECT_FALSE(NdjsonParseEnvelope("{\"v\":1.9,\"seq\":1,\"type\":\"event\"}", &h));
+    EXPECT_FALSE(NdjsonParseEnvelope("{\"v\":1,\"seq\":-1,\"type\":\"event\"}", &h));
+    EXPECT_FALSE(NdjsonParseEnvelope("{\"v\":1,\"seq\":1.9,\"type\":\"event\"}", &h));
+    EXPECT_FALSE(NdjsonParseEnvelope("{\"v\":1,\"seq\":4294967296,\"type\":\"event\"}", &h));
+
+    // The boundary integers still parse (the bound is not over-tight).
+    ASSERT_TRUE(NdjsonParseEnvelope("{\"v\":255,\"seq\":4294967295,\"type\":\"event\"}", &h));
+    EXPECT_EQ(h.v, 255);
+    EXPECT_EQ(h.seq, 4294967295u);
+}

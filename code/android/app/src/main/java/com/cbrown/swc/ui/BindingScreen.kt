@@ -10,6 +10,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.DropdownMenu
@@ -46,14 +47,26 @@ import com.oetsolutions.swc.model.Action
  * own parameter name from the contract (`package`, `action`, …), and the screen
  * refuses to save an empty one — the same rule the firmware enforces, from the same
  * generated table, so the two cannot disagree about which kinds need a parameter.
+ *
+ * **A cell tap opens [ActionPicker] for that cell.** It did not, once: the tap went
+ * straight to `onEdit(cell, null)`, which CLEARS the binding, and `ActionPicker` —
+ * written in the same commit as this screen — was composed nowhere. The only thing
+ * the Bindings screen could do was delete, and the user's route to binding a button
+ * to anything did not exist. Tapping now opens the picker; clearing is its own
+ * explicit button inside it, so "unbind" can no longer be the accidental result of
+ * a stray tap.
  */
 @Composable
 fun BindingScreen(
     state: BindingUiState,
-    onEdit: (BindingCell) -> Unit,
+    onEdit: (BindingCell, Action?) -> Unit,
     onSave: () -> Unit,
     modifier: Modifier = Modifier,
 ) {
+    // Which cell's picker is open, if any. Keyed by the same id the grid keys on,
+    // so a config refresh cannot leave the dialog pointed at a stale cell.
+    var editing by remember { mutableStateOf<BindingCell?>(null) }
+
     Column(
         modifier = modifier.fillMaxSize().padding(16.dp),
         verticalArrangement = Arrangement.spacedBy(12.dp),
@@ -84,7 +97,7 @@ fun BindingScreen(
                             Text(cell.gesture, style = MaterialTheme.typography.labelMedium)
                         }
                         TextButton(
-                            onClick = { onEdit(cell) },
+                            onClick = { editing = cell },
                             modifier = Modifier.semantics {
                                 contentDescription =
                                     "${cell.buttonName} ${cell.gesture}: " +
@@ -98,6 +111,21 @@ fun BindingScreen(
             }
         }
 
+        editing?.let { cell ->
+            ActionEditorDialog(
+                cell = cell,
+                onPick = { action ->
+                    onEdit(cell, action)
+                    editing = null
+                },
+                onClear = {
+                    onEdit(cell, null)
+                    editing = null
+                },
+                onDismiss = { editing = null },
+            )
+        }
+
         state.problems.takeIf { it.isNotEmpty() }?.let { problems ->
             Card(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(12.dp)) {
@@ -109,6 +137,32 @@ fun BindingScreen(
         Button(onClick = onSave, enabled = state.problems.isEmpty()) { Text("Save to device") }
     }
 }
+
+/** The picker for one cell, with an explicit way to clear the binding. */
+@Composable
+private fun ActionEditorDialog(
+    cell: BindingCell,
+    onPick: (Action) -> Unit,
+    onClear: () -> Unit,
+    onDismiss: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text("${cell.buttonName} · ${cell.gesture}") },
+        // The picker's own Apply button commits the action; this dialog's buttons
+        // are the two exits that do NOT commit. `Clear binding` is here and not on
+        // the cell, so unbinding is deliberate rather than what a stray tap does.
+        text = { ActionPicker(current = cell.action, onPick = onPick) },
+        confirmButton = {},
+        dismissButton = {
+            Row {
+                TextButton(onClick = onClear) { Text("Clear binding") }
+                TextButton(onClick = onDismiss) { Text("Cancel") }
+            }
+        },
+    )
+}
+
 
 data class BindingCell(
     val buttonId: String,

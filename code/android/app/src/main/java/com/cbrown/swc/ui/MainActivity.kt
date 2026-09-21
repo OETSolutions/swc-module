@@ -174,7 +174,7 @@ private fun AppScaffold(
                 Screen.LADDER -> LadderScreen(state = ladder)
                 Screen.BINDINGS -> BindingScreen(
                     state = bindings,
-                    onEdit = { onEdit(it, null) },
+                    onEdit = onEdit,
                     onSave = onSave,
                 )
                 Screen.UPDATE -> UpdateScreen(

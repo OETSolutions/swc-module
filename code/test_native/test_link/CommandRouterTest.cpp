@@ -1289,3 +1289,66 @@ TEST(CommandRouter, AConfigPatchStillAcceptsAnInRangeValueAtTheBoundary) {
     ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
     EXPECT_EQ(out.settings.timings.long_press_ms, 900u);
 }
+
+TEST(CommandRouter, AChannelIndexWithAFractionIsRefusedNotRounded) {
+    // Every channel-reading handler range-checked the CONVERTED int, which cannot
+    // see a fraction: `channel = 1.9` became 1 and drove the first channel -- a
+    // command accepted as channel 1.9 but executed on channel 1. Same rule as the
+    // codec's integer fields.
+    const char *frames[] = {
+        "{\"v\":1,\"seq\":1,\"type\":\"test_key\",\"channel\":1.9,\"key_mv\":2400}",
+        "{\"v\":1,\"seq\":2,\"type\":\"learn_start\",\"channel\":0.5}",
+        "{\"v\":1,\"seq\":3,\"type\":\"learn_commit\",\"channel\":1.2,\"button_id\":\"b\",\"name\":\"B\"}",
+    };
+    for (const char *f : frames) {
+        MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+        ASSERT_TRUE(store.Save(MockHalDefaultsConfig()));
+        CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+        cap.Attach(r);
+        r.OnLine(f, strlen(f));
+        EXPECT_TRUE(HasType(cap, "nack")) << f;
+        EXPECT_FALSE(HasType(cap, "ack")) << f;
+    }
+}
+
+TEST(CommandRouter, AnOutOfRangeCrcIsRefusedRatherThanWrapped) {
+    // `crc32 = 1e10` was cast to a wrapped 32-bit value no real CRC equals, so
+    // every chunk of the run was then rejected as corrupt with no visible reason.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const char *begin =
+        "{\"v\":1,\"seq\":1,\"type\":\"config_begin\",\"total_len\":100,\"crc32\":1e10}";
+    r.OnLine(begin, strlen(begin));
+    EXPECT_TRUE(HasType(cap, "nack"));
+    EXPECT_FALSE(HasType(cap, "ack"));
+}
+
+TEST(CommandRouter, ATestKeyWithAFractionalMillivoltIsRefused) {
+    // A bare `static_cast<int>` of an out-of-range double is undefined behavior,
+    // and the envelope check downstream can only see an int formed safely. This
+    // needs a REAL orchestrator, or the handler nacks `unavailable` before it
+    // ever reaches the key_mv conversion -- and the test would pass for a reason
+    // that has nothing to do with the conversion.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+    const char *f =
+        "{\"v\":1,\"seq\":1,\"type\":\"test_key\",\"channel\":0,\"key_mv\":2400.5}";
+    r.OnLine(f, strlen(f));
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("bad_param"), std::string::npos)
+        << "the refusal must be the key_mv check, not `unavailable`";
+    EXPECT_FALSE(HasType(cap, "ack"));
+
+    // And an in-envelope integer key still drives (the bound is not over-tight).
+    Capture cap2;
+    cap2.Attach(r);
+    const char *g =
+        "{\"v\":1,\"seq\":2,\"type\":\"test_key\",\"channel\":0,\"key_mv\":2400}";
+    r.OnLine(g, strlen(g));
+    EXPECT_TRUE(HasType(cap2, "ack")) << "an in-envelope integer key must still be acked";
+}

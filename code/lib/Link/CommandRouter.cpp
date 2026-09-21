@@ -62,6 +62,18 @@ bool NumToU8(const double v, uint8_t *out) {
     return true;
 }
 
+// A channel index is read by several handlers that each range-check it against
+// `kMaxChannels` afterwards. That check is on the CONVERTED int, so it cannot see
+// a fractional part: `channel = 1.9` became 1 and drove the first channel, a
+// command accepted as channel 1.9 but executed on channel 1. Same rule as the
+// codec's integer fields -- refuse the fraction, do not round it.
+bool NumToChannel(const double v, uint8_t *out) {
+    if (v < 0.0 || v >= static_cast<double>(kMaxChannels)) return false;
+    if (v != static_cast<double>(static_cast<uint8_t>(v))) return false;
+    *out = static_cast<uint8_t>(v);
+    return true;
+}
+
 }  // namespace
 
 CommandRouter::CommandRouter(IHAL *hal, SystemOrchestrator *sys, ConfigStore *store)
@@ -426,7 +438,14 @@ void CommandRouter::HandleConfigBegin(const cJSON *root, uint32_t for_seq) {
     }
     ResetRun();
     expected_len_ = static_cast<size_t>(tl);
-    expected_crc_ = static_cast<uint32_t>(crc->valuedouble);
+    // The CRC is a uint32 and arrived unbounded, so a peer-sent `crc32 = 1e10`
+    // was cast to a wrapped 32-bit value that no real CRC equals -- every chunk
+    // would then be rejected as corrupt with no visible reason. Bounded here so
+    // the peer's own number is what the final compare uses.
+    if (!NumToU32(crc->valuedouble, &expected_crc_)) {
+        Nack(for_seq, "bad_frame", "crc32 out of range");
+        return;
+    }
     run_open_ = true;
     char body[64];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
@@ -652,25 +671,40 @@ void CommandRouter::HandleTestKey(const cJSON *root, uint32_t for_seq) {
     // something other than what it asked for.
     const cJSON *ch = Num(root, "channel");
     const cJSON *hold = Num(root, "hold_ms");
-    const int channel = (ch != nullptr) ? static_cast<int>(ch->valuedouble) : 0;
-    if (channel < 0 || channel >= kMaxChannels) {
+    uint8_t channel = 0;
+    if (ch != nullptr && !NumToChannel(ch->valuedouble, &channel)) {
         Nack(for_seq, "bad_param", "channel out of range");
         return;
     }
-    const int mv = static_cast<int>(key_mv->valuedouble);
+    // `key_mv` is bounded BEFORE the int cast for the same reason as everything
+    // else here: a bare `static_cast<int>` of an out-of-range double is undefined
+    // behavior, and `TestDriveKeyMv` can only range-check an int that was formed
+    // safely. The envelope check still lives there -- this only ensures the value
+    // it sees is the value that was sent.
+    const double mvd = key_mv->valuedouble;
+    if (mvd != static_cast<double>(static_cast<int>(mvd)) || mvd < -32768.0 || mvd > 32767.0) {
+        Nack(for_seq, "bad_param", "key_mv is not an integer in range");
+        return;
+    }
+    const int mv = static_cast<int>(mvd);
     // `hold_ms` is bounded rather than taken as sent. A hold is time the OUTPUT
     // is driven, so an unbounded value pins the KEY line; 0 means "use the
     // default", matching the firmware's other hold sentinels.
     uint32_t hold_ms = kDefaultTestKeyHoldMs;
     if (hold != nullptr) {
         const double hd = hold->valuedouble;
-        if (hd < 0.0 || hd > static_cast<double>(kTestKeyMaxHoldMs)) {
+        uint32_t bounded = 0;
+        if (hd != 0.0 && !NumToU32(hd, &bounded)) {
             Nack(for_seq, "bad_param", "hold_ms out of range");
             return;
         }
-        if (hd > 0.0) hold_ms = static_cast<uint32_t>(hd);
+        if (bounded > kTestKeyMaxHoldMs) {
+            Nack(for_seq, "bad_param", "hold_ms out of range");
+            return;
+        }
+        if (bounded > 0) hold_ms = bounded;
     }
-    if (!sys_->TestDriveKeyMv(static_cast<uint8_t>(channel), mv, hold_ms, hal_->now_ms(hal_->ctx))) {
+    if (!sys_->TestDriveKeyMv(channel, mv, hold_ms, hal_->now_ms(hal_->ctx))) {
         Nack(for_seq, "out_of_range", "key_mv is outside the output envelope");
         return;
     }
@@ -853,8 +887,8 @@ void CommandRouter::HandleLearnStart(const cJSON *root, uint32_t for_seq) {
         Nack(for_seq, "bad_param", "channel is required");
         return;
     }
-    const int channel = static_cast<int>(ch->valuedouble);
-    if (channel < 0 || channel >= kMaxChannels) {
+    uint8_t channel = 0;
+    if (!NumToChannel(ch->valuedouble, &channel)) {
         Nack(for_seq, "bad_param", "channel out of range");
         return;
     }
@@ -917,8 +951,8 @@ void CommandRouter::HandleLearnCommit(const cJSON *root, uint32_t for_seq) {
         Nack(for_seq, "bad_param", "channel, button_id and name are required");
         return;
     }
-    const int channel = static_cast<int>(ch->valuedouble);
-    if (channel < 0 || channel >= kMaxChannels) {
+    uint8_t channel = 0;
+    if (!NumToChannel(ch->valuedouble, &channel)) {
         Nack(for_seq, "bad_param", "channel out of range");
         return;
     }
@@ -927,8 +961,8 @@ void CommandRouter::HandleLearnCommit(const cJSON *root, uint32_t for_seq) {
     // the LEARNED one from the running config (spec 6.3) -- reading the live idle
     // here would make the ratio denominator move with the rail, which is exactly
     // what renormalizing by a pinned idle exists to prevent.
-    const int level_mv = sys_->FilteredLevelMv(static_cast<uint8_t>(channel));
-    const int idle_mv = sys_->IdleReferenceMv(static_cast<uint8_t>(channel));
+    const int level_mv = sys_->FilteredLevelMv(channel);
+    const int idle_mv = sys_->IdleReferenceMv(channel);
     session_.AddSample(level_mv, idle_mv, static_cast<MilliVolt>(idle_mv), 0,
                        hal_ ? hal_->now_ms(hal_->ctx) : 0);
 

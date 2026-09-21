@@ -392,7 +392,31 @@ capability is tested now and will already be correct when the part changes.
 
 ## Web UI and the serial monitor
 
-Two behaviours that look like faults and are not, plus one that was a real bug.
+**The web UI.** A sticky status bar at the top is always visible: a pulsing dot and
+"Running test N" while work is in flight, "Ready" otherwise. When a test needs you,
+a yellow **Action required** banner appears with the exact instruction and a
+**Done — continue ▶** button. Tests are clickable rows; long ones show `RUNNING` in
+the table.
+
+**Why it used to lock up, and what actually fixed it.** Tests ran synchronously
+inside `loop()`, so for the whole duration of a test (9 s for test 20, 12 s for test
+22, up to 90 s for the operator tests) the HTTP server was never serviced — the page
+could not load, could not refresh, and clicks did nothing. Patching around that (a
+pump inside the wait, a deferred-request flag, a spinner) treated the symptom.
+
+The fix is architectural: **tests run on their own FreeRTOS task**
+(`include/TestTask.h`), while `loop()`'s task does only the web server and the serial
+menu. A test can now block as much as it likes. The page polls `/state` and
+re-renders from the server's own answer, so a dropped request self-corrects instead
+of leaving the page stuck — and it reloads **once**, only when a test *ends*.
+
+**The serial monitor shows nothing until you type.** The board cannot detect that a
+terminal *attached* — USB-Serial-JTAG gives no such event — so a monitor opened on an
+already-running board sees a blank screen. Type any character and the menu appears.
+The menu prints before the WiFi association too, so a monitor attached at power-on
+sees it immediately rather than after up to 15 s of silence.
+
+**Two more stale behaviours that are not faults:
 
 **The serial monitor shows nothing until you type.** The board cannot detect that a
 terminal *attached* — USB-Serial-JTAG gives no such event — so a monitor opened on an

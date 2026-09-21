@@ -3,6 +3,9 @@
 #include <Arduino.h>
 #include <string.h>
 
+#include "freertos/FreeRTOS.h"
+#include "freertos/semphr.h"
+
 namespace Log {
 
 // ---------------------------------------------------------------------------
@@ -27,8 +30,17 @@ static size_t s_count = 0;      // how many lines the ring holds, saturating
 static char   s_flat[kRingLines * kLineBytes + 1];
 static size_t s_flat_len = 0;
 
+// Recursive, because Capture() is called from a handler that may already hold it and
+// a plain mutex there would self-deadlock. Created in Begin() before anything else
+// can touch the buffer.
+static SemaphoreHandle_t s_mtx = nullptr;
+
+void Lock()   { if (s_mtx) xSemaphoreTakeRecursive(s_mtx, portMAX_DELAY); }
+void Unlock() { if (s_mtx) xSemaphoreGiveRecursive(s_mtx); }
+
 void Begin()
 {
+    if (!s_mtx) s_mtx = xSemaphoreCreateRecursiveMutex();
     Serial.begin(115200);
     // HWCDC's begin() allocates its ring buffers; give the host a moment to
     // enumerate so the banner is not the thing that gets dropped.
@@ -59,6 +71,7 @@ static const char *RingLine(size_t i)
 
 void Printf(const char *fmt, ...)
 {
+    Lock();
     char buf[kLineBytes];
     va_list ap;
     va_start(ap, fmt);
@@ -67,6 +80,7 @@ void Printf(const char *fmt, ...)
 
     Serial.println(buf);
     CaptureLine(buf);
+    Unlock();
 }
 
 void Prompt(const char *fmt, ...)
@@ -98,6 +112,7 @@ void Section(const char *title)
 
 const char *Capture(size_t *out_len)
 {
+    Lock();
     // Flatten oldest-first so the web reader sees the same order a terminal did.
     size_t off = 0;
     for (size_t i = 0; i < s_count; ++i) {
@@ -111,16 +126,20 @@ const char *Capture(size_t *out_len)
     s_flat[off] = '\0';
     s_flat_len = off;
     if (out_len) *out_len = off;
-    return s_flat;
+    const char *r = s_flat;
+    Unlock();
+    return r;
 }
 
 void ClearCapture()
 {
+    Lock();
     s_next = s_count = 0;
     s_flat_len = 0;
     s_flat[0] = '\0';
+    Unlock();
 }
 
-size_t CaptureLines() { return s_count; }
+size_t CaptureLines() { Lock(); const size_t n = s_count; Unlock(); return n; }
 
 }  // namespace Log

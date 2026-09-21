@@ -8,10 +8,13 @@
 // test knows about either transport, so the same 30 tests work tethered or over
 // WiFi, and neither path can have a formatting quirk the other lacks.
 //
-// Threading: the web server (Arduino WebServer) is polled from loop(), and the
-// serial menu runs there too, so all of this is single-threaded. The buffer is
-// deliberately NOT mutex-guarded -- if that ever stops being true, the guard
-// belongs here and the comment should say so.
+// THREADING. Tests run on their own FreeRTOS task (see include/TestTask.h) while the
+// web server and serial menu run on loop()'s task, so this IS multi-threaded and the
+// guard lives here. Two writers would otherwise interleave inside a line and the
+// reader could flatten the ring mid-update, producing garbled output on the exact page
+// you are using to diagnose the board.
+//
+// The cost is one mutex per line, which is nothing next to a serial write.
 
 #include <stdarg.h>
 #include <stddef.h>
@@ -19,6 +22,11 @@
 namespace Log {
 
 void Begin();
+
+// The mutex must exist before any other call. Called from Begin(); exposed so the
+// task that owns the tests can be sure of the ordering.
+void Lock();
+void Unlock();
 
 // printf-style, appends a newline. The workhorse.
 void Printf(const char *fmt, ...);

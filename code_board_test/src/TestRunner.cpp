@@ -168,6 +168,8 @@ const Outcome &LastOutcome(size_t index)
 
 int RunningIndex() { return s_running; }
 
+size_t CompletedCount() { return s_result_count; }
+
 Outcome Run(size_t index)
 {
     const Test *t = Get(index);

@@ -20,6 +20,8 @@
 #include "Secrets.h"
 #include "Temp.h"
 #include "TestRunner.h"
+#include "TestTask.h"
+#include "tests/SetupPrompts.h"
 #include "swc_logic/Output.h"
 
 // ---------------------------------------------------------------------------
@@ -27,8 +29,11 @@
 // ---------------------------------------------------------------------------
 static WebServer s_http(80);
 static bool      s_web_up = false;
-static volatile int s_web_requested = -1;   // a test index asked for by the page
 
+// Set by any HTTP handler that runs. The operator-wait pump (see WaitPump) uses it to
+// treat "the operator clicked or refreshed" as "continue" -- the web UI has no
+// keystroke, so a request is the equivalent signal.
+static volatile bool s_continue_seen = false;
 // The page is deliberately one self-contained string with no external assets: it
 // must work on a car bench with no internet, and a CDN reference would fail
 // exactly when the tool is most needed. It re-fetches the log on a timer rather
@@ -38,21 +43,51 @@ static const char kPageHead[] PROGMEM =
     "<!doctype html><html><head><meta charset=utf-8>"
     "<meta name=viewport content='width=device-width,initial-scale=1'>"
     "<title>SWC bring-up</title><style>"
-    "body{font:13px/1.45 ui-monospace,Menlo,Consolas,monospace;background:#111;color:#ddd;margin:0;padding:12px}"
-    "h1{font-size:16px;margin:0 0 8px}h2{font-size:14px;margin:16px 0 6px;color:#9cf}"
-    "a.b,button{display:inline-block;background:#234;color:#cfe;border:1px solid #456;"
-    "border-radius:4px;padding:3px 8px;margin:2px;text-decoration:none;font:inherit;cursor:pointer}"
-    "button:hover,a.b:hover{background:#345}button.all{background:#253;border-color:#475}"
-    "button.sum{background:#333;border-color:#555}"
-    "table{border-collapse:collapse;width:100%;margin:4px 0 12px}"
-    "td,th{border-bottom:1px solid #2a2a2a;padding:3px 6px;text-align:left;vertical-align:top}"
-    "th{color:#9cf;font-weight:600}"
-    ".PASS{color:#6d6}.FAIL{color:#f77;font-weight:700}.BLOCKED{color:#da6}"
-    ".SKIP{color:#888}.WARN{color:#dc6}.NOTRUN,.empty{color:#666}"
-    "pre{background:#000;border:1px solid #2a2a2a;padding:8px;overflow:auto;"
-    "max-height:60vh;white-space:pre-wrap;font:inherit}"
-    ".m{color:#888;font-size:11px}</style></head><body>"
-    "<h1>SWC adapter &mdash; bring-up</h1>";
+    ":root{--bg:#0f1115;--fg:#e6e6e6;--dim:#8b93a1;--line:#252a33;--acc:#4aa3ff;"
+    "--ok:#3ddc84;--bad:#ff5c5c;--warn:#ffc857;--panel:#161a21}"
+    "*{box-sizing:border-box}"
+    "body{font:13px/1.5 ui-monospace,Menlo,Consolas,monospace;background:var(--bg);"
+    "color:var(--fg);margin:0;padding:0 16px 24px}"
+    "h1{font-size:17px;margin:0;font-weight:600}"
+    "h2{font-size:13px;margin:22px 0 8px;color:var(--dim);text-transform:uppercase;"
+    "letter-spacing:.08em;font-weight:600}"
+    "#bar{position:sticky;top:0;z-index:30;background:var(--panel);"
+    "border-bottom:1px solid var(--line);padding:10px 14px;margin:0 -16px 14px;"
+    "display:flex;align-items:center;gap:12px;flex-wrap:wrap}"
+    "#dot{width:10px;height:10px;border-radius:50%;background:var(--dim);flex:0 0 auto}"
+    ".busy #dot{background:var(--acc);animation:p 1s infinite}"
+    "@keyframes p{0%,100%{opacity:1}50%{opacity:.25}}"
+    "#head{font-weight:600}"
+    "#sub{color:var(--dim)}"
+    ".sp{flex:1}"
+    "#act{display:none;background:#3a2f00;border:2px solid var(--warn);"
+    "border-radius:8px;padding:14px 16px;margin:0 0 16px}"
+    "#act.on{display:block;animation:glow 1.4s infinite}"
+    "@keyframes glow{0%,100%{box-shadow:0 0 0 0 rgba(255,200,87,.5)}"
+    "50%{box-shadow:0 0 0 8px rgba(255,200,87,0)}}"
+    "#act .t{color:var(--warn);font-weight:700;font-size:14px;letter-spacing:.06em;"
+    "text-transform:uppercase;margin-bottom:6px}"
+    "#act .w{font-size:15px;margin-bottom:12px}"
+    "button,a.b{background:#232a35;color:var(--fg);border:1px solid #39424f;"
+    "border-radius:6px;padding:6px 12px;margin:2px 2px 2px 0;font:inherit;"
+    "cursor:pointer;text-decoration:none;display:inline-block}"
+    "button:hover:not(:disabled),a.b:hover{background:#2d3644;border-color:var(--acc)}"
+    "button:disabled{opacity:.4;cursor:not-allowed}"
+    "#go{background:var(--warn);color:#241c00;border-color:var(--warn);"
+    "font-weight:700;font-size:15px;padding:10px 20px}"
+    "button.t{background:transparent;border:1px solid var(--line);text-align:left;"
+    "width:100%;padding:6px 8px}"
+    "table{border-collapse:collapse;width:100%}td,th{border-bottom:1px solid var(--line);"
+    "padding:5px 8px;text-align:left;vertical-align:top}"
+    "th{color:var(--dim);font-weight:600;font-size:12px}"
+    "tr.running{background:#12233a}"
+    ".PASS{color:var(--ok);font-weight:600}.FAIL{color:var(--bad);font-weight:700}"
+    ".BLOCKED{color:var(--warn)}.SKIP{color:var(--dim)}.WARN{color:var(--warn)}"
+    ".NOTRUN{color:#525a68}.RUNNING{color:var(--acc);font-weight:700}"
+    "pre{background:#0a0c10;border:1px solid var(--line);border-radius:6px;padding:10px;"
+    "overflow:auto;max-height:52vh;white-space:pre-wrap;font:inherit;margin:0}"
+    ".m{color:var(--dim);font-size:11px}"
+    "</style></head><body>";
 
 static String statusClass(TestRunner::Result r)
 {
@@ -69,125 +104,110 @@ static String statusClass(TestRunner::Result r)
 static void handleRoot()
 {
     String h;
-    h.reserve(24000);
+    h.reserve(26000);
     h += FPSTR(kPageHead);
 
-    // Board state, at the top, because it is the context every result is read in.
+    // ---- the always-visible status bar ---------------------------------
+    h += "<div id=bar><span id=dot></span><span id=head>Ready</span>"
+         "<span id=sub></span><span class=sp></span>";
+    h += "<button id=bAll class=all onclick=\"runAll()\">Run all</button>";
+    h += "<button onclick=\"fetch('/summary').catch(()=>{})\">Summary</button>";
+    h += "<button onclick=\"fetch('/clear').then(()=>setTimeout(refreshLog,300))"
+         ".catch(()=>{})\">Clear log</button>";
+    h += "<a class=b href='/identify'>Identify board</a></div>";
+
+    // ---- the action banner (hidden until a test asks for something) ----
+    h += "<div id=act><div class=t>&#9888; Action required</div>"
+         "<div class=w id=actw></div>"
+         "<button id=go onclick=\"continue_()\">Done &mdash; continue &#9654;</button></div>";
+
     uint32_t tmv = 0;
     Adc::ReadAvgMv(Adc::kTemp, 16, &tmv);
     const float tc = Temp::CelsiusFromMv((float)tmv, 3300.0f);
 
-    h += "<div class=m>heap " + String(ESP.getFreeHeap() / 1024) + " kB &middot; ";
-    h += "NTC ";
-    if (isnan(tc)) h += "n/a";
-    else h += String(tc, 1) + " C";
-    h += " &middot; DAC 0x" + String(Dac::Address(), HEX);
-    h += " " + String(Dac::Present() ? "present" : "ABSENT");
-    h += " &middot; ADC " + String(Adc::CalibrationDegraded() ? "linear fallback" : "eFuse cal");
+    h += "<h2>Board</h2><div class=m>heap " + String(ESP.getFreeHeap() / 1024) +
+         " kB &middot; NTC ";
+    h += isnan(tc) ? String("n/a") : String(tc, 1) + " C";
+    h += " &middot; DAC 0x" + String(Dac::Address(), HEX) + " " +
+         String(Dac::Present() ? "present" : "ABSENT");
+    h += " &middot; ADC " +
+         String(Adc::CalibrationDegraded() ? "linear fallback" : "eFuse cal");
     h += "</div>";
 
-    h += "<h2>Actions</h2><div>";
-    h += "<button class=all id=bAll onclick=\"runAll()\">Run all 30</button>";
-    h += "<button class=sum onclick=\"fetch('/summary').catch(()=>{})\">Summary</button>";
-    h += "<button class=sum onclick=\"fetch('/clear').catch(()=>{})\">Clear log</button>";
-    h += "<a class=b href='/log'>Log only</a>";
-    h += "<a class=b href='/identify'>Identify (blink + beep)</a>";
-    h += "</div>";
-    // A live status line. The page cannot be told "running" by the server (the
-    // server is busy running the test), so the browser tracks it itself.
-    h += "<div id=st class=m style='min-height:1.2em'></div>";
-
-    h += "<h2>Tests</h2><table><tr><th>#</th><th>Test</th><th>Needs</th>"
-         "<th>Result</th><th>Detail</th></tr>";
+    // ---- the tests -----------------------------------------------------
+    h += "<h2>Tests</h2><table><tr><th style='width:34px'>#</th><th>Test</th>"
+         "<th>Needs</th><th style='width:90px'>Result</th><th>Detail</th></tr>";
 
     for (size_t i = 0; i < TestRunner::Count(); ++i) {
         const TestRunner::Test *t = TestRunner::Get(i);
         if (!t) continue;
         const TestRunner::Outcome &o = TestRunner::LastOutcome(i);
+        const bool running = (TestTask::RunningIndex() == (int)i);
 
-        h += "<tr><td>" + String(t->number) + "</td>";
-        // A button, not a link: a link would navigate (and reload) instead of
-        // scheduling, which is the bug this replaces.
-        h += "<td><button style='text-align:left' onclick='runTest(" +
-             String(t->number) + ")'>" + String(t->title) + "</button>";
+        h += "<tr id=r" + String(t->number) + (running ? " class=running>" : ">");
+        h += "<td>" + String(t->number) + "</td>";
+        h += "<td><button class=t onclick='runTest(" + String(t->number) + ")'>" +
+             String(t->title) + "</button>";
         h += "<div class=m>" + String(t->covers ? t->covers : "") + "</div></td>";
         h += "<td class=m>" + String(t->needs ? t->needs : "") + "</td>";
-        const bool is_running = (TestRunner::RunningIndex() == (int)i);
-        h += "<td class=" + (is_running ? String("WARN") : statusClass(o.result)) + ">" +
-             (is_running ? String("RUNNING") : String(TestRunner::ResultName(o.result)));
-        if (o.duration_ms) h += "<div class=m>" + String(o.duration_ms) + " ms</div>";
-        h += "</td>";
-        h += "<td>" + String(o.summary) + "</td></tr>";
+        h += "<td class=" + String(running ? "RUNNING" : statusClass(o.result)) + ">" +
+             String(running ? "RUNNING" : TestRunner::ResultName(o.result));
+        if (o.duration_ms && !running)
+            h += "<div class=m>" + String(o.duration_ms) + " ms</div>";
+        h += "</td><td>" + String(o.summary) + "</td></tr>";
     }
     h += "</table>";
 
-    h += "<h2>Log</h2><pre id=l>";
-    size_t len = 0;
-    const char *cap = Log::Capture(&len);
+    h += "<h2>Log</h2><pre id=l>waiting for the first output...</pre>";
 
-    // Show only the TAIL of the log here. Escaping expands text (every '&'
-    // becomes five characters), and this part has no PSRAM -- so embedding the
-    // whole capture would put a 100 KB+ String on a heap that has to serve the
-    // WiFi stack too. 6 KB of tail is several screens and plenty to see the
-    // result of the test just run; the Log-only page and /log?raw=1 carry the
-    // rest. The page's poller replaces this pane with the full text anyway.
-    const size_t kTailBytes = 6144;
-    size_t start = 0;
-    bool truncated = false;
-    if (len > kTailBytes) {
-        start = len - kTailBytes;
-        // Only when we HAVE truncated does the start index need moving to a line
-        // boundary -- and only then is anything omitted. Doing this unconditionally
-        // skipped the first line of a short log AND printed the "earlier lines
-        // omitted" notice when nothing had been.
-        while (start < len && cap[start] != '\n') ++start;
-        if (start < len) ++start;
-        truncated = true;
-    }
-    if (truncated) h += "(... earlier lines omitted; use the Log-only page)\n";
-
-    // Escape the three characters that would break out of the <pre>.
-    for (size_t i = start; i < len; ++i) {
-        const char ch = cap[i];
-        if (ch == '<') h += "&lt;";
-        else if (ch == '>') h += "&gt;";
-        else if (ch == '&') h += "&amp;";
-        else h += ch;
-    }
-    h += "</pre>";
-
-    // THE CLICK MUST NOT RELOAD. A test runs synchronously inside loop(), so while
-    // one is running the HTTP server does not answer at all -- a reload issued right
-    // after the click hangs for the whole test (9 s for test 20, 12 s for test 22)
-    // and the browser shows a blank page. That is what "clicking does nothing"
-    // looked like: the test WAS running, the page just could not see it.
+    // ---- the logic -----------------------------------------------------
     //
-    // So the click only SCHEDULES the test (which the server does answer, with a 303)
-    // and then the poller watches the log. When the RESULT count grows, the test has
-    // finished and the page reloads ONCE to redraw the table.
+    // The page NEVER reloads while work is in flight and never assumes a click
+    // landed: it polls /state and re-renders from the server's own answer. A dropped
+    // request therefore self-corrects on the next poll instead of leaving the page
+    // stuck -- and because tests now run on their own task, the server answers
+    // normally even while a test is running or waiting for the operator.
     h += "<script>";
-    h += "var resultCount=-1, running=null, base=null;";
-    h += "function setStatus(s){document.getElementById('st').textContent=s}";
-    h += "function lockButtons(on){document.querySelectorAll('button')"
-         ".forEach(b=>{if(b.id!='bAll'||!on)b.disabled=on})}";
-    h += "function runTest(n){if(running!==null)return;running=n;base=resultCount;"
-         "setStatus('Test '+n+' requested - running... (long tests take up to ~15 s)');"
-         "lockButtons(true);"
-         "fetch('/run?n='+n).catch(()=>{});}";
-    h += "function runAll(){if(running!==null)return;running='all';base=resultCount;"
-         "setStatus('All 30 requested - running... this takes about 2 minutes');"
-         "lockButtons(true);fetch('/runall').catch(()=>{});}";
-    h += "function poll(){fetch('/log?raw=1',{cache:'no-store'})"
-         ".then(r=>r.text()).then(t=>{"
-         "const e=document.getElementById('l');if(e.textContent!==t)e.textContent=t;"
-         "var c=(t.match(/^RESULT /gm)||[]).length;"
-         "if(resultCount<0){resultCount=c;}"
-         "else if(running!==null&&c>base){running=null;setStatus('done - reloading');"
-         "lockButtons(false);location.reload();return;}"
-         "}).catch(()=>{setStatus('working... (the server is busy running the test)')})"
-         ".then(()=>setTimeout(poll,1500))}";
-    h += "setTimeout(poll,800)</script>";
-    h += "</body></html>";
+    h += "var polling=false,lastRunning=-1,done=0;";
+    h += "function el(i){return document.getElementById(i)}";
+    h += "function setBar(busy,run,res,prompt){";
+    h += "var bar=document.querySelector('#bar');";
+    h += "bar.className=busy?'busy':'';";
+    h += "el('head').textContent=busy?('Running test '+(run+1)):'Ready';";
+    h += "el('sub').textContent=busy?('&nbsp;'+(res-done)+' of 1 finished this run')"
+         ".replace('&nbsp;','')"
+         ":((res>0)?(res+' test'+(res==1?'':'s')+' completed this session')"
+         ":'Pick a test below');";
+    h += "el('bAll').disabled=busy;";
+    h += "var a=el('act');";
+    h += "if(prompt&&prompt.length){el('actw').textContent=prompt;a.className='on';}";
+    h += "else{a.className='';}";
+    h += "}";
+    h += "function refreshLog(){fetch('/log?raw=1',{cache:'no-store'})"
+         ".then(r=>r.text()).then(t=>{el('l').textContent=t;})"
+         ".then(()=>{el('l').scrollTop=el('l').scrollHeight;}).catch(()=>{})}";
+    h += "function poll(){";
+    h += "fetch('/state',{cache:'no-store'}).then(r=>r.json()).then(s=>{";
+    h += "setBar(s.busy,s.running,s.results,s.prompt);";
+    h += "if(s.running!==lastRunning){lastRunning=s.running;"
+         "if(s.running<0){location.reload();return;}}";   // one reload, only when a test ENDS
+    h += "}).catch(()=>{});";
+    h += "refreshLog();";
+    h += "setTimeout(poll,1200);";
+    h += "}";
+    h += "function runTest(n){";
+    h += "el('act').className='';";
+    h += "el('head').textContent='Starting test '+n+'...';";
+    h += "fetch('/run?n='+n).then(r=>r.text()).then(t=>{";
+    h += "if(t!=='started')setBar(false,-1,0,'');";
+    h += "}).catch(()=>{});}";
+    h += "function runAll(){el('head').textContent='Starting all tests...';"
+         "fetch('/runall').catch(()=>{});}";
+    h += "function continue_(){el('act').className='';"
+         "el('head').textContent='Continuing...';"
+         "fetch('/continue').catch(()=>{});}";
+    h += "poll();";
+    h += "</script></body></html>";
 
     s_http.send(200, "text/html; charset=utf-8", h);
 }
@@ -215,54 +235,48 @@ static void handleLog()
 
 static void handleRun()
 {
+    bool ok = false;
     if (s_http.hasArg("n")) {
-        const long n = s_http.arg("n").toInt();
-        // The page addresses tests by their printed NUMBER, not their index --
-        // that is what the menu, the summary and the README all use.
-        for (size_t i = 0; i < TestRunner::Count(); ++i) {
-            const TestRunner::Test *t = TestRunner::Get(i);
-            if (t && t->number == n) { s_web_requested = (int)i; break; }
-        }
+        ok = TestTask::RequestByNumber(s_http.arg("n").toInt());
     }
-    // Run the test inside the handler, NOT deferred to loop().
-    //
-    // The deferred version (set a flag, redirect, let loop() pick it up) is what
-    // WEDGED THE SERVER: the 303 redirect left a client connection that the Arduino
-    // WebServer had not finished tearing down, and the test that then ran for nine
-    // seconds -- without a single handleClient() call -- left it in a state it never
-    // recovered from. HTTP stayed dead indefinitely after a web-triggered test, while
-    // the identical test run from the serial menu was fine. That asymmetry is what
-    // pointed at the handler.
-    //
-    // Running it here is safe because the HTTP response is only the redirect, and
-    // the page no longer depends on receiving it -- it fires the request and then
-    // watches the log. So a long test blocking this one connection is acceptable:
-    // the test is the thing the user asked for, and the page is already polling.
-    //
-    // The response is sent BEFORE the test runs, so the client is released first.
-    s_http.sendHeader("Location", "/");
-    s_http.send(303, "text/plain", "");
-    s_http.client().stop();   // release the socket now, before the long test
-
-    // Then run it. Anything loop() would have done, done here instead.
-    if (s_web_requested >= 0) {
-        Log::Printf("");
-        Log::Printf("(requested from the web UI)");
-        TestRunner::Run((size_t)s_web_requested);
-        s_web_requested = -1;
-    }
+    s_http.send(200, "text/plain", ok ? "started" : "busy");
 }
 
 static void handleRunAll()
 {
-    // Same treatment as handleRun: respond, release the socket, then run.
-    s_http.sendHeader("Location", "/");
-    s_http.send(303, "text/plain", "");
-    s_http.client().stop();
+    s_http.send(200, "text/plain", TestTask::RequestAll() ? "started" : "busy");
+}
 
-    Log::Printf("");
-    Log::Printf("(run all, requested from the web UI)");
-    TestRunner::RunAll();
+// The operator says "I did it". Only meaningful while a test is waiting.
+static void handleContinue()
+{
+    TestTask::SignalContinue();
+    s_http.send(200, "text/plain", "ok");
+}
+
+// The page's status poll. Returns a tiny JSON object: the page re-renders its state
+// from this, so it always reflects reality even if a click was missed.
+static void handleState()
+{
+    // A tiny JSON status object. The page polls this and re-renders from it, so its
+    // display always reflects reality -- if a click was dropped or a request timed
+    // out, the next poll corrects the page rather than leaving it stuck.
+    String j;
+    j.reserve(320);
+    j += "{\"busy\":";
+    j += TestTask::Busy() ? "true" : "false";
+    j += ",\"running\":" + String(TestTask::RunningIndex());
+    j += ",\"results\":" + String((int)TestRunner::CompletedCount());
+    j += ",\"prompt\":\"";
+    // The prompt is operator-facing text going into JSON; strip the two characters
+    // that would break the string. It is our own text, not untrusted input.
+    const char *pr = TestTask::CurrentPrompt();
+    for (const char *c = pr; c && *c; ++c) {
+        if (*c == '"' || *c == '\\') j += '\\';
+        if (*c != '\n') j += *c;
+    }
+    j += "\"}";
+    s_http.send(200, "application/json", j);
 }
 
 static void handleSummary()
@@ -300,6 +314,9 @@ static void handleIdentify()
     s_http.send(303, "text/plain", "");
 }
 
+// The operator says "I did it, go on". This is the ONLY request that continues a
+// waiting test: the page's own poll must not, or the wait would satisfy itself
+// without the operator having done anything.
 static void handleNotFound()
 {
     // Any path redirects to the root: this is a bench tool on a LAN, and a 404
@@ -335,6 +352,8 @@ static bool WebBegin()
     s_http.on("/runall", handleRunAll);
     s_http.on("/summary", handleSummary);
     s_http.on("/clear", handleClear);
+    s_http.on("/continue", handleContinue);
+    s_http.on("/state", handleState);
     s_http.on("/identify", handleIdentify);
     s_http.onNotFound(handleNotFound);
     s_http.begin();
@@ -754,32 +773,6 @@ static void PrintHardware()
     Log::Printf("");
 }
 
-// Execute one deferred web request. Returns true if something ran.
-static bool ServiceWebRequest()
-{
-    const int req = s_web_requested;
-    if (req == -1) return false;
-    s_web_requested = -1;
-
-    if (req == -2) {
-        TestRunner::RunAll();
-        return true;
-    }
-    if (req >= 0) {
-        Log::Printf("");
-        Log::Printf("(requested from the web UI)");
-        TestRunner::Run((size_t)req);
-        return true;
-    }
-    return false;
-}
-
-// True once we have seen any input. The board cannot detect that a terminal
-// ATTACHED (USB-Serial-JTAG gives no such event -- DTR is not wired to the ROM
-// peripheral on this part), so the only reliable moment to greet a newly-attached
-// monitor is its first keystroke. Without this, opening `pio device monitor` on an
-// already-running board shows a blank screen until the user types something, which
-// reads as a dead board.
 static bool s_greeted = false;
 
 static void ServiceSerial()
@@ -815,24 +808,26 @@ static void ServiceSerial()
         buf[n] = '\0';
         const long num = atol(buf);
 
-        for (size_t i = 0; i < TestRunner::Count(); ++i) {
-            const TestRunner::Test *t = TestRunner::Get(i);
-            if (t && t->number == num) {
-                Log::Printf("");
-                TestRunner::Run(i);
-                PrintMenu();
-                return;
-            }
+        // Through the TASK, exactly as the web page does. One execution path, so the
+        // two front ends cannot behave differently -- and a direct call here would
+        // run the test on the web/loop task, which is what locked the page up.
+        if (TestTask::RequestByNumber((int)num)) {
+            Log::Printf("starting test %ld...", num);
+        } else if (TestTask::Busy()) {
+            Log::Printf("a test is already running -- wait for it to finish");
+        } else {
+            Log::Printf("no test numbered %ld (see the menu)", num);
         }
-        Log::Printf("no test numbered %ld (see the menu)", num);
         return;
     }
 
     switch (c) {
         case 'a': case 'A':
-            Log::Printf("");
-            TestRunner::RunAll();
-            PrintMenu();
+            if (TestTask::RequestAll()) {
+                Log::Printf("running all tests...");
+            } else {
+                Log::Printf("a test is already running -- wait for it to finish");
+            }
             break;
         case 's': case 'S':
             TestRunner::PrintSummary();
@@ -914,6 +909,16 @@ void Begin()
         Log::Printf("ADC: IO%d reads %u mV (ADC is live)", PIN_SWC1_ADC, probe_mv);
     }
 
+    // The test task MUST be created before anything can submit a job to it. Omitting
+    // this is silent in the worst way: s_jobs stays null, every submit returns false,
+    // and the web page reports "busy" forever while the serial menu does nothing --
+    // which reads as a dead board rather than as a missing init. Same class of defect
+    // as the Adc::Begin() omission found earlier in this project.
+    TestTask::Begin();
+    if (!TestTask::Ready()) {
+        Log::Printf("TESTS: the test task FAILED to start -- no test can run");
+    }
+
     const bool dac_ok = Dac::Begin();
     Log::Printf("DAC at 0x%02X: %s", Dac::Address(), dac_ok ? "present" : "NOT FOUND");
     if (!dac_ok) {
@@ -941,11 +946,13 @@ void Begin()
 
 void Loop()
 {
-    if (ServiceWebRequest()) {
-        PrintMenu();
-    }
+    // The web server and the serial menu ONLY. Tests run on their own task
+    // (include/TestTask.h), so this loop stays responsive even while a test is
+    // running or waiting for the operator -- which is the whole point of the
+    // split. Nothing here may block.
     ServiceSerial();
     if (s_web_up) s_http.handleClient();
+    delay(2);
 }
 
 }  // namespace FrontEnd

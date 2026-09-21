@@ -69,6 +69,10 @@ Outcome Run(size_t index);
 // construction -- what a passing test returns. `Blocked()` marks it and returns
 // it, for a test whose precondition is absent.
 const Outcome &Current();
+
+// The outcome under construction, mutable -- so a test can set its own Result (e.g.
+// SKIP when an operator step was not performed, which must not read as PASS).
+Outcome &MutableCurrent();
 Outcome Blocked();
 
 // The stored outcome for a test, for the summary and the web table.
@@ -80,6 +84,11 @@ void ResetOutcomes();
 // during which the HTTP server cannot answer, so the page needs a way to render
 // "in flight" on the reload that follows.
 int RunningIndex();
+
+// How many tests have a stored outcome (i.e. have been run this session). The web
+// page uses it to tell "a test finished" from "nothing has happened yet" without
+// having to count RESULT lines in the log.
+size_t CompletedCount();
 
 // Run every test in order. Returns the number that failed or errored.
 int RunAll();

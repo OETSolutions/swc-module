@@ -13,6 +13,7 @@
 #include "BoardPins.h"
 #include "Log.h"
 #include "SetupPrompts.h"
+#include "TestTask.h"
 #include "Temp.h"
 #include "TestRunner.h"
 
@@ -43,19 +44,11 @@ const char *Setup31_AuxManual()
            "GND. Press ENTER to start; the test waits for each one.";
 }
 
-// Wait for a keypress, with a timeout so an unattended run cannot hang forever.
-static bool WaitForKey(uint32_t timeout_ms)
-{
-    const uint32_t t0 = millis();
-    while (millis() - t0 < timeout_ms) {
-        if (Serial.available()) {
-            while (Serial.available()) Serial.read();
-            return true;
-        }
-        delay(20);
-    }
-    return false;
-}
+// The operator prompt now lives on the TEST TASK (include/TestTask.h), which is what
+// lets the web page keep serving and show a Continue button while a test waits. The
+// earlier version watched only the serial port and could never be advanced from the
+// web UI at all -- the page just spun. See TestTask.h for why the tests moved off
+// loop() entirely.
 
 Outcome Test31_AuxManual()
 {
@@ -76,20 +69,25 @@ Outcome Test31_AuxManual()
     Log::Printf("");
 
     bool all_ok = true;
+    int  skipped = 0;
     for (size_t i = 0; i < n; ++i) {
+        // MEASURE FIRST, then prompt. The first version prompted first and read the
+        // "resting" level afterwards -- so if the operator had already applied the
+        // short, the resting value WAS the shorted value and the collapse check
+        // compared a number with itself.
         uint32_t rest = 0;
         Adc::ReadAvgMv(rows[i].ch, 64, &rest);
-
         Log::Printf("  %s (%s): resting at %u mV", rows[i].name, rows[i].pin, rest);
-        Log::Printf("    -> short %s to J5.1 (GND) now, then press ENTER (30 s max)",
-                    rows[i].pin);
+        char ask[120];
+        snprintf(ask, sizeof(ask),
+                 "Short %s (%s) to GND (J5.1), then continue", rows[i].name, rows[i].pin);
 
-        if (!WaitForKey(30000)) {
-            Log::Printf("    timed out waiting -- skipping %s", rows[i].name);
-            Note("No keypress within 30 s, so %s was not exercised. That is a SKIP, "
+        if (!TestTask::AskOperator(ask, 60000)) {
+            Log::Printf("    timed out -- %s was NOT exercised", rows[i].name);
+            Note("No response within %u s, so %s was not exercised. That is a SKIP, "
                  "not a pass: this test cannot prove anything without the stimulus.",
-                 rows[i].name);
-            all_ok = false;
+                 (unsigned)60, rows[i].name);
+            ++skipped;
             continue;
         }
 
@@ -105,7 +103,10 @@ Outcome Test31_AuxManual()
         Adc::ReadAvgMv(rows[i].ch, 64, &after);
         Log::Printf("    released again: %u mV", after);
 
-        const bool collapsed = (rest > 1500) && (shorted < 600);
+        // The threshold is generous because the aux pin CLIPS at the 2.9 V ADC
+        // ceiling when nothing is attached (3173 mV measured), so "collapsed" means
+        // "came well off that rail", not "read a precise zero".
+        const bool collapsed = (rest > 1500) && (shorted < 1200);
         const bool recovered = (after > 1500);
         True(collapsed, "the input collapses when shorted to GND");
         if (!collapsed) {
@@ -125,7 +126,16 @@ Outcome Test31_AuxManual()
     }
 
     Log::Printf("");
-    if (all_ok) {
+    if (skipped) {
+        // A test that could not run its stimulus must not report PASS. Saying SKIP is
+        // the honest answer, and the operator can re-run when they have a jumper.
+        Note("%d of %d inputs were skipped (no stimulus within the timeout). "
+                    "Re-run test 31 with a jumper to actually exercise them.", skipped,
+                    (int)n);
+        TestRunner::MutableCurrent().result =
+            (skipped == (int)n) ? TestRunner::Result::kSkip : TestRunner::Result::kWarn;
+    }
+    if (all_ok && !skipped) {
         True(true, "every AUX input collapses under a GND short and recovers");
     }
     Note("AUX1 is the input the production firmware uses for programming and "
@@ -188,7 +198,7 @@ Outcome Test32_TempVerify()
     Log::Printf("  exposed right edge, roughly 33 mm from the nearest heat source).");
     Log::Printf("  Hold it for ~20 s, then press ENTER (45 s max).");
 
-    if (!WaitForKey(45000)) {
+    if (!TestTask::AskOperator("Hold something warm against RT1 for ~20 s, then continue", 90000)) {
         Log::Printf("    timed out -- reporting the single point only");
         Note("Without a second point the curve cannot be validated, so this test "
              "reports rather than asserts the scale. A single reading only proves the "

@@ -30,4 +30,15 @@ const char *Setup31_AuxManual();
 // SCALE without a calibrated chamber.
 const char *Setup32_TempVerify();
 
+// A hook the front end installs so an operator prompted by a test can continue from
+// EITHER console. Tests 31 and 32 wait for the operator; on the serial side that is a
+// keystroke, but the web UI has no keystroke.
+//
+// The hook SERVES the web server (it is a pump, not a poll) and returns true when a
+// request has arrived. Pumping is the load-bearing part: while a test is blocked in
+// this wait the HTTP server is otherwise never serviced, so the page could not even
+// be refreshed -- which is why a web-UI run of these tests appeared to hang with no
+// activity at all, and why they could only ever be completed over serial.
+void SetWaitPump(bool (*fn)());
+
 }  // namespace SwcTests

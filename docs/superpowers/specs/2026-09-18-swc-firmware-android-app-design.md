@@ -1510,6 +1510,17 @@ A press is "clearly off idle" (`> 300 mV` from the wheel's idle), because with n
 config there is no learned window to compare against. Feedback patterns are not
 played: there is nothing configured to resolve against.
 
+**`wheel_idle_mv` is PER CHANNEL.** §3.4's two SWC inputs are independent wheels
+(FR-9), and their idles need not match — so each channel's ratio is taken against
+*its own* captured idle. A single device-wide reference makes one channel's idle
+the other's press threshold: two channels idling 465 mV apart (a different wheel
+ladder) drive a phantom key on the lower-idle channel with nothing held, and a
+disconnected input reading ~0 does it unconditionally. Capturing and healing the
+reference per channel is the same rule FR-3's filter and the classifier already
+follow. Consequently **"disabled rather than guessed" is per input**: a channel
+whose own ladder was unreadable at Boot serves nothing while its healthy sibling
+still passes through — one dead wheel must not disable the other.
+
 The user gets a working steering wheel immediately, and the app is an *upgrade*,
 not a prerequisite. This is also the fallback if learning was never done.
 
@@ -2598,7 +2609,7 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-22 | Level-setting tests | N | Each level, including fully-off, suppresses the right classes and nothing else |
 | FR-23 | Atomic-persist test | N + D | Power loss at any byte offset yields the previous good config, never a torn one |
 | FR-24 | Corrupt/newer-config test | N | Corrupt CRC and newer `schema_version` each fall back to defaults **and** signal audibly |
-| FR-25 | No-config pass-through test | N | With empty config, a press drives a key at the wheel's ratio against the head unit's idle (not a copy of the wheel's volts), and no usable ladder reference disables pass-through rather than guessing |
+| FR-25 | No-config pass-through test | N | With empty config, a press drives a key at the wheel's ratio against the head unit's idle (not a copy of the wheel's volts), each channel against its OWN captured idle, and no usable ladder reference disables pass-through for that input rather than guessing |
 | FR-26 | Config-validation test | N + A | Invalid config → `nack`, and a read-back proves the old config is intact |
 | FR-27 | Export/import test | N + A | Full config JSON round-trips byte-identically through export → import |
 | FR-28 | Learn-mode tests | N + D + B | Measured level, tolerance and rail are stored and match the bench instrument |

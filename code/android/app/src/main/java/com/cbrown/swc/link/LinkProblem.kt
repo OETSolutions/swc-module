@@ -11,9 +11,9 @@ package com.oetsolutions.swc.link
  * refactor is a change to a USB driver.
  *
  * The plan is explicit that a generic "connection error" is not acceptable, and the
- * reason is practical: the five failures below have five different fixes, and
- * "connection error" tells the user none of them. A version mismatch is not fixed by
- * reseating the cable; a maintenance-mode device is not fixed by reinstalling.
+ * reason is practical: the failures below have different fixes, and "connection
+ * error" tells the user none of them. A version mismatch is not fixed by reseating
+ * the cable; a failed config digest is not fixed by replugging.
  *
  * Every one is rendered by `ui/LinkScreen.kt`'s `describe()`, whose `when` is
  * exhaustive so that adding a case here is a compile error there rather than a
@@ -29,9 +29,18 @@ sealed interface LinkProblem {
     /** The firmware speaks a different protocol version (spec 4.5). */
     data class VersionMismatch(val firmware: Int, val app: Int) : LinkProblem
 
-    /** The device is in maintenance mode and is not serving the app link. */
-    data object InMaintenance : LinkProblem
-
     /** The cable is not connected, or nothing enumerated. */
     data object NoDevice : LinkProblem
+
+    /**
+     * The link is up but the conversation failed, and the reason is known.
+     *
+     * Distinct from [NoDevice] on purpose. The client raises `LinkState.Failed`
+     * with a specific reason for a torn config run, a digest mismatch, a chunk
+     * that ran past its declared length, or an over-long input line -- every one
+     * of which is a device that IS enumerated and answering. Mapping them onto
+     * [NoDevice] told the user to check a cable that was working, and "Try again"
+     * re-ran the same failing read with nothing naming what actually broke.
+     */
+    data class LinkFailed(val reason: String) : LinkProblem
 }

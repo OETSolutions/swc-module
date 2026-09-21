@@ -186,9 +186,14 @@ int MockHal::NvsSet(const char *key, const void *in, size_t len) {
 int MockHal::NvsGet(const char *key, void *out, size_t len) {
     auto it = nvs_.find(key);
     if (it == nvs_.end()) return -1;
-    const size_t n = it->second.size() < len ? it->second.size() : len;
-    std::memcpy(out, it->second.data(), n);
-    return static_cast<int>(n);
+    // STRICT, like IDF. nvs_get_blob returns ESP_ERR_NVS_INVALID_LENGTH when the
+    // caller's buffer is smaller than the stored value -- it does NOT truncate --
+    // and EspHal::HalNvsGet maps that to -1. This used to truncate and return the
+    // short length, which hid a store that read a 2048-byte chunk into a 16-byte
+    // buffer: the config loaded on the host and never on the device.
+    if (it->second.size() > len) return -1;
+    std::memcpy(out, it->second.data(), it->second.size());
+    return static_cast<int>(it->second.size());
 }
 
 int  MockHal::AdcReadMvThunk(void *ctx, AdcChannel ch) {

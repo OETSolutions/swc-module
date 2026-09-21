@@ -55,16 +55,27 @@ bool ConfigStore::ReadSlot(char slot, uint8_t *blob, size_t blob_cap, size_t *ou
     // chunk and not the last: the count of remaining chunks follows from it.
     char key[16];
     ChunkKey(key, sizeof(key), slot, 0);
-    uint8_t header[kBlobHeaderBytes];
-    const int hn = hal_->nvs_get(hal_->ctx, key, header, sizeof(header));
-    if (hn != static_cast<int>(sizeof(header))) return false;
+    // Chunk 0 is read INTO THE CALLER'S BUFFER, not a local one. Its stored value
+    // is a whole chunk (up to kConfigChunkBytes), and nvs_get_blob does not
+    // truncate: given a buffer smaller than the value it returns
+    // ESP_ERR_NVS_INVALID_LENGTH, which is not NOT_FOUND, so the HAL maps it to
+    // -1 and this read fails. Reading the header's 16 bytes was exactly that, and
+    // it made Load return kFellBackToDefaults on a real device for EVERY config
+    // while passing on the host, where the mock truncated. A chunk never exceeds
+    // a full chunk, so `blob_cap` (which the caller already guaranteed covers the
+    // whole blob) is always large enough here, and no per-call chunk buffer is
+    // needed on the device's small stack.
+    const int hn = hal_->nvs_get(hal_->ctx, key, blob, blob_cap);
+    if (hn < static_cast<int>(kBlobHeaderBytes)) return false;
 
-    const size_t total = ConfigBlobTotalLength(header, sizeof(header));
+    const size_t total = ConfigBlobTotalLength(blob, static_cast<size_t>(hn));
     if (total == 0 || total > blob_cap) return false;
+    if (static_cast<size_t>(hn) > total) return false;
 
     const int chunks = ConfigChunkCountFor(total);
-    size_t got = 0;
-    for (int i = 0; i < chunks; ++i) {
+    // Chunk 0 is already in place from the read above; fetch the rest.
+    size_t got = static_cast<size_t>(hn);
+    for (int i = 1; i < chunks; ++i) {
         const size_t off = static_cast<size_t>(i) * kConfigChunkBytes;
         const size_t remaining = total - off;
         const size_t want = remaining < kConfigChunkBytes ? remaining : kConfigChunkBytes;

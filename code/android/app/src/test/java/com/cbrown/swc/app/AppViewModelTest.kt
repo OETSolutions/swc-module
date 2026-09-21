@@ -290,6 +290,38 @@ class AppViewModelTest {
     }
 
     @Test
+    fun `a failed config run reaches the screen with its reason, not as no-device`() = runTest {
+        // `SwcClient` raises `LinkState.Failed` with a NAMED reason for a torn run,
+        // a digest mismatch or an over-long line. The view model used to collapse
+        // every one onto `LinkProblem.NoDevice`, so the user was told to check a
+        // cable that was working, and the reason -- the only thing that says which
+        // of those actually happened -- was discarded and rendered nowhere.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        // A config run whose declared length the chunks do not fill: `endInboundConfig`
+        // reports "config run ended early" and leaves the model alone.
+        t.emit(frame("config_begin", "total_len" to "40", "crc32" to "0"))
+        t.emit(frame("config_end", "sha256" to "\"\""))
+        advanceUntilIdle()
+
+        assertTrue(
+            "the state must be Failed, was ${vm.link.value.link}",
+            vm.link.value.link is LinkState.Failed,
+        )
+        val problem = vm.link.value.problem
+        assertTrue(
+            "the failure must reach the screen with its reason, not as NoDevice: $problem",
+            problem is com.oetsolutions.swc.link.LinkProblem.LinkFailed,
+        )
+        assertEquals(
+            "config run ended early",
+            (problem as com.oetsolutions.swc.link.LinkProblem.LinkFailed).reason,
+        )
+    }
+
+    @Test
     fun `an edit is held locally and only sent on save`() = runTest {
         val t = FakeTransport()
         var saved: com.oetsolutions.swc.model.Config? = null

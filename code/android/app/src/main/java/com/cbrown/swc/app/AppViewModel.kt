@@ -195,7 +195,13 @@ class AppViewModel(
         val problem = when (state) {
             is LinkState.VersionMismatch ->
                 LinkProblem.VersionMismatch(state.firmware, state.app)
-            is LinkState.Failed -> LinkProblem.NoDevice
+            // The reason is CARRIED, not collapsed onto NoDevice. "Failed" is the
+            // state for a device that is enumerated and answering but whose
+            // conversation broke -- a torn config run, a digest mismatch, an
+            // over-long line. Mapping it onto NoDevice told the user to check a
+            // cable that was working, and gave them no way to tell a flaky transfer
+            // from a genuinely absent device.
+            is LinkState.Failed -> LinkProblem.LinkFailed(state.reason)
             is LinkState.Connected -> null
             LinkState.Disconnected -> _link.value.problem
         }
@@ -311,11 +317,18 @@ class AppViewModel(
             // so the read was dead -- and it would have been WRONG if it had ever
             // been sent: `rail_mv` is the +3V3 rail (~3300), not the wheel's idle
             // KEY level (~2835), and `LadderScreen` divides every band by whatever
-            // it is given. The idle the view needs already comes from the config
-            // (`onConfig` reads `ladder.learnedIdleMv`), so nothing is lost by
-            // dropping it. `vbus_present`, `output_safe` and `uptime_ms` are
-            // deliberately not mirrored yet: no screen consumes them, and inventing
-            // a place for them is not this fix.
+            // it is given.
+            //
+            // The idle the view uses comes from the config (`onConfig` reads
+            // `ladder.learnedIdleMv`). **That is the learn-TIME rail, and it is NOT
+            // the denominator the firmware classifies against** -- spec 6.3's
+            // `V_ADC_idle` is the LIVE idle. No frame carries a live idle, so the
+            // app's match indicator can disagree with the device once the rail
+            // drifts; recorded as spec open item N-25 with the required repair.
+            //
+            // `vbus_present`, `output_safe` and `uptime_ms` are deliberately not
+            // mirrored yet: no screen consumes them, and inventing a place for them
+            // is not this fix.
             Frames.STATUS -> {
                 val cs = frame.fields["config_state"]?.jsonPrimitive?.content
                 if (cs != null) _link.value = _link.value.copy(configState = cs)

@@ -75,6 +75,8 @@ public:
 
     // --- nvs ---------------------------------------------------------------
     int NvsSet(const char *key, const void *in, size_t len);
+    // Mirrors nvs_get_blob: -1 when the key is absent OR when the caller's buffer
+    // is smaller than the stored value (INVALID_LENGTH). It never truncates.
     int NvsGet(const char *key, void *out, size_t len);
     void FailNextNvsWrite() { fail_next_nvs_write_ = true; }
     // Simulate power loss partway through the next write: n bytes land, the

@@ -72,7 +72,23 @@ data class LadderUiState(
     fun ratioPermille(mv: Int): Int =
         if (idleMv <= 0) 0 else (mv.toLong() * 1000 / idleMv).toInt()
 
-    /** The button whose window contains the live reading, if any. */
+    /**
+     * The button whose window contains the live reading, if any.
+     *
+     * **This is an ABSOLUTE-millivolt test, and the firmware's is a RATIO test
+     * against the live idle (spec 6.3, `LadderClassify`). The two disagree once the
+     * rail moves.** `idleMv` here is the config's `learned_idle_mv` -- the
+     * learn-TIME rail -- because that is the only idle the wire carries; there is
+     * no live idle in any frame (`event`/`status`/`ladder_sample` do not carry one,
+     * and `status.rail_mv` has no producer). So a real press at a drifted rail can
+     * be marked "nothing" here while the device classifies it correctly and fires
+     * the right key -- the screen reporting the adapter as broken when it is
+     * working, which is the diagnosis it exists to make.
+     *
+     * Recorded as N-25 in the spec. The fix is a §4.3 decision to carry the live
+     * idle (or the event's own ratio) on the wire, then matching on
+     * `ratioPermille` against it, as `LadderDecode.cpp` does.
+     */
     fun matched(): LearnedButton? {
         val live = liveMv ?: return null
         return buttons.firstOrNull { abs(live - it.mvCenter) <= it.mvTolerance }
@@ -89,10 +105,14 @@ data class LadderUiState(
  * does nothing, the head unit is. Without the match marked, the user has a voltage
  * number and no way to act on it.
  *
- * Each band is placed by the DERIVED ratio against [LadderUiState.idleMv], which is
- * what makes the view rail-invariant (spec 6.3): the same button sits in the same
- * place whether the rail is 3.14 V or 3.47 V, because the firmware classifies by
- * ratio too.
+ * Each band is placed by the DERIVED ratio against [LadderUiState.idleMv]: the
+ * centre and the denominator are BOTH learn-era millivolts measured at the same
+ * rail, so their ratio is rail-invariant and the band sits in the same place
+ * whether the rail is 3.14 V or 3.47 V.
+ *
+ * **The placement is invariant; the MATCH is not.** [LadderUiState.matched] compares
+ * absolute millivolts, so it can disagree with the device on a moved rail — see its
+ * comment and spec N-25.
  */
 @Composable
 fun LadderScreen(state: LadderUiState, modifier: Modifier = Modifier) {

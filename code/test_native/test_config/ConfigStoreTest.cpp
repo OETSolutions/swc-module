@@ -44,6 +44,37 @@ TEST(ConfigStore, SaveThenLoadRoundTrips) {
     EXPECT_STREQ(out.device_id, "SWC-0001");
 }
 
+// The store reads chunk 0 at FULL CHUNK WIDTH, not at the header's 16 bytes.
+// Chunk 0's stored value is a whole chunk, and nvs_get_blob does not truncate: a
+// 16-byte buffer for a 2048-byte value yields ESP_ERR_NVS_INVALID_LENGTH, which
+// is not NOT_FOUND, so EspHal maps it to -1 and the read fails. ReadSlot used to
+// do exactly that, which made Load return kFellBackToDefaults on a real device
+// for EVERY config while passing on the host -- MockHal truncated where IDF
+// errors. This test pins the stored width so the bug cannot come back silently.
+TEST(ConfigStore, ChunkZeroIsStoredAtFullChunkWidthNotJustTheHeader) {
+    MockHal hal;
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(MakeConfig()));
+
+    // Chunk 0 must hold MORE than the header, or the undersized read would never
+    // have been a bug and this test would be vacuous.
+    const int c0 = hal.NvsGet("cfg_a_0", g_scratch, sizeof(g_scratch));
+    ASSERT_GT(c0, static_cast<int>(kBlobHeaderBytes))
+        << "chunk 0 must carry payload beyond its header";
+
+    // And an undersized read of it must FAIL, exactly as IDF's does -- this is
+    // the assertion that gives the fix teeth: with a truncating mock it would
+    // pass at the wrong length, and the store could go back to reading 16 bytes.
+    uint8_t too_small[kBlobHeaderBytes];
+    EXPECT_EQ(hal.NvsGet("cfg_a_0", too_small, sizeof(too_small)), -1)
+        << "a buffer smaller than the stored value must be an error, not a "
+           "truncated success";
+
+    Config out{};
+    EXPECT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+    EXPECT_STREQ(out.device_id, "SWC-0001");
+}
+
 TEST(ConfigStore, AlternatesSlotsSoThePreviousCopyStaysIntact) {
     MockHal hal;
     ConfigStore store(&hal.InterfaceRef());

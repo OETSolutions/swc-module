@@ -259,11 +259,11 @@ internal fun describe(problem: LinkProblem): Pair<String, String> = when (proble
             "${problem.app}. Nothing will be sent, because a partial match is how a " +
             "config gets corrupted. Update the app or the firmware so both match."
 
-    LinkProblem.InMaintenance ->
-        "Device is in maintenance mode" to
-            "The adapter is serving its WiFi/BLE setup page and is not answering the " +
-            "app link. Exit maintenance mode on the device (or let its 5-minute " +
-            "timeout expire) and retry."
+    is LinkProblem.LinkFailed ->
+        "The link failed" to
+            "${problem.reason}. The adapter is reachable — this was the conversation, " +
+            "not the cable. Retry, and if it repeats, replug the adapter so the " +
+            "transfer starts clean."
 
     LinkProblem.NoDevice ->
         "No device found" to

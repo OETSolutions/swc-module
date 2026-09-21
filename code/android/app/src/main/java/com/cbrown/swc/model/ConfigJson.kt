@@ -130,11 +130,18 @@ object ConfigJson {
                     ?: emptyList(),
             ),
             output = OutputProfile(
-                // A name this build does not know must NOT be silently coerced:
-                // `?: TRACKING` would turn a channel the device says is AUTO into
-                // a concrete 1.00 gain on the next save, changing behaviour the
-                // user never touched. Unknown names are recorded so a caller can
-                // refuse to round-trip rather than corrupt.
+                // `AUTO` is a member (see GainMode), so every name the firmware can
+                // emit is known here. An unknown name cannot arrive from a real
+                // device: the firmware's own decoder REFUSES one
+                // (`VALUE_OF(kGainModeNames, ...) < 0` -> `return false`,
+                // ConfigCodec.cpp), so a device that spoke a fourth mode would fail
+                // the protocol-version gate first and never reach this line. The
+                // `?: TRACKING` is therefore a defensive default for a hand-written
+                // config, NOT a mapping of device data -- and it is deliberately not
+                // a silent coercion of a real mode, because there is no real mode it
+                // could be. (An earlier comment here claimed unknown names were
+                // "recorded so a caller can refuse to round-trip"; no such mechanism
+                // exists, and this is the honest statement of why none is needed.)
                 gainMode = outputObj?.str("gain_mode")
                     ?.let { n -> GainMode.entries.firstOrNull { it.wireName == n } }
                     ?: GainMode.TRACKING,

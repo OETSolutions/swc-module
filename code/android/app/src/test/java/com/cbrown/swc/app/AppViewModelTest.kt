@@ -427,6 +427,59 @@ class AppViewModelTest {
         }
 
     @Test
+    fun `a stale edit for a button that no longer exists is dropped, not sent`() = runTest {
+        // The edit key comes from a grid built against an EARLIER config, and a
+        // later refresh (connect() re-reads) can re-learn the button away. The old
+        // code emitted the binding anyway, under a SWC1 fallback, which the
+        // firmware refuses (`BindingNamesARealInput`) -- and since the app's
+        // `problems()` does not mirror that rule, the whole save was nacked and
+        // every VALID edit lost behind the generic message. The stale one must be
+        // dropped instead.
+        val t = FakeTransport()
+        var saved: com.oetsolutions.swc.model.Config? = null
+        val vm = AppViewModel(SwcClient(t), scope = vmScope(), saveConfig = { c -> saved = c; true })
+        started(vm)
+
+        configRun(sampleConfig()).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        // Edit a button the current config HAS.
+        val stale = vm.bindings.value.cells.first { it.buttonId == "next" && it.gesture == "DOUBLE" }
+        vm.editBinding(stale, com.oetsolutions.swc.model.Action(ActionKind.APP_LAUNCH, "com.stale.app"))
+        // And edit one a refreshed config will still have, so the save carries a
+        // legitimate edit alongside the stale one.
+        val live = vm.bindings.value.cells.first { it.buttonId == "vol_up" && it.gesture == "DOUBLE" }
+        vm.editBinding(live, com.oetsolutions.swc.model.Action(ActionKind.APP_LAUNCH, "com.live.app"))
+        advanceUntilIdle()
+
+        // The device now reports a config where `next` is gone (re-learned away).
+        val refreshed = sampleConfig().let { base ->
+            base.copy(
+                channels = listOf(
+                    base.channels[0].copy(
+                        ladder = base.channels[0].ladder.copy(
+                            buttons = base.channels[0].ladder.buttons.filter { it.id != "next" },
+                        ),
+                    ),
+                ),
+                bindings = emptyList(),
+            )
+        }
+        configRun(refreshed).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        vm.save()
+        advanceUntilIdle()
+
+        assertNotNull("the save must reach the device", saved)
+        val buttons = saved!!.bindings.map { it.button }
+        assertFalse("a binding to a button that no longer exists must not be sent",
+            buttons.contains("next"))
+        assertTrue("and the still-valid edit must survive: $buttons",
+            buttons.contains("vol_up"))
+    }
+
+    @Test
     fun `a locally invalid config is refused before it is sent`() = runTest {
         // The same rule the firmware enforces, checked locally so the user gets the
         // FIELD named rather than a nack that can only name a check (SwcClient does

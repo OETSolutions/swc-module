@@ -476,6 +476,21 @@ class AppViewModel(
             val (button, gestureName) = key.split("/")
             val gesture = Gesture.fromWireName(gestureName) ?: return@mapNotNull null
             if (action == null || action.kind.wireName == "NONE") return@mapNotNull null
+            // A button that is on NO current ladder is a STALE edit: its key came
+            // from a grid built against an earlier config, and a later refresh (a
+            // `connect()` re-reads the config) can re-learn the button away. Emitting
+            // a binding for it anyway is worse than dropping it -- the firmware's
+            // `BindingNamesARealInput` refuses a binding that names no real input, and
+            // the app's `problems()` cannot catch it (it does not mirror that rule), so
+            // the WHOLE save would be nacked and the user's every valid edit lost
+            // behind the generic "device did not accept" message. The old code fell
+            // back to SWC1 here, which fabricates exactly that refused binding.
+            //
+            // Skipping is honest: a binding to a button that no longer exists on
+            // either channel cannot mean anything. (`buildCells` keys edits only by
+            // ladder button ids, so an AUX id never reaches here and this cannot drop
+            // a legitimate AUX binding.)
+            val channel = channelOfButton(config, button) ?: return@mapNotNull null
             com.oetsolutions.swc.model.Binding(
                 id = "${button}-${gestureName}",
                 // The channel comes from the BUTTON's OWN ladder, not from
@@ -485,8 +500,7 @@ class AppViewModel(
                 // written as SWC1 -- the firmware then resolves it only against
                 // channel 0, so the SWC2 button the user just programmed does
                 // nothing while SWC1's same-named button fires the SWC2 action.
-                channel = channelOfButton(config, button)
-                    ?: com.oetsolutions.swc.model.BindingChannel.SWC1,
+                channel = channel,
                 button = button,
                 gesture = gesture,
                 enabled = true,

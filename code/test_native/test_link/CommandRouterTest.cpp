@@ -822,3 +822,135 @@ TEST(CommandRouter, AnOversizedLogMessageIsTruncatedNotOverrun) {
     EXPECT_LT(cap.lines[0].size(), kNdjsonMaxFrame);
     EXPECT_NE(cap.lines[0].find("\"type\":\"log\""), std::string::npos);
 }
+
+TEST(CommandRouter, ReLearningAButtonByIdReplacesItRatherThanDuplicating) {
+    // The app names the button it learns (`button_id`), and it sends the SAME id
+    // again when the user re-measures one. The handler always appended, so
+    // re-learning put two buttons on the ladder with ONE id. Nothing rejects that
+    // -- `ConfigValidate` does not check id uniqueness -- and `BindingResolve`
+    // finds a binding by `strcmp` on the id, so the id became ambiguous between
+    // two different voltages.
+    //
+    // This is the app-path twin of the headless wizard's version of the same bug;
+    // both are fixed by replacing in place.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.channels[0].ladder.count = 0;
+    d.config.channels[0].ladder.learned_idle_mv = 2835;
+    // The fixture's bindings name buttons the emptied ladder no longer has, and
+    // `ConfigValidate` refuses a binding that names no real input. Left in, they
+    // make the config UNLOADABLE -- so `store.Load` fell back to defaults, and the
+    // first version of this test passed by measuring that fallback rather than the
+    // re-learn (`ConfigValidate` accepts defaults, so a commit over them looked
+    // like a success). Clearing them is what makes the store round-trip at all.
+    d.config.binding_count = 0;
+    ASSERT_TRUE(store.Save(d.config));
+
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    // The two levels are deliberately FAR APART. With nearby levels the
+    // duplicate's windows overlap, the config becomes unvalidatable, and the next
+    // `store.Load` falls back to DEFAULTS -- which resets `count` to 0 and hides
+    // the duplicate. That is how the first version of this test passed against a
+    // mutated build: it measured the fallback, not the bug. Well-separated levels
+    // keep the duplicate valid, so it persists and is visible.
+    const int levels[2] = {1430, 2500};
+    for (int pass = 0; pass < 2; ++pass) {
+        // TICK the orchestrator so its FR-3 filter warms: `FilteredLevelMv` returns
+        // 0 for a stale reading, and a commit of 0 is now correctly REFUSED (a
+        // centre of 0 is not a measurement), so without the ticks nothing would be
+        // learned at all and this test would be measuring the wrong thing.
+        hal.SetAdcMilliVolts(ADC_CH_SWC1, levels[pass]);
+        for (int i = 0; i < 20; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+
+        const std::string ls =
+            "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0,\"button_id\":\"vol_dn\"}";
+        r.OnLine(ls.c_str(), ls.size());
+        // learn_commit carries ONE sample each, so drive many of them to clear the
+        // count and span gates (>=10 samples over >=100 ms).
+        for (int i = 0; i < 20; ++i) {
+            const std::string lc =
+                "{\"v\":1,\"seq\":3,\"type\":\"learn_commit\",\"channel\":0,"
+                "\"button_id\":\"vol_dn\",\"name\":\"Volume Down\"}";
+            r.OnLine(lc.c_str(), lc.size());
+            hal.AdvanceMs(20);
+        }
+    }
+
+    Config out{};
+    EXPECT_EQ(store.Load(&out), ConfigLoadResult::kLoaded)
+        << "the config must still be loadable -- a duplicate id is accepted by "
+           "ConfigValidate, so a fallback here would mean the test measured the "
+           "fallback rather than the duplicate";
+    const LadderProfile &lp = out.channels[0].ladder;
+    EXPECT_EQ(lp.count, 1)
+        << "re-learning one id must CORRECT that button, not add a second entry";
+    if (lp.count >= 2) {
+        // Name the actual defect when it fires, so the failure is self-explaining.
+        ADD_FAILURE() << "duplicate id: two buttons share \"" << lp.buttons[1].id
+                      << "\" at " << static_cast<int>(lp.buttons[0].mv_center) << " and "
+                      << static_cast<int>(lp.buttons[1].mv_center) << " mV";
+    }
+    EXPECT_STREQ(lp.buttons[0].id, "vol_dn");
+    EXPECT_EQ(lp.buttons[0].mv_center, 2500)
+        << "and the LATER measurement is the one that survives";
+}
+
+TEST(CommandRouter, ALearnCommitOverAnUnreadableConfigRefusesRatherThanOverwriting) {
+    // The handler did `if (Load(&c) != kLoaded) c = ConfigDefault()`, which cannot
+    // tell "never configured" from "configured but UNREADABLE". In the second case
+    // the save overwrites the user's ENTIRE config -- bindings, the other channel,
+    // every setting -- with defaults. Measured before the fix: three bindings
+    // replaced by zero, from one `learn_commit`, with an `ack` returned.
+    //
+    // An unreadable stored config is a fault to report, not a blank sheet.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.channels[0].ladder.count = 0;
+    d.config.channels[0].ladder.learned_idle_mv = 2835;
+    d.config.binding_count = 0;
+    ASSERT_TRUE(store.Save(d.config));
+
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    // Rot the stored slots, so the config is present but cannot be decoded.
+    hal.CorruptNvsValue("cfg_a_0", 24);
+    hal.CorruptNvsValue("cfg_b_0", 24);
+    {
+        Config t{};
+        ASSERT_EQ(store.Load(&t), ConfigLoadResult::kFellBackToDefaults)
+            << "the fixture must actually be unreadable for this test to mean "
+               "anything";
+    }
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    for (int i = 0; i < 20; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    const std::string ls =
+        "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0,\"button_id\":\"vol_dn\"}";
+    r.OnLine(ls.c_str(), ls.size());
+    cap.lines.clear();
+    for (int i = 0; i < 20; ++i) {
+        const std::string lc =
+            "{\"v\":1,\"seq\":3,\"type\":\"learn_commit\",\"channel\":0,"
+            "\"button_id\":\"vol_dn\",\"name\":\"Volume Down\"}";
+        r.OnLine(lc.c_str(), lc.size());
+        hal.AdvanceMs(20);
+    }
+
+    // The refusal is the point, and it must be REPORTED rather than silent.
+    ASSERT_TRUE(HasType(cap, "nack"))
+        << "an unreadable config must be refused, not overwritten";
+    EXPECT_NE(cap.lines.back().find("config_unreadable"), std::string::npos);
+
+    // And the store is untouched: still unreadable, NOT replaced by defaults.
+    Config after{};
+    EXPECT_EQ(store.Load(&after), ConfigLoadResult::kFellBackToDefaults)
+        << "a refused commit must leave the stored bytes alone -- a load that now "
+           "SUCCEEDS means defaults were written over the user's config";
+}

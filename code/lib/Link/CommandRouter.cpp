@@ -804,16 +804,45 @@ void CommandRouter::HandleLearnCommit(const cJSON *root, uint32_t for_seq) {
 
     // Persisted through the config, NOT as a side channel: a learned button that
     // is not in the config is a button that vanishes at reboot.
+    //
+    // **Only `kNoConfig` may fall back to defaults.** Treating ANY failed load as
+    // "start from defaults" is a data-loss bug: it cannot tell "never configured"
+    // from "configured but UNREADABLE", and in the second case the save below
+    // overwrites the user's whole config -- bindings, the other channel, every
+    // setting -- with defaults. Measured: three bindings replaced by zero on a
+    // device whose slots were corrupt, from one `learn_commit`, with an `ack`. An
+    // unreadable config is a fault to report, not a blank sheet.
     Config c{};
-    if (store_->Load(&c) != ConfigLoadResult::kLoaded) c = ConfigDefault();
+    const ConfigLoadResult lr = store_->Load(&c);
+    if (lr == ConfigLoadResult::kFellBackToDefaults) {
+        Nack(for_seq, "config_unreadable",
+             "the stored config could not be read; refusing to overwrite it");
+        return;
+    }
+    if (lr == ConfigLoadResult::kNoConfig) c = ConfigDefault();
     LadderProfile &lp = c.channels[channel].ladder;
-    if (lp.count < kLadderMaxButtons) {
+
+    // REPLACE IN PLACE when the id is already on the ladder, rather than always
+    // appending. The host names the button it learns (`button_id`), and the app
+    // sends the same id again when the user re-measures one -- so appending put
+    // two buttons on the ladder with ONE id. Nothing rejects that
+    // (`ConfigValidate` does not check id uniqueness), and `BindingResolve` and
+    // `BindingsForButton` both look a binding up by `strcmp` on the id, so the id
+    // became ambiguous between two different voltages. The headless wizard path
+    // had the same defect and is fixed the same way there.
+    int target = -1;
+    for (uint8_t i = 0; i < lp.count; ++i) {
+        if (strcmp(lp.buttons[i].id, out.id) == 0) { target = i; break; }
+    }
+    if (target >= 0) {
+        lp.buttons[target] = out;
+    } else if (lp.count < kLadderMaxButtons) {
         lp.buttons[lp.count++] = out;
-        lp.learned_idle_mv = session_.LearnedIdleMv();
     } else {
         Nack(for_seq, "no_space", "the ladder has no free button slot");
         return;
     }
+    lp.learned_idle_mv = session_.LearnedIdleMv();
     if (!store_->Save(c)) {
         Nack(for_seq, "save_failed", "could not persist the learned button");
         return;

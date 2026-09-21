@@ -99,25 +99,18 @@ bool ConfigValidate(const Config &c) {
     for (uint8_t ch = 0; ch < c.channel_count; ++ch) {
         const ChannelConfig &cc = c.channels[ch];
         if (cc.name[0] == '\0') return false;
-        if (cc.ladder.count > kLadderMaxButtons) return false;
-        // The idle reference must be a plausible ADC reading: above zero and
-        // no higher than the 2900 mV ADC ceiling (spec 3.2).
-        if (cc.ladder.learned_idle_mv <= 0 || cc.ladder.learned_idle_mv > 2900) return false;
-        for (uint8_t i = 0; i < cc.ladder.count; ++i) {
-            const LadderButton &b = cc.ladder.buttons[i];
-            if (b.id[0] == '\0') return false;
-            // A button at or above the idle reference is physically impossible:
-            // a press pulls the input DOWN (spec 6.3), so every button sits
-            // below the idle. Both bounds are checked against the 2900 mV ADC
-            // ceiling (spec 3.2) rather than a 3300 mV rail -- no pin reading
-            // can exceed the ceiling, so a value above it is not a measurement.
-            if (b.mv_center == 0 || b.mv_center > 2900) return false;
-            if (b.mv_tolerance == 0) return false;
-            // And the DERIVED window must be a real one: a tolerance that
-            // rounds to zero permille can never match anything.
-            if (LadderRatioPermille(b.mv_tolerance, cc.ladder.learned_idle_mv) <= 0) return false;
+        // The LADDER's own checks live in `LadderProfileIsValid`, one home, because
+        // `LearnSession::Commit` must refuse to produce a profile this function
+        // would reject -- `ConfigStore::Save` does not validate, so a commit that
+        // skipped this would persist a config the next boot cannot load.
+        //
+        // The `id` is checked HERE rather than in the shared predicate: it is the
+        // caller's field, learn cannot invent it, and a profile that is not yet
+        // named is a legitimate intermediate for a learn.
+        for (uint8_t i = 0; i < cc.ladder.count && i < kLadderMaxButtons; ++i) {
+            if (cc.ladder.buttons[i].id[0] == '\0') return false;
         }
-        if (!LadderWindowsAreDistinguishable(cc.ladder)) return false;
+        if (!LadderProfileIsValid(cc.ladder)) return false;
     }
 
     // Bindings are a top-level table (spec 3.1/3.5), so their checks are too.

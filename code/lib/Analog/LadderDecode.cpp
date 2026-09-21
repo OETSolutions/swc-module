@@ -3,6 +3,9 @@
 #include <stdlib.h>
 
 namespace {
+// The calibrated ADC ceiling (spec 3.2): above this no pin reading is possible, so
+// a value beyond it is a wiring or calibration fault rather than a level.
+constexpr int kAdcCeilingMv = 2900;
 // The margin either side of the idle reference. Above idle+margin the reading
 // exceeds the reference, which is a short to a higher supply rather than a
 // button or an idle.
@@ -102,4 +105,25 @@ bool LadderWindowsAreDistinguishable(const LadderProfile &p) {
         }
     }
     return true;
+}
+
+bool LadderProfileIsValid(const LadderProfile &p) {
+    // The channel-level bounds, which ConfigValidate checks separately.
+    if (p.learned_idle_mv <= 0 || p.learned_idle_mv > kAdcCeilingMv) return false;
+    if (p.count > kLadderMaxButtons) return false;
+    for (uint8_t i = 0; i < p.count; ++i) {
+        const LadderButton &b = p.buttons[i];
+        // A button at or above the idle reference is physically impossible: a press
+        // pulls the input DOWN. Both bounds are against the ADC ceiling rather than
+        // the 3300 mV rail, because no pin reading can exceed the ceiling -- so a
+        // value above it is not a measurement. A centre of exactly 0 IS reachable
+        // from a learn (an unreadable ADC reports 0, and `FilteredLevelMv` returns
+        // 0 for a stale reading), which is the route that motivated this predicate.
+        if (b.mv_center == 0 || b.mv_center > kAdcCeilingMv) return false;
+        if (b.mv_tolerance == 0) return false;
+        // The DERIVED window must be a real one: a tolerance that rounds to zero
+        // permille can never match anything.
+        if (LadderRatioPermille(b.mv_tolerance, p.learned_idle_mv) <= 0) return false;
+    }
+    return LadderWindowsAreDistinguishable(p);
 }

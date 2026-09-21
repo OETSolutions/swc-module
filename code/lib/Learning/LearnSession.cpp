@@ -182,7 +182,12 @@ LearnReject LearnSession::Commit(LadderButton *out) {
             // zero while the live idle is a real reading.
             prospective.learned_idle_mv =
                 (learned_idle_mv_ > 0) ? learned_idle_mv_ : 1;
-            if (!LadderWindowsAreDistinguishable(prospective)) {
+            // The WHOLE validity predicate, not just the window relation. Three
+            // routes were found to a commit the validator refuses: a window
+            // overlapping its neighbour, a duplicate id (handled by the wizard,
+            // which owns ids), and a level of 0 from an unreadable ADC giving
+            // `mv_center == 0`. Checking one relation would have missed the last.
+            if (!LadderProfileIsValid(prospective)) {
                 return LearnReject::kTooNoisy;
             }
         }

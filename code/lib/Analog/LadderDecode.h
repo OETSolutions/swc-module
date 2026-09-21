@@ -65,6 +65,26 @@ int16_t LadderRatioPermille(int level_mv, int idle_mv);
 
 ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int idle_mv);
 
+/*
+ * Is this profile one a config may CARRY? Every check `ConfigValidate` applies to a
+ * channel's ladder, in one place.
+ *
+ * **It exists because `LearnSession::Commit` must refuse to produce a profile the
+ * validator would reject, and `ConfigStore::Save` does not validate.** Three
+ * separate routes were found, all of them silent and all of them ending in the same
+ * place: the learn reports LEARN_OK, the config is written, and the next boot's
+ * decode refuses it -- `ConfigStore::Load` then falls back to defaults and the user
+ * loses every learned button, reported only as a corrupt config. The routes were a
+ * window overlapping its neighbour, a duplicate id, and a level of 0 (what an
+ * unreadable ADC reports) producing `mv_center == 0`. Checking only the window
+ * relation would have missed the last two, which is why the gate is the WHOLE
+ * predicate rather than the one relation that was noticed first.
+ *
+ * The `id` field is deliberately NOT checked here: it is the CALLER's, learn cannot
+ * invent it, and a profile that is not yet named is a legitimate intermediate.
+ */
+bool LadderProfileIsValid(const LadderProfile &p);
+
 // Are every two of this profile's windows distinguishable, so classification is a
 // measurement rather than a coin toss?
 //

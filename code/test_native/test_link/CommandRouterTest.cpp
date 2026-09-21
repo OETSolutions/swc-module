@@ -869,15 +869,19 @@ TEST(CommandRouter, ReLearningAButtonByIdReplacesItRatherThanDuplicating) {
         const std::string ls =
             "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0,\"button_id\":\"vol_dn\"}";
         r.OnLine(ls.c_str(), ls.size());
-        // learn_commit carries ONE sample each, so drive many of them to clear the
-        // count and span gates (>=10 samples over >=100 ms).
+        // The REAL flow (spec 4.3): learn_start opens the stream, `Process()` ticks
+        // emit ladder_sample AND record each one, and ONE learn_commit accepts the
+        // streamed samples. Firing learn_commit repeatedly was how this test used
+        // to reach the sample count, which is not the flow the spec describes and
+        // is what masked the bug that the stream was never recorded.
         for (int i = 0; i < 20; ++i) {
-            const std::string lc =
-                "{\"v\":1,\"seq\":3,\"type\":\"learn_commit\",\"channel\":0,"
-                "\"button_id\":\"vol_dn\",\"name\":\"Volume Down\"}";
-            r.OnLine(lc.c_str(), lc.size());
+            r.Process();
             hal.AdvanceMs(20);
         }
+        const std::string lc =
+            "{\"v\":1,\"seq\":3,\"type\":\"learn_commit\",\"channel\":0,"
+            "\"button_id\":\"vol_dn\",\"name\":\"Volume Down\"}";
+        r.OnLine(lc.c_str(), lc.size());
     }
 
     Config out{};
@@ -934,14 +938,15 @@ TEST(CommandRouter, ALearnCommitOverAnUnreadableConfigRefusesRatherThanOverwriti
     const std::string ls =
         "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0,\"button_id\":\"vol_dn\"}";
     r.OnLine(ls.c_str(), ls.size());
-    cap.lines.clear();
     for (int i = 0; i < 20; ++i) {
-        const std::string lc =
-            "{\"v\":1,\"seq\":3,\"type\":\"learn_commit\",\"channel\":0,"
-            "\"button_id\":\"vol_dn\",\"name\":\"Volume Down\"}";
-        r.OnLine(lc.c_str(), lc.size());
+        r.Process();
         hal.AdvanceMs(20);
     }
+    cap.lines.clear();
+    const std::string lc =
+        "{\"v\":1,\"seq\":3,\"type\":\"learn_commit\",\"channel\":0,"
+        "\"button_id\":\"vol_dn\",\"name\":\"Volume Down\"}";
+    r.OnLine(lc.c_str(), lc.size());
 
     // The refusal is the point, and it must be REPORTED rather than silent.
     ASSERT_TRUE(HasType(cap, "nack"))
@@ -1351,4 +1356,60 @@ TEST(CommandRouter, ATestKeyWithAFractionalMillivoltIsRefused) {
         "{\"v\":1,\"seq\":2,\"type\":\"test_key\",\"channel\":0,\"key_mv\":2400}";
     r.OnLine(g, strlen(g));
     EXPECT_TRUE(HasType(cap2, "ack")) << "an in-envelope integer key must still be acked";
+}
+
+TEST(CommandRouter, TheStreamedSamplesAreWhatALearnCommitAccepts) {
+    // Spec 4.3 and this router's header both describe the learn flow as
+    // learn_start -> ladder_sample frames -> ONE learn_commit that "accepts the
+    // streamed samples". That could not work: `Process()` emitted and COUNTED
+    // samples but recorded none, and `AddSample` ran only inside the commit (once)
+    // while `LearnSession::Commit` needs >=10 samples over >=100 ms. Measured
+    // before the fix: a 30-frame stream followed by one learn_commit returned
+    // `learn_rejected: too_few_samples`, so the specified protocol never succeeded.
+    // The host suite masked it by firing 20 learn_commit frames, which is not a
+    // flow anyone would write.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.channels[0].ladder.count = 0;
+    d.config.channels[0].ladder.learned_idle_mv = 2835;
+    d.config.binding_count = 0;
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    for (int i = 0; i < 20; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+
+    const std::string ls = "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0}";
+    r.OnLine(ls.c_str(), ls.size());
+    ASSERT_TRUE(HasType(cap, "ack")) << "learn_start must open the stream";
+
+    // Stream for >=100 ms of span and well past the 10-sample floor.
+    int emitted = 0;
+    for (int i = 0; i < 30; ++i) {
+        cap.lines.clear();
+        r.Process();
+        hal.AdvanceMs(10);
+        if (HasType(cap, "ladder_sample")) ++emitted;
+    }
+    ASSERT_GE(emitted, 12) << "the stream must actually run for this test to mean anything";
+
+    // ONE commit, the way the spec's frame list describes it.
+    cap.lines.clear();
+    const std::string lc =
+        "{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":0,"
+        "\"button_id\":\"vol_dn\",\"name\":\"Volume Down\"}";
+    r.OnLine(lc.c_str(), lc.size());
+    ASSERT_TRUE(HasType(cap, "ack"))
+        << "one learn_commit after a real stream must be ACCEPTED; a "
+           "too_few_samples here means the stream was not recorded: "
+        << (cap.lines.empty() ? "(nothing)" : cap.lines.back());
+
+    Config out{};
+    ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+    ASSERT_EQ(out.channels[0].ladder.count, 1u) << "the streamed samples must become a button";
+    EXPECT_STREQ(out.channels[0].ladder.buttons[0].id, "vol_dn");
+    EXPECT_NEAR(out.channels[0].ladder.buttons[0].mv_center, 1430, 60);
 }

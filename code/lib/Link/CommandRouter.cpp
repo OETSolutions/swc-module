@@ -179,6 +179,17 @@ void CommandRouter::Process() {
     // per call, so the stream cannot starve the reply run or the key path.
     if (learn_open_ && !reply_open_) {
         EmitLadderSample();
+        // The streamed sample is RECORDED, not merely sent. Spec 4.3 and this
+        // router's own header both say learn_commit "accepts the streamed
+        // samples": the session is the accumulator that makes that true. Without
+        // this the sample went out over the wire and nowhere else -- measured, a
+        // 30-frame stream followed by one learn_commit returned
+        // `learn_rejected: too_few_samples`, because AddSample was called only
+        // from the commit itself (once) while `LearnSession::Commit` requires
+        // >=10 samples over >=100 ms. The protocol the spec describes could not
+        // succeed at all; the host suite masked it by firing 20 learn_commit
+        // frames, which is not the flow anyone would write.
+        RecordLearnSample();
         ++learn_samples_;
         return;
     }
@@ -804,6 +815,29 @@ void CommandRouter::EmitLadderSample() {
     Emit("ladder_sample", body);
 }
 
+/*
+ * Feed the value the stream is reporting into the session that learn_commit will
+ * commit. `EmitLadderSample` reads the level from the same call, so the frame and
+ * the sample are the same measurement -- recording a separate read would measure
+ * a value the app never saw.
+ *
+ * The idle reference is the LEARNED one from the running config (spec 6.3): the
+ * ratio denominator must stay pinned to the rail the button centres were measured
+ * at, and reading the live idle here would make it move with the rail.
+ *
+ * Out-of-range levels are still recorded: the session counts them and reports
+ * `out_of_range` (a wiring fault), rather than dropping them and reporting the
+ * vaguer `too_few_samples`.
+ */
+void CommandRouter::RecordLearnSample() {
+    if (sys_ == nullptr) return;
+    const uint8_t ch = static_cast<uint8_t>(learn_channel_);
+    const int level_mv = sys_->FilteredLevelMv(ch);
+    const int idle_mv = sys_->IdleReferenceMv(ch);
+    session_.AddSample(level_mv, idle_mv, static_cast<MilliVolt>(idle_mv), 0,
+                       hal_ != nullptr ? hal_->now_ms(hal_->ctx) : 0);
+}
+
 void CommandRouter::EmitLog(const char *level, const char *msg) {
     if (level == nullptr || msg == nullptr) return;
     char body[kNdjsonMaxFrame / 2];
@@ -957,15 +991,11 @@ void CommandRouter::HandleLearnCommit(const cJSON *root, uint32_t for_seq) {
         return;
     }
 
-    // The session holds every sample the stream carried. The idle reference is
-    // the LEARNED one from the running config (spec 6.3) -- reading the live idle
-    // here would make the ratio denominator move with the rail, which is exactly
-    // what renormalizing by a pinned idle exists to prevent.
-    const int level_mv = sys_->FilteredLevelMv(channel);
-    const int idle_mv = sys_->IdleReferenceMv(channel);
-    session_.AddSample(level_mv, idle_mv, static_cast<MilliVolt>(idle_mv), 0,
-                       hal_ ? hal_->now_ms(hal_->ctx) : 0);
-
+    // The session was fed by `RecordLearnSample` on every `Process()` tick the
+    // stream was open, which is what makes the spec's "accept the streamed
+    // samples" true. Deliberately NO sample is added here: the commit is the end
+    // of the stream, and folding one more reading in would measure a level the
+    // app never saw and could move the mean after the user stopped pressing.
     LadderButton out{};
     // id and name are the CALLER's: a slug and a display label are not facts
     // about a voltage, and learn cannot invent them (LearnSession.h).

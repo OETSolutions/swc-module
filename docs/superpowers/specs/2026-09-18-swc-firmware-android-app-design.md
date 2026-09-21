@@ -860,7 +860,7 @@ device actually resolved rather than a hardcoded word.
 | App → FW | `config_begin` / `config_chunk` / `config_end` | total_len+crc32; offset+data; sha256 | The chunked transport that carries **both** `config_get` and `config_set` (§4.2) |
 | App → FW | `config_patch` | `path`, `value` | Single-field change, cheaper and less racy — fits one line |
 | App → FW | `learn_start` / `learn_stop` | `channel`, `button_id` | Drive the learn wizard (§6.4) |
-| App → FW | `learn_commit` | `channel`, `button_id`, `name` | Accept the streamed samples as this button |
+| App → FW | `learn_commit` | `channel`, `button_id`, `name` | Accept the streamed samples as this button. **The device records every `ladder_sample` it streams**, so a single `learn_commit` after the stream commits those samples — they are the accumulator, not a count. (Recorded 2026-09-21: the stream was emitted and never stored, so one `learn_commit` always answered `learn_rejected: too_few_samples` and the flow as specified could not succeed.) |
 | App → FW | `maintenance_enter` / `maintenance_exit` | — | Enter/leave maintenance mode (§8.2) |
 | App → FW | `test_key` | `channel`, `key_mv`, `hold_ms` | Bench/production test of the output stage |
 | App → FW | `identify` | `pattern` | Flash LEDs / buzz, so the user knows *which* unit |

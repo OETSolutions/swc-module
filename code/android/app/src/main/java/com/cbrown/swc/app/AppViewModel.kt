@@ -272,11 +272,23 @@ class AppViewModel(
                 }
             }
 
+            // Spec 4.3's `status`, emitted every 2 s while connected. It carries
+            // the CONFIG's state, which spec 4.3 says exists so a config fault has
+            // "a name the app could read" (§6.8's `config_state: defaults`).
+            //
+            // This branch used to read `rail_mv` into the ladder's idle. That field
+            // has no producer anywhere in the firmware (grep-confirmed, spec N-22),
+            // so the read was dead -- and it would have been WRONG if it had ever
+            // been sent: `rail_mv` is the +3V3 rail (~3300), not the wheel's idle
+            // KEY level (~2835), and `LadderScreen` divides every band by whatever
+            // it is given. The idle the view needs already comes from the config
+            // (`onConfig` reads `ladder.learnedIdleMv`), so nothing is lost by
+            // dropping it. `vbus_present`, `output_safe` and `uptime_ms` are
+            // deliberately not mirrored yet: no screen consumes them, and inventing
+            // a place for them is not this fix.
             Frames.STATUS -> {
-                val rail = frame.fields["rail_mv"]?.jsonPrimitive?.intOrNull
-                if (rail != null && rail > 0) {
-                    _ladder.value = _ladder.value.copy(idleMv = rail)
-                }
+                val cs = frame.fields["config_state"]?.jsonPrimitive?.content
+                if (cs != null) _link.value = _link.value.copy(configState = cs)
             }
         }
     }

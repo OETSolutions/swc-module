@@ -171,6 +171,64 @@ class AppViewModelTest {
     }
 
     @Test
+    fun `a status frame reports the config state the device sends`() = runTest {
+        // Spec 4.3: `config_state` exists so a config fault has "a name the app
+        // could read" -- §6.8's corrupt-config response is `config_state: defaults`.
+        // The firmware emits it every 2 s; before this the app read none of it.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(frame("status", "vbus_present" to "true", "config_state" to "\"defaults\""))
+        advanceUntilIdle()
+
+        assertEquals("defaults", vm.link.value.configState)
+        assertNotNull(
+            "a config fallback must reach the user, not just the state object",
+            vm.link.value.configWarning,
+        )
+    }
+
+    @Test
+    fun `a status frame does NOT overwrite the ladder's idle with the rail`() = runTest {
+        // The STATUS branch used to read `rail_mv` into the ladder's idle. That
+        // field has no producer (spec N-22), and it is the +3V3 RAIL (~3300), not
+        // the wheel's idle KEY level (~2835) -- so had it ever been sent, every
+        // band in LadderScreen would have been divided by the wrong number. The
+        // idle comes from the config; a status frame must leave it alone.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        val c = sampleConfig()
+        configRun(c).forEach { t.emit(it) }
+        advanceUntilIdle()
+        assertEquals(2835, vm.ladder.value.idleMv)
+
+        t.emit(frame("status", "rail_mv" to "3300", "config_state" to "\"ok\""))
+        advanceUntilIdle()
+
+        assertEquals("the rail must never become the ladder's idle", 2835, vm.ladder.value.idleMv)
+        assertNull("a healthy config has nothing to warn about", vm.link.value.configWarning)
+    }
+
+    @Test
+    fun `a pass-through device with no config is not reported as a fault`() = runTest {
+        // FR-25's supported pass-through device reports `config_state: none`, which
+        // is deliberately NOT `defaults`: a device with no config still serves
+        // presses, so telling the user "your configuration is gone" would be false.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(frame("status", "config_state" to "\"none\""))
+        advanceUntilIdle()
+
+        assertEquals("none", vm.link.value.configState)
+        assertNull(vm.link.value.configWarning)
+    }
+
+    @Test
     fun `a version mismatch from the device becomes a link problem the screen can render`() = runTest {
         // Spec 4.5: a mismatch must be explicit, and the link screen has a distinct
         // message for it. A mismatch reaching only `LinkState` would render as

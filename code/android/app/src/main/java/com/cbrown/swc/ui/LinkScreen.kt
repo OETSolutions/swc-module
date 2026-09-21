@@ -45,7 +45,40 @@ data class LinkUiState(
     val maintenanceBusy: Boolean = false,
     /** Why the last maintenance request did not take effect. Null when it did. */
     val maintenanceProblem: String? = null,
-)
+    /**
+     * The device's config state from its `status` frame (spec 4.3): one of `ok`,
+     * `none`, `recovered` or `defaults`, or null before the first `status`.
+     *
+     * The firmware already reports this, and spec 4.3 says the field exists so a
+     * config fault has "a name the app could read" -- §6.8's corrupt-config
+     * response is `config_state: defaults`. Until this was read the app had no way
+     * to tell a device running the user's config from one that silently fell back
+     * to defaults, which is the exact fault the named field was added to surface.
+     *
+     * `none` is NOT a fault: it is FR-25's supported pass-through device (one with
+     * no config at all, which still serves presses). `defaults` and `recovered`
+     * are the two the user must be told about.
+     */
+    val configState: String? = null,
+) {
+    /**
+     * The config fault to show, or null when there is nothing to say.
+     *
+     * Deliberately a plain `when` rather than a message built in the view model:
+     * this is the wording, and wording belongs beside the screen that shows it.
+     */
+    val configWarning: String?
+        get() = when (configState) {
+            "defaults" ->
+                "The device lost its configuration and is running factory defaults. " +
+                    "Your learned buttons and bindings are gone. Program it again from " +
+                    "the Bindings screen."
+            "recovered" ->
+                "The device's saved configuration was damaged and it restored a backup. " +
+                    "Check the Bindings screen to confirm your buttons are right."
+            else -> null
+        }
+}
 
 /**
  * The link screen: is a device connected, what is it running, and if not, why not.
@@ -92,6 +125,18 @@ fun LinkScreen(
                 Column(Modifier.padding(16.dp)) {
                     Text(title, style = MaterialTheme.typography.titleMedium)
                     Text(detail, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        }
+
+        state.configWarning?.let { warning ->
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE)),
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Configuration problem", style = MaterialTheme.typography.titleMedium)
+                    Text(warning, style = MaterialTheme.typography.bodyMedium)
                 }
             }
         }

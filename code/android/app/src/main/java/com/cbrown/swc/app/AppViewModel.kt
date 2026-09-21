@@ -10,6 +10,7 @@ import com.oetsolutions.swc.link.LinkState
 import com.oetsolutions.swc.link.SwcClient
 import com.oetsolutions.swc.link.SwcTransport
 import com.oetsolutions.swc.model.Action
+import com.oetsolutions.swc.model.BindingChannel
 import com.oetsolutions.swc.model.Config
 import com.oetsolutions.swc.model.ConfigJson
 import com.oetsolutions.swc.model.Gesture
@@ -230,10 +231,11 @@ class AppViewModel(
                     ?.jsonPrimitive?.content
                 val level = frame.fields["level_mv"]?.jsonPrimitive?.intOrNull
                 val gesture = frame.fields["gesture"]?.jsonPrimitive?.content
+                val channel = frame.fields["channel"]?.jsonPrimitive?.intOrNull
                 if (gesture != null && level != null) {
                     _ladder.value = _ladder.value.copy(
                         liveMv = level,
-                        channelName = channelNameFor(frame.fields["channel"]?.jsonPrimitive?.intOrNull),
+                        channelName = channelNameFor(channel),
                         lastGesture = Gesture.fromWireName(gesture) ?: Gesture.NONE,
                         lastGestureButton = id,
                     )
@@ -242,7 +244,7 @@ class AppViewModel(
                     // action behind it. Resolving here is what makes an app-side
                     // binding do anything at all. Skipped for a null button: no
                     // binding can name a button that was not recognised.
-                    if (id != null && gesture != "NONE") runAppSideAction(id, gesture)
+                    if (id != null && gesture != "NONE") runAppSideAction(channel, id, gesture)
                 }
             }
 
@@ -313,10 +315,28 @@ class AppViewModel(
      * prevents the hardware key press. So a failure here is reported and nothing
      * else is affected.
      */
-    private fun runAppSideAction(buttonId: String, gestureName: String) {
+    private fun runAppSideAction(channelIndex: Int?, buttonId: String, gestureName: String) {
         val gesture = Gesture.fromWireName(gestureName) ?: return
+        // The channel filter mirrors `BindingResolve` (firmware) exactly: a binding
+        // fires for the channel the press came from, or for `ANY`. Filtering on the
+        // button id ALONE was a live defect once the board carries two channels with
+        // the same button names (the common case -- `vol_up` on both): a press on
+        // SWC1's `vol_up` would also fire SWC2's `vol_up` binding, launching an app
+        // or sending an intent the second channel never asked for. The firmware
+        // resolves channel+button; matching any less makes the app's half of spec
+        // 3.6 fire MORE bindings than the device did.
+        val asSwc = when (channelIndex) {
+            0 -> BindingChannel.SWC1
+            1 -> BindingChannel.SWC2
+            // An unknown or absent channel cannot be matched against a binding's
+            // channel field without guessing. The firmware only resolves the two SWC
+            // channels here (an AUX input has no ladder and never arrives as a
+            // channel index), so anything else matches nothing but `ANY`.
+            else -> null
+        }
         val bindings = client.config.value.bindings.filter {
-            it.enabled && it.button == buttonId && it.gesture == gesture
+            it.enabled && it.button == buttonId && it.gesture == gesture &&
+                (it.channel == BindingChannel.ANY || (asSwc != null && it.channel == asSwc))
         }
         if (bindings.isEmpty()) return
 

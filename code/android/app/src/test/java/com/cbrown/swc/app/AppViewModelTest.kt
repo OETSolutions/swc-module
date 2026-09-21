@@ -6,6 +6,7 @@ import com.oetsolutions.swc.link.SwcClient
 import com.oetsolutions.swc.link.SwcTransport
 import com.oetsolutions.swc.action.ActionOutcome
 import com.oetsolutions.swc.contract.ActionKind
+import com.oetsolutions.swc.model.Action
 import com.oetsolutions.swc.model.ConfigJson
 import com.oetsolutions.swc.model.Gesture
 import com.oetsolutions.swc.model.sampleConfig
@@ -629,6 +630,92 @@ class AppViewModelTest {
             assertFalse("and must NOT claim the binding is not app-side: $msg",
                 msg.contains("not an app-side action"))
         }
+
+    @Test
+    fun `an app-side binding fires only for the channel the press came from`() = runTest {
+        // The firmware resolves a binding by CHANNEL and button id (with `ANY` as a
+        // wildcard) -- `BindingResolve`/`BindingsForButton`. The app's half of spec
+        // 3.6 matched on button id alone, so once both channels carry a button of
+        // the same name (the common case: `vol_up` on SWC1 and SWC2) a press on one
+        // fired the OTHER channel's app-side action too -- launching an app or
+        // sending an intent the second channel never asked for. The app must resolve
+        // exactly what the device did, no more.
+        val t = FakeTransport()
+        val ran = mutableListOf<String>()
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            runAppAction = { kind, target, _ -> ran += "$kind:$target"; ActionOutcome.Ran },
+        )
+        started(vm)
+
+        // Two channels, the SAME button id `vol_up` on each, each binding DOUBLE to
+        // a different app. A press resolves to exactly one of them.
+        val c = com.oetsolutions.swc.model.sampleConfig().let { base ->
+            base.copy(
+                channels = listOf(
+                    base.channels[0],
+                    base.channels[0].copy(name = "SWC2"),
+                ),
+                bindings = listOf(
+                    com.oetsolutions.swc.model.Binding(
+                        "c1", com.oetsolutions.swc.model.BindingChannel.SWC1, "vol_up",
+                        Gesture.DOUBLE, true,
+                        listOf(Action(ActionKind.APP_LAUNCH, "com.swc1.app")),
+                    ),
+                    com.oetsolutions.swc.model.Binding(
+                        "c2", com.oetsolutions.swc.model.BindingChannel.SWC2, "vol_up",
+                        Gesture.DOUBLE, true,
+                        listOf(Action(ActionKind.APP_LAUNCH, "com.swc2.app")),
+                    ),
+                ),
+            )
+        }
+        configRun(c).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        t.emit(frame("event", "channel" to "0", "button" to "\"vol_up\"",
+            "gesture" to "\"DOUBLE\"", "t_ms" to "10", "level_mv" to "1430"))
+        advanceUntilIdle()
+
+        assertEquals(listOf("APP_LAUNCH:com.swc1.app"), ran)
+    }
+
+    @Test
+    fun `an ANY binding fires for a press on either channel`() = runTest {
+        // `ANY` is a real BindingChannel value (spec 3.5), and the firmware treats it
+        // as a wildcard (`b.channel != as_swc && b.channel != kAny`). The channel
+        // filter must not have narrowed that away.
+        val t = FakeTransport()
+        val ran = mutableListOf<String>()
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            runAppAction = { kind, target, _ -> ran += "$kind:$target"; ActionOutcome.Ran },
+        )
+        started(vm)
+
+        val c = com.oetsolutions.swc.model.sampleConfig().let { base ->
+            base.copy(
+                channels = listOf(base.channels[0], base.channels[0].copy(name = "SWC2")),
+                bindings = listOf(
+                    com.oetsolutions.swc.model.Binding(
+                        "a1", com.oetsolutions.swc.model.BindingChannel.ANY, "vol_up",
+                        Gesture.DOUBLE, true,
+                        listOf(Action(ActionKind.APP_LAUNCH, "com.any.app")),
+                    ),
+                ),
+            )
+        }
+        configRun(c).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        t.emit(frame("event", "channel" to "1", "button" to "\"vol_up\"",
+            "gesture" to "\"DOUBLE\"", "t_ms" to "10", "level_mv" to "1430"))
+        advanceUntilIdle()
+
+        assertEquals(listOf("APP_LAUNCH:com.any.app"), ran)
+    }
 
     @Test
     fun `checking for updates never claims to be up to date without checking`() = runTest {

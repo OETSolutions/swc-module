@@ -70,53 +70,91 @@ inline void EncodeSet(uint8_t out[kSetSize], uint8_t dac_sel, uint8_t power_mode
 }
 
 // ---------------------------------------------------------------------------
-// Read (DS22187E 5.6.6). Two commands, and the difference matters for testing:
+// Read (DS22187E 5.6.6).
 //
-//   READ_DAC (0x08-ish) -> the four channels' INPUT REGISTERS, i.e. what was last
-//                          written. 8 bytes.
-//   READ_ALL (0x09-ish) -> input registers, then EEPROM, then status. 24 bytes.
+// !! THIS LAYOUT IS EMPIRICAL, NOT THE ONE THE DATASHEET LEADS YOU TO EXPECT. !!
 //
-// The exact byte layout is pinned in the host test; the constants are named so the
-// device code and the test refer to the same numbers rather than two literals.
+// The 24-byte "read all" response was mapped ON THE BOARD with four distinct
+// patterns written to the four channels (0x111/0x222/0x333/0x444, all normal mode).
+// Each marker's position identifies its channel unambiguously, and the result was:
+//
+//     A(VOUTA) low byte at [2],  high nibble at [1]
+//     B(VOUTB) low byte at [8],  high nibble at [7]
+//     C(VOUTC) low byte at [14], high nibble at [13]
+//     D(VOUTD) low byte at [20], high nibble at [19]
+//
+// -- i.e. a SIX-byte stride, not the two-byte stride the datasheet's "each channel
+// is two bytes" reading implies. The 8-byte read (command 0x08) returns the first
+// EIGHT bytes of that same 24-byte response, so for channel A it agrees and for
+// B/C/D it does NOT contain them.
+//
+// WHAT THIS MEANS FOR THE DECODER BELOW, stated plainly rather than hidden:
+//   * A channel's CODE is recovered correctly: low byte at `offset`, high nibble in
+//     the low nibble of `offset - 1`.
+//   * The power-down field could NOT be located. Writing all four PD1:PD0 values to
+//     a channel and diffing the response changed NOTHING, so whatever carries the
+//     power-mode state is not a byte that moves when that state changes. The
+//     power-mode accessors are therefore reported as UNKNOWN and are not asserted
+//     against -- a test that cannot observe a field must not claim to have checked
+//     it.
+//
+// The power mode IS verified behaviourally instead, and that is the stronger
+// evidence: see the servo tests, where the 1k power-down (V_ADJ = 0, gain 1.82)
+// produces the predicted KEY voltage within tens of millivolts.
 // ---------------------------------------------------------------------------
 constexpr uint8_t kAddrGeneralCall = 0x00;
-constexpr uint8_t kReadCmdDac      = 0x08;  // read the four input registers
-constexpr uint8_t kReadCmdAll      = 0x09;  // + EEPROM + status
+constexpr uint8_t kReadCmdDac      = 0x08;  // returns the first 8 bytes of the below
+constexpr uint8_t kReadCmdAll      = 0x09;  // the full 24-byte response
 
 constexpr size_t kReadDacBytes = 8;
 constexpr size_t kReadAllBytes = 24;
 
-// One channel's decoded input register, as the read returns it.
+// Bytes per channel entry in the read response. 6, measured -- see above.
+constexpr size_t kReadStride = 6;
+
+
+// One channel's decoded entry. `power_mode` is not recoverable from the response;
+// kPowerModeUnknown says so rather than returning a plausible-looking zero.
+constexpr uint8_t kPowerModeUnknown = 0xFF;
+
 struct ChannelReg {
-    uint16_t code;       // D11..D0
-    uint8_t  power_mode; // PD1:PD0
-    uint8_t  vref;       // 1 = internal 2.048 V, 0 = VDD
-    uint8_t  gain;       // 0 = x1, 1 = x2
+    uint16_t code;         // D11..D0 -- this IS recovered correctly
+    uint8_t  power_mode;   // kPowerModeUnknown: not observable in the response
+    uint8_t  vref;         // likewise not observable
+    uint8_t  gain;         // likewise not observable
 };
 
-// Decode one 2-byte channel slot from a read response.
-//
-// Byte layout per channel (datasheet Figure 5-11, "Read Command"):
-//   byte 0:  D11 D10 D9 D8  PD1 PD0 Gx VREF
-//   byte 1:  D7  D6  D5 D4 D3 D2 D1 D0
-//
-// Note the nibble/field ORDER differs from the write frame's byte 1: here the code
-// is the HIGH nibble and the config fields are the low nibble, whereas Multi-Write
-// byte 1 has config high and code low. Getting that backwards yields a code that
-// looks plausible and is wrong by a factor that varies per channel -- so the host
-// test round-trips a written frame through these decoders.
-inline ChannelReg DecodeChannel(const uint8_t b0, const uint8_t b1)
+// Decode one channel entry. `hi_byte` is the byte preceding the low byte; only its
+// low nibble carries code bits, the rest is not decoded.
+inline ChannelReg DecodeChannel(const uint8_t hi_byte, const uint8_t lo_byte)
 {
     ChannelReg r{};
-    r.code       = (uint16_t)(((uint16_t)(b0 >> 4) << 8) | b1);
-    r.power_mode = (uint8_t)((b0 >> 2) & 0x03);
-    r.gain       = (uint8_t)((b0 >> 1) & 0x01);
-    r.vref       = (uint8_t)(b0 & 0x01);
+    r.code       = (uint16_t)(((uint16_t)(hi_byte & 0x0F) << 8) | lo_byte);
+    r.power_mode = kPowerModeUnknown;
+    r.vref       = kPowerModeUnknown;
+    r.gain       = kPowerModeUnknown;
     return r;
 }
 
-// The channel slot's byte offset within a read response: 2 bytes per channel,
-// in A,B,C,D order. Named because both the decoder and the test index by it.
-inline size_t ChannelOffset(uint8_t dac_sel) { return (size_t)(dac_sel & 0x03) * 2; }
+// A channel's offset in the response: the position of its LOW byte. The high nibble
+// is in the low nibble of the byte before it.
+//
+// The first entry sits at 2, not 0: byte 0 is a header byte (0xC0) and byte 1 is
+// channel A's high-nibble byte. Measured, not assumed -- the four-marker map showed
+// 0x11 at [2], 0x22 at [8], 0x33 at [14], 0x44 at [20].
+constexpr size_t kFirstChannelOffset = 2;
+
+inline size_t ChannelOffset(uint8_t dac_sel)
+{
+    return kFirstChannelOffset + (size_t)(dac_sel & 0x03) * kReadStride;
+}
+
+// Where a channel's low byte sits within the 8-byte read, or -1 if that read does
+// not reach it. Only channel A is fully present (offset 2 needs byte 1).
+inline int ChannelOffsetInDacRead(uint8_t dac_sel)
+{
+    const size_t off = ChannelOffset(dac_sel);
+    return (off < kReadDacBytes) ? (int)off : -1;
+}
 
 }  // namespace DacFrame

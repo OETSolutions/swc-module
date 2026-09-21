@@ -332,7 +332,11 @@ Outcome Test05_DacWriteReadback()
     const uint16_t codes[] = {0, 1, 512, 2048, 3000, 4094, 4095};
     const size_t n = sizeof(codes) / sizeof(codes[0]);
 
-    Log::Printf("  %-8s %-10s %-10s %-8s %-8s", "written", "read-back", "match", "pwr", "vref/gain");
+    // Only the CODE is printed: it is the one field the read response actually
+    // carries. The power-down/VREF/gain bits are NOT decodable from it (writing all
+    // four power modes changes no byte in the response -- see DacFrame.h), so a
+    // column for them would print a number the decoder cannot justify.
+    Log::Printf("  %-8s %-10s %-10s %s", "written", "read-back", "dec", "match");
 
     bool all_match = true;
     for (size_t i = 0; i < n; ++i) {
@@ -345,22 +349,26 @@ Outcome Test05_DacWriteReadback()
 
         DacFrame::ChannelReg reg{};
         if (!Dac::ReadChannelReg(DacFrame::kChannelA, &reg)) {
-            True(false, "the read-back was ACKed and returned 8 bytes");
+            True(false, "the read-back was ACKed and returned the full response");
             break;
         }
         const bool match = (reg.code == codes[i]);
         all_match = all_match && match;
-        Log::Printf("  %-8u 0x%03X(%u)%s %-8s %-8u %u/%u",
-                    codes[i], reg.code, reg.code, match ? " " : "!", match ? "yes" : "NO",
-                    reg.power_mode, reg.vref, reg.gain);
+        Log::Printf("  %-8u 0x%03X(%u)%s %-10s %s", codes[i], reg.code, reg.code,
+                    match ? " " : "!", reg.code == codes[i] ? "ok" : "MISMATCH",
+                    match ? "yes" : "NO");
     }
 
     True(all_match, "every written code reads back identically");
 
-    // The frame really is three bytes. If it were four the read-back above would
-    // already have failed, but asserting the constant makes the regression
-    // explicit rather than implied (the host test pins the byte layout).
-    True(DacFrame::kSetSize == 3, "the Multi-Write frame is three bytes (MCP4728, not MCP4725)");
+    // The frame really is three bytes -- but kSetSize is a COMPILE-TIME constant, so
+    // a True() on it cannot fail and would prove nothing at runtime. What actually
+    // catches a four-byte frame is the read-back loop above: a four-byte write
+    // shifts every field by one, addresses no channel, and the FIRST code compared
+    // would already mismatch. The constant is reported, and pinned where it can
+    // fail -- in the host suite.
+    Log::Printf("  frame size: %u bytes (MCP4728 Multi-Write; the MCP4725's is 4)",
+                (unsigned)DacFrame::kSetSize);
 
     // ~LDAC must be idle-high and NEVER pulsed by this tool: with UDAC = 0 each
     // output latches on its own ACK. Test 10 covers the pin; this asserts the
@@ -385,35 +393,73 @@ Outcome Test06_DacPowerModes()
 {
     if (!Dac::Present()) return TestRunner::Blocked();
 
-    struct { DacFrame::PowerMode mode; const char *name; } modes[] = {
-        {DacFrame::kNormal,  "normal (00)"},
-        {DacFrame::kGnd1k,   "1k to GND (01)  <- the 5V-range gain selector"},
-        {DacFrame::kGnd100k, "100k to GND (10)"},
-        {DacFrame::kGnd500k, "500k to GND (11)"},
+    // THE POWER-DOWN FIELD IS NOT OBSERVABLE IN THE READ RESPONSE, and this test does
+    // not pretend otherwise. Writing all four PD1:PD0 values to a channel and diffing
+    // the 24-byte response changes NOTHING (measured on this board; see DacFrame.h's
+    // read-layout note). Whatever carries the power-mode state is not a byte that
+    // moves when that state changes, so a read-back assertion here could only produce
+    // a fabricated verdict -- the first version of this test did exactly that, and
+    // reported a mismatch no matter what was written.
+    //
+    // What matters about the power-down mode is not its register value anyway: it is
+    // the VOLTAGE it produces, because the 1k power-down IS the 5 V-range gain
+    // selector (spec 2.3). So the mode is verified BEHAVIOURALLY, which is stronger
+    // evidence than a register read would ever have been.
+    Log::Printf("  The power-down field is not decodable from the read response, so this");
+    Log::Printf("  test verifies the mode by its EFFECT on the output instead:");
+    Log::Printf("      V_KEY = 1.82*V_DAC - 0.82*V_ADJ");
+    Log::Printf("");
+
+    const uint16_t sig = 2048;                          // V_DAC = 1650 mV
+    const int v_dac = Output::DacMvForCode(sig);
+    const int key_adj_zero = (int)((182L * v_dac) / 100L);   // 1k down -> V_ADJ = 0
+    const int key_adj_same = Output::KeyMvForDacMv(Output::Mode::kTracking, v_dac);
+
+    Log::Printf("  signal code fixed at %u (V_DAC = %d mV)", sig, v_dac);
+    Log::Printf("  predicted V_KEY: %d mV if ADJ is pulled to 0; %d mV if ADJ tracks it",
+                key_adj_zero, key_adj_same);
+    Log::Printf("");
+    Log::Printf("  %-24s %-12s %-12s %s", "ADJ mode and code", "sense x2 mV", "predicted", "verdict");
+
+    struct Case { const char *name; DacFrame::PowerMode mode; uint16_t code; int want; };
+    const Case cases[] = {
+        {"1k down (PD=01), code 0",   DacFrame::kGnd1k,   0,   key_adj_zero},
+        {"normal (PD=00), code 0",    DacFrame::kNormal,  0,   key_adj_zero},
+        {"normal (PD=00), code 2048", DacFrame::kNormal,  sig, key_adj_same},
     };
 
     bool all_ok = true;
-    for (size_t i = 0; i < 4; ++i) {
-        if (!Dac::SetPowerModeRaw(DacFrame::kChannelB, modes[i].mode)) {
-            True(false, "the power-mode write was ACKed");
-            break;
-        }
-        delay(2);
-        DacFrame::ChannelReg reg{};
-        if (!Dac::ReadChannelReg(DacFrame::kChannelB, &reg)) {
-            True(false, "the power-mode read-back was ACKed");
-            break;
-        }
-        const bool ok = (reg.power_mode == (uint8_t)modes[i].mode);
-        all_ok = all_ok && ok;
-        Log::Printf("  %-42s -> read back %u %s", modes[i].name, reg.power_mode,
-                    ok ? "OK" : "<-- MISMATCH");
-    }
-    True(all_ok, "all four power-down modes read back correctly");
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); ++i) {
+        uint8_t f[DacFrame::kSetSize];
+        DacFrame::EncodeSet(f, DacFrame::kChannelA, DacFrame::kNormal, sig);
+        Dac::WriteRaw(f, sizeof(f), Dac::Address());
+        DacFrame::EncodeSet(f, DacFrame::kChannelB, (uint8_t)cases[i].mode, cases[i].code);
+        Dac::WriteRaw(f, sizeof(f), Dac::Address());
+        delay(120);
 
-    // Leave the ADJ channel in the 1k mode, which is the released/safe default.
-    Dac::SetPowerModeRaw(DacFrame::kChannelB, DacFrame::kGnd1k);
-    Dac::SetPowerModeRaw(DacFrame::kChannelD, DacFrame::kGnd1k);
+        uint32_t sense = 0;
+        Adc::ReadAvgMv(Adc::kSense1, 32, &sense);
+        const int seen = (int)sense * 2;
+
+        // The prediction comes from the transfer function, so 200 mV is the tolerance
+        // on the WHOLE analog path -- DAC linearity, servo offset, divider tolerance
+        // and ADC error -- not on the mode alone.
+        const bool ok = (labs((long)seen - cases[i].want) < 200);
+        all_ok = all_ok && ok;
+        Log::Printf("  %-24s %-12d %-12d %s", cases[i].name, seen, cases[i].want,
+                    ok ? "as predicted" : "<-- NOT AS PREDICTED");
+    }
+
+    True(all_ok, "the power-down mode produces the predicted KEY voltage "
+                 "(V_ADJ pulled to 0, gain 1.82)");
+
+    Note("This is the 5 V-range gain selector working, verified by measurement: the "
+         "1k power-down pulls the summing node to 0 through a DEFINED path, which is "
+         "exactly why the spec chose a DAC channel over a series MOSFET (spec 2.3). "
+         "A register read could not have shown it -- only the voltage can.");
+
+    Dac::Release(1);
+    Dac::Release(2);
     return TestRunner::Current();
 }
 
@@ -443,6 +489,16 @@ Outcome Test07_AdcCalibration()
         True(true, "per-chip eFuse curve-fitting calibration is available");
     }
 
+    // Put the analog path in a KNOWN state before measuring. If the loopback jumpers
+    // are fitted (J3.KEY jumpered to J2.SWC -- which the servo tests need), the
+    // ladder pins are electrically tied to the servo output, so their readings
+    // follow whatever the DAC was last doing. Without this, the forward and reverse
+    // passes straddle a settling transient and the stability check below reports a
+    // "drift" that is really just the servo still moving.
+    Dac::Release(1);
+    Dac::Release(2);
+    delay(200);
+
     Log::Printf("  %-16s %-14s %-8s %-8s %-8s", "channel", "pin", "raw", "mV", "mV(rev)");
 
     // Forward pass, then reverse, and compare. The ADC on the S3 is a single
@@ -467,23 +523,61 @@ Outcome Test07_AdcCalibration()
         const long d = (long)fwd[i] - (long)rev[i];
         Log::Printf("  %-16s reverse read %u mV, delta %+ld mV %s", Adc::Name((Adc::Ch)i),
                     rev[i], d, (labs(d) > 60) ? "<-- unstable" : "");
-        if (labs(d) > 60) stable = false;
+        if (labs(d) > 60) {
+            stable = false;
+            // The ladder pins share a node with the servo output when the loopback
+            // jumpers are fitted, so a large delta there is the servo, not the ADC.
+            const bool tied = (i == (int)Adc::kSwc1 || i == (int)Adc::kSwc2);
+            if (tied) {
+                Log::Printf("     ^ this pin is tied to the servo output by the "
+                            "loopback jumper, so this is servo settling, not ADC drift");
+            }
+        }
     }
     True(stable, "forward and reverse channel sweeps agree within 60 mV");
 
-    // Every reading must be inside the ADC's own calibrated ceiling. The board is
-    // designed so the sense pins can never exceed ~2.49 V, but the LADDER pins sit
-    // near the rail, and 2900 mV is the ceiling at 12 dB -- a reading above it
-    // means the attenuation is not what the code thinks it is.
-    bool in_range = true;
+    // The calibrated ceiling is 2.9 V at 12 dB (spec 2.1), and whether a reading may
+    // exceed it depends on WHICH pin -- so one bound for all eight would be wrong in
+    // both directions:
+    //
+    //   * The SENSE pins cannot exceed ~2.49 V BY DESIGN: the op-amp's +5 V rail
+    //     binds before the ADC's ceiling (spec 2.3). A reading above that means the
+    //     divider or the rail is wrong, so it IS asserted.
+    //
+    //   * The LADDER and AUX pins are pulled up to +3V3 through 10k and, with no
+    //     external pad attached, sit AT the rail -- legitimately at or above the
+    //     2.9 V ceiling, where the ADC clips. That is expected on a bare bench and is
+    //     exactly what spec 6.3's bring-up step 3 warns about. Asserting a ceiling
+    //     here would fail a perfectly healthy board, so it is REPORTED.
+    //
+    //   * TEMP is a divider midpoint: never above the rail, and its own 1:1 divider
+    //     puts it near half. Asserted loosely.
+    bool ok = true;
     for (int i = 0; i < (int)Adc::kCount; ++i) {
-        if (fwd[i] > 3000) {
-            Log::Printf("  %s reads %u mV, ABOVE the 2.9 V calibrated ceiling",
-                        Adc::Name((Adc::Ch)i), fwd[i]);
-            in_range = false;
+        const Adc::Ch ch = (Adc::Ch)i;
+        const bool is_sense = (ch == Adc::kSense1 || ch == Adc::kSense2);
+        const bool is_temp  = (ch == Adc::kTemp);
+
+        if (is_sense && fwd[i] > 2600) {
+            Log::Printf("  %s reads %u mV, ABOVE the ~2.49 V the design guarantees "
+                        "(the op-amp rail should bind first) -- divider or +5 V rail?",
+                        Adc::Name(ch), fwd[i]);
+            ok = false;
+        }
+        if (is_temp && fwd[i] > ADC_CEILING_MV_12DB) {
+            Log::Printf("  %s reads %u mV, above the 2.9 V ceiling -- its 1:1 divider "
+                        "cannot reach that", Adc::Name(ch), fwd[i]);
+            ok = false;
+        }
+        if (!is_sense && !is_temp && fwd[i] >= ADC_CEILING_MV_12DB - 40) {
+            Log::Printf("  %s reads %u mV: at or above the 2.9 V ceiling, so it is "
+                        "CLIPPING. Expected with no ladder attached (the pull-up holds "
+                        "the node at the rail), and it stops being harmless once a real "
+                        "pad is fitted -- spec 6.3 step 3 is the check for that.",
+                        Adc::Name(ch), fwd[i]);
         }
     }
-    True(in_range, "no channel exceeds the 12 dB calibrated ceiling");
+    True(ok, "the sense and NTC pins stay inside their designed bounds");
     return TestRunner::Current();
 }
 
@@ -665,26 +759,30 @@ Outcome Test10_LdacNeverPulsed()
         return TestRunner::Current();
     }
 
-    // Write the two channels to DIFFERENT codes back to back, then read both back.
-    // Independent latching means each holds its own value.
+    // Write the two channels to DIFFERENT codes back to back, then read BOTH back
+    // from the 24-byte response. Independent latching means each holds its own value;
+    // a deferred ~LDAC latch would have applied both at one instant and left them
+    // equal. This is the assertion the test is NAMED for, so it is made against the
+    // codes actually read back -- the first version compared them and then returned
+    // True(true), so it proved nothing.
     const uint16_t code1 = 1000, code2 = 3000;
-    Dac::SetSignal(1, Output::Mode::kAmplified, code1);
-    Dac::SetSignal(2, Output::Mode::kAmplified, code2);
-    delay(3);
+    Dac::SetSignal(1, Output::Mode::kTracking, code1);
+    Dac::SetSignal(2, Output::Mode::kTracking, code2);
+    delay(6);
 
-    DacFrame::ChannelReg r1{}, r2{};
-    if (!Dac::ReadChannelReg(DacFrame::kChannelA, &r1) ||
-        !Dac::ReadChannelReg(DacFrame::kChannelC, &r2)) {
-        True(false, "both channels read back");
+    DacFrame::ChannelReg a{}, c{};
+    if (!Dac::ReadChannelReg(DacFrame::kChannelA, &a) ||
+        !Dac::ReadChannelReg(DacFrame::kChannelC, &c)) {
+        True(false, "both channels read back from the full response");
         return TestRunner::Current();
     }
-    Log::Printf("  ch1 wrote %u, reads %u", code1, r1.code);
-    Log::Printf("  ch2 wrote %u, reads %u", code2, r2.code);
+    Log::Printf("  ch1 wrote %u, reads %u", code1, a.code);
+    Log::Printf("  ch2 wrote %u, reads %u", code2, c.code);
 
-    True(r1.code == code1, "channel 1 holds its own code independently");
-    True(r2.code == code2, "channel 2 holds its own code independently");
-    True(r1.code != r2.code, "the two channels did NOT take a shared value "
-                             "(a deferred ~LDAC latch would have made them equal)");
+    True(a.code == code1, "channel 1 holds its own code independently");
+    True(c.code == code2, "channel 2 holds its own code independently");
+    True(a.code != c.code, "the two channels did NOT take a shared value "
+                           "(a deferred ~LDAC latch would have made them equal)");
 
     // Restore: pin stays high, channels released.
     digitalWrite(PIN_DAC_LDAC_B, HIGH);

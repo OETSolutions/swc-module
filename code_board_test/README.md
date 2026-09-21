@@ -210,8 +210,8 @@ that is the diagnosis, not a board fault.
 | 16 | SWC ladder inputs | pod (opt.) | idle is the HIGH state; `R_ladder ≤ pullup·7.25` |
 | 17 | AUX1–AUX3 | jumper (opt.) | all idle high; **AUX1 (the programming button) alive** |
 | 18 | NTC temperature | — | plausible °C; **the cost of a wrong rail assumption** |
-| 19 | Buzzer | listen | gate toggles; rhythm driven; sound = operator |
-| 20 | LEDs | watch | both polarities driven; which one lit = operator |
+| 19 | Buzzer | listen | gate toggles; rhythm **+ a 200 Hz–5 kHz sweep**; sound = operator |
+| 20 | LEDs | watch | both polarities; **1–60 Hz pulse sweep**; which lit = operator |
 | 21 | Gain auto-selection | loopback + pull-up | envelope, guard band, **safe 1.82 default** |
 | 22 | Servo trim loop | loopback | bounds are the spec's; loop **disabled** by default |
 | 23 | **Idle is high-Z** | loopback + pull-up | release needs no mode; sink-only proven both ways |
@@ -351,8 +351,46 @@ suite**; three files in one directory would collide on `_main`, `setUp` and
 
 ---
 
+## Findings from the first bring-up (2026-09-21)
+
+All 30 tests pass on the assembled board. Three things were learned that the tests
+now encode, and one that is worth knowing about the hardware.
+
+**The KEY line does not rest at 0 V.** With J3 open the line has *no* pull-up of its
+own — the 3V3 pull-ups are on the ladder pins, not here — so it settles at ~3.26 V
+(R36's 1 M path and the op-amp bias), and `Q4` can only *sink*. That level is the
+**ceiling** on what the servo can command on an open line: any target above it makes
+the servo turn the FET off and float the line, which is the *release* behaviour and
+not a fault. Several tests originally asserted against fixed expected voltages and
+reported a correctly-released line as broken. They now measure the float level
+(`include/KeyLine.h`) and derive their command ceiling from it, which is what the
+real firmware must do anyway (spec 6.2's headroom rule).
+
+**The MCP4728's read response is not laid out as the datasheet phrasing implies.**
+Mapping it with four distinct per-channel patterns showed a **6-byte stride** —
+A at byte 2, B at 8, C at 14, D at 20 — not the 2-byte stride that "each channel is
+two bytes" suggests. The decoder, and the host tests that pin it, were corrected to
+the measured layout. Separately, **the power-down field could not be located at
+all**: writing all four `PD1:PD0` values changes no byte in the response. That field
+is therefore reported `UNKNOWN` and never asserted against — and the mode is instead
+verified *behaviourally*, by the KEY voltage it produces, which is stronger evidence
+anyway.
+
+**Through the loopback, `KEY` and `SWC` are the same node.** So `SWC` *tracks* the
+command and rises with it — the opposite of the vehicle case, where a button pulls
+the ladder down. One test had the sign inverted from reasoning about the real
+system and applying it here.
+
+Hardware note, not a fault: **BZ1 is an *active* buzzer** (Huaneng TMB12A05) with its
+own oscillator at a fixed ~2.4 kHz, so it cannot follow a drive frequency. The
+200 Hz–5 kHz sweep is kept anyway — it exercises the drive path across the audio
+band, and a passive buzzer (which *can* follow it) is a likely future change, so the
+capability is tested now and will already be correct when the part changes.
+
 ## Known limits
 
+- **Test 19's sweep is not a clean tone on the fitted part.** See the finding
+  above: BZ1 is active, so the sweep is a drive-path test, not a pitch test.
 - **The absolute key resistance is not verified.** Every analog test proves the
   chain is present and moving together, but the resistance a head unit actually
   sees depends on that head unit's own pull-up. A bench cannot substitute for it.

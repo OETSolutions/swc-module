@@ -51,10 +51,14 @@ bool Present();
 uint8_t Address();
 void    SetAddress(uint8_t addr);
 
-// Read back the four input registers (8 bytes). Returns false on a bus error or a
-// malformed response. This is what makes "did the code actually latch" testable
-// with no meter attached.
-bool ReadInputRegisters(uint8_t out[DacFrame::kReadDacBytes]);
+// Read back the four input registers -- the full 24-byte response. Returns false on
+// a bus error or a malformed response. This is what makes "did the code actually
+// latch" testable with no meter attached.
+//
+// See DacFrame.h's read-layout note: the response's per-channel stride was MEASURED
+// as 6 bytes on the board, not the 2 the datasheet's phrasing suggests, and the
+// power-down field is not decodable from it at all.
+bool ReadInputRegisters(uint8_t out[DacFrame::kReadAllBytes]);
 
 // Convenience: the decoded register for one channel.
 bool ReadChannelReg(uint8_t frame_sel, DacFrame::ChannelReg *out);

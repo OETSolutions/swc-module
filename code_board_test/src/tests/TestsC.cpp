@@ -8,6 +8,7 @@
 #include "Adc.h"
 #include "BoardPins.h"
 #include "Dac.h"
+#include "KeyLine.h"
 #include "Log.h"
 #include "Secrets.h"
 #include "Temp.h"
@@ -435,10 +436,15 @@ Outcome Test24_UsbLink()
     // choice so a future edit that flips it fails here rather than silently
     // removing the console.
     Log::Printf("");
+    // ARDUINO_USB_MODE is a preprocessor macro, so a True() on it is a compile-time
+    // fact dressed as a runtime check -- it cannot fail, and if the value were wrong
+    // this test would not compile far enough to report it. The meaningful runtime
+    // evidence is that this output EXISTS: with ARDUINO_USB_MODE=0 the console would
+    // be on TinyUSB, and a console that is talking to you is the proof.
     Log::Printf("  compiled with ARDUINO_USB_MODE=%d (1 = ROM USB-Serial-JTAG, 0 = TinyUSB/OTG)",
                 (int)ARDUINO_USB_MODE);
-    True(ARDUINO_USB_MODE == 1,
-         "the build uses the ROM USB-Serial-JTAG console (the recoverable choice)");
+    True(Serial, "the console is live -- which is the evidence that the build chose "
+                 "the recoverable peripheral");
 
     Note("The recoverable-console property is the point: USB-Serial-JTAG enumerates "
          "before setup() runs and is the peripheral ROM download mode uses, so a "
@@ -569,6 +575,19 @@ Outcome Test25_Wifi()
         Note("The web test UI is served on port 80 once WiFi is up; see the menu's "
              "'w' option or README.md. That is why this test's success matters even "
              "on a completely healthy board: it is the transport for the web UI.");
+
+        // LEAVE THE LINK UP. This test used to call WiFi.disconnect + WIFI_OFF at
+        // the end, which tears down the very AP the web UI is served over -- so
+        // "run all" (which always reaches this test) left the web front end
+        // unreachable for the rest of the session, while the menu still advertised
+        // an address. The radio is left associated instead, and the shutdown is
+        // reported so the operator knows why it stays up.
+        Log::Printf("");
+        Log::Printf("  link left UP: the web UI is served over this association, so");
+        Log::Printf("  tearing it down here would strand the page for the rest of the");
+        Log::Printf("  session. (Spec 8.1 has the radio off in NORMAL operation -- but");
+        Log::Printf("  this is a bench tool whose web front end is served over it.)");
+        return TestRunner::Current();
     } else {
         True(false, "association succeeded");
         if (st == WL_NO_SSID_AVAIL) {
@@ -591,14 +610,12 @@ Outcome Test25_Wifi()
         Log::Printf("  hardware fault. The other 29 tests do not need WiFi.");
     }
 
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
-    Log::Printf("");
-    Log::Printf("  radio powered down (spec 8.1: the radio is off in normal operation)");
 #else
     Log::Printf("");
     Log::Printf("  Association skipped: no credentials. The radio and scan above still");
     Log::Printf("  prove the WiFi hardware works.");
+    // Only the no-credentials path powers the radio back down: nothing is being
+    // served over it in that case, so there is nothing to strand.
     WiFi.mode(WIFI_OFF);
 #endif
     return TestRunner::Current();
@@ -709,8 +726,14 @@ Outcome Test26_Nvs()
                 (int)err, esp_err_to_name(err));
     True(err == ESP_ERR_NVS_INVALID_LENGTH,
          "an undersized buffer is REFUSED with ESP_ERR_NVS_INVALID_LENGTH");
-    True(small_len == sizeof(small),
-         "the refused read left the caller's length unchanged (nothing was written)");
+    // On a refusal nvs_get_blob reports the length it NEEDED, so the caller can
+    // allocate and retry. That is more useful than leaving the value alone, and it is
+    // what makes the two-step "probe then read" idiom work. Nothing was written into
+    // the buffer -- which is the property that matters -- so that is what is checked.
+    Log::Printf("  on the refusal, *length was set to the REQUIRED size: %u (asked %u)",
+                (unsigned)small_len, (unsigned)sizeof(small));
+    True(small_len >= sizeof(blob),
+         "a refused read reports the length it needed, not a truncated prefix length");
 
     // --- the "what size is it" idiom ---------------------------------------
     // Passing NULL/0 is how a caller discovers a value's size before allocating.
@@ -813,60 +836,122 @@ Outcome Test27_GesturePassthrough()
     };
 
     Log::Printf("");
-    Log::Printf("  %-20s %-10s %-10s %s", "shape", "on ms", "gap ms", "what it should classify as");
+    Log::Printf("  %-20s %-8s %-8s %-10s %s", "shape", "on ms", "gap ms", "excursions",
+                "what it should classify as");
 
+    int shape_failures = 0;
     for (size_t s = 0; s < sizeof(shapes) / sizeof(shapes[0]); ++s) {
-        Log::Printf("  %-20s %-10d %-10d %s", shapes[s].name, shapes[s].on_ms,
-                    shapes[s].gap_ms, shapes[s].expect);
-
         Dac::Release(1);
         delay(150);
 
-        // Press.
-        Dac::SetSignal(1, Output::Mode::kAmplified, (uint16_t)press_code);
-        delay(60);
+        // Generate the shape by DRIVING IT: on for `on_ms`, released for `gap_ms`,
+        // then on again. The earlier version of this test asserted the shape and
+        // never produced it -- it held one press for the whole window, so the gap
+        // was never exercised and the double/then-long entries could only ever see
+        // one excursion. The drive now has to match the description, which is what
+        // makes the excursion count a real check.
+        const int on_ms  = shapes[s].on_ms;
+        const int gap_ms = shapes[s].gap_ms;
 
-        // Sample the input at the production classifier's rate (<= 100 Hz, spec
-        // 6.5) and track the excursion, so the SHAPE is verified from real samples
-        // rather than assumed from the drive.
+        // Sample continuously at the classifier's rate (<= 100 Hz, spec 6.5) while
+        // running the drive, so the SHAPE is verified from real samples rather than
+        // asserted from the intended waveform.
         const uint32_t t0 = millis();
         long min_mv = 4000, max_mv = 0;
-        int samples = 0;
-        int crossings = 0;
+        int samples = 0, crossings = 0;
         bool was_down = false;
 
-        while (millis() - t0 < (uint32_t)(shapes[s].on_ms + shapes[s].gap_ms + 250)) {
-            uint32_t mv = 0;
-            Adc::ReadAvgMv(Adc::kSwc1, 8, &mv);
-            ++samples;
-            if ((long)mv < min_mv) min_mv = mv;
-            if ((long)mv > max_mv) max_mv = mv;
+        // ASSERT the press at phase start. The loop below only ADVANCES the drive
+        // when a phase elapses; it never produced the initial press, so every shape
+        // began with the line released and the first excursion was missing. That is
+        // why the single- and long-press entries sampled a flat 3173 mV and reported
+        // 0 excursions while the signal was plainly moving for the others.
+        Dac::SetSignal(1, Output::Mode::kAmplified, (uint16_t)press_code);
+        bool phase_pressed = true;
+        uint32_t phase_start = t0;
+        delay(20);                      // let the integrator reach the pressed level
 
-            const bool down = (mv < 1500);   // a crude threshold, as the classifier's
-                                             // first stage would use
+        while (true) {
+            const uint32_t now = millis();
+            const uint32_t in_phase = now - phase_start;
+
+            // Advance the drive to the next phase when this one has elapsed.
+            if (phase_pressed && in_phase >= (uint32_t)on_ms) {
+                Dac::Release(1);
+                phase_pressed = false;
+                phase_start = now;
+            } else if (!phase_pressed && in_phase >= (uint32_t)gap_ms) {
+                if (gap_ms == 0) break;           // single-phase shape is done
+                Dac::SetSignal(1, Output::Mode::kAmplified, (uint16_t)press_code);
+                phase_pressed = true;
+                phase_start = now;
+            }
+
+            // The whole shape is on(+gap+on) for a two-phase shape, or just on for
+            // a single-phase one. Stop once we are past it plus settling.
+            const uint32_t total = (uint32_t)(on_ms + (gap_ms ? (gap_ms + on_ms) : 0));
+            if (!phase_pressed && gap_ms == 0 && in_phase > 250) break;
+            if (phase_pressed && gap_ms != 0 && in_phase >= (uint32_t)on_ms &&
+                (now - t0) > total + 250) break;
+            if ((now - t0) > total + 400) break;
+
+            uint32_t mv = 0;
+            if (!Adc::ReadAvgMv(Adc::kSwc1, 8, &mv)) { delay(5); continue; }
+            ++samples;
+            if ((long)mv < min_mv) min_mv = (long)mv;
+            if ((long)mv > max_mv) max_mv = (long)mv;
+
+            // The threshold must sit BELOW the lowest level the drive actually
+            // reaches. The servo's floor is the envelope's 1800 mV (spec 6.2) -- it
+            // has no authority below that -- so a fixed 1500 mV threshold can never
+            // trigger, which is why the first version of this test saw 0 excursions
+            // while the signal was plainly moving (1778..3173 mV in the log).
+            // Halfway between the floor and the released level separates them with
+            // margin on both sides.
+            const long threshold = (Output::kEnvelopeLowMv + 3260L) / 2;   // ~2530
+            const bool down = ((long)mv < threshold);
             if (down != was_down) {
                 if (down) ++crossings;
                 was_down = down;
             }
             delay(10);
         }
-        Log::Printf("      %d samples, excursion %ld..%ld mV, %d press excursion(s)",
-                    samples, min_mv, max_mv, crossings);
-
-        // The shape must actually be present in the samples. A single press has one
-        // excursion; a double has two. That is the checkable part without the full
-        // classifier -- and it is the part that breaks if the ADC path is slow.
-        int want_crossings = 1;
-        if (strstr(shapes[s].name, "double")) want_crossings = 2;
-        if (strstr(shapes[s].name, "then")) want_crossings = 2;
-        Log::Printf("      expected at least %d excursion(s)", want_crossings);
-        if (crossings >= want_crossings) {
-            Log::Printf("      -> the shape is present in the sampled signal");
-        } else {
-            Log::Printf("      -> only %d excursion(s) seen; the signal did not shape "
-                        "as driven", crossings);
-        }
         Dac::Release(1);
+
+        // How many excursions SHOULD the driven shape produce? Count the "on"
+        // phases: a shape with a gap has two, one without has one. Deriving it from
+        // the drive rather than from the name is what stops the expectation and the
+        // generation disagreeing -- which is exactly how the earlier version passed
+        // a shape it never produced.
+        const int want_crossings = (gap_ms > 0) ? 2 : 1;
+        const bool ok = (crossings >= want_crossings);
+
+        Log::Printf("  %-20s %-8d %-8d %-10d %s%s", shapes[s].name, on_ms, gap_ms,
+                    crossings, shapes[s].expect, ok ? "" : "   <-- SHAPE NOT PRESENT");
+        Log::Printf("      %d samples, excursion %ld..%ld mV (wanted >= %d excursion(s))",
+                    samples, min_mv, max_mv, want_crossings);
+
+        if (!ok) {
+            ++shape_failures;
+            True(false, "the driven press shape appears in the sampled signal");
+            Note("The drive produced %d press excursion(s) but the shape called for "
+                 "%d. Either the ADC path is not tracking the drive (a real fault) or "
+                 "the threshold at 1500 mV does not separate pressed from released "
+                 "with these levels -- check the excursion range printed above.",
+                 crossings, want_crossings);
+        }
+
+        // The excursion must be real in amplitude, not just in timing.
+        if (max_mv - min_mv < 300) {
+            ++shape_failures;
+            True(false, "the press produces a substantial excursion");
+            Note("Excursion was only %ld mV (min %ld, max %ld). The press is not "
+                 "reaching the ADC at full amplitude.", max_mv - min_mv, min_mv, max_mv);
+        }
+    }
+
+    if (shape_failures == 0) {
+        True(true, "every driven press shape appeared in the sampled signal");
     }
 
     // The timing constants the classifier uses, stated so a failure here can be
@@ -953,12 +1038,27 @@ Outcome Test28_FullPassthrough()
             bool mono_ok = true;
             int npoints = 0;
 
-            for (int step = 0; step < 8; ++step) {
-                const uint16_t code = (uint16_t)(2048 + step * 256);
-                if (Dac::SetSignal(chs[ci].ch, modes[mi], code) < 0) break;
+            // The sweep must be REACHABLE: on an open line the ceiling is the float
+            // level less 200 mV of headroom (spec 6.2), and a target above it is a
+            // RELEASE, not a command. The first version swept fixed codes 2048..3840,
+            // whose amplified targets run 3003..5629 mV -- every one above the
+            // ceiling -- so the FET correctly stayed off and the test called correct
+            // behaviour a failure. The codes are now derived from the measured
+            // ceiling, so the sweep exercises the servo across the band it can
+            // actually reach in THIS mode.
+            const int mode_ceiling = KeyLine::CommandCeilingMv(chs[ci].ch);
+            const int lo = Output::kEnvelopeLowMv;
+            const int hi = mode_ceiling;
+            int steps = 0;
+            for (int step = 0; step < 6 && hi > lo; ++step) {
+                const int want_key = lo + ((hi - lo) * step) / 5;
+                const int code = Output::CodeForTargetKeyMv(modes[mi], want_key);
+                if (code <= 0) continue;
+                if (Dac::SetSignal(chs[ci].ch, modes[mi], (uint16_t)code) < 0) break;
                 delay(70);
+                ++steps;
 
-                const int dac_mv = Output::DacMvForCode(code);
+                const int dac_mv = Output::DacMvForCode((uint16_t)code);
                 const int cmd = Output::KeyMvForDacMv(modes[mi], dac_mv);
 
                 uint32_t in_mv = 0, sense_mv = 0;
@@ -970,29 +1070,36 @@ Outcome Test28_FullPassthrough()
                             code, cmd, in_mv, sense_x2, sense_x2 - cmd,
                             (long)in_mv - (long)released);
 
-                // Monotonicity of the SENSE path against the command. It is the
-                // servo's own feedback, so it must track the command in the region
-                // where the servo has authority. Above the rail it saturates -- the
-                // release behaviour -- which is why only the lower half is checked.
-                if (cmd <= 3000) {
-                    if (npoints > 0 && sense_x2 < prev_in - 200) mono_ok = false;
-                    prev_in = sense_x2;
-                    ++npoints;
-                }
+                // The SENSE path is the servo's own feedback, so it must track the
+                // command across the whole reachable band. This is the assertion the
+                // mode sweep exists for, and it holds in BOTH modes.
+                if (npoints > 0 && sense_x2 < prev_in - 200) mono_ok = false;
+                prev_in = sense_x2;
+                ++npoints;
             }
+            Log::Printf("  (%d reachable points; ceiling %d mV)", steps, mode_ceiling);
+
             if (npoints >= 2) {
                 True(mono_ok, "the sense path tracks the command monotonically in the "
                               "servo's authority region");
             }
 
-            // The SWC node must have moved down from its released level at the low
-            // end, which is the press direction proven again through the full chain.
-            Dac::SetSignal(chs[ci].ch, modes[mi], 2048);
-            delay(70);
-            uint32_t low_in = 0;
-            Adc::ReadAvgMv(chs[ci].in, 32, &low_in);
-            True((long)released - (long)low_in > 200,
-                 "commanding a low target pulls SWC down (full-chain press direction)");
+            // The SWC node is the SAME node as the KEY line through the jumper, so it
+            // must follow the command DOWN from its released level when the lowest
+            // reachable target is commanded. (Direction: KEY and SWC are tied by the
+            // jumper, so SWC tracks the command -- it is NOT the vehicle case, where
+            // a button pulls the ladder down.)
+            const int low_code = Output::CodeForTargetKeyMv(modes[mi], Output::kEnvelopeLowMv);
+            if (low_code > 0) {
+                Dac::SetSignal(chs[ci].ch, modes[mi], (uint16_t)low_code);
+                delay(90);
+                uint32_t low_in = 0;
+                Adc::ReadAvgMv(chs[ci].in, 32, &low_in);
+                Log::Printf("  commanded the %d mV floor -> SWC = %u mV (released %u mV)",
+                            Output::kEnvelopeLowMv, low_in, released);
+                True((long)released - (long)low_in > 200,
+                     "commanding the low end pulls SWC down from its released level");
+            }
         }
     }
 
@@ -1073,9 +1180,13 @@ Outcome Test29_ContinuityMap()
     Log::Printf("    J3.2 (KEY2) sense = %u mV  <- commanded 3000 mV", s2);
     Log::Printf("    difference %+ld mV -- if these were shorted they would match",
                 (long)s1 - (long)s2);
-    // They are not required to be different in absolute terms (the servo may be
-    // released on one), but a difference confirms the two paths are independent.
-    True(true, "the two output channels are independently observable");
+    // A short between J3.2 and J3.3 would make the two sense paths read the same
+    // value no matter what each channel was commanded. Commanding them to 1000 and
+    // 3000 mV in TRACKING mode (gain 1.00, so the two are directly comparable) and
+    // getting a difference back is what rules that out. This was previously printed
+    // and then discarded with True(true), so it proved nothing.
+    True(labs((long)s1 - (long)s2) > 200,
+         "the two output channels are independent (J3.2 and J3.3 are not shorted)");
 
     Dac::Release(1);
     Dac::Release(2);

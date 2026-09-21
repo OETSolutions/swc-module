@@ -112,18 +112,21 @@ bool SetPowerModeRaw(uint8_t frame_sel, DacFrame::PowerMode mode)
 // ---------------------------------------------------------------------------
 // Read-back
 // ---------------------------------------------------------------------------
-bool ReadInputRegisters(uint8_t out[DacFrame::kReadDacBytes])
+bool ReadInputRegisters(uint8_t out[DacFrame::kReadAllBytes])
 {
-    // DS22187E: the read is initiated by a general-call address with the read
-    // command byte, then the device is addressed again for the data phase.
+    // The 24-byte read (command 0x09) is used rather than the 8-byte one, because
+    // only the 24-byte response contains all four channels' entries -- the 8-byte
+    // read returns the first 8 bytes of this same response, which covers channel A
+    // and a fragment of B. See DacFrame.h's read-layout note for the measured
+    // offsets and for why the power-down field is not decoded.
     Wire.beginTransmission(DacFrame::kAddrGeneralCall);
-    Wire.write(DacFrame::kReadCmdDac);
+    Wire.write(DacFrame::kReadCmdAll);
     if (Wire.endTransmission() != 0) return false;
 
-    const size_t got = Wire.requestFrom((int)s_addr, (int)DacFrame::kReadDacBytes);
-    if (got != DacFrame::kReadDacBytes) return false;
+    const size_t got = Wire.requestFrom((int)s_addr, (int)DacFrame::kReadAllBytes);
+    if (got != DacFrame::kReadAllBytes) return false;
 
-    for (size_t i = 0; i < DacFrame::kReadDacBytes; ++i) {
+    for (size_t i = 0; i < DacFrame::kReadAllBytes; ++i) {
         if (!Wire.available()) return false;
         out[i] = (uint8_t)Wire.read();
     }
@@ -132,11 +135,13 @@ bool ReadInputRegisters(uint8_t out[DacFrame::kReadDacBytes])
 
 bool ReadChannelReg(uint8_t frame_sel, DacFrame::ChannelReg *out)
 {
-    uint8_t buf[DacFrame::kReadDacBytes];
+    uint8_t buf[DacFrame::kReadAllBytes];
     if (!ReadInputRegisters(buf)) return false;
     const size_t off = DacFrame::ChannelOffset(frame_sel);
-    if (off + 1 >= DacFrame::kReadDacBytes) return false;
-    *out = DacFrame::DecodeChannel(buf[off], buf[off + 1]);
+    // The low byte is at `off`; the code's high nibble is in the low nibble of the
+    // byte before it. Both must be inside the response.
+    if (off < 1 || off >= DacFrame::kReadAllBytes) return false;
+    *out = DacFrame::DecodeChannel(buf[off - 1], buf[off]);
     return true;
 }
 

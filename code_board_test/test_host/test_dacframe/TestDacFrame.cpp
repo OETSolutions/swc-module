@@ -132,49 +132,62 @@ static void test_multiwrite_full_scale_encoding(void)
 // ---------------------------------------------------------------------------
 static void test_read_decode_field_positions(void)
 {
-    // byte0 = code-high-nibble(4) | PD1:PD0(2) | Gx(1) | VREF(1)
-    // 0xA8 = 1010 10 0 0 -> code high 0xA, PD=10(100k), gain 0, vref 0
+    // The code's high nibble is in the LOW nibble of the byte preceding the low
+    // byte. Everything else in those bytes is NOT decoded: the power-mode/VREF/gain
+    // fields could not be located on the board (writing all four power modes changes
+    // no byte in the response), so the decoder reports them UNKNOWN rather than
+    // inventing a value.
+    // 0xA8: only the LOW nibble (8) is a code bit; the upper nibble is not decoded.
     const DacFrame::ChannelReg r = DacFrame::DecodeChannel(0xA8, 0x5C);
-    TEST_ASSERT_EQUAL_HEX16(0xA5C, r.code);
-    TEST_ASSERT_EQUAL_UINT8(DacFrame::kGnd100k, r.power_mode);
-    TEST_ASSERT_EQUAL_UINT8(0, r.gain);
-    TEST_ASSERT_EQUAL_UINT8(0, r.vref);
+    TEST_ASSERT_EQUAL_HEX16(0x85C, r.code);
+    TEST_ASSERT_EQUAL_UINT8(DacFrame::kPowerModeUnknown, r.power_mode);
+    TEST_ASSERT_EQUAL_UINT8(DacFrame::kPowerModeUnknown, r.gain);
+    TEST_ASSERT_EQUAL_UINT8(DacFrame::kPowerModeUnknown, r.vref);
 }
 
-static void test_read_decode_vref_and_gain(void)
+static void test_read_decode_ignores_the_config_bits(void)
 {
-    // 0xAB = 1010 10 1 1 -> gain 1, vref 1
-    const DacFrame::ChannelReg r = DacFrame::DecodeChannel(0xAB, 0x00);
-    TEST_ASSERT_EQUAL_UINT8(1, r.gain);
-    TEST_ASSERT_EQUAL_UINT8(1, r.vref);
-    TEST_ASSERT_EQUAL_UINT8(DacFrame::kGnd100k, r.power_mode);
+    // Only the low nibble of the high byte carries code bits; the upper nibble of
+    // that byte is not decoded, so changing it must not change the code.
+    const DacFrame::ChannelReg a = DacFrame::DecodeChannel(0x08, 0x5C);
+    const DacFrame::ChannelReg b = DacFrame::DecodeChannel(0xF8, 0x5C);
+    TEST_ASSERT_EQUAL_HEX16(a.code, b.code);
+    TEST_ASSERT_EQUAL_HEX16(0x85C, a.code);
 }
 
-static void test_read_decode_roundtrips_a_written_frame(void)
+static void test_read_decode_roundtrips_a_written_code(void)
 {
-    // Encode a normal-mode write, then build the read slot the device would return
-    // for it, and check the decoder recovers the same code and power mode.
+    // Encode a write, build the read bytes the device returns for it, and check the
+    // decoder recovers the CODE. The code is all that round-trips: the config fields
+    // are not decodable from the response (see DacFrame.h), so they are not asserted.
     for (uint16_t code = 0; code <= 4095; code += 137) {
         uint8_t f[3];
         DacFrame::EncodeSet(f, DacFrame::kChannelC, DacFrame::kGnd1k, code);
 
-        // The write frame's byte1 low nibble is the code's high nibble; the read
-        // slot puts it back in the high nibble and the config in the low.
-        const uint8_t cfg = (uint8_t)((f[1] >> 5) & 0x03);  // PD1:PD0
-        const uint8_t slot0 = (uint8_t)(((f[1] & 0x0F) << 4) | (cfg << 2));
-        const DacFrame::ChannelReg r = DacFrame::DecodeChannel(slot0, f[2]);
+        // The write frame's byte 1 low nibble carries the code's high nibble. On the
+        // wire the read response puts it in the low nibble of the byte before the low
+        // byte (measured), so rebuild exactly that.
+        const uint8_t hi = (uint8_t)(f[1] & 0x0F);
+        const DacFrame::ChannelReg r = DacFrame::DecodeChannel(hi, f[2]);
 
         TEST_ASSERT_EQUAL_HEX16(code, r.code);
-        TEST_ASSERT_EQUAL_UINT8(cfg, r.power_mode);
     }
 }
 
-static void test_read_channel_offsets_are_two_bytes_apart(void)
+static void test_read_channel_offsets_match_the_measured_layout(void)
 {
-    TEST_ASSERT_EQUAL_size_t(0, DacFrame::ChannelOffset(DacFrame::kChannelA));
-    TEST_ASSERT_EQUAL_size_t(2, DacFrame::ChannelOffset(DacFrame::kChannelB));
-    TEST_ASSERT_EQUAL_size_t(4, DacFrame::ChannelOffset(DacFrame::kChannelC));
-    TEST_ASSERT_EQUAL_size_t(6, DacFrame::ChannelOffset(DacFrame::kChannelD));
+    // Measured on the board with four distinct markers: A at [2], B at [8], C at
+    // [14], D at [20] -- a 6-byte stride from a first offset of 2. NOT the 2-byte
+    // stride the datasheet's phrasing suggests, which is what an earlier version of
+    // this decoder assumed and why the read-back appeared to fail.
+    TEST_ASSERT_EQUAL_size_t(2,  DacFrame::ChannelOffset(DacFrame::kChannelA));
+    TEST_ASSERT_EQUAL_size_t(8,  DacFrame::ChannelOffset(DacFrame::kChannelB));
+    TEST_ASSERT_EQUAL_size_t(14, DacFrame::ChannelOffset(DacFrame::kChannelC));
+    TEST_ASSERT_EQUAL_size_t(20, DacFrame::ChannelOffset(DacFrame::kChannelD));
+    TEST_ASSERT_EQUAL_size_t(6, DacFrame::kReadStride);
+    // Every offset needs its preceding byte inside the response.
+    TEST_ASSERT_TRUE(DacFrame::ChannelOffset(DacFrame::kChannelA) > 0);
+    TEST_ASSERT_TRUE(DacFrame::ChannelOffset(DacFrame::kChannelD) < DacFrame::kReadAllBytes);
 }
 
 static void test_read_lengths(void)
@@ -198,9 +211,9 @@ int main(int, char **)
     RUN_TEST(test_multiwrite_code_is_masked_to_12_bits);
     RUN_TEST(test_multiwrite_full_scale_encoding);
     RUN_TEST(test_read_decode_field_positions);
-    RUN_TEST(test_read_decode_vref_and_gain);
-    RUN_TEST(test_read_decode_roundtrips_a_written_frame);
-    RUN_TEST(test_read_channel_offsets_are_two_bytes_apart);
+    RUN_TEST(test_read_decode_ignores_the_config_bits);
+    RUN_TEST(test_read_decode_roundtrips_a_written_code);
+    RUN_TEST(test_read_channel_offsets_match_the_measured_layout);
     RUN_TEST(test_read_lengths);
     return UNITY_END();
 }

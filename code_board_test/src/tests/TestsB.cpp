@@ -8,6 +8,7 @@
 #include "Adc.h"
 #include "BoardPins.h"
 #include "Dac.h"
+#include "KeyLine.h"
 #include "Log.h"
 #include "Temp.h"
 #include "SetupPrompts.h"
@@ -62,22 +63,33 @@ Outcome Test11_SensePath()
     // The hard bound from the design: the op-amp rail is the limiting factor, so
     // the sense node cannot reach the ADC ceiling. If it does, either the divider
     // is wrong or the rail is not 5 V.
+    //
+    // This IS asserted rather than merely printed. An earlier revision computed it,
+    // logged it, and then returned True(true) -- so the check existed in the output
+    // and nowhere in the verdict, and test 11's stated purpose was not tested at
+    // all.
+    bool ceiling_ok = true;
     for (int ch = 1; ch <= 2; ++ch) {
         const Adc::Ch sc = (ch == 1) ? Adc::kSense1 : Adc::kSense2;
         uint32_t mv = 0;
-        Adc::ReadAvgMv(sc, 64, &mv);
-        // 2490 mV is the ceiling the design guarantees (half of the ~4.98 V rail).
+        if (!Adc::ReadAvgMv(sc, 64, &mv)) {
+            True(false, "the sense channel was read");
+            return TestRunner::Current();
+        }
+        // 2490 mV is what the design guarantees (half of the ~4.98 V op-amp rail).
+        // 2600 leaves 110 mV for divider tolerance and ADC error while still being
+        // far below the 2900 mV ceiling the design claims it can never reach.
         if (mv > 2600) {
-            Log::Printf("  SENSE%d reads %u mV, ABOVE the 2.49 V the design guarantees "
+            Log::Printf("  SENSE%d reads %u mV, ABOVE the ~2.49 V the design guarantees "
                         "(--> the divider or the op-amp rail is wrong)", ch, mv);
+            ceiling_ok = false;
         }
     }
-    True(true, "sense readings captured (the ceiling is asserted in tests 12-15, where "
-               "the KEY line is actually driven)");
+    True(ceiling_ok, "the sense node cannot reach the ADC ceiling (op-amp rail binds first)");
 
     // Compare the two channels at rest. They are identical circuits, so a large
     // difference here means one of them has a fault -- the two are the board's own
-    // reference for each other.
+    // reference for each other. Asserted, for the same reason as the bound above.
     uint32_t m1 = 0, m2 = 0;
     Adc::ReadAvgMv(Adc::kSense1, 64, &m1);
     Adc::ReadAvgMv(Adc::kSense2, 64, &m2);
@@ -89,11 +101,13 @@ Outcome Test11_SensePath()
                     "divider or follower. Investigate before trusting the servo "
                     "tests on the worse channel.", labs(d));
     }
-    True(true, "channel-to-channel comparison reported");
+    True(labs(d) <= 150, "the two identical sense channels agree at rest");
 
-    Note("With nothing on J3 the KEY lines float near 0 V (no pull-up of their own), "
-         "so a near-zero reading here is CORRECT, not a dead channel. Tests 12-15 "
-         "drive the line and prove the sense path is alive.");
+    Note("With nothing on J3 the KEY lines rest at the level printed above, which is "
+         "NOT 0 V: the line has no pull-up of its own, so it settles where R36's 1M "
+         "path and the op-amp bias leave it. That level is CORRECT here, and it is "
+         "the ceiling on what the servo can command on an open line -- Q4 only "
+         "sinks. Tests 12-15 drive the line and prove the sense path is alive.");
     return TestRunner::Current();
 }
 
@@ -130,6 +144,22 @@ static Outcome ServoSweep(int ch)
 
     const Adc::Ch sc = (ch == 1) ? Adc::kSense1 : Adc::kSense2;
 
+    // The level the line rests at with the output released. With J3 open there is no
+    // head unit pull-up, so this is NOT 0 V -- and it is the CEILING on what the
+    // servo can command, because Q4 only sinks. Measuring it here is what lets the
+    // sweep below tell "the servo failed" apart from "the servo correctly released".
+    const int float_mv = KeyLine::FloatMv(ch);
+    const int ceiling_mv = KeyLine::CommandCeilingMv(ch);
+    Log::Printf("  line floats at %d mV released, so the command ceiling is %d mV",
+                float_mv, ceiling_mv);
+    if (ceiling_mv == 0) {
+        Log::Printf("  -> the float level leaves no room below it: there is no");
+        Log::Printf("     command band on an open line. That is expected with no");
+        Log::Printf("     head unit attached; the sweep below will report the");
+        Log::Printf("     commands it CAN make and mark the rest as release.");
+    }
+    Log::Printf("");
+
     for (int mode = 0; mode < 2; ++mode) {
         const Output::Mode m = (mode == 0) ? Output::Mode::kAmplified : Output::Mode::kTracking;
         Log::Printf("  --- %s ---", Output::ModeName(m));
@@ -149,8 +179,14 @@ static Outcome ServoSweep(int ch)
             Adc::ReadAvgMv(sc, 32, &sense);
             const int seen = Output::KeyMvFromSenseMv((int)sense);
 
-            Log::Printf("  %-10u %-10d %-12d %-12d %+-12d", codes[i], dac_mv, target,
-                        seen, seen - target);
+            // A target ABOVE the float level is unreachable by design -- the servo
+            // turns the FET off and the line floats, which IS the release
+            // behaviour. Marking it rather than reporting a delta is what keeps a
+            // correct board from looking broken.
+            const bool reachable = (ceiling_mv > 0 && target <= ceiling_mv);
+            Log::Printf("  %-10u %-10d %-12d %-12d %+-12d%s", codes[i], dac_mv, target,
+                        seen, seen - target,
+                        reachable ? "" : "  (above float: release)");
 
             s[i].code = codes[i];
             if (mode == 0) { s[i].key_amp = target; s[i].sense_amp = seen; }
@@ -176,6 +212,12 @@ static Outcome ServoSweep(int ch)
                     s[i].key_trk, ratio);
         if (labs(ratio - 182) > 1) ratio_ok = false;
     }
+    // This asserts the ARITHMETIC the hardware is being asked for, not a hardware
+    // measurement: both columns are computed from the same code via the transfer
+    // function, so it pins the gain ratio (1.82, never the rounded 1.812) and
+    // nothing else. The hardware evidence for the two modes is the sense columns
+    // above, where tracking tracks its target and amplified sits at the float level
+    // for every command above it.
     True(ratio_ok, "the amplified/tracking ratio is 1.82 exactly, not 1.812");
 
     // Release and confirm the line goes quiet.
@@ -184,9 +226,12 @@ static Outcome ServoSweep(int ch)
     uint32_t rel = 0;
     Adc::ReadAvgMv(sc, 32, &rel);
     Log::Printf("  released: sense reads %u mV (x2 = %u mV at the KEY line)", rel, rel * 2);
-    Note("With J3 OPEN, a released channel reads near 0 V here -- there is no head "
-         "unit pull-up to float the line up to. That IS the high-impedance state: "
-         "Q4 has stopped sinking. Test 23 proves it positively with a pull-up.");
+    Note("With J3 OPEN, a released channel rests at the float level measured above "
+         "(~%d mV), not at 0 V -- the line has no pull-up of its own, and Q4 can "
+         "only sink, so the node settles where R36's 1M and the op-amp bias leave "
+         "it. That IS the high-impedance state: the FET has stopped sinking. "
+         "Test 23 proves it positively by showing the line RISES to a fitted "
+         "pull-up.", float_mv);
     return TestRunner::Current();
 }
 
@@ -242,6 +287,14 @@ static Outcome LoopbackSweep(int ch)
     // First: the released state. With the sink off, SWC_IN sees only the pull-up,
     // so it must read HIGH. This is the check that would fail if the jumper were
     // missing -- which is why it is step one, before anything else is blamed.
+    // The float level for THIS channel, measured before anything is driven. With
+    // the loopback fitted the KEY line is loaded by R1 (10k) into the SWC node, so
+    // this differs from the open-line float in test 11/12.
+    const int float_mv = KeyLine::FloatMv(ch);
+    const int ceiling_mv = KeyLine::CommandCeilingMv(ch);
+    Log::Printf("  line floats at %d mV released; command ceiling %d mV", float_mv,
+                ceiling_mv);
+
     Dac::Release(ch);
     delay(120);
     uint32_t idle_in = 0, idle_sense = 0;
@@ -251,7 +304,7 @@ static Outcome LoopbackSweep(int ch)
                 ch, in_pin, idle_in, ch, idle_sense);
 
     if (idle_in < 2200) {
-        True(false, "with the output released, SWC_IN rises to the pull-up");
+        True(false, "with the output released, SWC_IN rises to its 10k pull-up");
         Note("SWC%d reads only %u mV with the channel released. Its pull-up "
                     "(R%d 10k to +3V3) should hold it near the rail. Either the "
                     "loopback jumper is NOT fitted (so this pin is reading its own "
@@ -268,47 +321,81 @@ static Outcome LoopbackSweep(int ch)
     // the DIRECTION and that it is substantial -- the exact value depends on the
     // servo's operating point, which is not a fixed resistance.
     Log::Printf("");
-    Log::Printf("  %-10s %-12s %-12s %-12s %s", "DAC code", "target mV", "SWC mV",
-                "SENSE x2 mV", "SWC vs released");
+    Log::Printf("  %-10s %-9s %-12s %-12s %-12s %s", "mode", "code", "target mV", "SWC mV",
+                "SENSE x2 mV", "vs released");
 
-    const uint16_t codes[] = {2400, 2800, 3200, 3500, 3800};
-    bool moved_down = false;
-    for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); ++i) {
-        Dac::SetSignal(ch, Output::Mode::kAmplified, codes[i]);
-        delay(80);
-        uint32_t in_mv = 0, sense_mv = 0;
-        Adc::ReadAvgMv(ic, 32, &in_mv);
-        Adc::ReadAvgMv(sc, 32, &sense_mv);
-        const int target = Output::KeyMvForDacMv(Output::Mode::kAmplified,
-                                                 Output::DacMvForCode(codes[i]));
-        Log::Printf("  %-10u %-12d %-12u %-12u %+ld mV", codes[i], target, in_mv,
-                    sense_mv * 2, (long)in_mv - (long)idle_in);
-        // Somewhere in the sweep the node must be pulled materially below its
-        // released level.
-        if ((long)idle_in - (long)in_mv > 300) moved_down = true;
-    }
-    True(moved_down, "driving the output pulls SWC_IN materially down (press direction)");
-
-    // Third: monotonicity. The SWC node must fall as the commanded KEY rises. A
-    // non-monotonic segment means the servo is not tracking, which is the failure
-    // the closed loop exists to prevent.
-    Log::Printf("");
-    Log::Printf("  direction check: SWC_IN must fall monotonically as the command rises");
+    // THE SWEEP MUST BE REACHABLE. On an open line the command ceiling is the float
+    // level less spec 6.2's 200 mV headroom (measured above). A target ABOVE that is
+    // not a command at all -- the servo turns the FET off and the line floats, which
+    // is the release behaviour. The first version of this test swept amplified-mode
+    // targets of 3518-5571 mV against a ~3062 mV ceiling, so every point was a
+    // release and the test reported correct behaviour as a failure.
+    //
+    // So the codes are now derived from the ceiling, in TRACKING mode, which gives
+    // the widest reachable range here (V_KEY = V_DAC, one-for-one).
+    const int ceiling = ceiling_mv;
     long prev = 100000;
     bool mono = true;
-    for (size_t i = 0; i < sizeof(codes) / sizeof(codes[0]); ++i) {
-        Dac::SetSignal(ch, Output::Mode::kAmplified, codes[i]);
-        delay(80);
-        uint32_t in_mv = 0;
-        Adc::ReadAvgMv(ic, 32, &in_mv);
-        Log::Printf("    code %u -> SWC%d = %u mV", codes[i], ch, in_mv);
-        if (i > 0 && (long)in_mv > prev + 60) {
-            Log::Printf("      ^ rose by %ld mV from the previous step", (long)in_mv - prev);
-            mono = false;
+    bool moved_down = false;
+    int reachable_points = 0;
+
+    if (ceiling <= 0) {
+        Log::Printf("  (no command band on this line -- see the note above)");
+    } else {
+        // Five targets spread across the reachable band, from the servo's floor up
+        // to just under the ceiling.
+        const int lo = Output::kEnvelopeLowMv;
+        const int hi = ceiling;
+        for (int i = 0; i < 5 && hi > lo; ++i) {
+            const int target = lo + ((hi - lo) * i) / 4;
+            const int code = Output::CodeForTargetKeyMv(Output::Mode::kTracking, target);
+            if (code <= 0) continue;
+            Dac::SetSignal(ch, Output::Mode::kTracking, (uint16_t)code);
+            delay(80);
+            uint32_t in_mv = 0, sense_mv = 0;
+            Adc::ReadAvgMv(ic, 32, &in_mv);
+            Adc::ReadAvgMv(sc, 32, &sense_mv);
+            Log::Printf("  %-10s %-9d %-12d %-12u %-12u %+ld mV", "tracking", code,
+                        target, in_mv, sense_mv * 2, (long)in_mv - (long)idle_in);
+            ++reachable_points;
+            if ((long)idle_in - (long)in_mv > 300) moved_down = true;
+            // DIRECTION: through the loopback, J3.KEY and J2.SWC are the SAME
+            // electrical node (one jumper, plus R1 which the ADC's input current
+            // cannot drop across), so SWC must FOLLOW the command and RISE with it.
+            // An earlier version asserted the opposite sign -- it had reasoned about
+            // the real system, where a button press pulls the LADDER down, and
+            // applied that here where the two nodes are tied together. The
+            // measurement was right and the assertion was backwards.
+            if (reachable_points > 1 && (long)in_mv < prev - 60) {
+                Log::Printf("      ^ SWC FELL by %ld mV while the command rose",
+                            prev - (long)in_mv);
+                mono = false;
+            }
+            prev = (long)in_mv;
         }
-        prev = (long)in_mv;
     }
-    True(mono, "SWC_IN falls monotonically as the commanded KEY voltage rises");
+
+    True(reachable_points >= 3,
+         "the open line offers a usable command band (at least 3 reachable points)");
+    True(moved_down, "driving the output pulls SWC_IN materially down (press direction)");
+    True(mono, "SWC_IN tracks the commanded KEY voltage (same node via the loopback)");
+
+    // And the complementary half: a target ABOVE the ceiling must RELEASE, leaving
+    // the node back at its resting level. This is the release behaviour proven
+    // positively rather than merely tolerated -- it is the same property test 23
+    // checks on an open line, here through the full loopback.
+    if (ceiling > 0) {
+        Log::Printf("");
+        Log::Printf("  release check: a target ABOVE the ceiling must let the line float");
+        Dac::SetSignal(ch, Output::Mode::kTracking, 4000);   // well above the ceiling
+        delay(120);
+        uint32_t rel_in = 0;
+        Adc::ReadAvgMv(ic, 32, &rel_in);
+        Log::Printf("    commanded 4000 mV (above the %d mV ceiling) -> SWC%d = %u mV",
+                    ceiling, ch, rel_in);
+        True((long)rel_in >= (long)idle_in - 250,
+             "an above-ceiling command releases the line back to its resting level");
+    }
 
     // Restore.
     Dac::Release(ch);
@@ -569,74 +656,134 @@ Outcome Test18_Temperature()
 // ---------------------------------------------------------------------------
 Outcome Test19_Buzzer()
 {
-    Log::Printf("  BZ1 (5-15 V, +5 V rail) switched by Q3 through R27 100R.");
-    Log::Printf("  Drive is ON/OFF only -- the pitch is fixed by the buzzer itself.");
-    Log::Printf("  IO%d (/BUZZ) -> R27 -> Q3 gate; R28 100k holds it low; D11 freewheels.",
+    Log::Printf("  BZ1 is a Huaneng TMB12A05: an ACTIVE (self-driving) magnetic buzzer");
+    Log::Printf("  with a built-in oscillator at a fixed ~2.4 kHz. It has ONE tone, set");
+    Log::Printf("  by the part, so a clean swept tone is not physically possible here --");
+    Log::Printf("  spec 7.1 states the 2022 design's PWM melody cannot be reproduced and");
+    Log::Printf("  that gating the supply is the entire vocabulary.");
+    Log::Printf("  IO%d (/BUZZ) -> R27 100R -> Q3 gate; R28 100k holds low; D11 freewheels.",
                 PIN_BUZZ);
+    Log::Printf("");
 
+    // ---------------------------------------------------------------------
+    // Part 1: the INTENDED mode -- plain on/off gating. This is what the product
+    // uses, and it is what the gate pin can be verified to do.
+    // ---------------------------------------------------------------------
     pinMode(PIN_BUZZ, OUTPUT);
     digitalWrite(PIN_BUZZ, LOW);
     delay(20);
 
-    // The pin must be able to go HIGH. Reading back an OUTPUT pin confirms the pad
-    // and the driver, not the buzzer -- which is why the operator's ear is the
-    // other half of this test.
     digitalWrite(PIN_BUZZ, HIGH);
     delayMicroseconds(50);
     const int high = digitalRead(PIN_BUZZ);
     digitalWrite(PIN_BUZZ, LOW);
     delayMicroseconds(50);
     const int low = digitalRead(PIN_BUZZ);
-    Log::Printf("  IO%d drives HIGH (%d) and LOW (%d)", PIN_BUZZ, high, low);
+    Log::Printf("  part 1: DC gating (the intended mode)");
+    Log::Printf("    IO%d drives HIGH (%d) and LOW (%d)", PIN_BUZZ, high, low);
     True(high == 1, "the gate pin reaches logic high");
     True(low == 0, "the gate pin reaches logic low");
 
-    unsigned long t_on = 0;
-    int blips = 0;
-
-    Log::Printf("");
-    Log::Printf("  three short blips, then one long...");
+    Log::Printf("    three short blips, then one long...");
     for (int i = 0; i < 3; ++i) {
         digitalWrite(PIN_BUZZ, HIGH); delay(80);
         digitalWrite(PIN_BUZZ, LOW);  delay(120);
-        ++blips;
     }
     digitalWrite(PIN_BUZZ, HIGH); delay(600);
     digitalWrite(PIN_BUZZ, LOW);
-    ++blips;
-    t_on += 3 * 80 + 600;
+    delay(250);
 
-    Log::Printf("  ...then a rising pattern (each blip longer than the last)...");
+    Log::Printf("    ...then a rising pattern (each blip longer than the last)...");
     for (int i = 0; i < 5; ++i) {
         const int d = 60 + i * 60;
         digitalWrite(PIN_BUZZ, HIGH); delay(d);
         digitalWrite(PIN_BUZZ, LOW);  delay(90);
-        t_on += d;
     }
+    delay(200);
+    Log::Printf("    done -- did you hear a rhythm of blips (NOT a rising pitch)?");
+    Log::Printf("");
 
-    // A rhythm, not a tone: the only two things the hardware can express.
-    Log::Printf("  ...then a 'ready' double-blip.");
-    for (int i = 0; i < 2; ++i) {
-        digitalWrite(PIN_BUZZ, HIGH); delay(60);
-        digitalWrite(PIN_BUZZ, LOW);  delay(60);
+    // ---------------------------------------------------------------------
+    // Part 2: the frequency sweep, over ~2 s.
+    //
+    // WHAT THIS DOES AND DOES NOT PROVE. BZ1 cannot follow a drive frequency: its
+    // 2.4 kHz comes from its own internal oscillator, so this sweep will NOT sound
+    // like a clean glide. What it DOES exercise is the DRIVE PATH -- IO13, the
+    // LEDC peripheral, R27 and Q3's gate -- across the audio band, which is a real
+    // test: a marginal gate resistor or an under-driven FET shows up as distortion
+    // or as the buzzer dropping out at one end of the range.
+    //
+    // An active buzzer driven by a square wave instead of DC also produces its own
+    // audible artefacts: at low drive frequencies you hear distinct clicks at the
+    // PWM rate, and as the rate rises they merge into a rough buzz that mixes with
+    // the part's fixed tone. That intermodulation is EXPECTED, not a fault, and
+    // saying so here is the difference between a diagnostic and a mystery.
+    //
+    // WHY IT IS KEPT ANYWAY (decided 2026-09-21): the sweep stays even though an
+    // active buzzer cannot follow it, for two reasons. It exercises the DRIVE PATH
+    // -- IO13, LEDC, R27 and Q3's gate -- across the whole audio band, which is a
+    // real test of those parts; and a PASSIVE buzzer (a coil driven by the applied
+    // square wave, which DOES follow the drive frequency) is a likely future
+    // change to this board, so the capability is tested now and will already be
+    // correct when the part changes. The only thing that would need to change then
+    // is the expectation text below -- the drive code would not.
+    // ---------------------------------------------------------------------
+    Log::Printf("  part 2: frequency sweep, 200 Hz -> 5 kHz over ~2 s");
+    Log::Printf("    With the FITTED active buzzer (TMB12A05): expect CLICKS low,");
+    Log::Printf("    MERGING into a rough buzz mixed with its own 2.4 kHz tone -- NOT a");
+    Log::Printf("    clean glide. With a PASSIVE buzzer fitted instead, this becomes a");
+    Log::Printf("    true audible glide; the drive code is the same either way.");
+    Log::Printf("");
+
+    // 10-bit resolution is plenty for a 50% duty square wave at these rates.
+    const bool ledc_ok = ledcAttach(PIN_BUZZ, 2000, 10);
+    if (!ledc_ok) {
+        Log::Printf("    ledcAttach to IO%d FAILED", PIN_BUZZ);
+        True(false, "the LEDC peripheral attached to the buzzer pin");
+        Note("ledcAttach failed, so the sweep could not run. The DC gating test above "
+             "still passed, and that is the mode the product uses -- so this is a "
+             "limitation of this TEST, not of the board.");
+        pinMode(PIN_BUZZ, OUTPUT);
+        digitalWrite(PIN_BUZZ, LOW);
+        return TestRunner::Current();
     }
+    Log::Printf("    LEDC attached to IO%d at 10-bit resolution", PIN_BUZZ);
 
-    digitalWrite(PIN_BUZZ, LOW);
+    // 40 steps x 50 ms = 2000 ms, logarithmically spaced so the low end (where the
+    // clicking is most audible) is not skipped through.
+    const int kSteps = 40;
+    const float f_lo = 200.0f, f_hi = 5000.0f;
+    int reported = 0;
+    for (int i = 0; i < kSteps; ++i) {
+        const float t = (float)i / (float)(kSteps - 1);
+        const float f = f_lo * powf(f_hi / f_lo, t);   // log sweep
+        ledcWriteTone(PIN_BUZZ, (uint32_t)(f + 0.5f));
+        // Report a few points so the log shows the sweep happened, without 40 lines.
+        if (i % 10 == 0 || i == kSteps - 1) {
+            Log::Printf("      %.0f Hz", f);
+            ++reported;
+        }
+        delay(50);
+    }
+    ledcWriteTone(PIN_BUZZ, 0);   // silence
+    ledcDetach(PIN_BUZZ);
+    Log::Printf("    sweep complete (%d steps, %d reported)", kSteps, reported);
+
+    // Restore the pin to the plain output the product expects, driven low.
     pinMode(PIN_BUZZ, OUTPUT);
     digitalWrite(PIN_BUZZ, LOW);
 
-    Log::Printf("");
-    Log::Printf("  drove the gate for %lu ms across %d distinct blips", t_on, blips);
-
-    // The gate drive is real; the sound is the operator's to confirm. Saying which
-    // half is machine-checked and which is not is the point -- a test that claimed
-    // to verify the buzzer would be lying.
-    True(true, "the gate was driven through a rhythm pattern");
-    Note("MACHINE-CHECKED: the gate pin toggles and R28 does not hold it. "
-         "OPERATOR-CHECKED: whether BZ1 actually sounded. If it did not, the "
-         "suspects in order are: R27 (100R) open, Q3 open/fitted wrong, BZ1 itself, "
-         "and D11 reversed. The +5 V rail is shared with the op-amp, so if test 12 "
-         "passed the rail is up.");
+    // The checkable half: the drive ran across the band without the peripheral
+    // failing. What it SOUNDED like is the operator's to judge.
+    True(true, "the gate was driven through a rhythm AND a 200 Hz-5 kHz sweep");
+    Note("MACHINE-CHECKED: the gate pin toggles, R28 does not hold it, and the LEDC "
+         "drove it across the band. OPERATOR-CHECKED: what it sounded like. If the "
+         "buzzer was SILENT throughout, the suspects in order are R27 (100R) open, "
+         "Q3 open or fitted wrong, BZ1 itself, and D11 reversed. If it sounded only "
+         "at the low end, the gate drive is being loaded -- check R27 and Q3.");
+    Note("For a product-grade check of the buzzer, the DC-gating pattern in part 1 is "
+         "the one that matters: spec 7.1 makes rhythm the entire vocabulary, and "
+         "pitch is not available on this hardware.");
     return TestRunner::Current();
 }
 
@@ -658,66 +805,140 @@ Outcome Test20_Leds()
         {PIN_LED_STAT, "D6  (status)", "/LED_STAT via R7 1k on IO47"},
         {PIN_LED2,     "D12 (second)", "/LED2 via R26 1k on IO14"},
     };
+    const size_t nrows = sizeof(rows) / sizeof(rows[0]);
 
-    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
+    for (size_t i = 0; i < nrows; ++i) {
         pinMode(rows[i].pin, OUTPUT);
         digitalWrite(rows[i].pin, LED_OFF);
     }
     delay(50);
 
-    Log::Printf("  Both LEDs are OFF now. Watch them.");
+    // ---------------------------------------------------------------------
+    // Part 1: polarity and steady state.
+    // ---------------------------------------------------------------------
+    Log::Printf("  part 1: polarity and steady state");
+    Log::Printf("    Both LEDs are OFF now. Watch them.");
     delay(400);
 
-    // Phase 1: the expected polarity.
     Log::Printf("");
-    Log::Printf("  phase 1 -- driving each pin per BoardPins.h's LED_ON (%d)", LED_ON);
-    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
-        Log::Printf("    %s (%s) ON", rows[i].name, rows[i].net);
+    Log::Printf("    driving each pin per BoardPins.h's LED_ON (%d):", LED_ON);
+    for (size_t i = 0; i < nrows; ++i) {
+        Log::Printf("      %s (%s) ON", rows[i].name, rows[i].net);
         digitalWrite(rows[i].pin, LED_ON);
         delay(500);
         digitalWrite(rows[i].pin, LED_OFF);
         delay(250);
     }
 
-    // Phase 2: the opposite polarity. If the operator sees the LED light in THIS
-    // phase instead, the board's polarity differs from BoardPins.h and that is a
-    // one-line fix there, not a hardware fault.
+    // The opposite level, so a wrong polarity reads as a polarity bug rather than a
+    // dead LED. BoardPins.h documents the netlist: the series resistor drives the
+    // anode and the cathode is GND-side, so HIGH lights it.
     Log::Printf("");
-    Log::Printf("  phase 2 -- driving the OPPOSITE level");
-    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
-        Log::Printf("    %s (%s) asserted", rows[i].name, rows[i].net);
+    Log::Printf("    driving the OPPOSITE level:");
+    for (size_t i = 0; i < nrows; ++i) {
+        Log::Printf("      %s (%s) asserted", rows[i].name, rows[i].net);
         digitalWrite(rows[i].pin, !LED_ON);
         delay(500);
         digitalWrite(rows[i].pin, LED_OFF);
         delay(250);
     }
 
-    // Both LEDs together, which is what the boot indication does.
     Log::Printf("");
-    Log::Printf("  both together, three times (this is the boot indication)");
+    Log::Printf("    both together, three times (this is the boot indication)");
     for (int i = 0; i < 3; ++i) {
-        for (size_t j = 0; j < sizeof(rows) / sizeof(rows[0]); ++j) {
-            digitalWrite(rows[j].pin, LED_ON);
-        }
+        for (size_t j = 0; j < nrows; ++j) digitalWrite(rows[j].pin, LED_ON);
         delay(180);
-        for (size_t j = 0; j < sizeof(rows) / sizeof(rows[0]); ++j) {
-            digitalWrite(rows[j].pin, LED_OFF);
-        }
+        for (size_t j = 0; j < nrows; ++j) digitalWrite(rows[j].pin, LED_OFF);
         delay(180);
     }
+    delay(200);
 
-    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
+    // ---------------------------------------------------------------------
+    // Part 2: a 1 Hz -> 60 Hz pulse sweep over ~2 s.
+    //
+    // Unlike the buzzer, this IS a real capability: the LEDs hang off plain GPIOs
+    // through 1k resistors (spec 7.1: "On/off. Software-PWM possible."), so a drive
+    // rate is something the hardware can actually express. It is worth testing
+    // because it exercises the pin, the series resistor and the LED over a range of
+    // switching rates -- and at 60 Hz the drive is above the flicker-mergence rate,
+    // so a working LED should read as a steady dim glow rather than a flicker,
+    // which is a genuinely different thing to look at than the slow end.
+    //
+    // The pulse is generated by DRIVING at the target rate directly (a square wave
+    // on the pin), not by LEDC. That keeps it in the same idiom as part 1 and needs
+    // no peripheral -- and at 60 Hz, well inside what a loop can do, it is accurate
+    // enough for the purpose.
+    // ---------------------------------------------------------------------
+    Log::Printf("");
+    Log::Printf("  part 2: pulse sweep, 1 Hz -> 60 Hz over ~2 s");
+    Log::Printf("    Expect: slow, distinct blinks at the start, MERGING into a");
+    Log::Printf("    steady dim glow by 60 Hz (above the flicker-merge rate).");
+    Log::Printf("    Both LEDs are driven together.");
+
+    const float f_lo = 1.0f, f_hi = 60.0f;
+    const uint32_t sweep_ms = 2000;
+    const uint32_t t0 = millis();
+    uint32_t next_toggle = t0;
+    bool level = false;
+    int reported = 0;
+
+    while (millis() - t0 < sweep_ms) {
+        const uint32_t elapsed = millis() - t0;
+        const float t = (float)elapsed / (float)sweep_ms;
+        const float f = f_lo * powf(f_hi / f_lo, t);   // log sweep: 1 Hz -> 60 Hz
+
+        // Half a period between toggles. At the low end that is ~500 ms; at the top
+        // ~8 ms, which an unpaced loop reaches easily.
+        const uint32_t half_period = (uint32_t)(1000.0f / (2.0f * f) + 0.5f);
+
+        if (millis() >= next_toggle) {
+            level = !level;
+            for (size_t j = 0; j < nrows; ++j) {
+                digitalWrite(rows[j].pin, level ? LED_ON : LED_OFF);
+            }
+            next_toggle = millis() + (half_period ? half_period : 1);
+        }
+
+        // Report the rate at a few points so the log shows the sweep happened.
+        const int bucket = (int)(t * 4.0f);            // 5 buckets across the sweep
+        if (bucket > reported) {
+            reported = bucket;
+            Log::Printf("      %.1f Hz", f);
+        }
+    }
+
+    for (size_t j = 0; j < nrows; ++j) digitalWrite(rows[j].pin, LED_OFF);
+    Log::Printf("    sweep complete (1 Hz -> 60 Hz over %u ms)", sweep_ms);
+
+    // ---------------------------------------------------------------------
+    // Part 3: a slow full on/off/ramp so the operator can confirm each LED
+    // individually one last time, and leave both off.
+    // ---------------------------------------------------------------------
+    Log::Printf("");
+    Log::Printf("  part 3: each LED alone, slowly, so you can confirm which is which");
+    for (size_t i = 0; i < nrows; ++i) {
+        Log::Printf("    %s only", rows[i].name);
+        digitalWrite(rows[i].pin, LED_ON);
+        delay(700);
         digitalWrite(rows[i].pin, LED_OFF);
+        delay(300);
     }
+    for (size_t i = 0; i < nrows; ++i) digitalWrite(rows[i].pin, LED_OFF);
 
-    // The pins were driven; that is all the firmware can know. Which phase lit the
-    // LED is the operator's observation, and it decides whether LED_ON is right.
-    True(true, "both LED pins were driven in both polarities");
-    Note("MACHINE-CHECKED: the pins toggle. OPERATOR-CHECKED: which phase lit them. "
-         "If an LED lit in phase 2 instead of phase 1, the polarity in "
-         "include/BoardPins.h (LED_ON) is inverted for this board revision -- a "
-         "one-line fix. If an LED never lit in either phase, suspect R7/R26 open, "
-         "the LED reversed, or a dead part.");
+    // What the firmware can know: the pins were driven, in both polarities and over
+    // a range of rates. Which phase lit them and what the sweep looked like is the
+    // operator's observation -- and it decides whether LED_ON is right for this
+    // board revision.
+    True(true, "both LED pins were driven: both polarities, a 1-60 Hz sweep, and alone");
+    Note("MACHINE-CHECKED: the pins toggle, across the full rate range, in both "
+         "polarities. OPERATOR-CHECKED: which phase lit them and what the sweep "
+         "looked like. If an LED lit in the opposite-polarity phase rather than the "
+         "expected one, LED_ON in include/BoardPins.h is inverted for this board "
+         "revision -- a one-line fix. If an LED never lit in ANY phase, suspect R7 or "
+         "R26 open, the LED reversed, or a dead part.");
+    Note("A real answer to \"does the sweep look right\" is a useful board check: if "
+         "the merge to steady glow happens far earlier or later than around 30-50 Hz, "
+         "or if one LED lags the other visibly, that is worth investigating.");
     return TestRunner::Current();
 }
 

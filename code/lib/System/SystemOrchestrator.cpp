@@ -467,12 +467,18 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
                 wizard_.Exit(now_ms);
             } else {
                 // The learn's idle reference is captured HERE, on entry, because
-                // spec 3.4 wants the idle AS MEASURED AT LEARN TIME. During the
-                // prompt the user is holding the wheel button, so the live reading
-                // is the pressed level and cannot serve -- and the previously
-                // STORED idle is exactly what a re-learn is meant to correct.
+                // spec 3.4 wants the idle AS MEASURED AT LEARN TIME. At this
+                // instant the wheel is still idle (the user is holding AUX1, not a
+                // wheel button), so the live reading is the denominator the commit
+                // will store as `learned_idle_mv` -- the app-driven path captures
+                // the same quantity. Reading it later, during the prompt, would
+                // sample the pressed level instead.
                 const int live = hal_->adc_read_mv(
                     hal_->ctx, (learn_channel_ == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
+                // A zero reading means the ADC is unreadable, so fall back to the
+                // channel's tracked idle reference rather than committing a learn
+                // whose denominator is 0. Both are live idles; neither is the
+                // stored `learned_idle_mv`, which is the value a re-learn corrects.
                 learn_idle_mv_ = (live > 0)
                                      ? live
                                      : IdleReferenceMv(static_cast<uint8_t>(learn_channel_));

@@ -73,7 +73,16 @@ void LearnWizard::Enter(uint64_t now_ms, bool aux_held, const LadderProfile *exi
                                                                 : kLadderMaxButtons;
         for (uint8_t i = 0; i < n; ++i) profile_.buttons[i] = existing->buttons[i];
         profile_.count = n;
+        // The frame the seeded buttons' millivolts are in, so the first tick can
+        // rescale them onto the LIVE rail this session measures at. A profile has
+        // ONE denominator, so leaving the seeded entries in their old frame while
+        // the newly measured button lands in the live one makes the stored ladder
+        // self-inconsistent -- see `Tick`.
+        seed_idle_mv_ = existing->learned_idle_mv;
+    } else {
+        seed_idle_mv_ = 0;
     }
+    seed_framed_ = false;
     press_count_ = 0;
     selected_slot_ = 0;
     any_press_ = false;
@@ -126,6 +135,27 @@ bool LearnWizard::ConsumeExited() {
 
 void LearnWizard::Tick(int channel, uint64_t now_ms, int idle_mv, int temp_tenths_c) {
     if (hal_ == nullptr) return;
+    // Rescale the SEEDED buttons from the rail they were stored against onto the
+    // LIVE rail, once, before anything compares or commits them.
+    //
+    // A `LadderProfile` has ONE `learned_idle_mv` and every button's millivolts
+    // are in that frame, but this session measures the new button on the live rail
+    // and stamps the live idle as the profile's denominator. If the rail has moved
+    // since the seeded buttons were learned, leaving them alone stores two frames
+    // under one denominator, and classification then reads them on the wrong
+    // scale: the press lands in whichever window it now falls inside and the WRONG
+    // button fires. Measured through the real learn path -- two buttons 200 mV
+    // apart learned at 2835 mV, one re-learned at 2693 mV (-5 %): pressing the
+    // other fired the 794-permille button when the press was at 864.
+    //
+    // Done here, on the first tick with a usable reference, rather than in Enter:
+    // Enter does not receive the live idle. `NeighbourSetExcludingTheSlotBeingLearned`
+    // reads `profile_`, so the session's neighbour set and the committed ladder
+    // both see the converted values -- one conversion, one frame.
+    if (!seed_framed_ && idle_mv > 0 && seed_idle_mv_ > 0) {
+        LadderProfileRebase(profile_, seed_idle_mv_, idle_mv);
+        seed_framed_ = true;
+    }
     // Remembered so the id-based neighbour exclusion can build the id this learn
     // is about to produce; `Tick` is the only place the channel arrives.
     channel_ = channel;

@@ -66,6 +66,21 @@ void LearnSession::Start(const LadderProfile &existing) {
 
 void LearnSession::AddSample(int level_mv, int idle_mv, MilliVolt rail_mv,
                              int16_t temp_tenths_c, uint64_t now_ms) {
+    // The first sample fixes the frame this session measures in, so the SEEDED
+    // neighbour set is converted into that frame exactly once.
+    //
+    // This is not cosmetic. `existing_` holds the channel's already-learned
+    // buttons as absolute millivolts at the rail they were STORED against, while
+    // `level_mv` -- and so `mean_mv`, which the gates below compare to those
+    // buttons -- is an absolute reading on the LIVE rail. Two frames in one
+    // comparison is the defect class this project keeps re-finding, and here it
+    // is silent: the new measurement matches the wrong sibling, and the
+    // tolerance's nearest-gap is measured to a centre that moved. The caller
+    // rebases its own copy of the seeded buttons the same way (`LadderProfileRebase`)
+    // so what is STORED and what was GATED agree.
+    if (!have_sample_ && idle_mv > 0) {
+        LadderProfileRebase(existing_, existing_.learned_idle_mv, idle_mv);
+    }
     ++sample_count_;
     if (!have_sample_) {
         first_ms_ = now_ms;

@@ -74,6 +74,40 @@ int16_t LadderRatioPermille(int level_mv, int idle_mv);
 ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int idle_mv);
 
 /*
+ * Rescale a profile's ABSOLUTE millivolts from the rail they were measured at
+ * onto another rail, so a profile can keep ONE denominator after a re-learn.
+ *
+ * **Why this has to exist.** `LadderProfile` carries a single `learned_idle_mv`,
+ * while each `LadderButton` carries `mv_center`/`mv_tolerance` as absolute pin
+ * millivolts measured at that one rail. A learn measures on the LIVE rail and
+ * both learn paths SEED the profile with the channel's existing buttons (so a
+ * re-learn corrects one entry instead of deleting the rest -- spec 7.4). If the
+ * stored profile was measured at a different rail than the live one, the newly
+ * measured button lands in the live frame while every seeded sibling stays in the
+ * stored frame, and the profile's single denominator then applies to both. The
+ * ratios are read on the wrong scale, and that does not fail loudly: the press
+ * matches whichever window it now falls inside, so the WRONG button fires.
+ *
+ * Measured through the real learn path: two buttons 200 mV apart learned at
+ * 2835 mV, then one re-learned at 2693 mV (a -5 % regulator deviation, inside the
+ * documented +-5 % band). Pressing the OTHER button -- stored ratio 864 permille
+ * -- fired the button at 794 permille, and its own window was no longer reachable.
+ *
+ * Scaling is the correct transform, not ratio preservation in the abstract: the
+ * ladder is a divider off +3V3, so a button's pin voltage (and its spread) scale
+ * with the rail. Both `mv_center` and `mv_tolerance` therefore scale, which keeps
+ * every relative permille window EXACTLY invariant -- `LadderRatioPermille` of a
+ * scaled button against the scaled denominator returns the same permille, so
+ * `LadderWindowsAreDistinguishable` cannot change under a rebase.
+ *
+ * A non-positive `from_idle_mv` (a profile that has no reference yet -- a fresh
+ * learn, or a channel with no learned ladder) is left untouched: there is no
+ * source frame to convert from, and the caller's own measurement is already in
+ * the target frame.
+ */
+void LadderProfileRebase(LadderProfile &p, int from_idle_mv, int to_idle_mv);
+
+/*
  * Is this profile one a config may CARRY? Every check `ConfigValidate` applies to a
  * channel's ladder, in one place.
  *

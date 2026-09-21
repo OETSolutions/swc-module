@@ -872,9 +872,15 @@ void CommandRouter::EmitLadderSample() {
  * the sample are the same measurement -- recording a separate read would measure
  * a value the app never saw.
  *
- * The idle reference is the LEARNED one from the running config (spec 6.3): the
- * ratio denominator must stay pinned to the rail the button centres were measured
- * at, and reading the live idle here would make it move with the rail.
+ * The idle reference is the channel's LIVE idle (spec 6.3), the same denominator
+ * the classifier uses and the same one the headless wizard captures. `Commit`
+ * records the button's `mv_center` in absolute millivolts AT this reference and
+ * the config stores this reference as `learned_idle_mv`, so the pair is
+ * self-consistent however far the rail has moved since the last learn. Passing
+ * the STORED learned idle instead would record centres against the old rail while
+ * stamping them as belonging to the current one, so every subsequent classify
+ * would derive them against a denominator the learn never used -- and on a moved
+ * rail the recorded ratio would be wrong by the rail's own deviation.
  *
  * Out-of-range levels are still recorded: the session counts them and reports
  * `out_of_range` (a wiring fault), rather than dropping them and reporting the
@@ -1098,6 +1104,21 @@ void CommandRouter::HandleLearnCommit(const cJSON *root, uint32_t for_seq) {
     }
     if (lr == ConfigLoadResult::kNoConfig) c = ConfigDefault();
     LadderProfile &lp = c.channels[channel].ladder;
+
+    // Rescale the stored ladder's millivolts onto the LIVE rail this learn
+    // measured at, so every button shares the ONE denominator the profile is about
+    // to be stamped with.
+    //
+    // A `LadderProfile` has a single `learned_idle_mv` and every button's
+    // millivolts are in that frame. The measured button below is in the LIVE
+    // frame, and `lp.learned_idle_mv` is set to the live idle at the end of this
+    // handler -- so a rail that moved since these buttons were learned would leave
+    // them in the old frame under a new denominator. Classification reads them on
+    // the wrong scale and the press lands in whichever window it now falls inside:
+    // the WRONG button fires. Scaling both `mv_center` and `mv_tolerance` keeps
+    // every permille window exactly invariant, so nothing the validator or the
+    // classifier derives from ratios changes here.
+    LadderProfileRebase(lp, lp.learned_idle_mv, session_.LearnedIdleMv());
 
     // REPLACE IN PLACE when the id is already on the ladder, rather than always
     // appending. The host names the button it learns (`button_id`), and the app

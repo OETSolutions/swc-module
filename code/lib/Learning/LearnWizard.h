@@ -148,6 +148,14 @@ private:
     LadderProfile profile_{};
     LadderProfile aux_profile_{};
 
+    // The rail the SEEDED buttons' millivolts are in, and whether they have been
+    // rescaled onto the live rail yet. A profile has one denominator, so a re-learn
+    // on a moved rail must convert the seeded entries into the live frame before
+    // anything compares or commits them (`Tick` does it once). Zero means the seed
+    // had no reference, so there is nothing to convert.
+    int  seed_idle_mv_ = 0;
+    bool seed_framed_ = false;
+
     // The channel being learned, learned from `Tick`. Only used to spell the id
     // pattern this class generates (`swc<ch>_bt<slot>`), never to index anything.
     int      channel_ = 0;

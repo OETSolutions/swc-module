@@ -151,11 +151,24 @@ public:
         return static_cast<int>(channels_[channel_index].reader.Value());
     }
 
-    /* The channel's LEARNED idle reference: the ratio denominator (spec 6.3). */
+    /*
+     * The channel's ratio denominator: `V_ADC_idle`, the LIVE idle (spec 6.3).
+     *
+     * NOT `ladder.learned_idle_mv`. The learned idle is the rail the button
+     * centres were measured at and is what `LadderClassify` derives those centres
+     * against; the denominator here is the rail NOW. Pinning this to the learned
+     * value would make a learn taken on a moved rail record ratios against the
+     * wrong rail, and would leave `LadderClassify`'s FR-30 sag check comparing a
+     * value to itself (its reference argument and `profile.learned_idle_mv`
+     * would be the same). Seeded at Boot and re-adopted as the rail moves.
+     *
+     * Returns 0 for an out-of-range channel, or before Boot has established a
+     * reference.
+     */
     int IdleReferenceMv(uint8_t channel_index) const
     {
         if (channel_index >= kMaxChannels) return 0;
-        return static_cast<int>(config_.channels[channel_index].ladder.learned_idle_mv);
+        return channels_[channel_index].idle_reference_mv;
     }
 
     /*

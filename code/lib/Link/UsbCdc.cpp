@@ -100,10 +100,14 @@ void UsbCdc::FeedBytes(const uint8_t *data, size_t len) {
 
 void UsbCdc::NoteDisconnected() {
     connected_ = false;
-    // Deliberately NOT clearing the TX buffer: a frame half-sent when the host
-    // unplugged is gone anyway, and clearing it here would also discard a frame
-    // queued for a host that is about to re-enumerate (spec 4.4 says reconnect is
-    // stateless, so nothing is replayed -- but nothing is corrupted either).
+    // Drop BOTH the pending TX bytes and the RX assembler. Spec 4.4 makes
+    // reconnect stateless: nothing is replayed and nothing carries over. The TX
+    // bytes must go because a frame half-written when the host unplugged is
+    // indistinguishable from a whole one still queued -- `tx_off_` records what
+    // was already accepted by the FIFO, not what the host consumed -- so
+    // resuming it would deliver a frame's TAIL to a session that never saw its
+    // head. The reader is reset for the same reason in the other direction: a
+    // half-assembled RX line belongs to the session that ended.
     tx_off_ = 0;
     tx_len_ = 0;
     reader_ = NdjsonReader();

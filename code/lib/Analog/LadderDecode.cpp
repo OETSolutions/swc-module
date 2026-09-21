@@ -107,6 +107,21 @@ bool LadderWindowsAreDistinguishable(const LadderProfile &p) {
     return true;
 }
 
+void LadderProfileRebase(LadderProfile &p, int from_idle_mv, int to_idle_mv) {
+    if (from_idle_mv <= 0 || to_idle_mv <= 0) return;   // no source frame to convert
+    if (from_idle_mv == to_idle_mv) return;
+    for (uint8_t i = 0; i < p.count && i < kLadderMaxButtons; ++i) {
+        LadderButton &b = p.buttons[i];
+        b.mv_center = static_cast<MilliVolt>(
+            (static_cast<long long>(b.mv_center) * to_idle_mv + from_idle_mv / 2) /
+            from_idle_mv);
+        b.mv_tolerance = static_cast<MilliVolt>(
+            (static_cast<long long>(b.mv_tolerance) * to_idle_mv + from_idle_mv / 2) /
+            from_idle_mv);
+    }
+    p.learned_idle_mv = static_cast<MilliVolt>(to_idle_mv);
+}
+
 bool LadderProfileIsValid(const LadderProfile &p) {
     // The channel-level bounds, which ConfigValidate checks separately.
     if (p.learned_idle_mv <= 0 || p.learned_idle_mv > kAdcCeilingMv) return false;

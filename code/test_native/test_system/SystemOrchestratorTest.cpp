@@ -1118,6 +1118,81 @@ TEST(SystemOrchestrator, AHeadlessLearnStoresAButtonAndItClassifiesImmediately) 
     EXPECT_EQ(g_reported[0].gesture, Gesture::kSingle);
 }
 
+TEST(SystemOrchestrator, AReLearnOnAMovedRailKeepsTheOtherButtonsOnTheirOwnWindows) {
+    // A ladder profile has ONE `learned_idle_mv`, and every button stores its
+    // centre in ABSOLUTE millivolts measured at that one rail. A re-learn measures
+    // the new button on the LIVE rail and stamps the live idle as the denominator,
+    // so if the rail moved since the seeded buttons were learned, leaving THEM
+    // alone stores two frames under one denominator. Classification then reads
+    // them on the wrong scale, and because nearest-centre matching still returns
+    // SOMETHING, the wrong button fires -- a silent wrong action rather than an
+    // error. Measured before the fix: two buttons 200 mV apart learned at 2835 mV,
+    // one re-learned at 2693 mV (-5 %, inside the documented band); pressing the
+    // other, whose window is centred at 864 permille, reported the 794-permille
+    // button.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.channels[0].ladder.count = 2;
+    d.config.channels[0].ladder.learned_idle_mv = 2835;
+    d.config.channels[0].ladder.buttons[0] = {"swc1_bt1", "A", 2250, 100, 3300, 235, 200, 98};
+    d.config.channels[0].ladder.buttons[1] = {"swc1_bt2", "B", 2450, 100, 3300, 235, 200, 98};
+    // The default bindings name `vol_up`/`next`, which this renamed ladder does
+    // not carry; `ConfigValidate` refuses a binding that names no real button, and
+    // a refused config decodes to defaults (spec 6.8). Zero them.
+    d.config.binding_count = 0;
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+
+    // The rail has moved DOWN to 2693 (a -5 % regulator deviation), and the wheel
+    // idles there. Boot adopts the live idle as the reference.
+    const int kMovedIdle = 2693;
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, kMovedIdle);
+    o.Boot();
+    ASSERT_EQ(o.IdleReferenceMv(0), kMovedIdle)
+        << "Boot must adopt the live moved rail (spec 6.3)";
+
+    // Re-learn slot 1 over the button physically at 2250 mV, which is 2137 mV on
+    // the moved rail.
+    HoldAuxToToggle(o, hal);
+    ASSERT_TRUE(o.LearnActive());
+    PressAux(o, hal, 1);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2137);
+    PollFor(o, hal, 400);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, kMovedIdle);
+    PollFor(o, hal, 200);
+    HoldAuxToToggle(o, hal);   // leave the wizard
+
+    const LadderProfile *learned = o.LastLearnedProfile(0);
+    ASSERT_NE(learned, nullptr) << "the re-learn must have committed";
+    ASSERT_EQ(learned->count, 2) << "the re-learn must CORRECT a slot, not add a third";
+
+    // Now press the OTHER button -- the one this re-learn did not touch. Its
+    // physical level on the moved rail is 2450 * 2693/2835 = 2327 mV. It must
+    // still name ITSELF; naming the 2250-mV button means the two frames were
+    // mixed and the wrong window fired.
+    g_reported.clear();
+    o.SetGestureSink(&RecordGesture, nullptr);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2327);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, kMovedIdle);
+    PollFor(o, hal, 700);
+
+    ASSERT_EQ(g_reported.size(), 1u)
+        << "the untouched button must classify after a re-learn on a moved rail";
+    // `button_id` is null when the level matched no window, so compare through a
+    // guard: a null deref here would turn a clean assertion failure into a crash.
+    const char *got = g_reported[0].button_id;
+    EXPECT_STREQ(got == nullptr ? "(none)" : got, "swc1_bt2")
+        << "the press at 2327 mV is the 2450-mV button; reporting the 2250-mV one "
+           "means the seeded buttons were left in the OLD rail's frame while the "
+           "profile was stamped with the new one";
+}
+
 TEST(SystemOrchestrator, AHeadlessLearnedButtonDrivesTheOutputOnceABindingNamesIt) {
     // The other half of the composition: the generated id is DETERMINISTIC
     // ("swc1_bt1"), so a config can bind it in advance and a headless learn fills
@@ -2537,9 +2612,14 @@ TEST(SystemOrchestrator, ACorruptConfigFallsBackToDefaultsAndActuallyRunsThem) {
      * masked it by constructing with `ConfigDefault()`; a caller passing a real
      * config got a status frame that said one thing while the device did another.
      *
-     * The observable that separates them is the channel's learned idle reference: a
-     * caller-supplied config carries a distinctive one, `ConfigDefault()` carries
-     * 2835.
+     * The observable that separates them is the channel's idle reference. Boot
+     * seeds it from the live reading when that reading is a plausible rail idle
+     * (spec 6.3) and from the learned idle otherwise, so the two configs still
+     * diverge: the default's 2835 matches the 2835 the HAL reports and becomes the
+     * reference, while the caller's 1234 does not (2835/1234 is far outside the
+     * ±5 % rail band) and stays. A distinctive caller-supplied learned idle is
+     * therefore still observable through `IdleReferenceMv`, which is what this
+     * assertion needs.
      */
     MockHal hal;
     hal.ClearNvs();

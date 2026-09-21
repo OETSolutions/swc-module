@@ -1550,3 +1550,96 @@ TEST(CommandRouter, ALearnCommitOnADifferentChannelThanTheStreamIsRefused) {
     EXPECT_EQ(out.channels[1].ladder.count, 0u)
         << "channel 1 must not receive channel 0's measurement";
 }
+
+TEST(CommandRouter, ALearnTakenOnAMovedRailNormalizesToTheLiveIdle) {
+    // Spec 6.3: the ratio denominator is `V_ADC_idle`, the LIVE idle -- NOT the
+    // config's `learned_idle_mv`. The app-driven path (`RecordLearnSample`) passed
+    // the STORED learned idle while the headless wizard passed the live reading, so
+    // the two learn paths disagreed, and on a moved rail the app recorded a
+    // button's `mv_center` against a denominator the classify step would never use.
+    //
+    // This test moves the rail between the stored learn and the re-learn: the
+    // config's learned idle is 2835 (the nominal rail), but the wheel now idles at
+    // 2660 (a ~-6 % rail, still inside the ADC ceiling). A committed button must
+    // carry `mv_center` in the units of THAT rail AND stamp its own
+    // `learned_idle_mv` with it, so the stored pair stays self-consistent.
+    //
+    // Under the old code the denominator was 2835, so a 1330 mV press recorded
+    // `mv_center = 1330` and stamped `learned_idle_mv = 2835` -- mixing the two.
+    //
+    // The ladder also carries a SIBLING button measured at the stored 2835 rail.
+    // A profile has ONE denominator, so the re-learn must rescale that sibling
+    // onto the live rail too: leaving it in the old frame while the profile is
+    // stamped with the new one makes classification read it on the wrong scale,
+    // and nearest-centre matching then fires the WRONG button rather than
+    // reporting an error.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.channels[0].ladder.count = 1;
+    d.config.channels[0].ladder.learned_idle_mv = 2835;   // the STALE stored rail
+    // 2450 mV at the 2835 rail = 864 permille, 200 mV from the 2250-mV button the
+    // re-learn will land on -- a gap the commit's tolerance cannot cover.
+    d.config.channels[0].ladder.buttons[0] = {"sib", "Sibling", 2450, 100, 3300, 235, 200, 98};
+    d.config.binding_count = 0;
+    ASSERT_TRUE(store.Save(d.config));
+
+    // The rail has since moved DOWN, to 2700 mV. Boot idles the input there before
+    // it establishes the reference, and 2700/2835 = 952 permille is inside spec
+    // 6.3's +-5 % plausibility window, so the live reading is adopted rather than
+    // the stored 2835.
+    const int kMovedIdle = 2700;
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, kMovedIdle);
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    ASSERT_EQ(sys.IdleReferenceMv(0), kMovedIdle)
+        << "Boot must adopt the live moved rail as the denominator (spec 6.3)";
+
+    // Hold a button at 1330 mV (a real press on the moved rail).
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1330);
+    for (int i = 0; i < 20; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+
+    const std::string ls = "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0}";
+    r.OnLine(ls.c_str(), ls.size());
+    for (int i = 0; i < 30; ++i) { r.Process(); hal.AdvanceMs(10); }
+
+    cap.lines.clear();
+    const std::string lc =
+        "{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":0,"
+        "\"button_id\":\"vol_dn\",\"name\":\"Volume Down\"}";
+    r.OnLine(lc.c_str(), lc.size());
+    ASSERT_TRUE(HasType(cap, "ack")) << "the learn must be accepted: "
+                                     << (cap.lines.empty() ? "(nothing)" : cap.lines.back());
+
+    Config out{};
+    ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+    ASSERT_EQ(out.channels[0].ladder.count, 2u) << "the sibling must survive the re-learn";
+    EXPECT_EQ(out.channels[0].ladder.learned_idle_mv, kMovedIdle)
+        << "the committed learn must stamp the rail it was measured at (the LIVE "
+           "idle), not the stale stored one -- 2835 here means the denominator "
+           "came from the config instead of the live reading (spec 6.3)";
+
+    // The measured button is in the live frame; the sibling must have been
+    // rescaled INTO it. 2450 mV at 2835 is 2450 * 2700/2835 = 2333 mV at 2700, and
+    // its permille window must be unchanged by the move.
+    const LadderButton *learned_btn = nullptr;
+    const LadderButton *sibling = nullptr;
+    for (uint8_t i = 0; i < out.channels[0].ladder.count; ++i) {
+        const LadderButton &b = out.channels[0].ladder.buttons[i];
+        if (strcmp(b.id, "vol_dn") == 0) learned_btn = &b;
+        if (strcmp(b.id, "sib") == 0) sibling = &b;
+    }
+    ASSERT_NE(learned_btn, nullptr);
+    ASSERT_NE(sibling, nullptr);
+    EXPECT_NEAR(learned_btn->mv_center, 1330, 60)
+        << "the centre is in millivolts ON THE MEASURED RAIL";
+    EXPECT_NEAR(sibling->mv_center, 2333, 20)
+        << "the sibling must be REBASED onto the live rail, not left at its stored "
+           "2450 mV: two frames under one denominator makes classification read it "
+           "on the wrong scale and fire the wrong button";
+    EXPECT_EQ(LadderRatioPermille(sibling->mv_center, kMovedIdle), 864)
+        << "and rebasing must leave the sibling's permille window EXACTLY as it "
+           "was (both its centre and the denominator scale together)";
+}

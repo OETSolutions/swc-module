@@ -856,6 +856,15 @@ An interrupted run is discarded wholesale — a partial config is never applied.
 press must not be held hostage to the app being responsive. The firmware acts on
 the local binding first and tells the app second (§6.6).
 
+**`test_key` carries all three of its fields, and `hold_ms` is bounded.** A
+handler that reads a frame's `key_mv` while ignoring `channel` and `hold_ms` is
+worse than one that refuses them: the app's own test button then measures a
+different output, for a different time, than the user asked for, and reports
+success. `channel` selects the output (it was hardcoded to 0); `hold_ms` is
+bounded at 1000 ms (a hold is time the OUTPUT is driven, so an unbounded value
+pins the KEY line, and `now + hold_ms` is a wrap primitive); `hold_ms` = 0 means
+the default. Each refusal is a `nack: bad_param`.
+
 **`level_mv` is the FILTERED level, not a raw conversion, and the field is named
 for what it is.** FR-3 requires the classification to run on a noise-filtered
 reading (§6.3), so a field called `raw_mv` would label the filtered number as

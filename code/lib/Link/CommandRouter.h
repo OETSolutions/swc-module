@@ -97,6 +97,10 @@ public:
 
     // The app must not outrun the head unit's key recognition.
     static constexpr uint32_t kDefaultTestKeyHoldMs = 200;
+    // The longest `test_key` hold a caller may ask for. A bench command drives the
+    // KEY line for the whole hold, so an unbounded value is a way to pin it; this
+    // is generous (a second) for a measurement that needs a settled reading.
+    static constexpr uint32_t kTestKeyMaxHoldMs = 1000;
 
     uint32_t LastSeenSeqSent() const { return seq_sent_; }
     uint32_t LastSeenSeqReceived() const { return expected_seq_ - 1; }

@@ -591,8 +591,33 @@ void CommandRouter::HandleTestKey(const cJSON *root, uint32_t for_seq) {
         Nack(for_seq, "unavailable", "no orchestrator");
         return;
     }
+    // Spec 4.3 spells the frame `channel`, `key_mv`, `hold_ms`. This handler read
+    // ONLY `key_mv` and hardcoded channel 0 with the default hold, so the bench
+    // could not exercise the second output at all and a caller's hold time was
+    // silently replaced -- a command that accepts a field and ignores it is worse
+    // than one that refuses it, because the app's own test button then measures
+    // something other than what it asked for.
+    const cJSON *ch = Num(root, "channel");
+    const cJSON *hold = Num(root, "hold_ms");
+    const int channel = (ch != nullptr) ? static_cast<int>(ch->valuedouble) : 0;
+    if (channel < 0 || channel >= kMaxChannels) {
+        Nack(for_seq, "bad_param", "channel out of range");
+        return;
+    }
     const int mv = static_cast<int>(key_mv->valuedouble);
-    if (!sys_->TestDriveKeyMv(0, mv, kDefaultTestKeyHoldMs, hal_->now_ms(hal_->ctx))) {
+    // `hold_ms` is bounded rather than taken as sent. A hold is time the OUTPUT
+    // is driven, so an unbounded value pins the KEY line; 0 means "use the
+    // default", matching the firmware's other hold sentinels.
+    uint32_t hold_ms = kDefaultTestKeyHoldMs;
+    if (hold != nullptr) {
+        const double hd = hold->valuedouble;
+        if (hd < 0.0 || hd > static_cast<double>(kTestKeyMaxHoldMs)) {
+            Nack(for_seq, "bad_param", "hold_ms out of range");
+            return;
+        }
+        if (hd > 0.0) hold_ms = static_cast<uint32_t>(hd);
+    }
+    if (!sys_->TestDriveKeyMv(static_cast<uint8_t>(channel), mv, hold_ms, hal_->now_ms(hal_->ctx))) {
         Nack(for_seq, "out_of_range", "key_mv is outside the output envelope");
         return;
     }

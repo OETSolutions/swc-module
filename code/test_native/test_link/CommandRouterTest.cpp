@@ -1081,3 +1081,66 @@ TEST(CommandRouter, AConfigPatchOverAnUnreadableConfigRefusesRatherThanOverwriti
         << "a refused patch must leave the stored bytes alone -- a load that now "
            "SUCCEEDS means defaults were written over the user's config";
 }
+
+TEST(CommandRouter, TestKeyDrivesTheChannelItNamesNotAlwaysChannelZero) {
+    // Spec 4.3 spells the frame `channel`, `key_mv`, `hold_ms`. The handler read
+    // ONLY key_mv and hardcoded channel 0, so a bench test of the SECOND output
+    // was impossible -- it silently drove the first one instead. The DAC channel
+    // is what proves which output moved.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    // Two channels, or channel 1 does not exist and the test would be asserting
+    // the range check rather than the routing.
+    d.config.channel_count = 2;
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    const uint16_t key1_before = hal.LastDacCode(DAC_CH_KEY1);
+    const uint16_t key2_before = hal.LastDacCode(DAC_CH_KEY2);
+
+    const std::string t =
+        "{\"v\":1,\"seq\":1,\"type\":\"test_key\",\"channel\":1,\"key_mv\":2400,\"hold_ms\":200}";
+    r.OnLine(t.c_str(), t.size());
+    ASSERT_TRUE(HasType(cap, "ack")) << "an in-envelope channel-1 test must be acked";
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), key1_before)
+        << "channel 1 must not move the channel 0 output";
+    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY2), key2_before)
+        << "channel 1 must drive the channel 1 output";
+}
+
+TEST(CommandRouter, TestKeyRefusesAHoldLongerThanTheBound) {
+    // A hold is time the OUTPUT is driven. An unbounded value pins the KEY line,
+    // and `now + hold_ms` in uint64 is a wrap primitive. Refused, not clamped: a
+    // silently shortened hold would measure a different thing than was asked for.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    const std::string t =
+        "{\"v\":1,\"seq\":1,\"type\":\"test_key\",\"channel\":0,\"key_mv\":2400,"
+        "\"hold_ms\":100000}";
+    r.OnLine(t.c_str(), t.size());
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("bad_param"), std::string::npos);
+    EXPECT_FALSE(HasType(cap, "ack"));
+}
+
+TEST(CommandRouter, TestKeyRefusesAChannelOutOfRange) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    const std::string t =
+        "{\"v\":1,\"seq\":1,\"type\":\"test_key\",\"channel\":9,\"key_mv\":2400}";
+    r.OnLine(t.c_str(), t.size());
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("bad_param"), std::string::npos);
+}

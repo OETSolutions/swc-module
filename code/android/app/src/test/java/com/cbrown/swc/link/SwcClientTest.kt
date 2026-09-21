@@ -278,6 +278,31 @@ class SwcClientTest {
     }
 
     @Test
+    fun `two overlapping getConfig calls are both resolved by the one run`() = runTest {
+        // Overlap is reachable in normal use (a connect while the update screen
+        // re-reads the config). A single waiter slot would let the second call
+        // overwrite the first's, so the first would time out on a link that
+        // answered it -- the same shape the `awaiting` map was made concurrent
+        // for. One run ends both callers.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        val body = com.oetsolutions.swc.model.ConfigJson.encode(sampleConfig())
+
+        val a = launch { client.getConfig(timeoutMs = 15_000) }
+        runCurrent()
+        val b = launch { client.getConfig(timeoutMs = 15_000) }
+        runCurrent()
+
+        configRun(body).forEach { t.emit(it + "\n") }
+        runCurrent()
+
+        assertTrue("the first call must be resolved too", a.isCompleted)
+        assertTrue("the second call must be resolved", b.isCompleted)
+        job.cancel()
+    }
+
+    @Test
     fun `getConfig still gives up when the device never runs`() = runTest {
         // The other direction: waiting on the run must not become waiting
         // forever. A device that accepts the request and stays silent has to

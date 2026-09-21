@@ -89,7 +89,7 @@ class SwcClient(private val transport: SwcTransport) {
     private var inboundLen = 0
     private var inboundCrc = 0L
 
-    // Signals the END of an inbound config run to a caller awaiting it.
+    // Signals the END of an inbound config run to any caller awaiting it.
     //
     // `getConfig` cannot wait on `for_seq`. The firmware answers `config_get`
     // with the chunked run ITSELF, and no frame of that run
@@ -97,10 +97,20 @@ class SwcClient(private val transport: SwcTransport) {
     // ARE the reply, not a frame answering one. Waiting on a `for_seq` therefore
     // never matched and every `getConfig` burned its whole timeout before
     // returning, which is what `connect()` did on every launch.
-    private var configRunWaiter: CompletableDeferred<Unit>? = null
+    //
+    // A SET, and a concurrent one, for the same reason `awaiting` is a
+    // `ConcurrentHashMap`: calls overlap (a connect while the update screen
+    // re-reads the config), they arrive from `Dispatchers.Default` coroutines
+    // while the reader completes them, and a single slot would let the second
+    // call overwrite the first's waiter -- so the first would time out on a link
+    // that answered it. Every waiter is completed and the set swept, because one
+    // run ends all of them.
+    private val configRunWaiters =
+        java.util.concurrent.CopyOnWriteArrayList<CompletableDeferred<Unit>>()
 
     private fun finishConfigRun() {
-        configRunWaiter?.complete(Unit)
+        for (w in configRunWaiters) w.complete(Unit)
+        configRunWaiters.clear()
     }
 
     private fun beginInboundConfig(frame: Frame) {
@@ -404,13 +414,14 @@ class SwcClient(private val transport: SwcTransport) {
      */
     suspend fun getConfig(timeoutMs: Long = 15_000): Config {
         val waiter = CompletableDeferred<Unit>()
-        configRunWaiter = waiter
+        configRunWaiters.add(waiter)
         try {
             send(Frames.CONFIG_GET)
             awaitOrNull(waiter, timeoutMs)
         } finally {
-            // Cleared unconditionally: a later run must not complete THIS waiter.
-            configRunWaiter = null
+            // Removed unconditionally: a later run must not complete THIS waiter,
+            // and a timed-out call must not be left in the set holding memory.
+            configRunWaiters.remove(waiter)
         }
         return _config.value
     }

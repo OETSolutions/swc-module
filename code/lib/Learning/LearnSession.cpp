@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include "Analog/LadderDecode.h"
+
 namespace {
 
 // At least this many readings, and at least this long a span. The span matters
@@ -154,6 +156,38 @@ LearnReject LearnSession::Commit(LadderButton *out) {
     if (tolerance > kMaxToleranceMv) tolerance = kMaxToleranceMv;
     if (tolerance < spread_mv) tolerance = spread_mv;
     if (tolerance < 1) tolerance = 1;
+
+    // REFUSE a window the config validator would reject, checked against the
+    // profile this button would COMPLETE. Without this the learn commits, reports
+    // LEARN_OK, is applied in memory, and persists -- and then the next boot's
+    // `ConfigDecodeBlob` refuses the whole config (`ConfigValidate` runs at the end
+    // of every decode), so `ConfigStore::Load` falls back to defaults and the user
+    // loses every button they ever taught, with the cause reported only as a
+    // corrupt config. `Save` does not validate, which is what makes that reachable.
+    //
+    // Reachable in practice: the tolerance FLOOR above runs after the cap, so a
+    // noisy learn (spread just under kNoiseLimitMv) can push the window past
+    // kMaxToleranceMv and into its neighbour. The gate below the "too close" check
+    // asks the same question of the MEAN; this one asks it of the WINDOW, which is
+    // what the validator compares.
+    {
+        LadderProfile prospective = existing_;
+        if (prospective.count < kLadderMaxButtons) {
+            LadderButton probe{};
+            probe.mv_center = static_cast<MilliVolt>(mean_mv);
+            probe.mv_tolerance = static_cast<MilliVolt>(tolerance);
+            prospective.buttons[prospective.count] = probe;
+            ++prospective.count;
+            // The reference the validator and the classifier both use. A fresh
+            // headless learn passes an empty profile, so its own reference is
+            // zero while the live idle is a real reading.
+            prospective.learned_idle_mv =
+                (learned_idle_mv_ > 0) ? learned_idle_mv_ : 1;
+            if (!LadderWindowsAreDistinguishable(prospective)) {
+                return LearnReject::kTooNoisy;
+            }
+        }
+    }
 
     out->mv_center = static_cast<MilliVolt>(mean_mv);
     out->mv_tolerance = static_cast<MilliVolt>(tolerance);

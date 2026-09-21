@@ -64,3 +64,20 @@ struct ClassifyOutcome {
 int16_t LadderRatioPermille(int level_mv, int idle_mv);
 
 ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int idle_mv);
+
+// Are every two of this profile's windows distinguishable, so classification is a
+// measurement rather than a coin toss?
+//
+// **This predicate has ONE home, and it has two callers on purpose.** The config
+// validator refuses a profile that fails it (FR-26), and `LearnSession` refuses to
+// COMMIT one -- because `ConfigStore::Save` writes whatever it is handed, so a
+// learn that skipped this check could persist a config its own decoder then
+// refused to load, costing the user their whole config at the next boot. Deriving
+// the relation in two places is how the two would drift; the comparison is in the
+// same derived permille form the classifier uses, and it must stay that way.
+//
+// Adjacent windows may legitimately OVERLAP by a few permille -- the classifier
+// resolves that by nearest centre. What is ambiguous is when the centres are
+// closer together than the wider of the two tolerances: every reading in the
+// overlap is then equally close to both.
+bool LadderWindowsAreDistinguishable(const LadderProfile &p);

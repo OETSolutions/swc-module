@@ -2,6 +2,9 @@
 
 #include <gtest/gtest.h>
 
+#include "Config/ConfigCodec.h"
+#include "Config/ConfigModel.h"
+
 #include <cstring>
 #include <set>
 #include <string>
@@ -224,4 +227,86 @@ TEST(LearnSession, AStartResetsStateSoOneSessionCannotLeakIntoTheNext) {
     EXPECT_EQ(s2.SampleCount(), 0);
     EXPECT_EQ(s2.Commit(&out2), LearnReject::kTooFewSamples)
         << "a reset session must not inherit the prior run's samples";
+}
+
+TEST(LearnSession, AWindowThatWouldMakeTheProfileInvalidIsRefusedAtCommit) {
+    // A learn must NEVER produce a profile `ConfigValidate` would reject, because
+    // `ConfigStore::Save` writes whatever it is handed -- it does not validate.
+    // The consequence of committing one is not a bad window, it is a LOST CONFIG:
+    // the learn reports LEARN_OK and persists, and the next boot's
+    // `ConfigDecodeBlob` ends by calling `ConfigValidate`, refuses the whole thing,
+    // and `ConfigStore::Load` falls back to defaults. The user loses every button
+    // they ever taught, reported only as a corrupt config.
+    //
+    // Reachable because the tolerance FLOOR runs AFTER the kMaxToleranceMv cap, so
+    // a noisy learn pushes the window past the cap and into its neighbour. The
+    // "too close" gate asks that question of the MEAN; this asks it of the WINDOW,
+    // which is what the validator compares.
+    //
+    // The numbers here are the measured case: an existing button at 1430 +/- 120,
+    // a new one at 1560 with a 130 mV spread. The commit used to return kNone.
+    LearnSession s;
+    s.Start(0, ExistingWith("vol_up", 1430, 120));
+    uint64_t t = 1000;
+    for (int i = 0; i < 40; ++i) {
+        // A 130 mV spread, alternating so min/max reach it. Under the 170 mV noise
+        // limit, so the noise gate does not fire first.
+        s.AddSample((i % 2) ? 1495 : 1625, 2835, kRailMv, kTempTenths, t);
+        t += 10;
+    }
+    LadderButton out{};
+    EXPECT_EQ(s.Commit(&out), LearnReject::kTooNoisy)
+        << "a commit here would persist a config the device cannot load, losing "
+           "every learned button at the next boot";
+}
+
+TEST(LearnSession, EveryCommittedProfileIsAcceptedByTheConfigValidator) {
+    // The general form of the test above, and the invariant that actually matters:
+    // sweep the neighbour distance and the spread, and assert that whatever the
+    // session COMMITS is a profile `ConfigValidate` accepts. This is the check that
+    // would have caught the defect without anyone reasoning about the tolerance
+    // floor and the cap's ordering -- it fails on the PROPERTY, not on one case.
+    for (int center = 1450; center <= 2100; center += 10) {
+        for (int spread = 0; spread <= 180; spread += 10) {
+            LearnSession s;
+            s.Start(0, ExistingWith("vol_up", 1430, 120));
+            uint64_t t = 1000;
+            for (int i = 0; i < 40; ++i) {
+                const int mv = (i % 2 == 0) ? center - spread / 2 : center + spread / 2;
+                s.AddSample(mv, 2835, kRailMv, kTempTenths, t);
+                t += 10;
+            }
+            LadderButton out{};
+            const LearnReject r = s.Commit(&out);
+            if (r != LearnReject::kNone) continue;   // refused: nothing was committed
+
+            LadderProfile p = ExistingWith("vol_up", 1430, 120);
+            ASSERT_LT(static_cast<int>(p.count), kLadderMaxButtons);
+            out.id[0] = '\0';   // the caller's field; not learn's business
+            std::strncpy(out.id, "swc1_bt2", sizeof(out.id) - 1);
+            p.buttons[p.count++] = out;
+
+            // Build the smallest real Config around the profile and put it through
+            // the same validator the decoder runs.
+            Config c{};
+            c.schema_version = kConfigSchemaVersion;
+            std::strncpy(c.device_id, "SWC-0000", sizeof(c.device_id) - 1);
+            c.settings.timings = GestureTimingsDefault();
+            c.settings.gain_policy = GainPolicy::kAuto;
+            c.settings.buzzer_level = 2;
+            c.settings.led_level = 2;
+            c.channel_count = 1;
+            c.channels[0].enabled = true;
+            std::strncpy(c.channels[0].name, "SWC1", sizeof(c.channels[0].name) - 1);
+            c.channels[0].ladder = p;
+            c.channels[0].output.gain_mode = GainMode::kAmplified;
+            c.channels[0].output.idle_dac_code = 4095;
+
+            EXPECT_TRUE(ConfigValidate(c))
+                << "center=" << center << " spread=" << spread
+                << ": the session committed a profile that ConfigValidate refuses, "
+                   "so ConfigStore::Save would persist a config the next boot "
+                   "cannot load";
+        }
+    }
 }

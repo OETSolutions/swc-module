@@ -34,33 +34,11 @@ static_assert(sizeof(BlobHeader) == kBlobHeaderBytes,
               "ConfigCodec.h's kBlobHeaderBytes must match the real header; Task 9 sizes its "
               "slot buffer from it, so a divergence under-allocates silently");
 
-// Adjacent ladder windows legitimately overlap by a few permille, and the
-// classifier resolves that by nearest centre (Task 3). What is genuinely
-// ambiguous is when the *centres* are closer together than the wider of the two
-// tolerances: every reading in the overlap is then equally close to both, so
-// classification is a coin toss rather than a measurement.
-//
-// Compared in the DERIVED permille the classifier actually uses, not in raw
-// millivolts. Two buttons 10 mV apart at a high rail are a much narrower window
-// than 10 mV apart at a low one, so the raw-mv distance is not the quantity the
-// ambiguity depends on.
-bool CentresAreDistinguishable(const LadderProfile &p) {
-    if (p.learned_idle_mv == 0) return false;   // no reference, nothing to derive
-    for (uint8_t i = 0; i < p.count; ++i) {
-        for (uint8_t j = static_cast<uint8_t>(i + 1); j < p.count; ++j) {
-            const int ci = LadderRatioPermille(p.buttons[i].mv_center, p.learned_idle_mv);
-            const int cj = LadderRatioPermille(p.buttons[j].mv_center, p.learned_idle_mv);
-            const int ti = LadderRatioPermille(p.buttons[i].mv_tolerance, p.learned_idle_mv);
-            const int tj = LadderRatioPermille(p.buttons[j].mv_tolerance, p.learned_idle_mv);
-            if (ci < 0 || cj < 0 || ti < 0 || tj < 0) return false;
-            const int distance  = abs(ci - cj);
-            const int tolerance = ti > tj ? ti : tj;
-            if (distance <= tolerance) return false;
-        }
-    }
-    return true;
-}
-
+// The window-distinguishability relation lives in LadderDecode (one home, because
+// LearnSession must refuse to commit a profile this validator would reject --
+// `ConfigStore::Save` writes whatever it is handed). It is called below via
+// LadderWindowsAreDistinguishable; the local copy that used to sit here was the
+// second home, and it had already drifted from learn's tolerance floor.
 bool BindingNamesARealInput(const Config &c, const Binding &b) {
     if (strcmp(b.button, "NONE") == 0) return true;   // gestures on the prog button
     for (uint8_t ch = 0; ch < c.channel_count; ++ch) {
@@ -139,7 +117,7 @@ bool ConfigValidate(const Config &c) {
             // rounds to zero permille can never match anything.
             if (LadderRatioPermille(b.mv_tolerance, cc.ladder.learned_idle_mv) <= 0) return false;
         }
-        if (!CentresAreDistinguishable(cc.ladder)) return false;
+        if (!LadderWindowsAreDistinguishable(cc.ladder)) return false;
     }
 
     // Bindings are a top-level table (spec 3.1/3.5), so their checks are too.

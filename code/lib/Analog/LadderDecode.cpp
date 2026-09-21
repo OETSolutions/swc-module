@@ -82,3 +82,24 @@ ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int i
     }
     return out;
 }
+
+bool LadderWindowsAreDistinguishable(const LadderProfile &p) {
+    // No reference means no ratio, so nothing can be said about the windows.
+    // The config validator refuses this separately (a learned idle must be a
+    // plausible ADC reading); returning false here keeps the two agreeing.
+    if (p.learned_idle_mv == 0) return false;
+    for (uint8_t i = 0; i < p.count && i < kLadderMaxButtons; ++i) {
+        for (uint8_t j = static_cast<uint8_t>(i + 1); j < p.count && j < kLadderMaxButtons;
+             ++j) {
+            const int ci = LadderRatioPermille(p.buttons[i].mv_center, p.learned_idle_mv);
+            const int cj = LadderRatioPermille(p.buttons[j].mv_center, p.learned_idle_mv);
+            const int ti = LadderRatioPermille(p.buttons[i].mv_tolerance, p.learned_idle_mv);
+            const int tj = LadderRatioPermille(p.buttons[j].mv_tolerance, p.learned_idle_mv);
+            if (ci < 0 || cj < 0 || ti < 0 || tj < 0) return false;
+            const int distance  = abs(ci - cj);
+            const int tolerance = ti > tj ? ti : tj;
+            if (distance <= tolerance) return false;
+        }
+    }
+    return true;
+}

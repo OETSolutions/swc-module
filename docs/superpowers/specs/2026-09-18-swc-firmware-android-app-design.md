@@ -1646,6 +1646,11 @@ AUX1 + buzzer/LED prompts (fallback, FR-31).
  8. Exit             BEEP PROGRAM_EXIT · LED_STAT solid
 ```
 
+**A learn MUST NOT produce a profile `ConfigValidate` would reject, and MUST NOT be reported as persisted unless it was (`store.Save` returned true).** Both are normative, not implementation notes, because both fail *silently and late*:
+
+- **A profile the validator refuses loses the whole config.** `ConfigStore::Save` encodes and writes; it does **not** validate (the `config_end` comment claiming `ConfigEncodeBlob` refuses an invalid config was wrong, and is corrected there). The validator runs at the end of every `ConfigDecodeBlob`/`ConfigDecodeJson` — i.e. on the way *in*, never on the way out — so an invalid profile is written happily and then, at the next boot, `ConfigStore::Load` refuses the slot, falls back to defaults, and the user loses **every button they ever taught**, reported only as a corrupt config. Reachable in practice rather than theoretically: `mv_tolerance`'s floor (below) runs *after* its cap, so a noisy learn can push a window past the cap and into its neighbour. The check belongs where the profile is chosen, against the profile the button would *complete* — `LadderWindowsAreDistinguishable` (§3.4) is the shared predicate, so the validator and the learn cannot drift. The rejection is `LEARN_REJECT`/`too_noisy`.
+- **A failed save reported as success is a broken promise.** "Persisted" means the bytes are in NVS, so it must be `store != null && Save(config)` — not `store != null`. A full NVS, a write error, or a store that refused the config all report LEARN_OK otherwise, and the user finds the button gone after a power cycle with nothing having warned them.
+
 **Rejection reasons are spoken aloud as distinct rhythms**, not a single generic
 failure, because "it didn't work" is not actionable and the user is doing this
 blind, holding a button with one hand.

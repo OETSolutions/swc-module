@@ -656,6 +656,54 @@ void RecordGesture(void *, const SystemOrchestrator::GestureEventRecord &ev) {
 
 }  // namespace
 
+TEST(SystemOrchestrator, AnIdleAdjacentButtonStillClassifiesWhenTheRailMoves) {
+    // Spec 6.3: the ratio denominator is the idle "measured now", so `n` is
+    // invariant to the +3V3 rail's own tolerance. Pinning it to the LEARNED idle
+    // instead makes every ratio drift with the rail, and the drift is largest
+    // for the most idle-adjacent button -- `next` at 757 permille (FR-6's worst
+    // case). At the +5% band edge a press's ratio lands outside `next`'s window
+    // and the press is reported UNKNOWN instead of the button.
+    //
+    // This pins the invariant by DRIVING A PRESS at a moved rail: a fix that
+    // merely moved the number around would not make the button fire.
+    g_reported.clear();
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    const int rail = 3465;   // +5% of 3300, the top of spec 6.3's band
+    const int live_idle = (2835 * rail) / 3300;   // 2976 mV
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, live_idle);
+    o.Boot();
+    o.SetGestureSink(&RecordGesture, nullptr);
+
+    // `next` at 757 permille of the rail-scaled idle.
+    const int next_mv = (live_idle * 757) / 1000;
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, next_mv);
+    PollFor(o, hal, 100);                      // press + debounce
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, live_idle);   // release
+    PollFor(o, hal, 700);                      // let the DOUBLE window elapse
+    ASSERT_EQ(g_reported.size(), 1u)
+        << "an idle-adjacent press at a +5% rail must still resolve";
+    EXPECT_EQ(std::string(g_reported[0].button_id), "next")
+        << "a pinned denominator drops an idle-adjacent button at the band edge";
+}
+
+TEST(SystemOrchestrator, APressOnAHealthyMovedRailDoesNotReadAsAFault) {
+    // The other half of the same defect: with the denominator pinned to the
+    // LEARNED idle, a reading at the top of the +-5% band is >3% ABOVE the
+    // reference, which LadderClassify reports as kFault -- the "short to a
+    // supply" case. So a merely high rail fabricated a wiring fault. The live
+    // denominator keeps idle at 1000 by construction, so it never trips.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, (2835 * 3465) / 3300);   // idle at +5% rail
+    o.Boot();
+    PollFor(o, hal, 200);
+    EXPECT_FALSE(o.Faulted())
+        << "a healthy +5% rail must not be reported as a fault";
+}
+
 TEST(SystemOrchestrator, ARecognizedGestureIsReportedAsAnEventWithTheLearnedButtonId) {
     // Spec 4.3 calls `event` "the core event", but the router emitted no such
     // frame anywhere: the app's live view had no source for "which button the

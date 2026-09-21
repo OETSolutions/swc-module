@@ -5,6 +5,7 @@
 #include <cstring>
 
 #include "Bindings/BindingResolver.h"
+#include "Analog/LadderDecode.h"
 #include "Config/ConfigDefaults.h"
 #include "Config/ConfigStore.h"
 #include "Output/GainPolicy.h"
@@ -15,6 +16,16 @@ namespace {
 // the sense reading. This appears in three places (gain selection, the trim
 // loop, and here) and is a property of R54/R55, not a tuning value.
 constexpr int kSenseDividerRatio = 2;
+
+// How far from the idle reference a settled reading may sit and still be taken
+// as idle drift rather than a press or a fault, in permille. The +3V3 rail's own
+// tolerance is +/-5% (spec 6.3), so the reference must follow a slow move; a real
+// button sits far lower (the idle-adjacent worst case is ~830), and a short to a
+// supply reads ABOVE idle -- which LadderClassify treats as a fault at +3%
+// (spec 6.3's idle margin). Adopting only [1000-60, 1000+30] tracks a gradual
+// rail move while rejecting a step to a press or a short.
+constexpr int kIdleRefTrackPermille = 60;   // lower bound: rail drift, not a press
+constexpr int kIdleRefMarginPermille = 30;  // upper bound: idle, not a short
 
 /*
  * How far off idle the wheel must move before pass-through calls it a press.
@@ -315,12 +326,35 @@ void SystemOrchestrator::Boot() {
         // running a software loop against the hardware integrator is how you
         // build an oscillator.
         //
-        // The live ladder reading is this channel's own pass-through reference.
-        // Read it AFTER safe idle so the KEY line is already released and cannot
-        // be pulling the ladder; a reference taken while the output was driving
-        // would be a level the user is not holding.
+        // The configured path's ratio denominator is `V_ADC_idle`. Seed it from
+        // the LIVE reading when that reading is a plausible rail idle -- within
+        // the +-5% +3V3 tolerance of the learned idle (spec 6.3) -- so a device
+        // that boots on a moved rail is classified correctly from the first tick.
+        // Otherwise seed from the learned idle, which is the one value KNOWN to be
+        // an idle reading: a button held at power-on is far below the rail, so it
+        // fails the plausibility test and cannot become the reference.
+        //
+        // Seeding from the learned idle unconditionally was the bug: on a +5%
+        // rail the live idle is ~1050 permille of it, which LadderClassify reads
+        // as a fault (its threshold is +3%), and an idle-adjacent button's ratio
+        // drifts out of its window at the band edge.
+        //
+        // The pass-through path (FR-25) has no learned ladder, so its reference
+        // can only come from the live reading; it self-heals a boot-time press
+        // separately (ServiceChannel).
+        //
+        // Read AFTER safe idle so the KEY line is already released and cannot be
+        // pulling the ladder.
+        const int live = hal_->adc_read_mv(hal_->ctx, (i == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
+        const int learned_idle = config_.channels[i].ladder.learned_idle_mv;
+        cs.idle_reference_mv = learned_idle;
+        if (learned_idle <= 0) {
+            cs.idle_reference_mv = (live > 0) ? live : 0;
+        } else if (live > 0) {
+            const int r = LadderRatioPermille(live, learned_idle);
+            if (r >= 950 && r <= 1050) cs.idle_reference_mv = live;
+        }
         if (pass_through_) {
-            const int live = hal_->adc_read_mv(hal_->ctx, (i == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
             cs.pass_through_idle_mv = (live > 0) ? live : 0;
             if (cs.pass_through_idle_mv > 0) any_reference = true;
         }
@@ -783,14 +817,37 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     // A single noisy conversion can flip a classification, which is exactly the
     // failure FR-3 forbids; the median-of-32 window rejects it.
     //
-    // The idle reference is the LEARNED idle, not the live reading: it is the
-    // ratio denominator, so it must stay pinned to the rail the button centres
-    // were measured at (spec 6.3/LadderProfile). The live rail health is a
-    // separate check on the KEY sense pin, below.
+    // The ratio denominator is `V_ADC_idle` "measured now" (spec 6.3), NOT the
+    // learned idle: both numerator and denominator then scale with the 3V3 rail,
+    // which is what makes `n` invariant to it. A denominator pinned to the
+    // LEARNED idle instead lets the ratio drift with the rail's own tolerance
+    // (~5% across the 3.14-3.47 V band), which pushes an idle-adjacent button --
+    // FR-6's worst case -- out of its window at the band edges. It also leaves
+    // `LadderClassify`'s FR-30 check inert, because that compares its reference
+    // argument against `profile.learned_idle_mv` (the same value). Found
+    // 2026-09-22.
+    //
+    // `idle_reference_mv` is the live idle, re-adopted from settled readings that
+    // are idle DRIFT rather than a press or a short: within
+    // [1000-`kIdleRefTrackPermille`, 1000+`kIdleRefMarginPermille`] permille of
+    // the current reference. Reading above that is a short to a supply (fault);
+    // below it is a button. Adopting every idle-ish reading tracks a moving rail;
+    // adopting blindly would let a press become the reference.
     cs.reader.Update(now_ms);
+    if (cs.reader.Settled()) {
+        const int settled_mv = cs.reader.Value();
+        if (cs.idle_reference_mv <= 0) {
+            cs.idle_reference_mv = settled_mv;
+        } else {
+            const int ratio = LadderRatioPermille(settled_mv, cs.idle_reference_mv);
+            if (ratio >= 1000 - kIdleRefTrackPermille &&
+                ratio <= 1000 + kIdleRefMarginPermille) {
+                cs.idle_reference_mv = settled_mv;
+            }
+        }
+    }
     const int level_mv = cs.reader.Value();
-    const int idle_ref = cc.ladder.learned_idle_mv;
-    const ChannelLevel level = cs.classifier.Update(level_mv, idle_ref, now_ms);
+    const ChannelLevel level = cs.classifier.Update(level_mv, cs.idle_reference_mv, now_ms);
 
     // The head unit's own idle, live. Outside the envelope the head unit has
     // gone (spec 6.8, VBUS off / rail collapse) and the KEY line must be

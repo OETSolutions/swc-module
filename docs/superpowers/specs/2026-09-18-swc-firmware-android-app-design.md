@@ -1306,6 +1306,29 @@ step.
 Absolute millivolts are still stored and displayed (§3.2) because they are what a
 human compares against a datasheet — but **classification runs on `n`.**
 
+> **`V_ADC_idle` is the LIVE idle, not `learned_idle_mv`.** The denominator must
+> be maintained at runtime (seeded at Boot from the live rail idle and re-adopted
+> as the rail moves), because a denominator pinned to the *learned* idle is the
+> learn-time rail — so `n` drifts with the rail's own ±5 % deviation instead of
+> cancelling it. Two concrete failures follow, both found 2026-09-22:
+>
+> 1. **An idle-adjacent button is lost at the band edge.** `next` at 757 ‰ (the
+>    profile's most idle-adjacent button, and FR-6's named worst case) drifts to
+>    ~792 ‰ at +5 % rail — just outside its ±39 ‰ window — so a real press is
+>    reported `UNKNOWN`.
+> 2. **A healthy rail is mis-reported as a fault.** At +5 % the live idle is
+>    ~1050 ‰ of the learned idle, above §6.3's +30 ‰ idle margin, so
+>    `LadderClassify` returns `kFault` — the "short to a supply" case — on a rail
+>    that is merely high. The same inertness disables the rail-sag check below.
+>
+> The orchestrator seeds the denominator from the live reading **only when that
+> reading is within the ±5 % rail tolerance of the learned idle** (950–1050 ‰), so
+> a button held at power-on — far below the rail — cannot become the reference.
+> It then re-adopts settled readings within `[1000−60, 1000+30]` ‰: wide enough to
+> follow a gradual rail move, narrow enough to reject a step to a press or a
+> short. The FR-30 sag check then works as written, because its reference argument
+> (`V_ADC_idle`) and `profile.learned_idle_mv` are now genuinely different values.
+
 `AUTO` gain mode plus the measured `V_KEY_idle` is the mechanism; a fixed voltage
 table is the anti-pattern.
 

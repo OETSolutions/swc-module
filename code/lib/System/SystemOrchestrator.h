@@ -359,6 +359,15 @@ private:
         // press whenever their idles differ by more than kPassThroughPressDeltaMv,
         // driving a phantom key with nothing held.
         int                 pass_through_idle_mv = 0;
+        // Spec 6.3's ratio denominator for the CONFIGURED path: `V_ADC_idle`,
+        // measured now. Seeded at Boot from the live idle and re-adopted as the
+        // rail moves. It must NOT be the learned idle: that pins the denominator
+        // to the rail the ladder was learned at, so the ratio drifts with the
+        // rail's own deviation (~5% across the 3.14-3.47 V band), which pushes an
+        // idle-adjacent button out of its window at the band edges and leaves
+        // `LadderClassify`'s FR-30 sag check comparing a value to itself (its
+        // reference argument and `profile.learned_idle_mv` would be the same).
+        int                 idle_reference_mv = 0;
         // FR-12: one report and one KEY_UNKNOWN beep per unrecognised press, not
         // one per poll tick. A held level is unrecognised on every tick, so
         // without this latch a held press would emit 100 events/s and play a

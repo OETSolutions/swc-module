@@ -78,6 +78,9 @@ void CommandRouter::OnDisconnected() {
     // An interrupted run is discarded wholesale: a partial config is never
     // applied (spec 4.2).
     ResetRun();
+    // The learn stream is link-scoped too: the app session that opened it is what
+    // ends it, and that session is over.
+    learn_open_ = false;
     reply_open_ = false;
     reply_off_ = 0;
     reply_len_ = 0;
@@ -87,10 +90,20 @@ void CommandRouter::OnDisconnected() {
     // No peer, so no periodic status: a status written now would sit in a FIFO
     // nobody is draining.
     connected_ = false;
+    // The liveness clock restarts with the link; the next frame seeds it again.
+    rx_clock_seeded_ = false;
+    last_rx_ms_ = 0;
+    link_down_ = false;
 }
 
 void CommandRouter::OnConnected() {
     connected_ = true;
+    // A fresh link has no silence history: seed the liveness clock on the frame
+    // that follows rather than letting a stale `last_rx_ms_` from a previous
+    // connection reap the new one.
+    rx_clock_seeded_ = false;
+    last_rx_ms_ = 0;
+    link_down_ = false;
     // Seed the periodic-status clock so a status is not sent on the same tick as
     // `hello`; the first periodic status lands one period after connect.
     status_clock_seeded_ = false;
@@ -195,14 +208,38 @@ void CommandRouter::SendStatus() {
     ReplyStatus(seq_sent_);
 }
 
+void CommandRouter::NoteSilenceIfStale(uint64_t now) {
+    if (link_down_) return;              // already reaped; idempotent
+    if (!rx_clock_seeded_) return;       // no peer has ever spoken
+    if (now - last_rx_ms_ <= kLinkSilenceMs) return;
+    // Link down (spec 4.4). Both runs are LINK-SCOPED state and neither survives:
+    // a half-received config_set is discarded wholesale (spec 4.2 -- a partial
+    // config is never applied), and a learn stream belongs to the app session
+    // that opened it. Reaping HERE is what recovers an interrupted transfer,
+    // because the router's OnDisconnected is only called on a real transport
+    // event, which a link that merely went quiet does not produce.
+    ResetRun();
+    learn_open_ = false;
+    // Stop the periodic status until a frame re-arms the link: a status written
+    // now would sit in a FIFO nobody is draining, exactly as with no peer at all.
+    connected_ = false;
+    link_down_ = true;
+}
+
 void CommandRouter::Tick() {
     if (hal_ == nullptr) return;
+    const uint64_t now = hal_->now_ms(hal_->ctx);
+
+    // Link liveness runs BEFORE the connected check, deliberately: the case that
+    // matters is the link that was connected and then went quiet, and that state
+    // is exactly the one the connected check would skip past.
+    NoteSilenceIfStale(now);
+
     // The periodic status belongs to a CONNECTED link only (spec 4.4). Writing
     // one with no peer would fill the TX buffer with frames nothing drains, and
     // the buffer is small enough that it would then refuse a real reply.
     if (!connected_) return;
 
-    const uint64_t now = hal_->now_ms(hal_->ctx);
     if (!status_clock_seeded_) {
         // First tick of a connection: seed the clock rather than sending, so
         // `hello` and a periodic status do not arrive on the same tick.
@@ -221,6 +258,24 @@ void CommandRouter::OnLine(const char *line, size_t len) {
     // armed even if the transport never called `OnConnected` (a test may drive
     // `OnLine` directly; the device path sets this in `OnConnected`).
     connected_ = true;
+    // A frame IS the proof of liveness (spec 4.4): it clears a silence that had
+    // already gone stale, so a link that recovers without re-enumerating resumes
+    // rather than staying marked down until the next connect event.
+    if (hal_ != nullptr) {
+        const uint64_t now = hal_->now_ms(hal_->ctx);
+        last_rx_ms_ = now;
+        rx_clock_seeded_ = true;
+        if (link_down_) {
+            // A frame recovered a link that had gone down, without a reconnect.
+            // Recovery is a fresh start: seed the status clock rather than firing
+            // a status on the heels of the first frame back. The REAP itself is
+            // `Tick`'s -- it runs every poll and is the only thing that needs to
+            // time out, so a second reap here would be a branch nothing reaches.
+            link_down_ = false;
+            status_clock_seeded_ = false;
+            connected_ = true;
+        }
+    }
     if (len > kNdjsonMaxFrame) {
         Nack(0, "bad_frame", "line exceeds the frame cap");
         return;
@@ -383,7 +438,6 @@ void CommandRouter::HandleConfigChunk(const cJSON *root, uint32_t for_seq) {
     }
     memcpy(staging_ + staging_len_, decoded, dn);
     staging_len_ += dn;
-    if (hal_ != nullptr) last_chunk_ms_ = hal_->now_ms(hal_->ctx);
 
     char body[64];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));

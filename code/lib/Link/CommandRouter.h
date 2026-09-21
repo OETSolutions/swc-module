@@ -158,7 +158,6 @@ private:
     size_t   staging_len_ = 0;      // bytes landed so far
     size_t   expected_len_ = 0;     // total_len from config_begin
     uint32_t expected_crc_ = 0;
-    uint64_t last_chunk_ms_ = 0;
     bool     run_open_ = false;
 
     // --- outbound reply run ------------------------------------------------
@@ -190,6 +189,28 @@ private:
     bool     status_clock_seeded_ = false;
     uint64_t last_status_ms_ = 0;
     static constexpr uint64_t kStatusPeriodMs = 2000;   // spec 4.4
+
+    // --- link-liveness (spec 4.4) ------------------------------------------
+    // "After 10 s of silence the firmware considers the link down." The silence
+    // is INBOUND: the app is specified to ping at 5 s, so 10 s with no frame
+    // means the peer is gone. Before this existed the firmware had no link-down
+    // notion at all -- it sent a periodic status every 2 s forever, and the two
+    // link-scoped runs (a half-received config_set, an open learn stream) were
+    // reaped only by a real disconnect event, which a half-dead USB link never
+    // delivers. An app that died mid-`config_set` therefore left the device
+    // refusing every later config with `run_open` until the cable was pulled.
+    uint64_t last_rx_ms_ = 0;
+    bool     rx_clock_seeded_ = false;
+    // Set when silence has reaped the link. It stays true until a frame arrives,
+    // because that is the only signal that the link recovered WITHOUT a
+    // reconnect -- `rx_clock_seeded_` cannot carry it (the reap clears it).
+    bool     link_down_ = false;
+    static constexpr uint64_t kLinkSilenceMs = 10000;   // spec 4.4
+
+    // Drop the link-scoped runs once inbound silence exceeds `kLinkSilenceMs`,
+    // and stop the periodic status until a frame re-arms the link. Idempotent:
+    // the reap runs once per link-down, so a second call does nothing.
+    void NoteSilenceIfStale(uint64_t now);
 
     // --- learn run (FR-5) ---------------------------------------------------
     // A learn run is an OPEN STREAM, not a request/response: the app sends

@@ -898,6 +898,13 @@ The head unit may sleep, suspend, or reboot at any moment, and it supplies power
 - App sends `ping` if it has seen nothing for **5 s**; firmware replies `status`.
 - After **10 s** of silence the firmware considers the link down. **This does not
   change key behavior** — bindings continue to work with no app present (§6.6).
+  Going down stops the periodic status and **discards the link-scoped runs** — a
+  half-received `config_set` (§4.2) and an open learn stream (§7.5) are both link
+  state, and neither survives a link that has gone quiet. This is what makes an
+  interrupted transfer recoverable: the app that died mid-`config_set` leaves the
+  device refusing every later config until the cable is pulled, unless silence
+  reaps it. The first frame of the next connection re-arms the link, so the reap
+  is stateless.
 - **Reconnect is stateless.** On a new `hello`, no replay of missed events; the
   app re-reads `status` and `config_get` if it needs to. Trying to replay events
   across a USB re-enumeration is a source of duplicate key actions, and is not

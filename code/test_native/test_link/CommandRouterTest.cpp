@@ -954,3 +954,93 @@ TEST(CommandRouter, ALearnCommitOverAnUnreadableConfigRefusesRatherThanOverwriti
         << "a refused commit must leave the stored bytes alone -- a load that now "
            "SUCCEEDS means defaults were written over the user's config";
 }
+
+// --- link liveness (spec 4.4) ------------------------------------------------
+
+TEST(CommandRouter, AnAbandonedConfigRunIsReapedAfterTenSecondsOfSilence) {
+    // Spec 4.4: "After 10 s of silence the firmware considers the link down."
+    // The app that dies mid-`config_set` -- or a USB glitch that drops the tail --
+    // must not leave the device refusing every later config. Measured before the
+    // fix: a config_begin with no config_end, 60 s of silence, then a legitimate
+    // config_begin came back `nack run_open`.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    // A frame arms the liveness clock (a peer exists and has spoken).
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    SendConfigBegin(r, 2, 10, 0);
+    cap.lines.clear();
+
+    // Still inside the bound: the run is intact and a second begin is refused.
+    hal.AdvanceMs(9999);
+    r.Tick();
+    SendConfigBegin(r, 3, 10, 0);
+    ASSERT_TRUE(HasType(cap, "nack")) << "inside 10 s the run is still open";
+    EXPECT_NE(cap.lines.back().find("run_open"), std::string::npos);
+    cap.lines.clear();
+
+    // Past the bound since the LAST inbound frame (the seq-3 probe refreshed it):
+    // the abandoned run is gone and a fresh begin is accepted.
+    hal.AdvanceMs(10001);                 // 10001 ms since that frame
+    r.Tick();
+    SendConfigBegin(r, 4, 10, 0);
+    ASSERT_TRUE(HasType(cap, "ack")) << "silence must reap the abandoned run";
+    EXPECT_FALSE(HasType(cap, "nack"));
+}
+
+TEST(CommandRouter, SilenceStopsThePeriodicStatusUntilAFrameReArmsIt) {
+    // The other half of spec 4.4's link-down state: with the peer gone, a status
+    // is written into a FIFO nobody drains, exactly as when there was never a
+    // peer at all. A frame afterwards proves the link recovered, and the status
+    // resumes WITHOUT a reconnect (the app may simply have been quiet).
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    hal.AdvanceMs(10001);
+    r.Tick();
+    cap.lines.clear();
+
+    hal.AdvanceMs(20000);
+    r.Tick();
+    EXPECT_TRUE(cap.lines.empty()) << "a link gone quiet sends no periodic status";
+
+    // A frame re-arms the link; recovery behaves like a fresh connect, so the
+    // status clock is seeded first and the status lands one period later.
+    const std::string p2 = "{\"v\":1,\"seq\":2,\"type\":\"ping\"}";
+    r.OnLine(p2.c_str(), p2.size());
+    cap.lines.clear();
+    hal.AdvanceMs(2000);
+    r.Tick();                    // seeds the recovered link's status clock
+    hal.AdvanceMs(2000);
+    r.Tick();
+    ASSERT_TRUE(HasType(cap, "status")) << "a frame recovers the link";
+}
+
+TEST(CommandRouter, SilenceClosesAnOpenLearnStream) {
+    // A learn stream is link-scoped: it belongs to the app session that opened it.
+    // If that session dies, the device must stop streaming ladder samples into a
+    // FIFO nobody drains.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    r.OnConnected();
+    DrainReplies(r);            // finish the hello-time config reply run
+
+    const std::string ls = "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0}";
+    r.OnLine(ls.c_str(), ls.size());
+    r.Process();
+    ASSERT_TRUE(HasType(cap, "ladder_sample")) << "the stream is live while the app is";
+    cap.lines.clear();
+
+    hal.AdvanceMs(10001);
+    r.Tick();
+    r.Process();
+    r.Process();
+    EXPECT_FALSE(HasType(cap, "ladder_sample"))
+        << "after the link goes quiet the learn stream must stop";
+}

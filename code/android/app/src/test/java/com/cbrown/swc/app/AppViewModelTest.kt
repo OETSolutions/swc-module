@@ -326,6 +326,48 @@ class AppViewModelTest {
     }
 
     @Test
+    fun `a new binding takes its channel from the button, not from an unrelated binding`() =
+        runTest {
+            // The channel for a NEW binding must come from the BUTTON's own ladder.
+            // It came from `config.bindings.firstOrNull()?.channel` -- whatever the
+            // first existing binding happened to name. A device whose first binding
+            // is `ANY` (or SWC2) therefore wrote every newly authored SWC1 binding
+            // with THAT channel: an `ANY` binding fires on BOTH channels, so a
+            // binding the user made for one specific button also fired on the other
+            // wheel's same-named button -- a wrong command from a button the user
+            // never touched.
+            val t = FakeTransport()
+            var saved: com.oetsolutions.swc.model.Config? = null
+            val vm = AppViewModel(SwcClient(t), scope = vmScope(), saveConfig = { c -> saved = c; true })
+            started(vm)
+
+            val base = sampleConfig()
+            // Make the FIRST binding name ANY, so the old derivation would copy
+            // `ANY` onto the edited SWC1 binding. The grid itself shows channel 0's
+            // buttons (the app's bindings screen is single-channel in v1), and
+            // `vol_up`/`next` are SWC1's.
+            val anyFirst = base.bindings[0].copy(channel = com.oetsolutions.swc.model.BindingChannel.ANY)
+            val c = base.copy(bindings = listOf(anyFirst) + base.bindings.drop(1))
+            configRun(c).forEach { t.emit(it) }
+            advanceUntilIdle()
+
+            val cell = vm.bindings.value.cells.first { it.buttonId == "next" && it.gesture == "SINGLE" }
+            vm.editBinding(cell, com.oetsolutions.swc.model.Action(ActionKind.OUT_VOLTAGE, keyMv = 2000))
+            advanceUntilIdle()
+            vm.save()
+            advanceUntilIdle()
+
+            assertNotNull(saved)
+            val added = saved!!.bindings.firstOrNull { it.button == "next" && it.gesture == Gesture.SINGLE }
+            assertNotNull("the edited cell must appear as a binding", added)
+            assertEquals(
+                "an SWC1 button must bind to SWC1, not to whatever channel the first binding named",
+                com.oetsolutions.swc.model.BindingChannel.SWC1,
+                added!!.channel,
+            )
+        }
+
+    @Test
     fun `a locally invalid config is refused before it is sent`() = runTest {
         // The same rule the firmware enforces, checked locally so the user gets the
         // FIELD named rather than a nack that can only name a check (SwcClient does

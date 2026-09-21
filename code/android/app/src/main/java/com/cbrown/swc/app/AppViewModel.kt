@@ -446,7 +446,14 @@ class AppViewModel(
             if (action == null || action.kind.wireName == "NONE") return@mapNotNull null
             com.oetsolutions.swc.model.Binding(
                 id = "${button}-${gestureName}",
-                channel = config.bindings.firstOrNull()?.channel
+                // The channel comes from the BUTTON's OWN ladder, not from
+                // `config.bindings.firstOrNull()`. That read the channel of
+                // whichever binding happened to be first, so on a device whose
+                // first binding is SWC1 every newly authored SWC2 binding was
+                // written as SWC1 -- the firmware then resolves it only against
+                // channel 0, so the SWC2 button the user just programmed does
+                // nothing while SWC1's same-named button fires the SWC2 action.
+                channel = channelOfButton(config, button)
                     ?: com.oetsolutions.swc.model.BindingChannel.SWC1,
                 button = button,
                 gesture = gesture,
@@ -460,6 +467,25 @@ class AppViewModel(
         // back a config whose SWC2 channel is gone, replacing the device's
         // learned second ladder with nothing on every save.
         return config.copy(bindings = kept + added)
+    }
+
+    /**
+     * The channel a button id belongs to, by its ladder.
+     *
+     * Only SWC1/SWC2 have ladders, so those are the two ids this can return; an
+     * AUX button is a separate table and never appears in the bindings grid. A
+     * button on neither ladder (a stale edit whose ladder was re-learned away)
+     * returns null, and the caller falls back to SWC1 -- which is the same
+     * assumption the old code made unconditionally.
+     */
+    private fun channelOfButton(config: Config, buttonId: String): com.oetsolutions.swc.model.BindingChannel? {
+        config.channels.forEachIndexed { i, ch ->
+            if (ch.ladder.buttons.any { it.id == buttonId }) {
+                return if (i == 0) com.oetsolutions.swc.model.BindingChannel.SWC1
+                else com.oetsolutions.swc.model.BindingChannel.SWC2
+            }
+        }
+        return null
     }
 
     /**

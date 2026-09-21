@@ -158,3 +158,54 @@ TEST(LadderClassify, OverlappingWindowsResolveToTheNearestCentreNotTheFirstMatch
     EXPECT_EQ(LadderClassify(p, 1418, kIdleMv).index, 0);  // 500 -> centre 0
     EXPECT_EQ(LadderClassify(p, 1531, kIdleMv).index, 1);  // 540 -> centre 1
 }
+
+TEST(LadderProfileRebase, ScalesCentresAndTolerancesAndPreservesEveryPermilleWindow) {
+    // A profile has ONE denominator, so a re-learn on a moved rail must put every
+    // button in the frame the profile is about to be stamped with. Scaling the
+    // centre and the tolerance TOGETHER is what makes the permille window exactly
+    // invariant: LadderRatioPermille of a scaled button against the scaled
+    // denominator is the same number, so nothing the classifier or the validator
+    // derives from ratios can change under a rebase.
+    LadderProfile p = MakeProfile(kIdleMv);   // learned at 2835
+    const int before_center = LadderRatioPermille(p.buttons[0].mv_center, kIdleMv);
+    const int before_tol    = LadderRatioPermille(p.buttons[0].mv_tolerance, kIdleMv);
+
+    const int kMoved = 2693;                  // ~-5 %, inside the documented band
+    LadderProfileRebase(p, kIdleMv, kMoved);
+
+    EXPECT_EQ(p.learned_idle_mv, kMoved);
+    EXPECT_EQ(LadderRatioPermille(p.buttons[0].mv_center, kMoved), before_center)
+        << "the centre's permille window must be UNCHANGED by the rebase";
+    EXPECT_EQ(LadderRatioPermille(p.buttons[0].mv_tolerance, kMoved), before_tol);
+    // And the absolute value moved with the rail, which is the point.
+    EXPECT_LT(p.buttons[0].mv_center, 1430);
+    EXPECT_GT(p.buttons[0].mv_center, 1330);
+}
+
+TEST(LadderProfileRebase, AProfileWithNoSourceFrameIsLeftUntouched) {
+    // A fresh learn passes an empty profile (learned_idle_mv 0): there is no frame
+    // to convert FROM, and the measured button is already in the target frame.
+    LadderProfile p = MakeProfile(kIdleMv);
+    const LadderButton first = p.buttons[0];
+    LadderProfileRebase(p, 0, 2693);
+    EXPECT_EQ(p.learned_idle_mv, 2835) << "no source frame means no conversion";
+    EXPECT_EQ(p.buttons[0].mv_center, first.mv_center);
+    EXPECT_EQ(p.buttons[0].mv_tolerance, first.mv_tolerance);
+}
+
+TEST(LadderProfileRebase, AnImpossibleScaleClampsRatherThanWrappingTheType) {
+    // MilliVolt is a uint16_t, and the validator bounds a centre only by the ADC
+    // ceiling -- NOT relative to `learned_idle_mv`. So a profile it ACCEPTS (a
+    // near-zero learned idle with centres at the ceiling) scales past the type,
+    // and an unchecked write wraps to a small, plausible-looking, WRONG value.
+    // Clamping keeps the profile self-consistent and bounded instead.
+    LadderProfile p{};
+    p.learned_idle_mv = 1;                 // accepted by LadderProfileIsValid today
+    p.count = 1;
+    p.buttons[0] = {"x", "X", 2900, 100, 3300, 235, 200, 98};
+    LadderProfileRebase(p, 1, 2900);
+    EXPECT_EQ(p.learned_idle_mv, 2900);
+    EXPECT_LE(p.buttons[0].mv_center, 2900) << "the centre must not wrap";
+    EXPECT_LE(p.buttons[0].mv_tolerance, 2900) << "nor the tolerance";
+    EXPECT_GT(p.buttons[0].mv_center, 2900 / 2) << "and clamping is at the top, not zero";
+}

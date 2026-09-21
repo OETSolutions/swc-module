@@ -110,14 +110,23 @@ bool LadderWindowsAreDistinguishable(const LadderProfile &p) {
 void LadderProfileRebase(LadderProfile &p, int from_idle_mv, int to_idle_mv) {
     if (from_idle_mv <= 0 || to_idle_mv <= 0) return;   // no source frame to convert
     if (from_idle_mv == to_idle_mv) return;
+    const auto scale = [from_idle_mv, to_idle_mv](int v) -> MilliVolt {
+        const long long scaled =
+            (static_cast<long long>(v) * to_idle_mv + from_idle_mv / 2) / from_idle_mv;
+        // Clamped, not wrapped. `MilliVolt` is a uint16_t and the validator bounds a
+        // centre only by the ADC ceiling, NOT relative to `learned_idle_mv` -- so a
+        // profile it accepts (a near-zero learned idle with centres at the ceiling)
+        // would scale past the type and wrap to a plausible-looking small value.
+        // Clamping keeps the profile in ONE frame with a bounded value, which is
+        // what the caller's single denominator needs; the input was physically
+        // impossible either way, so there is no value here worth preserving.
+        if (scaled > kAdcCeilingMv) return static_cast<MilliVolt>(kAdcCeilingMv);
+        return static_cast<MilliVolt>(scaled);
+    };
     for (uint8_t i = 0; i < p.count && i < kLadderMaxButtons; ++i) {
         LadderButton &b = p.buttons[i];
-        b.mv_center = static_cast<MilliVolt>(
-            (static_cast<long long>(b.mv_center) * to_idle_mv + from_idle_mv / 2) /
-            from_idle_mv);
-        b.mv_tolerance = static_cast<MilliVolt>(
-            (static_cast<long long>(b.mv_tolerance) * to_idle_mv + from_idle_mv / 2) /
-            from_idle_mv);
+        b.mv_center = scale(b.mv_center);
+        b.mv_tolerance = scale(b.mv_tolerance);
     }
     p.learned_idle_mv = static_cast<MilliVolt>(to_idle_mv);
 }

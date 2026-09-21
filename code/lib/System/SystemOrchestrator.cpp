@@ -2,6 +2,7 @@
 
 #include <new>
 #include <cstdio>
+#include <cstring>
 
 #include "Bindings/BindingResolver.h"
 #include "Config/ConfigDefaults.h"
@@ -85,16 +86,34 @@ SystemOrchestrator::SystemOrchestrator(IHAL *hal, const Config &config,
       // rather than an unbounded one.
       maintenance_(hal, 300000) {}
 
-// The bindings a channel's buttons actually have, which is what makes the
-// gesture resolve adaptive (spec 6.6). Scanned from the config rather than
-// assumed: a button binding only SINGLE must not inherit the double-press
-// window's latency, and a button with no LONG must never emit one.
-GestureBindings SystemOrchestrator::BindingsFor(uint8_t channel_index) const {
+/*
+ * The bindings for ONE button's gestures, which is the granularity spec 6.6
+ * rule 3 actually names ("the button binds ... the wait before driving").
+ *
+ * **A per-CHANNEL scan was the earlier shape, and using it for the resolve was a
+ * real bug.** A channel-wide scan reports `has_double` if ANY of the channel's
+ * buttons binds DOUBLE, so a button that binds nothing -- or binds only SINGLE --
+ * still paid the 500 ms double-press window, and worse, a HELD unbound button
+ * emitted a `LONG` it has no binding for: a gesture the config never assigned,
+ * reported to the app as `event{gesture:long}`. Spec 6.6 rule 3 is explicit that
+ * the wait is "a per-button property, not a per-device one", and the struct's own
+ * comment in GestureStateMachine.h says "which gestures a BUTTON's bindings
+ * cover". The channel-wide helper was removed with this, so there is no second
+ * scan left for a reader to mistake for the right one.
+ *
+ * `button_index` is an index into the channel's ladder; the binding names the
+ * button's `id`, so this is the same join `BindingResolve` performs.
+ */
+GestureBindings SystemOrchestrator::BindingsForButton(uint8_t channel_index,
+                                                      uint8_t button_index) const {
     GestureBindings out;
     out.has_double = false;
     out.has_long = false;
     if (channel_index >= config_.channel_count) return out;
     if (config_.binding_count > kMaxBindings) return out;
+    const LadderProfile &ladder = config_.channels[channel_index].ladder;
+    if (button_index >= ladder.count) return out;
+    const char *button_id = ladder.buttons[button_index].id;
 
     const uint8_t as_swc = (channel_index == 0)
                                ? static_cast<uint8_t>(BindingChannel::kSwc1)
@@ -105,6 +124,7 @@ GestureBindings SystemOrchestrator::BindingsFor(uint8_t channel_index) const {
         if (b.channel != as_swc && b.channel != static_cast<uint8_t>(BindingChannel::kAny)) {
             continue;
         }
+        if (strcmp(b.button, button_id) != 0) continue;
         if (b.gesture == Gesture::kDouble) out.has_double = true;
         if (b.gesture == Gesture::kLong) out.has_long = true;
     }
@@ -249,7 +269,9 @@ void SystemOrchestrator::Boot() {
         // window would let a press on SWC1 move SWC2's reported level.
         cs.reader.Bind(*hal_, (i == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
         cs.servo = ServoLoop(ServoConfigDefault());
-        cs.bindings = BindingsFor(i);
+        // No cached binding set: the resolve reads the PRESSED BUTTON's bindings
+        // each tick (`BindingsForButton`), because the granularity is per button
+        // (spec 6.6 rule 3) and the button is not known until classification.
         cs.key_driven = false;
         cs.key_released_at_ms = 0;
         // The trim loop is present but DISABLED in v1: spec 6.5 says open-loop
@@ -452,10 +474,9 @@ void SystemOrchestrator::ApplyLearnedProfile(int channel, const LadderProfile &p
     channels_[channel].gestures.Reset();
     channels_[channel].reader.Reset();
 
-    // Bindings name buttons by ID, so a learned button is only reachable if the
-    // channel's binding set is rebuilt against the new profile. `BindingsFor`
-    // reads the config, so it is called AFTER the profile is stored.
-    channels_[channel].bindings = BindingsFor(static_cast<uint8_t>(channel));
+    // No cached binding set to rebuild: the resolve reads the pressed button's
+    // bindings fresh each tick (`BindingsForButton`), so a profile change is
+    // picked up with no second copy to refresh.
 
     // Persist. The wizard cannot: it holds no Config and no store. A null store
     // means a bench build without NVS, where the learn is real but not durable --
@@ -731,8 +752,18 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
         // phantom key). Release is not configuration-dependent.
     } else {
         GestureEvent ev{};
+        // The bindings are the PRESSED BUTTON's, not the channel's (spec 6.6 rule
+        // 3). While the press is in flight the classifier names the button; on
+        // release it names none, so the machine's own tracked button is used --
+        // the press being resolved is the one it is holding. Falling back to a
+        // channel-wide scan here would make a button that binds nothing wait out
+        // a sibling's double window and emit a LONG it has no binding for.
+        const uint8_t pressed_button = (level == ChannelLevel::kPressed)
+                                           ? cs.classifier.ButtonIndex()
+                                           : cs.gestures.Button();
+        const GestureBindings for_button = BindingsForButton(index, pressed_button);
         const bool fired = cs.gestures.Update(level, cs.classifier.ButtonIndex(), now_ms, &ev,
-                                              cs.bindings);
+                                              for_button);
 
         // FR-12, stated in the spec three times (§6.3, §7.2, and the FR table): a
         // press that matches no learned window is reported as `event{button:

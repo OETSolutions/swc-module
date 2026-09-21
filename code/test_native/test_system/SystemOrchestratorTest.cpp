@@ -48,6 +48,34 @@ void PollFor(SystemOrchestrator &o, MockHal &hal, uint32_t ms) {
 // selects gain 1.82 (spec 6.2 step 4).
 constexpr int kSenseFor5vHeadUnit = 2490;
 
+/*
+ * Press `mv` on SWC1, release, and return the DAC code while the pulse is still
+ * ON THE LINE -- or the idle code if none was driven.
+ *
+ * **Why a mid-pulse capture rather than reading the code after the window.** The
+ * pulse is only `send_duration_ms` (200 ms) long (spec 6.6 rule 2), so a test
+ * that polls a fixed 700 ms past the release and then reads the code sees the
+ * RELEASE, not the key -- and would only pass if the pulse were wrongly
+ * lengthened. This is the same sampling the headless-learn test already uses.
+ *
+ * It also makes the resolve timing explicit: a button binding SINGLE+LONG (no
+ * DOUBLE) resolves at RELEASE (spec 6.6 rule 3), so the pulse begins there; a
+ * button binding DOUBLE would begin it a double-press window later.
+ */
+int PressAndCaptureDrivenCode(SystemOrchestrator &o, MockHal &hal, int mv) {
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, mv);
+    PollFor(o, hal, 100);                 // press + debounce
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    for (uint32_t t = 0; t < 900; t += 10) {
+        o.Tick(hal.NowMs());
+        hal.AdvanceMs(10);
+        const int code = hal.LastDacCode(DAC_CH_KEY1);
+        if (code != idle_code) return code;   // the pulse is on the line
+    }
+    return idle_code;                         // nothing was driven
+}
+
 }  // namespace
 
 TEST(SystemOrchestrator, SafeIdleIsEstablishedBeforeAnythingElse) {
@@ -146,19 +174,16 @@ TEST(SystemOrchestrator, APressProducesTheBoundOutputLevelAndThenReleases) {
     // vol_up at its learned 1430 mV. The ladder pulls DOWN from an idle of
     // 2835 mV, so a press is a LOWER reading -- never above idle.
     //
-    // vol_up binds SINGLE (a 2400 mV output) AND LONG (a release), so the press
-    // must stay UNDECIDED until it resolves (spec 6.6): driving at press time
-    // would let the head unit act on a level the gesture had not settled on yet.
-    // The press is therefore held past the debounce, released, and allowed the
-    // double-press window to close.
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
-    PollFor(o, hal, 100);                              // press + debounce
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
-    PollFor(o, hal, 700);                              // release + resolve the SINGLE
-
-    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code) << "a resolved press must change the output";
+    // vol_up binds SINGLE (a 2400 mV output) AND LONG (a release), but NOT
+    // DOUBLE, so per spec 6.6 rule 3 the press resolves at RELEASE with no
+    // double-press wait. The pulse is then `send_duration_ms` long, so the DAC
+    // must be sampled WHILE it is on the line -- reading afterwards sees the
+    // release, not the key.
+    const int driven = PressAndCaptureDrivenCode(o, hal, 1430);
+    EXPECT_NE(driven, idle_code) << "a resolved press must change the output";
 
     // Let the recognition pulse elapse; the line must return to idle.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
     PollFor(o, hal, 400);
     EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code) << "must return to idle";
 }
@@ -171,11 +196,8 @@ TEST(SystemOrchestrator, ServesPressesWithNoUsbAndNoApp) {
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
     o.Boot();
     const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
-    PollFor(o, hal, 100);
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
-    PollFor(o, hal, 700);
-    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code);
+    EXPECT_NE(PressAndCaptureDrivenCode(o, hal, 1430), idle_code)
+        << "a press must be served with no link present";
 }
 
 TEST(SystemOrchestrator, TheOutputIsNotDrivenWhileTheGestureIsUndecided) {
@@ -203,12 +225,13 @@ TEST(SystemOrchestrator, ARailSagDuringAPressReleasesTheKey) {
     o.Boot();
     const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
 
-    // Drive a key first: press and let the SINGLE resolve.
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
-    PollFor(o, hal, 100);
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
-    PollFor(o, hal, 700);
-    ASSERT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code);
+    // Drive a key and HOLD it open with a bench command whose hold outlasts the
+    // test. A real press is no good here: vol_up binds SINGLE+LONG (no DOUBLE),
+    // so its SINGLE is a 200 ms pulse that self-releases, and the assertion below
+    // could not tell the fault-release from the normal timeout. Holding the line
+    // open makes the fault the ONLY thing that can release it.
+    ASSERT_TRUE(o.TestDriveKeyMv(0, 2400, 5000, hal.NowMs()));
+    ASSERT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code) << "the bench drive must hold a key";
 
     // The +3V3 rail sags: 500 mV is 18% of the learned 2835 mV idle, and the
     // KEY line collapses with it (2 x 250 = 500 mV, outside the 1.8-5.2 V
@@ -217,7 +240,7 @@ TEST(SystemOrchestrator, ARailSagDuringAPressReleasesTheKey) {
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 250);
     PollFor(o, hal, 400);
     EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
-        << "a rail fault during a press must release the key, not hold it";
+        << "a rail fault during a driven key must release it, not hold it";
 }
 
 TEST(SystemOrchestrator, AnUnlearnedLevelNeverChangesTheOutput) {
@@ -555,16 +578,6 @@ TEST(SystemOrchestrator, AnUnrecognizedPressDoesNotDriveTheOutput) {
 // The fixture's `vol_dn` (1785 mV) has a learned window but NO binding, which is
 // exactly the no-app shape: recognised, and unbound.
 
-namespace {
-// Hold a button and let its gesture resolve as a SINGLE.
-void PressButton(SystemOrchestrator &o, MockHal &hal, int mv) {
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, mv);
-    PollFor(o, hal, 100);          // press + debounce
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
-    PollFor(o, hal, 700);          // release + resolve
-}
-}  // namespace
-
 TEST(SystemOrchestrator, AnUnboundGesturePresentsTheButtonRatherThanDoingNothing) {
     // The core no-app requirement: with no binding for a recognised button's
     // gesture, the device acts as a STOCK WHEEL and presents that button's own
@@ -575,10 +588,11 @@ TEST(SystemOrchestrator, AnUnboundGesturePresentsTheButtonRatherThanDoingNothing
     o.Boot();
     const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
 
-    PressButton(o, hal, 1785);     // vol_dn: learned (1785 +/- 120), and unbound
-
-    // The head unit must have been given a key -- the line left its idle.
-    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+    // vol_dn is learned (1785 +/- 120) and UNBOUND, so it has neither DOUBLE nor
+    // LONG of its own: per spec 6.6 rule 3 it resolves at release and presents
+    // immediately. Sampled mid-pulse, because the present is 200 ms long.
+    const int driven = PressAndCaptureDrivenCode(o, hal, 1785);
+    EXPECT_NE(driven, idle_code)
         << "an unbound gesture on a RECOGNISED button must present the button, "
            "not silently do nothing -- this is the no-app product requirement";
 }
@@ -592,14 +606,42 @@ TEST(SystemOrchestrator, TheUnboundGestureIsPresentedAsABoundedPulseThenReleased
     o.Boot();
     const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
 
-    PressButton(o, hal, 1785);
-    ASSERT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code);
-    // Hold long past send_duration_ms with the line back at idle: the pulse must
-    // have ENDED rather than being held for as long as the press lasted.
+    ASSERT_NE(PressAndCaptureDrivenCode(o, hal, 1785), idle_code);
+    // The line must have returned to idle well inside the poll window above: the
+    // present is `send_duration_ms` (200 ms), not a line held for the press.
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
     PollFor(o, hal, 400);
     EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
         << "the present must be a bounded pulse, not a held key";
+}
+
+TEST(SystemOrchestrator, AnUnboundButtonResolvesAtThePressWithNoSiblingLatency) {
+    // Spec 6.6 rule 3: the double-press wait is a PER-BUTTON property. `vol_dn`
+    // binds NOTHING, so it has no ambiguity at all and must resolve the instant
+    // it is classified -- NOT wait out the 500 ms window that `next`'s DOUBLE
+    // (a sibling button on the same channel) would impose.
+    //
+    // The earlier resolve read the CHANNEL's bindings, so any DOUBLE anywhere on
+    // the channel added ~500 ms to EVERY button's SINGLE. That is the latency
+    // this asserts against: the gesture must be reported within ~100 ms of the
+    // press (the debounce), not ~600 ms.
+    g_reported.clear();
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    o.SetGestureSink(&RecordGesture, nullptr);
+
+    const uint64_t pressed_at = hal.NowMs();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1785);   // vol_dn: unbound
+    PollFor(o, hal, 300);
+
+    ASSERT_EQ(g_reported.size(), 1u) << "an unbound button must resolve promptly";
+    EXPECT_EQ(std::string(g_reported[0].button_id), "vol_dn");
+    EXPECT_EQ(g_reported[0].gesture, Gesture::kSingle);
+    const uint64_t latency = g_reported[0].at_ms - pressed_at;
+    EXPECT_LT(latency, 200u)
+        << "an unbound button must not inherit a sibling's double-press window";
 }
 
 TEST(SystemOrchestrator, ARecognizedAndUnboundPressIsAcceptedNotBeepedUnknown) {
@@ -620,17 +662,17 @@ TEST(SystemOrchestrator, ARecognizedAndUnboundPressIsAcceptedNotBeepedUnknown) {
     PollFor(o, hal, 400);          // let the boot announcement finish
     ASSERT_FALSE(hal.BuzzerIsOn());
 
-    // Press, release, then wait out the double-press window: channel 0 DOES bind
-    // DOUBLE (on `next`) and LONG (on `vol_up`), so `BindingsFor` reports both and
-    // the unbound `vol_dn` press stays undecided until its ambiguity window closes.
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1785);
-    PollFor(o, hal, 100);
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    // vol_dn is unbound, so per spec 6.6 rule 3 it binds neither DOUBLE nor LONG
+    // and has NO ambiguity to resolve: the press resolves as a SINGLE AT THE
+    // PRESS (the fast path), so the acknowledging tone plays immediately and the
+    // count must span the press as well as the release.
     int on_ticks = 0;
-    for (uint32_t t = 0; t < 800; t += 5) {
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1785);
+    for (uint32_t t = 0; t < 700; t += 5) {
         o.Tick(hal.NowMs());
         if (hal.BuzzerIsOn()) ++on_ticks;
         hal.AdvanceMs(5);
+        if (t == 95) hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);   // release ~100 ms in
     }
     // 5 ms cadence: the 25 ms accepted pulse is ~5 ticks, the 120 ms unknown pulse
     // ~24. A threshold of 12 ticks (60 ms) sits between them with margin.
@@ -1022,11 +1064,7 @@ TEST(SystemOrchestrator, PressesStillWorkWhileMaintenanceIsOpen) {
     o.EnterMaintenance(MaintenanceTrigger::kUsbCommand, hal.NowMs());
     ASSERT_TRUE(o.MaintenanceActive());
 
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
-    PollFor(o, hal, 100);
-    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
-    PollFor(o, hal, 700);
-    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+    EXPECT_NE(PressAndCaptureDrivenCode(o, hal, 1430), idle_code)
         << "the steering wheel must keep working while maintenance is open";
 }
 

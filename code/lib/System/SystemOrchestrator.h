@@ -315,7 +315,6 @@ private:
         // channel move the other's reported level (FR-9).
         AdcReader           reader;
         ServoLoop           servo{ServoConfigDefault()};
-        GestureBindings     bindings;
         bool                key_driven = false;    // a pulse is currently on the line
         uint64_t            key_released_at_ms = 0;
         // FR-25: pass-through has no gesture machine to latch a press, and its
@@ -361,10 +360,11 @@ private:
     // tick (a LONG fires when its threshold elapses, a SINGLE when its ambiguity
     // window closes).
     void ReportGesture(uint8_t index, const GestureEvent &ev, int level_mv);
-    // What the channel's own bindings say about how long a press must stay
+    // What ONE button's own bindings say about how long its press must stay
     // undecided. Derived from the config, not assumed -- a button that binds
-    // only SINGLE must not wait out the double-press window (spec 6.6).
-    GestureBindings BindingsFor(uint8_t channel_index) const;
+    // only SINGLE must not wait out the double-press window (spec 6.6 rule 3,
+    // which is a PER-BUTTON property).
+    GestureBindings BindingsForButton(uint8_t channel_index, uint8_t button_index) const;
 
     IHAL          *hal_;
     Config         config_;

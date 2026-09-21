@@ -58,6 +58,18 @@ public:
 
     void Reset();
 
+    /*
+     * The button of the press currently in flight, or 0xFF when none is.
+     *
+     * The caller needs it because the resolve is PER BUTTON (spec 6.6 rule 3):
+     * `Update` takes the `GestureBindings` of the button being resolved, and once
+     * a press is released the classifier reports no button at all -- so the
+     * caller cannot ask it which button's bindings to supply for the release. The
+     * machine already tracks the button internally; this exposes the same fact
+     * rather than making the caller keep a second copy that could disagree.
+     */
+    uint8_t Button() const { return button_; }
+
 private:
     void Emit(Gesture g, uint64_t now_ms, GestureEvent *out);
 

@@ -1317,7 +1317,13 @@ Three rules follow, and they are normative:
 
    A button that binds only `SINGLE` has no ambiguity to resolve and must not
    inherit the double-press window's latency. This is a per-button property, not a
-   per-device one.
+   per-device one — **and "per button" is load-bearing, not a figure of speech:**
+   the bindings consulted for a press are the ones whose `button` field names the
+   button *being pressed*. Scanning the channel instead (any `DOUBLE` anywhere on
+   it) adds the double-press window to every press on that channel and can emit a
+   `LONG` for a button that binds neither. The implementation reads the pressed
+   button's own bindings each tick, because the button is not known until the
+   level is classified.
 
    **A `DOUBLE` is the SAME button pressed twice inside the window.** Two
    *different* buttons pressed in quick succession are two separate presses: the

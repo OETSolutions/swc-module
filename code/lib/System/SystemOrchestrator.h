@@ -280,6 +280,36 @@ public:
     bool Faulted() const { return faulted_; }
 
     /*
+     * How the config came up at boot, as a word for spec 4.3's `status` frame.
+     *
+     * **The `status` frame reported the wrong quantity under this name.** It sent
+     * `config_state` derived from `SafeIdleEstablished()`, so a device whose
+     * config had fallen back to defaults -- the exact case spec 6.8 requires be
+     * reported as `config_state: defaults` -- answered `"ok"`, and the app could
+     * not distinguish a healthy config from a lost one. The fault was only on the
+     * buzzer (transient) and the LED (a colour, not a name).
+     *
+     * `kNoConfig` is `"none"` rather than `"defaults"`: FR-25's pass-through
+     * device is a supported state, not a fault, and collapsing the two would make
+     * a fresh board report a corrupt config.
+     *
+     * A local enum rather than `ConfigLoadResult`: this header forward-declares
+     * `ConfigStore` on purpose so including it does not pull NVS into every host
+     * test, and the four states here are exactly the ones `Boot` distinguishes.
+     */
+    enum class BootConfigState { kOk, kNone, kRecovered, kDefaults };
+
+    const char *ConfigStateWord() const {
+        switch (boot_config_state_) {
+            case BootConfigState::kOk:        return "ok";
+            case BootConfigState::kNone:      return "none";
+            case BootConfigState::kRecovered: return "recovered";
+            case BootConfigState::kDefaults:  return "defaults";
+        }
+        return "unknown";
+    }
+
+    /*
      * A diagnostic line for the app's log view (spec 4.3's `log` frame).
      *
      * A sink rather than a return value because the events that need reporting
@@ -409,6 +439,10 @@ private:
     void       *gesture_sink_ctx_ = nullptr;
     bool        usb_connected_ = false;
     bool        faulted_ = false;
+    // How the config came up at boot, for `status`'s `config_state` (see
+    // ConfigStateWord). Defaults to kOk so a caller that never calls Boot -- a
+    // bare test -- does not report a fault it never had.
+    BootConfigState boot_config_state_ = BootConfigState::kOk;
     // The LED2 pattern the driving-state derivation last chose. Kept so `Tick`
     // only calls `Set2` on a CHANGE: `Set2` restarts the pattern's phase clock,
     // so re-setting the same value every tick would hold every LED2 pattern at

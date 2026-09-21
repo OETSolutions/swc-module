@@ -232,6 +232,15 @@ void SystemOrchestrator::Boot() {
     // spec 6.3's ratio normalization needs.
     pass_through_ = (result == ConfigLoadResult::kNoConfig);
 
+    // Record what the load actually did, so `status`'s `config_state` carries the
+    // CONFIG's state rather than the output's (see ConfigStateWord).
+    switch (result) {
+        case ConfigLoadResult::kLoaded:             boot_config_state_ = BootConfigState::kOk; break;
+        case ConfigLoadResult::kNoConfig:           boot_config_state_ = BootConfigState::kNone; break;
+        case ConfigLoadResult::kRecoveredFromBackup: boot_config_state_ = BootConfigState::kRecovered; break;
+        case ConfigLoadResult::kFellBackToDefaults: boot_config_state_ = BootConfigState::kDefaults; break;
+    }
+
     // 2. Establish safe idle. This is BEFORE anything else that could accept a
     //    command (FR-13), and before the per-channel state exists.
     EstablishSafeIdle();

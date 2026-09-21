@@ -192,15 +192,24 @@ void CommandRouter::Process() {
 
 void CommandRouter::ReplyStatus(uint32_t for_seq) {
     const bool vbus = (hal_ != nullptr) && hal_->gpio_read(hal_->ctx, GPIO_VBUS_VALID);
-    const bool safe = (sys_ != nullptr) && sys_->SafeIdleEstablished();
-    char body[256];
+    // `config_state` reports the CONFIG's state, not the output's. It used to be
+    // derived from `SafeIdleEstablished()`, which answers "is the KEY line safe"
+    // -- so a device whose config fell back to defaults, the exact case spec 6.8
+    // requires be reported, answered `"ok"` and the app could not tell a healthy
+    // config from a lost one. The output's own state is `output_safe`, a
+    // separate field, and neither name can now be read as the other.
+    const char *cfg = (sys_ != nullptr) ? sys_->ConfigStateWord() : "unknown";
+    char body[288];
     snprintf(body, sizeof(body),
              "\"for_seq\":%u,\"vbus_present\":%s,\"gain_mode\":\"%s\",\"uptime_ms\":%llu,"
-             "\"config_state\":\"%s\"",
+             "\"config_state\":\"%s\",\"output_safe\":%s",
              static_cast<unsigned>(for_seq), vbus ? "true" : "false",
-             "amplified",   // refined once per-channel gain mode is tracked here
+             (sys_ != nullptr) ? (sys_->ChannelGainMode(0) == GainMode::kAmplified ? "amplified"
+                                                                                  : "tracking")
+                               : "unknown",
              static_cast<unsigned long long>(hal_ ? hal_->now_ms(hal_->ctx) : 0ULL),
-             safe ? "ok" : "unsafe");
+             cfg,
+             ((sys_ != nullptr) && sys_->SafeIdleEstablished()) ? "true" : "false");
     Emit("status", body);
 }
 

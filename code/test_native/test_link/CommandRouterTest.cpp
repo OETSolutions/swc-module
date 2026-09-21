@@ -1144,3 +1144,92 @@ TEST(CommandRouter, TestKeyRefusesAChannelOutOfRange) {
     ASSERT_TRUE(HasType(cap, "nack"));
     EXPECT_NE(cap.lines.back().find("bad_param"), std::string::npos);
 }
+
+// --- status carries the CONFIG's state (spec 4.3 / 6.8) ----------------------
+
+TEST(CommandRouter, StatusReportsConfigStateNotTheOutputsState) {
+    // Spec 6.8 requires a corrupt config to be reported as `config_state:
+    // defaults`. The frame instead derived `config_state` from
+    // `SafeIdleEstablished()`, so a device running on fallback defaults answered
+    // `"ok"` -- the one answer that hides the fault. The output's own state is a
+    // SEPARATE field, so neither name can be read as the other.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    ASSERT_TRUE(store.Save(d.config));   // a real, readable stored config
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    ASSERT_STREQ(sys.ConfigStateWord(), "ok") << "fixture: the config loaded";
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    ASSERT_TRUE(HasType(cap, "status"));
+    const std::string &s = cap.lines.back();
+    EXPECT_NE(s.find("\"config_state\":\"ok\""), std::string::npos)
+        << "a healthy config is `ok`; got: " << s;
+    EXPECT_NE(s.find("\"output_safe\":true"), std::string::npos)
+        << "the output's state is its own field now; got: " << s;
+}
+
+TEST(CommandRouter, AConfigThatFellBackToDefaultsIsReportedAsDefaults) {
+    // The case spec 6.8 exists for: the stored config is unreadable, so the device
+    // runs on defaults and MUST say so. This is also the case the old code hid --
+    // it reported the OUTPUT's state (`unsafe` only if safe idle failed), so a
+    // device on defaults answered `ok` and the fault had no name anywhere.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    ASSERT_TRUE(store.Save(d.config));
+    hal.CorruptNvsValue("cfg_a_0", 24);
+    hal.CorruptNvsValue("cfg_b_0", 24);
+    {
+        Config t{};
+        ASSERT_EQ(store.Load(&t), ConfigLoadResult::kFellBackToDefaults)
+            << "the fixture must actually be unreadable for this test to mean anything";
+    }
+
+    // Boot reads through its OWN store, so the corrupted slots are what it sees.
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    ASSERT_STREQ(sys.ConfigStateWord(), "defaults")
+        << "an unreadable config must be named, not reported as safe";
+    ASSERT_TRUE(sys.SafeIdleEstablished())
+        << "the fixture must ALSO be output-safe, or the two fields never diverge "
+           "and the test cannot tell the old derivation from the new";
+
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    ASSERT_TRUE(HasType(cap, "status"));
+    const std::string &s = cap.lines.back();
+    EXPECT_NE(s.find("\"config_state\":\"defaults\""), std::string::npos)
+        << "spec 6.8 names this exact word; got: " << s;
+    EXPECT_NE(s.find("\"output_safe\":true"), std::string::npos)
+        << "the output IS safe even so -- which is why the two must be separate "
+           "fields; got: " << s;
+}
+
+TEST(CommandRouter, StatusGainModeReflectsTheOrchestratorsResolvedMode) {
+    // The frame hardcoded `"amplified"` with a comment saying the real per-channel
+    // mode would be refined in later. `ChannelGainMode(0)` already returned it, so
+    // the hardcode was a stale lie: a device running in tracking mode told the app
+    // it was amplified.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    // A tracking-mode channel: the config names it concretely, which overrides the
+    // device-wide policy, so the resolved mode is unambiguous.
+    d.config.channels[0].output.gain_mode = GainMode::kTracking;
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2490);   // head unit present
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    ASSERT_EQ(sys.ChannelGainMode(0), GainMode::kTracking) << "fixture: tracking";
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    ASSERT_TRUE(HasType(cap, "status"));
+    EXPECT_NE(cap.lines.back().find("\"gain_mode\":\"tracking\""), std::string::npos)
+        << "the frame must report the mode the device actually resolved; got: "
+        << cap.lines.back();
+}

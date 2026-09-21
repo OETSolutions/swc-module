@@ -31,6 +31,14 @@ TEST(DacFrame, PacksCommandAndChannelSelectIntoTheFirstByte) {
         EXPECT_EQ(f[0] & DacFrame::kUdacHold, 0)
             << "UDAC must be clear so the write latches on its own ACK";
     }
+    // UDAC is byte 0 BIT 0 (`0 1 0 0 0 DAC1 DAC0 UDAC` -- the diagram above and
+    // the datasheet figure). Pinning the bit POSITION, not just "the mask bit is
+    // clear", is what makes the loop above non-vacuous: `kUdacHold` used to be
+    // 0x08, which is bit 3, so the mask named a bit the encoder can never set and
+    // the assertion passed no matter what byte 0 was.
+    EXPECT_EQ(DacFrame::kUdacHold, 0x01u)
+        << "the UDAC mask must name bit 0; any other bit makes the clear-check "
+           "above a tautology";
 }
 
 // The frame is THREE bytes. Four was the defect: an extra byte pushed data into

@@ -63,9 +63,14 @@ constexpr uint8_t kChannelD = 3;  // U4.VOUTD -> /V_ADJ2
 
 // Command-type bits C2:C1:C0 = 0:1:0, in their positions (byte 0 bits 7:5).
 constexpr uint8_t kCommandMultiWrite = 0x40;
-// UDAC, byte 0 bit 3. Named so the "we send 0" decision is visible at the call
-// site rather than implied by a missing `|=`.
-constexpr uint8_t kUdacHold = 0x08;
+// UDAC, byte 0 bit 0 (the wire-format diagram above and the datasheet's
+// Figure 5-8 both put it there -- `0 1 0 0 0 DAC1 DAC0 UDAC`). Named so the "we
+// send 0" decision is visible at the call site rather than implied by a missing
+// `|=`. It was 0x08 (bit 3), which is not UDAC at all: the mask was wrong, and
+// the test that "asserted UDAC is clear" read a bit the encoder could never set,
+// so it passed vacuously. Sending bit 3 set would have asked the part for
+// something undefined; the mask must name the real bit for the test to bite.
+constexpr uint8_t kUdacHold = 0x01;
 
 constexpr size_t kSize = 3;
 

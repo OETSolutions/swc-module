@@ -1959,3 +1959,72 @@ TEST(SystemOrchestrator, ABuzzBindingPlaysItsPatternAndStillDrivesTheKey) {
     EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), -1);
     (void)idle_code;
 }
+
+TEST(SystemOrchestrator, AFailedNvsWriteIsReportedAsNotPersisted) {
+    // `persisted_` answers "is this learn DURABLE", not "is a store attached".
+    // An earlier revision set it from the pointer alone
+    // (`persisted_ = (store_ != nullptr)`), so a FAILED write -- full NVS, a write
+    // error, a config the store refused -- reported the learn as saved. The user
+    // hears LEARN_OK, nothing anywhere says otherwise, and the button is gone at
+    // the next boot. `Save` returns false for exactly these cases and the return
+    // value was discarded.
+    MockHal hal;
+    hal.ClearNvs();
+    Config c = ConfigDefault();
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(c));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), c, c.settings.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    HoldAuxToToggle(o, hal);
+    ASSERT_TRUE(o.LearnActive());
+    PressAux(o, hal, 1);
+
+    // Arm the failure immediately before the commit's write, not before the
+    // learn, so nothing else consumes it.
+    hal.FailNextNvsWrite();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 400);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 300);
+
+    ASSERT_NE(o.LastLearnedProfile(0), nullptr)
+        << "the learn itself must still have completed -- this is about the REPORT";
+    EXPECT_FALSE(o.LastLearnPersisted())
+        << "the NVS write failed, so the learn is NOT durable and must not be "
+           "reported as saved -- the user would lose the button at the next boot "
+           "with nothing having said so";
+}
+
+TEST(SystemOrchestrator, ASuccessfulNvsWriteIsReportedAsPersisted) {
+    // The other direction, so the test above cannot pass by `persisted_` simply
+    // always being false.
+    MockHal hal;
+    hal.ClearNvs();
+    Config c = ConfigDefault();
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(c));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), c, c.settings.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    HoldAuxToToggle(o, hal);
+    ASSERT_TRUE(o.LearnActive());
+    PressAux(o, hal, 1);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 400);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 300);
+
+    ASSERT_NE(o.LastLearnedProfile(0), nullptr);
+    EXPECT_TRUE(o.LastLearnPersisted()) << "a good write must report as durable";
+}

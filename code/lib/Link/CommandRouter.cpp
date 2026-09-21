@@ -441,10 +441,18 @@ void CommandRouter::HandleConfigEnd(const cJSON *root, uint32_t for_seq) {
     // decode above rejects first with "decode". The test now asserts the code that
     // actually comes back.)
     //
-    // The order still matters and is preserved: nothing is written until both the
-    // staged bytes and the decoded result are known good, and `Save` re-validates
-    // on its own way in (`ConfigEncodeBlob` refuses an invalid config), so a config
-    // that somehow got past the decode cannot be persisted.
+    // The order still matters and is preserved: nothing is written until BOTH the
+    // staged bytes and the decoded result are known good.
+    //
+    // **`Save` does NOT re-validate, and an earlier version of this comment claimed
+    // it did** ("`ConfigEncodeBlob` refuses an invalid config"). It does not:
+    // `ConfigEncodeBlob` only encodes. That claim mattered, because it was the
+    // stated reason no validation was needed on other write paths -- and one of
+    // those paths, `SystemOrchestrator::ApplyLearnedProfile`, could commit a profile
+    // this validator refuses, which `Save` then persisted. The validation that
+    // protects a headless learn now lives where the profile is chosen
+    // (`LearnSession::Commit`, via `LadderWindowsAreDistinguishable`), because that
+    // is the only place that knows what the learn is about to build.
     if (store_ == nullptr || !store_->Save(c)) {
         // The OLD config is untouched by a failed Save, which is the point of the
         // A/B slots. Report the failure rather than acking a config that is not

@@ -478,13 +478,20 @@ void SystemOrchestrator::ApplyLearnedProfile(int channel, const LadderProfile &p
     // bindings fresh each tick (`BindingsForButton`), so a profile change is
     // picked up with no second copy to refresh.
 
-    // Persist. The wizard cannot: it holds no Config and no store. A null store
-    // means a bench build without NVS, where the learn is real but not durable --
-    // and that is reported rather than silently dropped.
-    if (store_ != nullptr) {
-        store_->Save(config_);
-    }
-    persisted_ = (store_ != nullptr);
+    // Persist. The wizard cannot: it holds no Config and no store.
+    //
+    // **The RESULT is what `persisted_` must report, not the POINTER.** An earlier
+    // revision wrote `persisted_ = (store_ != nullptr)`, which answers "is there a
+    // store attached" and calls that "the learn was saved". So a full NVS, a failed
+    // write, or a config the store refused all reported the learn as durable: the
+    // user hears LEARN_OK, the app is told nothing is wrong, and the button is gone
+    // at the next boot with no explanation anywhere. `Save` returns false precisely
+    // for those cases, and the return value was being discarded.
+    //
+    // A null store is still a real distinction worth keeping -- a bench build with
+    // no NVS learns correctly and cannot persist -- and it is reported the same way
+    // as a failed write, because the user-visible fact is identical: not durable.
+    persisted_ = (store_ != nullptr) && store_->Save(config_);
 }
 
 void SystemOrchestrator::ReportGesture(uint8_t index, const GestureEvent &ev, int level_mv) {

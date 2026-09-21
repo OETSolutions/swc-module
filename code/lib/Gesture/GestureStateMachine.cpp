@@ -34,17 +34,40 @@ bool GestureStateMachine::Update(ChannelLevel level, uint8_t button_index,
         // emit as well as the release branch below.
         bool emitted = false;
         if (!pressed_) {
+            // The button the PREVIOUS press was on, before this press overwrites
+            // it. A double press is the SAME button tapped twice (spec 6.6), so
+            // the comparison below needs both.
+            const uint8_t prev_button = button_;
             pressed_ = true;
             button_ = button_index;
             press_started_ms_ = now_ms;
             long_fired_ = false;
-            if (awaiting_second_) {
-                // Second press inside the window: this is the DOUBLE.
+            if (awaiting_second_ && button_index == prev_button) {
+                // Second press of the SAME button inside the window: the DOUBLE.
                 awaiting_second_ = false;
                 pending_single_ = false;
                 Emit(Gesture::kDouble, now_ms, out);
                 long_fired_ = true;  // sentinel: this press must not emit SINGLE
                 emitted = true;
+            } else if (awaiting_second_) {
+                // A DIFFERENT button pressed inside the window. This is NOT a
+                // double -- two different buttons are two separate presses, and
+                // folding them into a DOUBLE would send the SECOND button's
+                // double-press command while silently swallowing the first
+                // button's press entirely: the driver taps `vol_dn` then `next`
+                // and the radio gets `next`'s DOUBLE. That is the wrong-command
+                // hazard spec 6.7/FR-12 exist to prevent, so the first press must
+                // resolve as its own SINGLE and the new press start fresh.
+                awaiting_second_ = false;
+                pending_single_ = false;
+                // Emit the FIRST button's SINGLE (Emit reads `button_`), then
+                // adopt the new button for the press now beginning.
+                button_ = prev_button;
+                Emit(Gesture::kSingle, now_ms, out);
+                button_ = button_index;
+                emitted = true;
+                // long_fired_ was cleared above, so the new press can still become
+                // a LONG; press_started_ms_ is this press's start, already set.
             } else if (!bindings.has_double && !bindings.has_long) {
                 // No ambiguity to resolve (spec 6.6): nothing this button binds
                 // could differ from a SINGLE, so the press IS the single. Making

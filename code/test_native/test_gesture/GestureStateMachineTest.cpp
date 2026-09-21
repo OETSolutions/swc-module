@@ -57,6 +57,39 @@ TEST(Gesture, TwoPressesInsideTheWindowEmitOneDoubleAndNoSingles) {
     EXPECT_EQ(ev.gesture, Gesture::kNone) << "the second press must not also emit a SINGLE";
 }
 
+TEST(Gesture, TwoDifferentButtonsInsideTheWindowAreTwoSinglesNotADouble) {
+    // A double press is the SAME button tapped twice (spec 6.6). Two DIFFERENT
+    // buttons are two separate presses. Folding them into a DOUBLE would send the
+    // SECOND button's double-press command while swallowing the first button's
+    // press entirely -- the driver taps `vol_dn` then `next` and the radio acts on
+    // `next`'s DOUBLE, a command nobody asked for. That is precisely the
+    // wrong-command hazard spec 6.7 and FR-12 exist to prevent.
+    //
+    // Both buttons here use bindings that FORCE the double window (`has_double`),
+    // which is the case that exposes it -- with no double window there is nothing
+    // to fold.
+    GestureStateMachine sm(GestureTimingsDefault());
+    const GestureBindings both{/*has_double=*/true, /*has_long=*/true};
+    uint64_t now = 1000;
+
+    Feed(sm, ChannelLevel::kPressed, 1, now, 100, both);   // press vol_dn
+    GestureEvent ev = Feed(sm, ChannelLevel::kIdle, 0, now, 200, both);  // gap < 500
+    EXPECT_EQ(ev.gesture, Gesture::kNone) << "the first press is still undecided";
+
+    // The second press is a DIFFERENT button, inside the window. It must NOT be a
+    // DOUBLE; the first button resolves as its own SINGLE, naming button 1.
+    ev = Feed(sm, ChannelLevel::kPressed, 2, now, 100, both);
+    EXPECT_EQ(ev.gesture, Gesture::kSingle)
+        << "a second press of a DIFFERENT button is not a double";
+    EXPECT_EQ(ev.button_index, 1)
+        << "the first button's press must be reported on the first button";
+
+    // The second press then resolves as its own SINGLE on its own button.
+    ev = Feed(sm, ChannelLevel::kIdle, 0, now, 600, both);
+    EXPECT_EQ(ev.gesture, Gesture::kSingle);
+    EXPECT_EQ(ev.button_index, 2) << "the second press resolves on the second button";
+}
+
 TEST(Gesture, DoubleWindowBoundaryIsInclusiveAt499AndExclusiveAt500) {
     // Spec 10.4 requires the 500ms boundary at exactly 499/500/501. Feed()
     // CANNOT express it: its loop steps 10ms and runs `elapsed < hold_ms`, so

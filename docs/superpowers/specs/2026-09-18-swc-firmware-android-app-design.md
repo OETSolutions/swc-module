@@ -1319,6 +1319,16 @@ Three rules follow, and they are normative:
    inherit the double-press window's latency. This is a per-button property, not a
    per-device one.
 
+   **A `DOUBLE` is the SAME button pressed twice inside the window.** Two
+   *different* buttons pressed in quick succession are two separate presses: the
+   first resolves as its own `SINGLE` and the second starts a fresh press. Folding
+   them into one `DOUBLE` would send the *second* button's double-press command
+   while swallowing the first button's press entirely — the driver taps `vol_dn`
+   then `next` and the radio acts on `next`'s `DOUBLE`, a command nobody asked for.
+   That is the wrong-command hazard rules 1 and the §6.7 safe-idle property exist
+   to prevent, so the button identity is part of the double's definition, not an
+   afterthought.
+
 `SINGLE` is therefore not "delayed by design" — it is delayed by exactly the
 ambiguity that its button actually has, and no more.
 

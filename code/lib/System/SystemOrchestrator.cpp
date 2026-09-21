@@ -222,8 +222,24 @@ void SystemOrchestrator::Boot() {
         buzzer_ = BuzzerGrammar(hal_, config_.settings.buzzer_level);
         leds_ = LedGrammar(hal_, config_.settings.led_level);
     } else if (result == ConfigLoadResult::kFellBackToDefaults) {
-        // Spec 6.8: a corrupt config falls back to defaults AND says so loudly.
-        // The defaults keep the output safe, which is the part that matters.
+        // Spec 6.8: a corrupt config falls back to DEFAULTS. That has to actually
+        // ASSIGN them, and the earlier revision did not -- it reported
+        // `config_state: "defaults"`, latched the fault LED, and left `config_`
+        // as the constructor's argument. The constructor is PUBLIC, so a caller
+        // that passed a non-default config kept running it while the status frame
+        // and the LED both claimed defaults: the report and the reality disagreed,
+        // which is the exact class of lie spec 6.8 exists to prevent. The device
+        // path hides it because it constructs with `ConfigDefault()`, and no test
+        // caught it because the store and the constructor carried the SAME config,
+        // so "reported defaults" and "running defaults" were indistinguishable.
+        //
+        // Safe to do here: the output's SAFE state (FR-13) is a DAC code derived
+        // from the gain mode and the envelope, not from `config_`, and
+        // `EstablishSafeIdle` runs below against the defaults -- which are the
+        // same shape it would have used anyway. `timings_` is assigned from
+        // `config_.settings.timings` further down, so the fallback propagates to
+        // the classifiers too.
+        config_ = ConfigDefault();
         buzzer_ = BuzzerGrammar(hal_, config_.settings.buzzer_level);
         leds_ = LedGrammar(hal_, config_.settings.led_level);
     }

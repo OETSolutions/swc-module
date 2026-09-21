@@ -119,7 +119,11 @@ void CommandRouter::Nack(uint32_t for_seq, const char *err, const char *detail) 
         ++n;
     }
     det[n] = '\0';
-    char body[256];
+    // Sized so the longest realistic `err` can never truncate the body: with the
+    // detail bounded to 192 and the wrapper ~43 bytes, this leaves ~85 bytes for
+    // `err` (the longest today is 17), so adding an error code cannot silently
+    // reintroduce the mid-string cut this function was fixed to remove.
+    char body[320];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"err\":\"%s\",\"detail\":\"%s\"",
              static_cast<unsigned>(for_seq), err, det);
     Emit("nack", body);

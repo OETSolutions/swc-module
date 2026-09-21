@@ -2001,6 +2001,28 @@ TEST(SystemOrchestrator, ABindingResolvesOnADeviceRunningTheProductionConfig) {
     hal.ClearNvs();   // a NEVER-configured device: Boot() takes the real path
 
     Config c = ConfigDefault();
+    // The binding below must name a button the config ALREADY CARRIES. A binding
+    // to a button that is not yet on the ladder fails `ConfigValidate`
+    // (`BindingNamesARealInput`), so `store.Save` persists a config the next
+    // `Load` refuses -- and after Boot's `kFellBackToDefaults` fix that config is
+    // replaced by the DEFAULTS (spec 6.8), taking the binding with it. This test
+    // used to pass only because the fallback silently kept the constructor's
+    // config, which is the bug the fix removes.
+    //
+    // So seed slot 1 with the id the wizard re-measures: the config is then VALID
+    // from the first save, it loads as `kLoaded`, and the headless learn below
+    // re-measures that same entry in place. (The app works the same way -- it can
+    // only bind a button the device has already learned.)
+    c.channels[0].ladder.count = 1;
+    std::strncpy(c.channels[0].ladder.buttons[0].id, "swc1_bt1",
+                 sizeof(c.channels[0].ladder.buttons[0].id) - 1);
+    std::strncpy(c.channels[0].ladder.buttons[0].name, "Button 1",
+                 sizeof(c.channels[0].ladder.buttons[0].name) - 1);
+    c.channels[0].ladder.buttons[0].mv_center = 1430;
+    c.channels[0].ladder.buttons[0].mv_tolerance = 100;
+    c.channels[0].ladder.buttons[0].learned_at_rail_mv = 3300;
+    c.channels[0].ladder.buttons[0].sample_count = 30;
+    c.channels[0].ladder.buttons[0].confidence = 90;
     // Pre-bind the id the wizard generates for slot 1, so the learn fills in the
     // level that this binding names.
     c.binding_count = 1;
@@ -2014,6 +2036,11 @@ TEST(SystemOrchestrator, ABindingResolvesOnADeviceRunningTheProductionConfig) {
     c.bindings[0].actions[0].key_mv = 2400;   // the BOUND level
 
     ConfigStore store(&hal.InterfaceRef());
+    // Guards the fixture: if `c` ever stops being a config the device would
+    // ACCEPT, `Save` persists bytes the next `Load` refuses, Boot falls back to
+    // defaults, and the assertions below measure the fallback instead of the
+    // binding. Asserting validity here is what keeps that from being a green lie.
+    ASSERT_TRUE(ConfigValidate(c)) << "the fixture config must be one the device accepts";
     ASSERT_TRUE(store.Save(c));
 
     SystemOrchestrator o(&hal.InterfaceRef(), c, c.settings.timings);
@@ -2403,4 +2430,53 @@ TEST(SystemOrchestrator, ADisabledChannelStillReleasesAKeyDrivenByTheBench) {
     PollFor(o, hal, 200);
     EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
         << "the pulse must still self-release on a disabled channel";
+}
+
+TEST(SystemOrchestrator, ACorruptConfigFallsBackToDefaultsAndActuallyRunsThem) {
+    /*
+     * Spec 6.8: "Config corrupt / bad checksum -> DEFAULTS; loud buzzer pattern;
+     * report `config_state: defaults` over USB".
+     *
+     * The report and the LED were always right; what was MISSING is the fallback
+     * itself. `Boot`'s `kFellBackToDefaults` branch reported "defaults" and
+     * latched the fault but never assigned `config_`, so the device kept running
+     * whatever the caller passed to the (PUBLIC) constructor. The device path
+     * masked it by constructing with `ConfigDefault()`; a caller passing a real
+     * config got a status frame that said one thing while the device did another.
+     *
+     * The observable that separates them is the channel's learned idle reference: a
+     * caller-supplied config carries a distinctive one, `ConfigDefault()` carries
+     * 2835.
+     */
+    MockHal hal;
+    hal.ClearNvs();
+
+    // A stored config that decodes to garbage: corrupt the ONLY slot's payload so
+    // no slot yields a usable config.
+    {
+        ConfigStore boot_store(&hal.InterfaceRef());
+        Config good = ConfigDefault();
+        std::strncpy(good.device_id, "REALDEVICE", sizeof(good.device_id) - 1);
+        ASSERT_TRUE(boot_store.Save(good));
+    }
+    hal.CorruptNvsValue("cfg_a_0", 20);
+
+    // A caller config with a DISTINCTIVE idle reference, deliberately not the
+    // default. If Boot applies the defaults this becomes 2835; if it leaves the
+    // caller's config in place it stays 1234.
+    Config ctor_cfg = ConfigDefault();
+    std::strncpy(ctor_cfg.device_id, "CTOR-CONFIG", sizeof(ctor_cfg.device_id) - 1);
+    ctor_cfg.channels[0].ladder.learned_idle_mv = 1234;
+
+    SystemOrchestrator o(&hal.InterfaceRef(), ctor_cfg, ctor_cfg.settings.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    EXPECT_STREQ(o.ConfigStateWord(), "defaults")
+        << "a corrupt config must be REPORTED as a defaults fallback (spec 6.8)";
+    EXPECT_EQ(o.IdleReferenceMv(0), 2835)
+        << "and the fallback must actually RUN, not just be reported: the caller's "
+           "1234 would mean the device kept a config it just told the app it had "
+           "discarded";
 }

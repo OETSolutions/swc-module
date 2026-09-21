@@ -175,3 +175,21 @@ TEST(LinkWiring, TheHelloFrameParsesAsJsonEvenWhenTheVersionMacroIsEmpty) {
     EXPECT_GT(strlen(fw->valuestring), 0u) << "an empty fw_version is not a version";
     cJSON_Delete(root);
 }
+
+TEST(LinkWiring, TheRebootAckReachesTheTransportBeforeTheReset) {
+    // The ack must be ON THE WIRE, not merely queued, when `reboot()` is called:
+    // the poll loop's ServiceTx never runs again, so a queued-only ack is lost
+    // with the reset and the app cannot distinguish a successful reboot from a
+    // dropped link. The capture sink records at EMIT time, so this must go
+    // through the real UsbCdc into a raw-write sink, with NO ServiceTx call of
+    // its own -- exactly like the device.
+    Fixture f;
+    f.router.OnConnected();
+    f.sink.got.clear();
+    const std::string rb = "{\"v\":1,\"seq\":7,\"type\":\"reboot\",\"boot_target\":\"app\"}";
+    const std::string wire = rb + "\n";
+    f.cdc.FeedBytes(reinterpret_cast<const uint8_t *>(wire.data()), wire.size());
+    ASSERT_EQ(f.hal.RebootCount(), 1);
+    EXPECT_NE(f.sink.got.find("\"type\":\"ack\""), std::string::npos)
+        << "the reboot ack must be flushed before reboot(), not queued into the reset";
+}

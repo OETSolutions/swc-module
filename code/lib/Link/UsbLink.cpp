@@ -101,8 +101,10 @@ void CdcLineStateCallback(int itf, cdcacm_event_t *event)
 
 // The device's raw write: queue into the CDC FIFO and flush. Returns the bytes
 // ACCEPTED, which is exactly what `UsbCdc::ServiceTx` retries against. The queue
-// copies only what fits in the FIFO, so a maximum frame (1024 B) is delivered
-// over two rounds and the retry path is exercised on every large frame.
+// copies only what fits in the FIFO, so a frame larger than
+// `CONFIG_TINYUSB_CDC_TX_BUFSIZE` (512 B by default) is delivered over several
+// rounds and the retry path is exercised on any frame over that size -- which
+// includes every 512-byte config chunk reply.
 size_t CdcRawWrite(void *ctx, const uint8_t *data, size_t len)
 {
     (void)ctx;

@@ -87,6 +87,11 @@ void CommandRouter::SetSink(FrameSink sink, void *ctx) {
     sink_ctx_ = ctx;
 }
 
+void CommandRouter::SetTxFlush(TxFlush flush, void *ctx) {
+    tx_flush_ = flush;
+    tx_flush_ctx_ = ctx;
+}
+
 void CommandRouter::Emit(const char *type, const char *body_fields) {
     if (sink_ == nullptr) return;
     NdjsonWriter w;
@@ -1144,6 +1149,12 @@ void CommandRouter::HandleReboot(const cJSON *root, uint32_t for_seq) {
     char body[64];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
     Emit("ack", body);
+    // FLUSH IT. `Emit` only queues into the transport; the poll loop's
+    // `ServiceTx` is what writes to the USB FIFO, and it never runs again before
+    // `reboot()` below. Without this the ack is lost with the reset -- the app
+    // cannot tell a successful reboot from a dropped link, which is precisely
+    // what the ack-before-reset ordering exists to avoid.
+    if (tx_flush_ != nullptr) tx_flush_(tx_flush_ctx_);
     // A reboot into the bootloader is a serial-flash helper: the device stops
     // running the app and does nothing else. Both targets reset, so the reboot
     // request itself is the same call; the distinction is what the app does next.

@@ -599,8 +599,11 @@ TEST(CommandRouter, IdentifyIsAcceptedAndAnUnknownPatternIsRefused) {
 }
 
 TEST(CommandRouter, ARebootIsAckedBeforeTheReset) {
-    // If the ack came after reboot(), it would be lost with the reset and the
-    // app could not tell a successful reboot from a dropped link.
+    // The ack is EMITTED before `reboot()`, so a device that is reset by the call
+    // still queued it first. This test's `Capture` sink records at emit time, so
+    // it does NOT prove the ack reaches the wire -- `LinkWiringTest`'s
+    // `TheRebootAckReachesTheTransportBeforeTheReset` does, through the real
+    // transport with no ServiceTx (the flush is what makes the ordering real).
     MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
     CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
     cap.Attach(r);

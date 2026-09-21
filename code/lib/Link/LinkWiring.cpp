@@ -24,12 +24,21 @@ void RouterOutSinkThunk(void *ctx, const char *line, size_t len) {
     if (cdc != nullptr) cdc->Send(line, len);
 }
 
+// A synchronous drain of the transport's TX buffer. The router calls this only
+// where it must reach the host before the poll loop stops (the reboot ack).
+void RouterTxFlushThunk(void *ctx) {
+    UsbCdc *cdc = static_cast<UsbCdc *>(ctx);
+    if (cdc != nullptr) cdc->ServiceTx();
+}
+
 }  // namespace
 
 void LinkBind(CommandRouter &router, UsbCdc &cdc, UsbCdc::RawWrite raw, void *raw_ctx) {
     // The router's OUTBOUND sink goes straight to the transport. Binding it via
     // the router's own context (not the CDC's) keeps `Send` called on THIS `cdc`.
     router.SetSink(&RouterOutSinkThunk, &cdc);
+    // ...and its synchronous flush, so a reply that must beat a reset can.
+    router.SetTxFlush(&RouterTxFlushThunk, &cdc);
     // The transport's INBOUND sink goes to the router. Two different thunks, two
     // different contexts: neither direction can be mistaken for the other.
     cdc.Init(raw, raw_ctx, &RouterSinkThunk, &router);

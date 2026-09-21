@@ -38,6 +38,22 @@ public:
 
     void SetSink(FrameSink sink, void *ctx);
 
+    /*
+     * A synchronous TX flush, for the one reply that must leave BEFORE the device
+     * stops servicing the poll loop: the reboot ack.
+     *
+     * `Emit` only QUEUES into the transport; `UsbCdc::ServiceTx` -- the thing that
+     * actually writes bytes to the USB FIFO -- runs on the poll loop, and
+     * `HandleReboot` calls `hal_->reboot()` in the same call. So on the device
+     * path nothing between the `Emit` and the reset ever drains the buffer, and
+     * the ack is lost with the reset: the app cannot tell a successful reboot from
+     * a dropped link, which is the exact outcome the ordering exists to prevent.
+     * A host test could not see it because its capture sink records at `Emit`
+     * time. Measured 2026-09-22: at `reboot()`, 0 bytes had reached the transport.
+     */
+    using TxFlush = void (*)(void *ctx);
+    void SetTxFlush(TxFlush flush, void *ctx);
+
     // Feed one frame, WITHOUT its trailing newline.
     void OnLine(const char *line, size_t len);
 
@@ -156,6 +172,8 @@ private:
     ConfigStore       *store_;
     FrameSink          sink_ = nullptr;
     void              *sink_ctx_ = nullptr;
+    TxFlush            tx_flush_ = nullptr;
+    void              *tx_flush_ctx_ = nullptr;
 
     uint32_t seq_sent_ = 0;
     // The next `seq` we expect from the peer. Per-sender monotonic (spec 4.2),

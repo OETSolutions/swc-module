@@ -24,6 +24,29 @@ private:
 };
 }  // namespace
 
+TEST(ServoLoop, TheStepUsesTheModesOwnGainNotTheTrackingFigure) {
+    // The step must convert a sense-pin error to codes with the ACTIVE mode's
+    // gain. One code moves the sense pin ~0.733 mV in amplified mode (1.82) and
+    // ~0.403 mV in tracking mode (1.00) -- so `codes_per_mV` is 1.82x smaller in
+    // amplified. Using the tracking figure in amplified mode over-corrects by
+    // 1.82x. The shipped `max_step_codes` of 8 masks this (every error past the
+    // deadband saturates it), so this test raises the cap to expose the
+    // arithmetic -- which is what a hardware-gain retune will do.
+    ServoConfig wide = ServoConfigEnabledForTest();
+    wide.max_step_codes = 100000;
+    wide.max_total_codes = 100000;
+    ServoLoop loop(wide);
+    loop.Target(GainMode::kAmplified, 4000);   // sense target = 2000
+    const uint16_t before = loop.Code();
+    loop.Update(1900);                          // error = +100 mV at the sense pin
+    const int moved = static_cast<int>(loop.Code()) - static_cast<int>(before);
+    // Correct: 100 mV x 2 x 4096 x 1000 / (1820 x 3300) = ~136 codes.
+    // The old (tracking-gain) figure gives ~248.
+    EXPECT_NEAR(moved, 136, 2)
+        << "the step must use the amplified-mode gain; the tracking figure "
+           "over-corrects by 1.82x and rings";
+}
+
 TEST(ServoLoop, CorrectsAThreePercentGainErrorWithinTheCodeBudget) {
     Plant plant(1030);
     ServoLoop loop(ServoConfigEnabledForTest());

@@ -73,6 +73,31 @@ TEST(LearnSession, TooFewSamplesIsRejectedNotAcceptedFromOneReading) {
     EXPECT_EQ(s.Commit(&out), LearnReject::kTooFewSamples);
 }
 
+TEST(LearnSession, TheNoiseGateIsAPermilleOfIdleNotAnAbsoluteMillivolt) {
+    // Spec 6.3: the ladder is a divider off +3V3, so a "clean" hold's spread
+    // scales with the rail. An absolute (mV) gate gives different answers at
+    // different rails for the same PROPORTIONAL wobble.
+    const auto commit_with = [](int idle, int lo) {
+        LearnSession s;
+        s.Start(LadderProfile{});
+        uint64_t t = 1000;
+        for (int i = 0; i < 30; ++i) {
+            s.AddSample((i % 2) ? lo : idle - 1, idle, kRailMv, kTempTenths, t);
+            t += 10;
+        }
+        LadderButton out{};
+        return s.Commit(&out);
+    };
+    // ~53 permille of wobble: accepted at a low and a high idle alike.
+    EXPECT_EQ(commit_with(2400, 2272), LearnReject::kNone);
+    EXPECT_EQ(commit_with(2800, 2651), LearnReject::kNone);
+    // ~66 permille at a LOW idle, i.e. only 159 mV: too noisy. An absolute 170 mV
+    // gate ACCEPTS this, which is the defect -- the same relative wobble would be
+    // rejected at a high rail and accepted here.
+    EXPECT_EQ(commit_with(2400, 2240), LearnReject::kTooNoisy)
+        << "the noise gate must reject on the ratio, not an absolute millivolt";
+}
+
 TEST(LearnSession, ANoisyLevelIsRejectedWithTheNoiseReason) {
     LearnSession s;
     s.Start(LadderProfile{});

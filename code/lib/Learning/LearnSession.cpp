@@ -16,10 +16,14 @@ constexpr uint64_t kMinSpanMs   = 100;
 // so a sample exceeding it is a wiring or calibration fault, not a level.
 constexpr int kAdcCeilingMv = 2900;
 
-// ~60 permille at a 2835 mV idle. Wider than the classification tolerance on
-// purpose: this gate rejects a learn the classifier could not serve, not one
-// that is merely imperfect.
-constexpr int kNoiseLimitMv = 170;
+// The learn's noise gate, as a permille of the idle reference -- NOT an absolute
+// millivolt figure. The spread a "clean" hold produces scales with the rail (the
+// ladder is a divider off +3V3, spec 6.3), so an absolute threshold is stricter
+// at a high rail and looser at a low one. 60 permille is ~170 mV at the 2835 mV
+// nominal idle, which is what the earlier absolute constant encoded; making it
+// permille keeps that behaviour at nominal and rail-invariant everywhere else,
+// matching how `LadderRatioPermille` already normalizes.
+constexpr int kNoiseLimitPermille = 60;
 
 // How close to the idle reference still counts as "not pressed", in permille.
 constexpr int kIdleMarginPermille = 20;
@@ -124,7 +128,9 @@ LearnReject LearnSession::Commit(LadderButton *out) {
         return LearnReject::kAtIdle;
     }
 
-    if (spread_mv > kNoiseLimitMv) return LearnReject::kTooNoisy;
+    if (LadderRatioPermille(spread_mv, idle) > kNoiseLimitPermille) {
+        return LearnReject::kTooNoisy;
+    }
 
     // Too close to something already learned: every reading in the overlap is
     // equally close to both, so the classifier could not choose.
@@ -165,7 +171,7 @@ LearnReject LearnSession::Commit(LadderButton *out) {
     // corrupt config. `Save` does not validate, which is what makes that reachable.
     //
     // Reachable in practice: the tolerance FLOOR above runs after the cap, so a
-    // noisy learn (spread just under kNoiseLimitMv) can push the window past
+    // noisy learn (spread just under kNoiseLimitPermille) can push the window past
     // kMaxToleranceMv and into its neighbour. The gate below the "too close" check
     // asks the same question of the MEAN; this one asks it of the WINDOW, which is
     // what the validator compares.

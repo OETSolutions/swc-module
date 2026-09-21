@@ -127,3 +127,25 @@ TEST(ImageVerify, SemverTreatsEqualVersionsAsEqualAndMissingPartsAsZero) {
     EXPECT_EQ(SemverCompare("1.2.0", "1.2"), 0);
     EXPECT_EQ(SemverCompare("1", "1.0.0"), 0);
 }
+
+TEST(ImageVerify, SemverOrdersPrereleasesBelowTheirRelease) {
+    // semver 2.0.0 rule 11. Without this, "1.3.0-rc1" compared EQUAL to "1.3.0",
+    // so a device running the release candidate was never offered the final
+    // release -- a silent no-upgrade, the same shape as the lexicographic bug
+    // above but one field over.
+    EXPECT_LT(SemverCompare("1.3.0-rc1", "1.3.0"), 0);
+    EXPECT_GT(SemverCompare("1.3.0", "1.3.0-rc1"), 0);
+    EXPECT_LT(SemverCompare("1.3.0-alpha", "1.3.0-beta"), 0);
+    EXPECT_LT(SemverCompare("1.3.0-alpha.1", "1.3.0-alpha.2"), 0);
+    EXPECT_LT(SemverCompare("1.3.0-alpha", "1.3.0-alpha.1"), 0)
+        << "fewer identifiers sorts lower";
+    // Numeric identifiers compare numerically and sort below alphanumeric.
+    EXPECT_LT(SemverCompare("1.3.0-2", "1.3.0-10"), 0);
+    EXPECT_LT(SemverCompare("1.3.0-1", "1.3.0-abc"), 0);
+    EXPECT_EQ(SemverCompare("1.3.0-01", "1.3.0-1"), 0) << "leading zeros compare equal";
+    // Build metadata is ignored for precedence (rule 10).
+    EXPECT_EQ(SemverCompare("1.3.0+build5", "1.3.0"), 0);
+    EXPECT_EQ(SemverCompare("1.3.0+build5", "1.3.0+build9"), 0);
+    // A numeric gap still dominates the suffix: 1.4.0-beta is newer than 1.3.0.
+    EXPECT_GT(SemverCompare("1.4.0-beta", "1.3.0"), 0);
+}

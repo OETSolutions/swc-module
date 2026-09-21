@@ -40,9 +40,31 @@ bool ServoLoop::Update(int measured_sense_mv) {
     }
     settled_samples_ = 0;
 
-    // One code is roughly kDacFullScaleMv/4096 = 0.8mV at the DAC, so 0.4mV at
-    // the sense pin in amplified mode. Convert the error to codes, then clamp.
-    int delta = (error_mv * 4096) / (kDacFullScaleMv / 2);
+    // Convert the SENSE-pin error to DAC codes. One code moves the KEY line by
+    // `gain * (kDacFullScaleMv / 4096)` mV, and the sense divider halves that, so
+    // in amplified mode (gain 1.82) the sense pin moves ~0.733 mV per code --
+    // NOT the 0.4 mV an earlier revision assumed, which is the TRACKING-mode
+    // figure (gain 1.00). Using the tracking figure made the computed step ~1.82x
+    // too large.
+    //
+    // That error is currently MASKED by the shipped tuning -- `max_step_codes` is
+    // 8, which every error past the 20 mV deadband already saturates, so the loop
+    // behaves identically either way. It would bite the moment the step cap is
+    // raised while the gain is measured on hardware (spec 6.5): a step 1.82x too
+    // large puts the loop gain near unity, where the correction overshoots and
+    // rings instead of converging. Fixed while the arithmetic is being read.
+    //
+    // `gain_milli` is the exact ratio, never a rounded decimal (spec 6.2): 1820
+    // for amplified, 1000 for tracking. Tracking returns above, but the formula
+    // is written for both so the two cannot drift apart.
+    const int gain_milli =
+        (mode_ == GainMode::kTracking) ? 1000 : ((kGainR58 + kGainR61) * 1000 / kGainR61);
+    // codes per mV of sense error, x1000 to keep it integer:
+    //   2 * 4096 * 1e6 / (gain_milli * kDacFullScaleMv)
+    const long long codes_per_sense_mv_milli =
+        (2LL * (kDacMaxCode + 1) * 1000000LL) / (gain_milli * kDacFullScaleMv);
+    int delta = static_cast<int>((static_cast<long long>(error_mv) *
+                                  codes_per_sense_mv_milli) / 1000);
     if (delta > cfg_.max_step_codes) delta = cfg_.max_step_codes;
     if (delta < -cfg_.max_step_codes) delta = -cfg_.max_step_codes;
 

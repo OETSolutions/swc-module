@@ -1194,8 +1194,18 @@ dynamic range. Therefore:
 button pressed** — the single most important measured number in the system, and
 exactly what the 2022 design never did.
 
-**Gain mode is re-evaluated, not latched:** on head-unit power change
+**Gain mode should be re-evaluated, not latched:** on head-unit power change
 (`/VBUS_VALID` transitions, rail changes) and periodically while idle.
+
+> **v1 LATCHES it, deliberately — see N-20.** `gain_mode_` is resolved once in
+> `EstablishSafeIdle` and not re-derived, so the sentence above describes the
+> target rather than this build. A runtime re-selection needs a debounce on
+> `ADC_CH_KEY_SENSE1` first, because a press's own transient on that pin would
+> otherwise re-select gain mid-key, and choosing that debounce is a measurement
+> on the real ladder. The safety posture is unaffected: the initial selection is
+> the conservative one (1.82 unless the line measures below 2.6 V), and latching
+> cannot move a channel toward the dangerous over-range direction.
+
 
 **Command targets must stay inside `[min_ladder, V_KEY_idle − 0.20 V]`** so the
 sink FET is never asked to drive above the line's own resting level — above that

@@ -1233,3 +1233,59 @@ TEST(CommandRouter, StatusGainModeReflectsTheOrchestratorsResolvedMode) {
         << "the frame must report the mode the device actually resolved; got: "
         << cap.lines.back();
 }
+
+// --- config_patch value bounds (spec 4.3: a patch is one field) --------------
+
+TEST(CommandRouter, AConfigPatchRefusesAValueTheCodecWouldRefuse) {
+    // The handler cast a peer double straight to uint8_t/uint32_t. Measured before
+    // the fix: `buzzer_level = 259` persisted as 3, and `send_duration_ms = 1e10`
+    // persisted as 4294967295 -- a ~49-DAY KEY-line hold. `ConfigValidate` only
+    // checks these are nonzero and internally ordered, so it accepted all of them;
+    // the codec's ReadU32/ReadU8 are the rule, and this path had no equivalent.
+    struct Case { const char *path; const char *value; };
+    const Case cases[] = {
+        {"settings.buzzer_level", "259"},              // wraps into 0..3
+        {"settings.led_level", "256"},
+        {"settings.timings.long_press_ms", "1e19"},    // > UINT32_MAX
+        {"settings.timings.send_duration_ms", "1e10"},
+        {"settings.timings.debounce_ms", "-5"},
+        {"settings.timings.debounce_ms", "2.7"},       // fractional ms
+    };
+    for (const Case &c : cases) {
+        MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+        ASSERT_TRUE(store.Save(MockHalDefaultsConfig()));
+        CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+        cap.Attach(r);
+        const std::string patch = std::string("{\"v\":1,\"seq\":1,\"type\":\"config_patch\",\"path\":\"") +
+                                  c.path + "\",\"value\":" + c.value + "}";
+        r.OnLine(patch.c_str(), patch.size());
+        EXPECT_TRUE(HasType(cap, "nack")) << c.path << "=" << c.value << " must be refused";
+        EXPECT_FALSE(HasType(cap, "ack")) << c.path << "=" << c.value << " must not be acked";
+
+        // And the stored config is untouched: the hostile value did not land.
+        Config out{};
+        ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+        EXPECT_EQ(out.settings.timings.send_duration_ms, 200u)
+            << "a refused patch must not have written a wrapped value";
+        EXPECT_EQ(out.settings.buzzer_level, 2u);
+    }
+}
+
+TEST(CommandRouter, AConfigPatchStillAcceptsAnInRangeValueAtTheBoundary) {
+    // The bound must not be so tight it refuses a legal value: 0xFF for a level
+    // and UINT32_MAX for a timing are both IN range for the conversion (whether
+    // they are semantically sane is ConfigValidate's call, and it refuses what it
+    // should -- the point here is that the RANGE check does not over-reject).
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(MockHalDefaultsConfig()));
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string patch =
+        "{\"v\":1,\"seq\":1,\"type\":\"config_patch\",\"path\":"
+        "\"settings.timings.long_press_ms\",\"value\":900}";
+    r.OnLine(patch.c_str(), patch.size());
+    ASSERT_TRUE(HasType(cap, "ack"));
+    Config out{};
+    ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+    EXPECT_EQ(out.settings.timings.long_press_ms, 900u);
+}

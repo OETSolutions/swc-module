@@ -38,6 +38,30 @@ const cJSON *Str(const cJSON *root, const char *name) {
     return (cJSON_IsString(v) && v->valuestring != nullptr) ? v : nullptr;
 }
 
+// A peer-supplied number, converted to an integer ONLY after proving it is in
+// range. A bare `static_cast` is not a conversion safety net: it truncates a
+// fraction, wraps a value past the width, and (for a value past the target's
+// range) is undefined behavior. Measured on `config_patch`: `buzzer_level = 259`
+// became 3 and `send_duration_ms = 1e10` became 4294967295.
+//
+// These mirror `ReadU32`/`ReadU8` in ConfigCodec, which refuse the same values --
+// one rule for "is this number legal", so a patch and a chunked config_set cannot
+// disagree about the config they produce. Fractions are REFUSED rather than
+// rounded, because a millisecond count of 2.7 is a caller bug, not 2 ms.
+bool NumToU32(const double v, uint32_t *out) {
+    if (v < 0.0 || v > 4294967295.0) return false;
+    if (v != static_cast<double>(static_cast<uint32_t>(v))) return false;   // fractional
+    *out = static_cast<uint32_t>(v);
+    return true;
+}
+
+bool NumToU8(const double v, uint8_t *out) {
+    if (v < 0.0 || v > 255.0) return false;
+    if (v != static_cast<double>(static_cast<uint8_t>(v))) return false;
+    *out = static_cast<uint8_t>(v);
+    return true;
+}
+
 }  // namespace
 
 CommandRouter::CommandRouter(IHAL *hal, SystemOrchestrator *sys, ConfigStore *store)
@@ -558,26 +582,46 @@ void CommandRouter::HandleConfigPatch(const cJSON *root, uint32_t for_seq) {
     }
     if (lr == ConfigLoadResult::kNoConfig) c = ConfigDefault();
 
+    // BOUNDED before the cast, exactly as the config codec's `ReadU32`/`ReadU8`
+    // are. A raw `static_cast` is not a range check: measured before this fix,
+    // `buzzer_level = 259` persisted as 3 (259 & 0xFF), and
+    // `long_press_ms = 1e19` / `send_duration_ms = 1e10` both persisted as
+    // 4294967295 -- a ~49-DAY KEY-line hold, which is the phantom-key hazard
+    // FR-15/FR-39 exist to prevent. `ConfigValidate` only checks that these are
+    // NONZERO and internally ordered, so it accepts any of those. The codec
+    // refuses such a config on the way in; this path wrote it happily, so the two
+    // had two different answers to "what is a legal value".
     const double v = value->valuedouble;
-    bool applied = true;
+    // A path the patch vocabulary does not carry is its own error, distinct from
+    // a value out of range: "I do not know that field" and "that number is not
+    // legal" need different fixes, and the user is reading this in a log view.
+    bool known_path = true;
+    bool in_range = true;
     if (strcmp(path->valuestring, "settings.timings.debounce_ms") == 0) {
-        c.settings.timings.debounce_ms = static_cast<uint32_t>(v);
+        in_range = NumToU32(v, &c.settings.timings.debounce_ms);
     } else if (strcmp(path->valuestring, "settings.timings.double_press_off_ms") == 0) {
-        c.settings.timings.double_press_off_ms = static_cast<uint32_t>(v);
+        in_range = NumToU32(v, &c.settings.timings.double_press_off_ms);
     } else if (strcmp(path->valuestring, "settings.timings.long_press_ms") == 0) {
-        c.settings.timings.long_press_ms = static_cast<uint32_t>(v);
+        in_range = NumToU32(v, &c.settings.timings.long_press_ms);
     } else if (strcmp(path->valuestring, "settings.timings.send_duration_ms") == 0) {
-        c.settings.timings.send_duration_ms = static_cast<uint32_t>(v);
+        in_range = NumToU32(v, &c.settings.timings.send_duration_ms);
     } else if (strcmp(path->valuestring, "settings.buzzer_level") == 0) {
-        c.settings.buzzer_level = static_cast<uint8_t>(v);
+        in_range = NumToU8(v, &c.settings.buzzer_level);
     } else if (strcmp(path->valuestring, "settings.led_level") == 0) {
-        c.settings.led_level = static_cast<uint8_t>(v);
+        in_range = NumToU8(v, &c.settings.led_level);
     } else {
-        applied = false;
+        known_path = false;
     }
 
-    if (!applied) {
+    if (!known_path) {
         Nack(for_seq, "unknown_path", path->valuestring);
+        return;
+    }
+    if (!in_range) {
+        // Refused, not clamped: the codec refuses the same value on the way in, so
+        // a clamp here would make an app-written config decode differently from
+        // one written over the chunked run -- two answers to one question.
+        Nack(for_seq, "bad_value", path->valuestring);
         return;
     }
     // A patch that would make the config invalid is refused: the old config stays.

@@ -1,6 +1,5 @@
 package com.oetsolutions.swc.action
 
-import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
@@ -148,21 +147,6 @@ class ActionRunner(private val context: Context) {
             )
         } catch (e: Exception) {
             ActionOutcome.Blocked(e.message ?: e::class.java.simpleName)
-        }
-    }
-
-    /** Whether the target of a `KEYCODE` action resolves to anything that can take it. */
-    fun canHandle(kind: String, target: String, payload: String = ""): Boolean {
-        if (kind != "APP_LAUNCH" && kind != "APP_INTENT" && kind != "APP_RAW") return false
-        return if (kind == "APP_LAUNCH") {
-            context.packageManager.getLaunchIntentForPackage(target) != null
-        } else {
-            val intent = Intent(target)
-            if (payload.isNotEmpty()) intent.data = Uri.parse(payload)
-            // ComponentName is referenced so the resolved handler is a real
-            // component rather than a category-only match.
-            context.packageManager.queryIntentActivities(intent, 0)
-                .any { it.activityInfo?.let { ai -> ComponentName(ai.packageName, ai.name) } != null }
         }
     }
 }

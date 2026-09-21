@@ -236,6 +236,40 @@ resistor (`R23`–`R25`) and the same pull-up/clamp/filter, on IO4/IO5/IO6.
   recessed and a strapping pin it is reserved for recovery, not user gestures —
   the user-facing physical input is **AUX1** (§2.2, §7.5).
 
+#### 2.5.1 The MCP4728 write frame, and why `~LDAC` is never pulsed
+
+The DAC is driven by the **Multi-Write command** (DS22187E §5.6.2, Figure 5-8),
+chosen because its single channel-select field addresses exactly one output per
+transaction and, with `UDAC = 0`, that output updates on the transaction's final
+ACK — **no `~LDAC` pulse is required.** The frame is **three bytes**:
+
+| Byte | Bits | Meaning |
+| --- | --- | --- |
+| 0 | `0 1 0 0 0 DAC1 DAC0 UDAC` | command type `C2:C1:C0 = 010`, channel select, `UDAC` |
+| 1 | `VREF PD1 PD0 Gx D11 D10 D9 D8` | reference, **power-down** (`PD1:PD0`), gain, code high nibble |
+| 2 | `D7 … D0` | code low byte |
+
+`VREF = 0` (VDD reference) and `Gx = 0` (×1) always; the gain mode lives entirely
+in `PD1:PD0`, per §2.3. The bytes are built by `DacFrame::EncodeSet`
+(`lib/HAL/DacFrame.h`) rather than inline in `EspHal.cpp`, **because `EspHal` is
+the one `lib/` file the host build excludes** — a byte layout written inside it
+is checked by no test. An earlier revision made exactly that mistake and emitted
+a **four-byte** frame (an MCP4725-shaped one, command in its own byte, `PD1:PD0`
+at bits 5:4), so on the wire the device read the channel-select byte as the
+command byte and never addressed channels B/C/D: **no output was ever written.**
+Found 2026-09-22; the host `DacFrameTest` now pins every byte to Figure 5-8.
+
+**`~LDAC` (IO48) is therefore never asserted by the firmware.** It is configured
+as an output and held HIGH at boot (so the `R13` 10 kΩ pulldown cannot latch at
+an arbitrary time during start-up), and the `dac_ldac` HAL member exists for the
+deferred-latch path — but with `UDAC = 0` on every write, each output latches on
+its own ACK and no pulse is needed. `~LDAC` additionally has a *required*
+High→Low transition mid-frame to programme the I²C address bits (§5.6.7), which
+this design does not do: the address is the strap default `0x60` (§12.1, N-4).
+Deferring the latch to a shared `~LDAC` pulse is explicitly rejected in §2.3
+consequence 1 — it would apply both channels' new values at one instant and
+destroy the intermediate state the servo depends on.
+
 ---
 
 ## 3. The data model
@@ -2575,8 +2609,10 @@ eyeballed. Nothing later is trusted until the step before it passed.
    absence of PSRAM the build assumed. *If this disagrees with the board JSON,
    stop and fix the board definition — every later measurement is void.*
 2. **I²C and the DAC.** Scan the bus, find the MCP4728 at its strap address,
-   write a mid-code, measure with a meter. Confirms §2.5's wiring and that
-   `LDAC` behaves.
+   write a mid-code, measure with a meter. Confirms §2.5's wiring and that the
+   code **latches on the frame's own ACK** — `UDAC = 0`, so no `~LDAC` pulse is
+   asserted (§2.5.1), and a mid-code that appears at the pin proves both the
+   three-byte frame and the latch behaviour on real silicon.
 3. **The ADC ladder — and the `R15`/`R16` decision.** With a resistor ladder in
    place, sweep the **+3V3 rail 3.14 → 3.47 V** and record the idle and
    per-button readings. **Fit the real calibration here** — this is where the

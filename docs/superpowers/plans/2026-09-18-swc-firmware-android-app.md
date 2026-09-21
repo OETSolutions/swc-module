@@ -6268,8 +6268,13 @@ Key requirements, each a specific ESP-IDF choice:
   *This is the only consumer of Task 4.* Without this wiring `CalibrationCurve`
   is dead code and the spec's mandatory-fallback requirement is unimplemented.
 - **DAC:** `i2c_master` on `SWC_PIN_I2C_SDA`/`SCL` at 400 kHz. The MCP4728 write
-  sequence is the multi-write command (0x40) so code and power-down mode land
-  together; `LDAC` is asserted via `SWC_PIN_DAC_LDAC_B` after the write.
+  sequence is the **Multi-Write** command (`C2:C1:C0 = 010`) so code and
+  power-down mode land together. The frame is **three bytes** (DS22187E
+  Figure 5-8) and is built by `DacFrame::EncodeSet` in `lib/HAL/DacFrame.h` —
+  host-testable, because `EspHal.cpp` is excluded from the host build.
+  `~LDAC` is **not** pulsed: `UDAC = 0` latches the addressed channel on the
+  frame's final ACK (spec §2.5.1), and `SWC_PIN_DAC_LDAC_B` is merely held HIGH
+  so the `R13` pulldown cannot latch at boot.
 - **`now_ms`/`now_us`:** `esp_timer_get_time() / 1000` and its microsecond form.
   Using one time source for both is what keeps the host tests' semantics
   identical on device.
@@ -9138,8 +9143,10 @@ reality disagrees.
   measurement is void until the board definition is fixed (spec §12.1, N-1).
   Record the measured idle current.
 - [ ] **Step 2: I2C and the DAC.** Scan the bus, record the MCP4728's actual strap
-  address (spec §12.1, N-4). Write mid-code, measure with a meter, confirm
-  `LDAC` latches.
+  address (spec §12.1, N-4). Write mid-code, measure with a meter, confirm the
+  code **latches on the frame's own ACK** with `~LDAC` never pulsed
+  (`UDAC = 0`; spec §2.5.1) — a mid-code at the pin is what proves the
+  three-byte frame on real silicon.
 - [ ] **Step 3: The ADC ladder — and the R15/R16 decision.** With a resistor
   ladder attached, **sweep the +3V3 rail 3.14 → 3.47 V** and record the idle and
   per-button readings. **Do NOT sweep a 12 V vehicle rail** — no vehicle-rail

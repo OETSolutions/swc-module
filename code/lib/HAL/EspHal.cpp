@@ -16,6 +16,7 @@
 
 #include "Analog/CalibrationCurve.h"
 #include "HAL/PinMap.h"
+#include "HAL/DacFrame.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
@@ -142,27 +143,21 @@ static void HalDacSetCode(void *ctx, DacChannel ch, uint16_t code)
 
     // Which MCP4728 output: A=KEY1, B=ADJ1, C=KEY2, D=ADJ2 (DESIGN.md 4.3).
     uint8_t dac_sel;
-    switch (ch) {
-        case DAC_CH_KEY1: dac_sel = SWC_MCP4728_MW_DAC0; break;
-        case DAC_CH_ADJ1: dac_sel = SWC_MCP4728_MW_DAC1; break;
-        case DAC_CH_KEY2: dac_sel = SWC_MCP4728_MW_DAC2; break;
-        case DAC_CH_ADJ2: dac_sel = SWC_MCP4728_MW_DAC3; break;
-        default: return;
-    }
+    if (!DacFrame::SelectForChannel(ch, &dac_sel)) return;
 
-    // Sequenced multi-write, one channel: [cmd] [DAC sel | UDAC] [hi] [lo]
+    // Multi-write, one channel: THREE bytes, with the command type, the channel
+    // select and UDAC packed into byte 0 (DS22187E Figure 5-8). DacFrame.h owns
+    // the field layout AND the reason it is host-testable rather than inline
+    // here -- EspHal is the one file the host build excludes, so a byte layout
+    // written inline is checked by nothing.
     //
-    // UDAC is CLEAR (latched immediately) rather than deferred to ~LDAC. The
-    // spec's gain-mode switch depends on a power-down mode being in effect
-    // *while* the signal code is written (spec 2.3): with a deferred latch, a
-    // later ~LDAC pulse would apply both channels' new values at one instant and
-    // the intermediate state is the one the servo sees. Writing through keeps
-    // the two independent, which is what dac_power_mode's separate call implies.
-    uint8_t frame[4];
-    frame[0] = SWC_MCP4728_CMD_MULTI_WRITE;
-    frame[1] = (uint8_t)(dac_sel & ~SWC_MCP4728_MW_UDAC);
-    frame[2] = (uint8_t)((code >> 8) & 0x0F);
-    frame[3] = (uint8_t)(code & 0xFF);
+    // UDAC is CLEAR (0), so the addressed channel's output updates on the final
+    // ACK with no ~LDAC pulse. That matters for the gain switch: spec 2.3 wants
+    // a power-down mode in effect *while* the signal code is written, and a
+    // deferred latch would apply both channels' new values at one instant.
+    uint8_t frame[DacFrame::kSize];
+    DacFrame::EncodeSet(frame, dac_sel, 0 /* VREF = VDD */, 0 /* normal power */,
+                        0 /* gain x1 */, code);
 
     // NO RETRY. An earlier version of this comment said "the driver retries
     // internally on a bus fault" -- it does not. `i2c_master_transmit` is one
@@ -184,33 +179,21 @@ static void HalDacPowerMode(void *ctx, DacChannel ch, DacPowerMode mode)
     if (g_state.dac == NULL) return;
 
     uint8_t dac_sel;
-    switch (ch) {
-        case DAC_CH_KEY1: dac_sel = SWC_MCP4728_MW_DAC0; break;
-        case DAC_CH_ADJ1: dac_sel = SWC_MCP4728_MW_DAC1; break;
-        case DAC_CH_KEY2: dac_sel = SWC_MCP4728_MW_DAC2; break;
-        case DAC_CH_ADJ2: dac_sel = SWC_MCP4728_MW_DAC3; break;
-        default: return;
-    }
+    if (!DacFrame::SelectForChannel(ch, &dac_sel)) return;
 
-    // PD1:PD0 in bits 5:4 of the high data byte. The MCP4728 has NO
-    // high-impedance state -- every mode is a pull-DOWN (spec 2.3), which is why
-    // "release" is a high command rather than a disconnected output.
-    uint8_t pd;
-    switch (mode) {
-        case DAC_POWER_NORMAL:  pd = 0x0; break;
-        case DAC_POWER_GND_1K:  pd = 0x1; break;
-        case DAC_POWER_GND_100K: pd = 0x2; break;
-        case DAC_POWER_GND_500K: pd = 0x3; break;
-        default:               pd = 0x0; break;
-    }
-
-    uint8_t frame[4];
-    frame[0] = SWC_MCP4728_CMD_MULTI_WRITE;
-    frame[1] = (uint8_t)(dac_sel & ~SWC_MCP4728_MW_UDAC);
     // Power-down replaces the top data bits, so the code field is 12 bits and
-    // the PD bits sit above them in the high byte.
-    frame[2] = (uint8_t)(pd << 4);
-    frame[3] = 0x00;
+    // PD1:PD0 sits above them in byte 1 (DacFrame::EncodeSet). The MCP4728 has
+    // NO high-impedance state -- every mode is a pull-DOWN (spec 2.3), which is
+    // why "release" is a high command rather than a disconnected output.
+    //
+    // The 12-bit code is written as 0: a power-mode write is a mode change, not
+    // a code change, and the channel's stored code is re-driven on the next
+    // code write. Keeping the two independent is exactly why they are separate
+    // IHAL members.
+    uint8_t frame[DacFrame::kSize];
+    DacFrame::EncodeSet(frame, dac_sel, 0 /* VREF = VDD */,
+                        DacFrame::PowerDownCode(mode), 0 /* gain x1 */,
+                        0 /* code field */);
 
     esp_err_t err = i2c_master_transmit(g_state.dac, frame, sizeof(frame), 100);
     if (err != ESP_OK) {

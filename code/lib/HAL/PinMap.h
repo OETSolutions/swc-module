@@ -37,24 +37,14 @@
 // address read off the bus; if it differs, change it HERE and nowhere else.
 #define SWC_MCP4728_ADDR   0x60
 
-// MCP4728 command bytes (datasheet DS22187).
-//   0x40  Multi-Write: writes DAC input registers AND EEPROM for the addressed
-//         channels in one transaction. Using it is what makes a code and its
-//         power-down mode land TOGETHER -- the power-down mode IS the gain mode
-//         here (spec 2.3), so a write that split them would momentarily drive
-//         the output at the wrong gain.
-//   0x60  Write DAC Register: input registers only, no EEPROM.
-//   0x58  Write DAC Input Register (no EEPROM), for a single channel.
-#define SWC_MCP4728_CMD_MULTI_WRITE 0x40
-#define SWC_MCP4728_CMD_WRITE_DAC   0x60
-
-// Sequenced multi-write control bits. The low byte of the command is
-// DAC1:DAC0 (which channel pair this transaction addresses) ORed with these.
-#define SWC_MCP4728_MW_DAC0 0x00   /* channel A */
-#define SWC_MCP4728_MW_DAC1 0x01   /* channel B */
-#define SWC_MCP4728_MW_DAC2 0x02   /* channel C */
-#define SWC_MCP4728_MW_DAC3 0x03   /* channel D */
-#define SWC_MCP4728_MW_UDAC 0x08   /* 1 = do not latch to output until ~LDAC */
+// MCP4728 I2C address (datasheet DS22187E).
+//   The Multi-Write *frame bytes* are NOT here. They are built by
+//   DacFrame::EncodeSet in DacFrame.h, which is host-testable -- EspHal.cpp is
+//   the one lib/ file the host build excludes, so a byte layout written inline
+//   in it is checked by no test. An earlier revision kept the command constants
+//   here, wrote a FOUR-byte frame inline, and shipped a DAC that was never
+//   addressed at all. See DacFrame.h's header comment.
+#define SWC_MCP4728_ADDR   0x60
 
 // ADC attenuation. 12 dB is the only setting whose calibrated ceiling is 2.9 V
 // (spec 2.1); the 11 dB setting is NOT a substitute for it and the S3 has no

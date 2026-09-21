@@ -38,6 +38,7 @@ class BindingScreenTest {
     val rule = createComposeRule()
 
     private fun cell(action: Action? = null) = BindingCell(
+        channel = com.oetsolutions.swc.model.BindingChannel.SWC1,
         buttonId = "vol_up",
         buttonName = "Volume Up",
         gesture = "SINGLE",

@@ -334,29 +334,37 @@ class AppViewModel(
             // channel index), so anything else matches nothing but `ANY`.
             else -> null
         }
-        val bindings = client.config.value.bindings.filter {
+        // ONLY THE FIRST matching binding, mirroring `BindingResolve`, which
+        // returns the first match and stops. Running EVERY match fires app-side
+        // actions the device never resolved: with an `ANY` wildcard and a
+        // channel-specific binding on the same triple (`vol_up` SINGLE on both is
+        // the common case), the app would launch TWO apps for one press while the
+        // device acted on one binding. The app's half of spec 3.6 must fire the
+        // same binding the device did, not more of them.
+        val binding = client.config.value.bindings.firstOrNull {
             it.enabled && it.button == buttonId && it.gesture == gesture &&
                 (it.channel == BindingChannel.ANY || (asSwc != null && it.channel == asSwc))
-        }
-        if (bindings.isEmpty()) return
+        } ?: return
 
+        // EVERY action in that binding, not just the first. Spec 3.5 makes the
+        // list ordered and best-effort, and the product's core case is one binding
+        // with "the factory key press AND tell the app" -- the firmware runs the
+        // `OUT_` half, the app runs the rest. Skipping a kind the firmware owns is
+        // what makes those the firmware's rather than a second, competing
+        // implementation.
         val outcomes = mutableListOf<String>()
-        for (binding in bindings) {
-            for (action in binding.actions) {
-                val outcome = when (action.kind.wireName) {
-                    "OUT_VOLTAGE", "OUT_RELEASE", "NONE", "BUZZ" ->
-                        // The firmware's half of spec 3.6. It has already done it.
-                        //
-                        // BUZZ is included because the firmware executes it: spec
-                        // 3.6 puts it in the firmware's column, and it plays the
-                        // named §7.2 pattern (replacing the default KEY_ACCEPTED).
-                        // Skipping it here is what makes it the firmware's action
-                        // rather than a second, competing implementation.
-                        null
-                    else -> runOne(action)
-                }
-                if (outcome != null) outcomes += "$buttonId $gestureName: $outcome"
+        for (action in binding.actions) {
+            val outcome = when (action.kind.wireName) {
+                "OUT_VOLTAGE", "OUT_RELEASE", "NONE", "BUZZ" ->
+                    // The firmware's half of spec 3.6. It has already done it.
+                    //
+                    // BUZZ is included because the firmware executes it: spec 3.6
+                    // puts it in the firmware's column, and it plays the named
+                    // §7.2 pattern (replacing the default KEY_ACCEPTED).
+                    null
+                else -> runOne(action)
             }
+            if (outcome != null) outcomes += "$buttonId $gestureName: $outcome"
         }
         _actionOutcomes.value = outcomes
     }
@@ -402,34 +410,90 @@ class AppViewModel(
     }
 
     /**
-     * One cell per button×gesture, with the config's own binding for that pair.
+     * One cell per (channel, button, gesture), with the config's own binding for
+     * that triple.
      *
-     * The GESTURE list is the protocol's four, not the three the plan's example
-     * used: NONE exists on the wire (spec 3.6) and a grid that cannot express it
-     * could not show a binding the device might hold.
+     * **Every channel that has a ladder gets its cells**, not just the first. The
+     * board is two-channel (FR-9) and the firmware binds per channel (spec 3.5,
+     * `BindingResolve`); a grid built from `channels.firstOrNull()` showed SWC2's
+     * bindings nowhere and could not edit them, and its channel-blind edit key
+     * (see [editKey]) then made an SWC1 edit delete SWC2's same-named binding.
      */
     private fun buildCells(config: Config): List<BindingCell> {
-        val channel = config.channels.firstOrNull() ?: return emptyList()
+        // The three GESTURES a user assigns by hand. `NONE` is a protocol value
+        // (spec 3.6) but it is not one a user performs: the firmware emits it for
+        // a press it could not classify, and such an event carries `button: null`
+        // (spec 4.3), so it can never resolve a binding -- `BindingResolve` refuses
+        // an event whose button index is past the ladder. There is therefore no
+        // behaviour a `NONE` cell could bind, and no cell is offered for it. A
+        // config carrying a `NONE` binding still round-trips untouched.
         val gestures = listOf(Gesture.SINGLE, Gesture.DOUBLE, Gesture.LONG)
-        return channel.ladder.buttons.flatMap { b ->
-            gestures.map { g ->
-                val edit = pendingEdits["${b.id}/${g.wireName}"]
-                BindingCell(
-                    buttonId = b.id,
-                    buttonName = b.name.ifEmpty { b.id },
-                    gesture = g.wireName,
-                    action = if (pendingEdits.containsKey("${b.id}/${g.wireName}")) edit
-                    else config.bindings
-                        .firstOrNull { it.button == b.id && it.gesture == g }
-                        ?.actions?.firstOrNull(),
-                )
+        return config.channels.flatMapIndexed { index, channel ->
+            val asSwc = swcChannel(index) ?: return@flatMapIndexed emptyList()
+            channel.ladder.buttons.flatMap { b ->
+                gestures.map { g ->
+                    val key = editKey(asSwc, b.id, g.wireName)
+                    val edit = pendingEdits[key]
+                    BindingCell(
+                        channel = asSwc,
+                        buttonId = b.id,
+                        buttonName = b.name.ifEmpty { b.id },
+                        gesture = g.wireName,
+                        action = if (pendingEdits.containsKey(key)) edit
+                        else resolvedBindingFor(config, asSwc, b.id, g)?.actions?.firstOrNull(),
+                    )
+                }
             }
         }
     }
 
+    /** The SWC channel a ladder index names, or null for an index with no ladder. */
+    private fun swcChannel(index: Int): BindingChannel? = when (index) {
+        0 -> BindingChannel.SWC1
+        1 -> BindingChannel.SWC2
+        else -> null
+    }
+
+    /**
+     * The binding the DEVICE would fire for (channel, button, gesture), if any.
+     *
+     * This mirrors `BindingResolve` rather than querying for an exact channel
+     * match, and the difference is the `ANY` wildcard: an `ANY` binding fires from
+     * EITHER channel, so a cell whose channel has no binding of its own but whose
+     * config holds an `ANY` one must show THAT binding -- the device would. A
+     * channel-exact lookup would draw the cell empty and let the user "bind" a
+     * gesture the device already acts on.
+     *
+     * The scan stops at the first match, exactly as the resolver does, so an `ANY`
+     * binding that appears EARLIER in the table wins -- see [withEdits] for why the
+     * ordering that makes this true is a correctness requirement, not a nicety.
+     */
+    private fun resolvedBindingFor(
+        config: Config,
+        channel: BindingChannel,
+        button: String,
+        gesture: Gesture,
+    ): com.oetsolutions.swc.model.Binding? = config.bindings.firstOrNull {
+        it.enabled && it.button == button && it.gesture == gesture &&
+            (it.channel == channel || it.channel == BindingChannel.ANY)
+    }
+
+    /**
+     * The identity of an edit: channel, button and gesture, all three.
+     *
+     * A binding is matched on all three (`BindingResolve`), so an edit must key on
+     * all three or it names a different triple than the one it replaces. Keying on
+     * `button/gesture` alone was a live data-loss defect: `vol_up` is on BOTH
+     * ladders (both wheels have volume), so an edit to SWC1's `vol_up` SINGLE
+     * produced the same key as SWC2's, and [withEdits] then dropped the device's
+     * SWC2 binding as "edited" -- deleting it in a save the user was told worked.
+     */
+    private fun editKey(channel: BindingChannel, button: String, gesture: String): String =
+        "${channel.wireName}/$button/$gesture"
+
     /** Record an edit locally. It is not sent until [save]. */
     fun editBinding(cell: BindingCell, action: Action?) {
-        pendingEdits["${cell.buttonId}/${cell.gesture}"] = action
+        pendingEdits[editKey(cell.channel, cell.buttonId, cell.gesture)] = action
         _bindings.value = _bindings.value.copy(cells = buildCells(client.config.value))
     }
 
@@ -467,39 +531,43 @@ class AppViewModel(
 
     private fun withEdits(config: Config): Config {
         if (config.channels.isEmpty()) return config
-        // Rebuild the binding list: keep every binding whose pair was NOT edited,
-        // then add one per edited pair that has an action.
+        // Rebuild the binding list: keep every binding whose TRIPLE was NOT edited,
+        // then add one per edited triple that has an action.
+        //
+        // The filter is channel-scoped for the same reason the edit key is: a
+        // binding is `(channel, button, gesture)`, so dropping by `button/gesture`
+        // alone removed an UNEDITED binding on the other channel whenever the two
+        // ladders shared a button id -- which is the normal case (`vol_up`).
         val kept = config.bindings.filter { b ->
-            !pendingEdits.containsKey("${b.button}/${b.gesture.wireName}")
+            !pendingEdits.containsKey(editKey(b.channel, b.button, b.gesture.wireName))
         }
         val added = pendingEdits.mapNotNull { (key, action) ->
-            val (button, gestureName) = key.split("/")
+            val parts = key.split("/")
+            if (parts.size != 3) return@mapNotNull null
+            val (channelName, button, gestureName) = parts
+            val channel = BindingChannel.fromWireName(channelName) ?: return@mapNotNull null
             val gesture = Gesture.fromWireName(gestureName) ?: return@mapNotNull null
             if (action == null || action.kind.wireName == "NONE") return@mapNotNull null
-            // A button that is on NO current ladder is a STALE edit: its key came
-            // from a grid built against an earlier config, and a later refresh (a
-            // `connect()` re-reads the config) can re-learn the button away. Emitting
-            // a binding for it anyway is worse than dropping it -- the firmware's
-            // `BindingNamesARealInput` refuses a binding that names no real input, and
-            // the app's `problems()` cannot catch it (it does not mirror that rule), so
-            // the WHOLE save would be nacked and the user's every valid edit lost
-            // behind the generic "device did not accept" message. The old code fell
-            // back to SWC1 here, which fabricates exactly that refused binding.
+            // The button must be on the LADDER THE EDIT'S CHANNEL names -- not
+            // merely on SOME ladder. `BindingResolve` looks the id up in
+            // `channels[channel_index].ladder`, so a binding whose channel's ladder
+            // does not hold the id is never found. Checking "on any ladder" would
+            // pass an SWC2 edit of a button that exists only on SWC1, and the
+            // firmware's `BindingNamesARealInput` would then refuse the whole
+            // config. `vol_up` is on BOTH ladders (the common case), so the check
+            // must be per-channel or it drops a legitimate second-channel edit.
             //
-            // Skipping is honest: a binding to a button that no longer exists on
-            // either channel cannot mean anything. (`buildCells` keys edits only by
-            // ladder button ids, so an AUX id never reaches here and this cannot drop
-            // a legitimate AUX binding.)
-            val channel = channelOfButton(config, button) ?: return@mapNotNull null
+            // A button that is on NO ladder the config still has is a STALE edit:
+            // its key came from a grid built against an earlier config, and a later
+            // refresh (a `connect()` re-reads) can re-learn the button away.
+            // Emitting a binding for it is worse than dropping it -- the firmware
+            // refuses it and the app's `problems()` cannot catch it (it does not
+            // mirror that rule), so the WHOLE save would be nacked and every valid
+            // edit lost behind "device did not accept". (An AUX id never reaches
+            // here: `buildCells` keys only ladder buttons.)
+            if (!buttonOnThatLadder(config, channel, button)) return@mapNotNull null
             com.oetsolutions.swc.model.Binding(
                 id = "${button}-${gestureName}",
-                // The channel comes from the BUTTON's OWN ladder, not from
-                // `config.bindings.firstOrNull()`. That read the channel of
-                // whichever binding happened to be first, so on a device whose
-                // first binding is SWC1 every newly authored SWC2 binding was
-                // written as SWC1 -- the firmware then resolves it only against
-                // channel 0, so the SWC2 button the user just programmed does
-                // nothing while SWC1's same-named button fires the SWC2 action.
                 channel = channel,
                 button = button,
                 gesture = gesture,
@@ -512,26 +580,36 @@ class AppViewModel(
         // independent -- trimming the list to `firstOrNull()` here would send
         // back a config whose SWC2 channel is gone, replacing the device's
         // learned second ladder with nothing on every save.
-        return config.copy(bindings = kept + added)
+        //
+        // The EDITS come FIRST, ahead of everything kept, because
+        // `BindingResolve` returns the FIRST match -- so a binding's POSITION is
+        // its precedence. An `ANY` binding fires from either channel (spec 3.5),
+        // and `kept` retains one; if it sat ahead of the edit it would win, and
+        // the channel-specific binding the user just made would be silently
+        // ineffective. Appending the edits puts the more specific binding ahead of
+        // the wildcard, which is the precedence the user expects from editing one
+        // channel's cell. (For the ordinary case -- no `ANY` binding for the
+        // triple -- `kept` holds nothing that could shadow the edit, so the order
+        // is immaterial; it matters only here.)
+        return config.copy(bindings = added + kept)
     }
 
     /**
-     * The channel a button id belongs to, by its ladder.
+     * Whether [buttonId] is on the ladder [channel] names.
      *
-     * Only SWC1/SWC2 have ladders, so those are the two ids this can return; an
-     * AUX button is a separate table and never appears in the bindings grid. A
-     * button on neither ladder (a stale edit whose ladder was re-learned away)
-     * returns null, and the caller falls back to SWC1 -- which is the same
-     * assumption the old code made unconditionally.
+     * Only SWC1/SWC2 have ladders, so those are the two channels this can answer
+     * for; an AUX button is a separate table (`cfg.aux`) and never appears in the
+     * bindings grid, so it never reaches here. A channel with no ladder (an index
+     * past the two, or AUX) answers false.
      */
-    private fun channelOfButton(config: Config, buttonId: String): com.oetsolutions.swc.model.BindingChannel? {
-        config.channels.forEachIndexed { i, ch ->
-            if (ch.ladder.buttons.any { it.id == buttonId }) {
-                return if (i == 0) com.oetsolutions.swc.model.BindingChannel.SWC1
-                else com.oetsolutions.swc.model.BindingChannel.SWC2
-            }
+    private fun buttonOnThatLadder(config: Config, channel: BindingChannel, buttonId: String): Boolean {
+        val index = when (channel) {
+            BindingChannel.SWC1 -> 0
+            BindingChannel.SWC2 -> 1
+            else -> return false
         }
-        return null
+        val ch = config.channels.getOrNull(index) ?: return false
+        return ch.ladder.buttons.any { it.id == buttonId }
     }
 
     /**

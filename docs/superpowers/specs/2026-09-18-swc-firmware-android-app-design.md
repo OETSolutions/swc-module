@@ -379,6 +379,18 @@ Two rules that matter:
 - **Action execution is best-effort and ordered.** If action 1 fails, action 2
   still runs (unless action 1 is a `MACRO` with `abort_on_failure: true`). A
   failed app-side action must never prevent the hardware key press.
+- **Resolution takes the FIRST match, and a binding's POSITION is therefore its
+  precedence.** `BindingResolve` scans the top-level `bindings` array in order and
+  returns on the first binding whose `enabled`/`channel`/`button`/`gesture` all
+  match; a later binding for the same triple is never reached. This matters most
+  for the `ANY` wildcard, which matches from either channel: an `ANY` binding that
+  sits ahead of a channel-specific one for the same `(button, gesture)` wins on
+  BOTH channels, and the specific binding is dead. **The app's dispatch must
+  mirror this exactly** — it runs the app-side actions of the binding the device
+  resolved, not of every binding that matches, or it fires more than the device
+  did (two launches for one press). A writer that appends a specific binding must
+  therefore place it *ahead* of any surviving `ANY` binding for the same triple,
+  or the edit saves, is reported as applied, and does nothing.
 
 ### 3.6 The action library
 

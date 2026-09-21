@@ -402,9 +402,8 @@ class AppViewModelTest {
 
             val base = sampleConfig()
             // Make the FIRST binding name ANY, so the old derivation would copy
-            // `ANY` onto the edited SWC1 binding. The grid itself shows channel 0's
-            // buttons (the app's bindings screen is single-channel in v1), and
-            // `vol_up`/`next` are SWC1's.
+            // `ANY` onto the edited SWC1 binding. `vol_up`/`next` are SWC1's, and
+            // the cell edited below is SWC1's `next SINGLE`.
             val anyFirst = base.bindings[0].copy(channel = com.oetsolutions.swc.model.BindingChannel.ANY)
             val c = base.copy(bindings = listOf(anyFirst) + base.bindings.drop(1))
             configRun(c).forEach { t.emit(it) }
@@ -477,6 +476,316 @@ class AppViewModelTest {
             buttons.contains("next"))
         assertTrue("and the still-valid edit must survive: $buttons",
             buttons.contains("vol_up"))
+    }
+
+    @Test
+    fun `editing a button on one channel does not destroy the other channel's binding`() = runTest {
+        // The board is two-channel and `vol_up` is the SAME id on both ladders --
+        // the common case, since both wheels have volume. The edit key is
+        // `button/gesture`, which a channel-blind `kept` filter then uses to drop
+        // every binding whose pair was "edited": an edit to SWC1's vol_up SINGLE
+        // also removes SWC2's vol_up SINGLE, because the two keys are identical.
+        // The device's SWC2 binding is gone after a save the user was told worked.
+        val t = FakeTransport()
+        var saved: com.oetsolutions.swc.model.Config? = null
+        val vm = AppViewModel(SwcClient(t), scope = vmScope(), saveConfig = { c -> saved = c; true })
+        started(vm)
+
+        val base = sampleConfig()
+        val second = base.channels[0].copy(
+            name = "SWC2",
+            ladder = base.channels[0].ladder.copy(learnedIdleMv = 2801),
+        )
+        // Both channels carry vol_up; SWC2's SINGLE binding is the one at risk.
+        val swc2Binding = com.oetsolutions.swc.model.Binding(
+            "b9", com.oetsolutions.swc.model.BindingChannel.SWC2, "vol_up", Gesture.SINGLE, true,
+            listOf(Action(ActionKind.OUT_VOLTAGE, "", "", 2600)),
+        )
+        val c = base.copy(channels = base.channels + second, bindings = base.bindings + swc2Binding)
+        configRun(c).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        // Edit SWC1's vol_up SINGLE (the cell the grid shows).
+        val cell = vm.bindings.value.cells.first { it.buttonId == "vol_up" && it.gesture == "SINGLE" }
+        vm.editBinding(cell, Action(ActionKind.OUT_VOLTAGE, keyMv = 2000))
+        advanceUntilIdle()
+        vm.save()
+        advanceUntilIdle()
+
+        assertNotNull(saved)
+        val swc2Survived = saved!!.bindings.firstOrNull {
+            it.button == "vol_up" && it.gesture == Gesture.SINGLE &&
+                it.channel == com.oetsolutions.swc.model.BindingChannel.SWC2
+        }
+        assertNotNull(
+            "editing SWC1's vol_up must not delete SWC2's vol_up (bindings: ${saved!!.bindings})",
+            swc2Survived,
+        )
+        assertEquals(2600, swc2Survived!!.actions.first().keyMv)
+    }
+
+    @Test
+    fun `the grid shows a binding for every channel that has a ladder`() = runTest {
+        // The board is two-channel (FR-9) and a binding names its channel (spec
+        // 3.5). A grid built from `channels.firstOrNull()` showed SWC2's buttons
+        // NOWHERE, so SWC2's bindings could not be seen or edited at all.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        val base = sampleConfig()
+        val second = base.channels[0].copy(
+            name = "SWC2",
+            ladder = base.channels[0].ladder.copy(learnedIdleMv = 2801),
+        )
+        configRun(base.copy(channels = base.channels + second)).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        val channels = vm.bindings.value.cells.map { it.channel }.distinct()
+        assertEquals(
+            "both channels' buttons must appear in the grid",
+            listOf(com.oetsolutions.swc.model.BindingChannel.SWC1, com.oetsolutions.swc.model.BindingChannel.SWC2),
+            channels,
+        )
+    }
+
+    @Test
+    fun `an edit is dropped when the button is on the OTHER channel's ladder, not this one`() =
+        runTest {
+            // `BindingResolve` looks the id up in `channels[channel_index].ladder`,
+            // so a binding whose channel's ladder does not hold the id is never
+            // found -- and `BindingNamesARealInput` refuses it, nacking the WHOLE
+            // save. The check must therefore be "on THIS channel's ladder", not "on
+            // SOME ladder": the two differ exactly when a button is re-learned onto
+            // one channel only, which is what a second-channel re-learn does. The
+            // mutation that weakened the check to "on any ladder" survived every
+            // other test in this file.
+            val t = FakeTransport()
+            var saved: com.oetsolutions.swc.model.Config? = null
+            val vm = AppViewModel(SwcClient(t), scope = vmScope(), saveConfig = { c -> saved = c; true })
+            started(vm)
+
+            val base = sampleConfig()
+            // BOTH ladders hold `next` to begin with, so an SWC2 cell exists to edit.
+            val second = base.channels[0].copy(name = "SWC2")
+            configRun(base.copy(channels = base.channels + second)).forEach { t.emit(it) }
+            advanceUntilIdle()
+
+            // Edit SWC2's `next` -- legitimate NOW.
+            val cell = vm.bindings.value.cells.first {
+                it.channel == com.oetsolutions.swc.model.BindingChannel.SWC2 &&
+                    it.buttonId == "next" && it.gesture == "SINGLE"
+            }
+            vm.editBinding(cell, Action(ActionKind.OUT_VOLTAGE, keyMv = 2000))
+            advanceUntilIdle()
+
+            // The device now reports SWC2 re-learned WITHOUT `next`, while SWC1
+            // still has it. The pending edit names (SWC2, next): `next` is on SOME
+            // ladder (SWC1's) but not SWC2's, so it must be dropped.
+            val relearned = sampleConfig().let { b ->
+                val swc2NoNext = base.channels[0].copy(
+                    name = "SWC2",
+                    ladder = base.channels[0].ladder.copy(
+                        buttons = base.channels[0].ladder.buttons.filter { it.id != "next" },
+                    ),
+                )
+                b.copy(channels = listOf(b.channels[0], swc2NoNext))
+            }
+            configRun(relearned).forEach { t.emit(it) }
+            advanceUntilIdle()
+            vm.save()
+            advanceUntilIdle()
+
+            assertNotNull(saved)
+            assertFalse(
+                "a binding on SWC2 for a button only SWC1's ladder holds must not be sent: " +
+                    "${saved!!.bindings}",
+                saved!!.bindings.any {
+                    it.button == "next" && it.channel == com.oetsolutions.swc.model.BindingChannel.SWC2
+                },
+            )
+        }
+
+    @Test
+    fun `a cell shows the ANY binding the device would actually fire`() = runTest {
+        // `ANY` fires from EITHER channel (spec 3.5), and `BindingResolve` matches
+        // it. A cell that looked for a channel-exact binding would draw SWC2's
+        // `vol_up SINGLE` empty even though the device acts on it -- and the user
+        // would "bind" a gesture the device already fires, seeing the wrong action
+        // as a result.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        val base = sampleConfig()
+        val second = base.channels[0].copy(name = "SWC2")
+        // b4 is `next LONG` on ANY; give SWC2 a vol_up ANY SINGLE to check.
+        val anyBinding = com.oetsolutions.swc.model.Binding(
+            "b7", com.oetsolutions.swc.model.BindingChannel.ANY, "vol_up", Gesture.SINGLE, true,
+            listOf(Action(ActionKind.OUT_VOLTAGE, "", "", 2700)),
+        )
+        val c = base.copy(channels = base.channels + second, bindings = base.bindings + anyBinding)
+        configRun(c).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        val swc2Cell = vm.bindings.value.cells.first {
+            it.channel == com.oetsolutions.swc.model.BindingChannel.SWC2 &&
+                it.buttonId == "vol_up" && it.gesture == "SINGLE"
+        }
+        assertEquals(
+            "an ANY binding fires from either channel, so the SWC2 cell must show it",
+            ActionKind.OUT_VOLTAGE, swc2Cell.action?.kind,
+        )
+    }
+
+    @Test
+    fun `editing one channel's cell wins over a surviving ANY binding for that gesture`() = runTest {
+        // `BindingResolve` returns the FIRST match, so binding ORDER is
+        // precedence. An `ANY` binding is kept by `withEdits`, and if it sat ahead
+        // of the edit the channel-specific binding the user just made would never
+        // be reached -- the edit would save, be reported as applied, and do nothing
+        // on the device.
+        val t = FakeTransport()
+        var saved: com.oetsolutions.swc.model.Config? = null
+        val vm = AppViewModel(SwcClient(t), scope = vmScope(), saveConfig = { c -> saved = c; true })
+        started(vm)
+
+        val base = sampleConfig()
+        // Drop the fixture's SWC1 vol_up SINGLE (b1) so only an ANY binding holds
+        // that triple.
+        val anyBinding = com.oetsolutions.swc.model.Binding(
+            "b7", com.oetsolutions.swc.model.BindingChannel.ANY, "vol_up", Gesture.SINGLE, true,
+            listOf(Action(ActionKind.OUT_VOLTAGE, "", "", 2700)),
+        )
+        val c = base.copy(bindings = listOf(anyBinding))
+        configRun(c).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        val cell = vm.bindings.value.cells.first {
+            it.channel == com.oetsolutions.swc.model.BindingChannel.SWC1 &&
+                it.buttonId == "vol_up" && it.gesture == "SINGLE"
+        }
+        vm.editBinding(cell, Action(ActionKind.OUT_VOLTAGE, keyMv = 2000))
+        advanceUntilIdle()
+        vm.save()
+        advanceUntilIdle()
+
+        assertNotNull(saved)
+        // The FIRST binding for the triple is what the device fires. It must be the
+        // edit, not the surviving ANY wildcard.
+        val first = saved!!.bindings.firstOrNull {
+            it.button == "vol_up" && it.gesture == Gesture.SINGLE &&
+                (it.channel == com.oetsolutions.swc.model.BindingChannel.SWC1 ||
+                    it.channel == com.oetsolutions.swc.model.BindingChannel.ANY)
+        }
+        assertNotNull(first)
+        assertEquals(
+            "the edited binding must precede the ANY wildcard, or the device ignores it",
+            com.oetsolutions.swc.model.BindingChannel.SWC1, first!!.channel,
+        )
+        assertEquals(2000, first.actions.first().keyMv)
+    }
+
+
+    @Test
+    fun `an edit on SWC2 of a button also on SWC1 is not dropped`() = runTest {
+        val t = FakeTransport()
+        var saved: com.oetsolutions.swc.model.Config? = null
+        val vm = AppViewModel(SwcClient(t), scope = vmScope(), saveConfig = { c -> saved = c; true })
+        started(vm)
+        val base = sampleConfig()
+        val second = base.channels[0].copy(name = "SWC2")
+        configRun(base.copy(channels = base.channels + second)).forEach { t.emit(it) }
+        advanceUntilIdle()
+        val cell = vm.bindings.value.cells.first {
+            it.channel == com.oetsolutions.swc.model.BindingChannel.SWC2 &&
+                it.buttonId == "next" && it.gesture == "SINGLE"
+        }
+        vm.editBinding(cell, Action(ActionKind.OUT_VOLTAGE, keyMv = 2500))
+        advanceUntilIdle()
+        vm.save()
+        advanceUntilIdle()
+        assertNotNull(saved)
+        val added = saved!!.bindings.firstOrNull {
+            it.button == "next" && it.gesture == Gesture.SINGLE &&
+                it.channel == com.oetsolutions.swc.model.BindingChannel.SWC2
+        }
+        assertNotNull("an SWC2 edit of a shared button id must not be dropped: ${saved!!.bindings}", added)
+    }
+
+
+    @Test
+    fun `only the first matching binding's app-side action fires, as the firmware resolves`() =
+        runTest {
+            // `BindingResolve` returns the FIRST match and stops. When two bindings
+            // match one press -- an `ANY` wildcard plus a channel-specific one on
+            // the same triple, which is the common case (`vol_up` SINGLE on both) --
+            // the device acts on the first only. Running EVERY match made the app
+            // launch TWO apps for one press while the device resolved one binding,
+            // so the app's half of spec 3.6 fired more than the device did.
+            val t = FakeTransport()
+            val ran = mutableListOf<String>()
+            val vm = AppViewModel(
+                SwcClient(t), scope = vmScope(),
+                runAppAction = { kind, target, _ -> ran += "$kind:$target"; ActionOutcome.Ran },
+            )
+            started(vm)
+            val base = sampleConfig()
+            val anyDup = com.oetsolutions.swc.model.Binding(
+                "b8", com.oetsolutions.swc.model.BindingChannel.ANY, "vol_up", Gesture.SINGLE, true,
+                listOf(Action(ActionKind.APP_LAUNCH, "com.second.app")),
+            )
+            val first = base.bindings[0].copy(
+                actions = listOf(Action(ActionKind.APP_LAUNCH, "com.first.app")),
+            )
+            val c = base.copy(bindings = listOf(first, anyDup) + base.bindings.drop(1))
+            configRun(c).forEach { t.emit(it) }
+            advanceUntilIdle()
+
+            t.emit(frame("event", "channel" to "0", "button" to "\"vol_up\"",
+                "gesture" to "\"SINGLE\"", "t_ms" to "5", "level_mv" to "1430"))
+            advanceUntilIdle()
+
+            assertEquals(
+                "only the binding the device resolved may fire its app-side action",
+                listOf("APP_LAUNCH:com.first.app"), ran,
+            )
+        }
+
+    @Test
+    fun `every action in the resolved binding runs, in order`() = runTest {
+        // Spec 3.5: a binding's action list is ordered and best-effort, and the
+        // product's core case is ONE binding with "the factory key press AND tell
+        // the app". Taking only `actions[0]` would run the OUT_ half and drop the
+        // app notification the user paired with it.
+        val t = FakeTransport()
+        val ran = mutableListOf<String>()
+        val vm = AppViewModel(
+            SwcClient(t), scope = vmScope(),
+            runAppAction = { kind, target, _ -> ran += "$kind:$target"; ActionOutcome.Ran },
+        )
+        started(vm)
+        val base = sampleConfig()
+        // (SWC1, next, DOUBLE) -> [OUT_RELEASE (firmware's), APP_INTENT (the app's)].
+        val paired = com.oetsolutions.swc.model.Binding(
+            "b9", com.oetsolutions.swc.model.BindingChannel.SWC1, "next", Gesture.DOUBLE, true,
+            listOf(
+                Action(ActionKind.OUT_RELEASE),
+                Action(ActionKind.APP_INTENT, "com.oetsolutions.swc.ACTION_NAVIGATE", "geo:1,2"),
+            ),
+        )
+        val c = base.copy(bindings = base.bindings.filter { it.id != "b3" } + paired)
+        configRun(c).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        t.emit(frame("event", "channel" to "0", "button" to "\"next\"",
+            "gesture" to "\"DOUBLE\"", "t_ms" to "7", "level_mv" to "2145"))
+        advanceUntilIdle()
+
+        assertEquals(
+            "the firmware's OUT_RELEASE is skipped; the app's APP_INTENT runs",
+            listOf("APP_INTENT:com.oetsolutions.swc.ACTION_NAVIGATE"), ran,
+        )
     }
 
     @Test

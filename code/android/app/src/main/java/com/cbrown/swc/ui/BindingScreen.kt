@@ -31,6 +31,7 @@ import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
 import com.oetsolutions.swc.contract.ActionKind
 import com.oetsolutions.swc.model.Action
+import com.oetsolutions.swc.model.BindingChannel
 
 /**
  * The bindings grid: buttons × gestures, each cell a bound action.
@@ -86,21 +87,28 @@ fun BindingScreen(
             Modifier.weight(1f),
             verticalArrangement = Arrangement.spacedBy(8.dp),
         ) {
-            items(state.cells, key = { "${it.buttonId}/${it.gesture}" }) { cell ->
+            items(state.cells, key = { "${it.channel.wireName}/${it.buttonId}/${it.gesture}" }) { cell ->
                 Card(Modifier.fillMaxWidth()) {
                     Row(
                         Modifier.fillMaxWidth().padding(12.dp),
                         horizontalArrangement = Arrangement.SpaceBetween,
                     ) {
                         Column {
-                            Text(cell.buttonName, style = MaterialTheme.typography.bodyLarge)
+                            // The channel is shown because the SAME button name is
+                            // usually on both ladders: two rows reading "Volume Up /
+                            // SINGLE" with no channel would be indistinguishable, and
+                            // the user could not tell which binding they were editing.
+                            Text(
+                                "${cell.channel.wireName} · ${cell.buttonName}",
+                                style = MaterialTheme.typography.bodyLarge,
+                            )
                             Text(cell.gesture, style = MaterialTheme.typography.labelMedium)
                         }
                         TextButton(
                             onClick = { editing = cell },
                             modifier = Modifier.semantics {
                                 contentDescription =
-                                    "${cell.buttonName} ${cell.gesture}: " +
+                                    "${cell.channel.wireName} ${cell.buttonName} ${cell.gesture}: " +
                                         (cell.action?.kind?.wireName ?: "not bound")
                             },
                         ) {
@@ -164,7 +172,19 @@ private fun ActionEditorDialog(
 }
 
 
+/**
+ * One cell: a (channel, button, gesture) triple and its bound action.
+ *
+ * **The CHANNEL is part of the cell's identity, not decoration.** A binding is
+ * `(channel, button, gesture)` on the wire (spec 3.5), and the firmware's
+ * `BindingResolve` matches all three. A cell that carried only the button and
+ * gesture could not say WHICH channel it edits, and `vol_up` is the same id on
+ * both ladders -- the common case, since both wheels have volume. Keying edits by
+ * `button/gesture` alone then made an edit to SWC1's `vol_up` indistinguishable
+ * from one to SWC2's, so saving the SWC1 edit DELETED the device's SWC2 binding.
+ */
 data class BindingCell(
+    val channel: BindingChannel,
     val buttonId: String,
     val buttonName: String,
     val gesture: String,

@@ -230,8 +230,10 @@ void LearnWizard::ServicePrompt(int channel, uint64_t now_ms, int idle_mv, int t
     // The RAIL during learn (spec 3.4's `learned_at_rail_mv`). There is no rail
     // sense channel on this board (AdcChannel carries SWC1/SWC2/TEMP/AUX1-3/
     // KEY_SENSE1-2 and none of them is +3V3), so this is the board's nominal rail
-    // and is recorded as such. It is deliberately NOT read from the HAL.
-    const int rail_mv = 3300;
+    // and is recorded as such. It is deliberately NOT read from the HAL. The
+    // constant is shared with the app-driven learn path in `CommandRouter`, so the
+    // two cannot record a different value for the same field.
+    const int rail_mv = kNominalRailMv;
 
     // WAIT for the user to actually press. Sampling on every tick rejected the
     // learn with "at_idle" before the user's hand was even on the button, which

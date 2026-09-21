@@ -880,7 +880,13 @@ void CommandRouter::RecordLearnSample() {
     const uint8_t ch = static_cast<uint8_t>(learn_channel_);
     const int level_mv = sys_->FilteredLevelMv(ch);
     const int idle_mv = sys_->IdleReferenceMv(ch);
-    session_.AddSample(level_mv, idle_mv, static_cast<MilliVolt>(idle_mv), 0,
+    // The third argument is the +3V3 RAIL, not the idle. It used to be `idle_mv`
+    // again, which recorded the wheel's idle level (~2835 mV) in a field defined
+    // as the regulated rail (~3300 mV, spec 3.4/FR-30) -- a field the app displays
+    // and uses to detect a sagging regulator. The headless wizard records the
+    // nominal rail; the app path recorded a different quantity for the same field,
+    // so the two learn paths disagreed. Both now use `kNominalRailMv`.
+    session_.AddSample(level_mv, idle_mv, kNominalRailMv, 0,
                        hal_ != nullptr ? hal_->now_ms(hal_->ctx) : 0);
 }
 

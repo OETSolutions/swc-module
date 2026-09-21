@@ -20,6 +20,14 @@ constexpr int kLadderMaxButtons = 16;
 constexpr int kLadderIdLen   = 16;
 constexpr int kLadderNameLen = 16;
 
+// The board's nominal +3V3 rail, which is what `learned_at_rail_mv` records
+// (spec 3.4/FR-30). There is no rail SENSE channel on this board (AdcChannel
+// carries SWC1/SWC2/TEMP/AUX1-3/KEY_SENSE1-2 and none is +3V3), so this is the
+// nominal value, recorded as such. It lives here, beside the field it fills,
+// because BOTH learn paths record it -- the app-driven session in `CommandRouter`
+// and the headless wizard -- and a literal in each is two homes that drift.
+constexpr MilliVolt kNominalRailMv = 3300;
+
 // The spec 3.4 shape, in millivolts at the pin. The *ratio* the classifier
 // compares is DERIVED at classify time from mv_center and the profile's learned
 // idle -- it is deliberately not stored, because storing both forms is 105% of

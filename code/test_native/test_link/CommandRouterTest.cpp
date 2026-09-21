@@ -1485,6 +1485,14 @@ TEST(CommandRouter, TheStreamedSamplesAreWhatALearnCommitAccepts) {
     ASSERT_EQ(out.channels[0].ladder.count, 1u) << "the streamed samples must become a button";
     EXPECT_STREQ(out.channels[0].ladder.buttons[0].id, "vol_dn");
     EXPECT_NEAR(out.channels[0].ladder.buttons[0].mv_center, 1430, 60);
+    // `learned_at_rail_mv` is the +3V3 RAIL (spec 3.4/FR-30), not the wheel's
+    // idle. The app-driven path used to pass the idle (~2835 here) for this field,
+    // so the app displayed a rail that was really an idle level and the sagging-
+    // regulator check compared against the wrong number -- while the headless
+    // wizard recorded the nominal rail. This asserts the RAIL, which is what
+    // separates the two quantities.
+    EXPECT_EQ(out.channels[0].ladder.buttons[0].learned_at_rail_mv, kNominalRailMv)
+        << "the recorded rail must be the nominal +3V3 rail, not the wheel's idle";
 }
 
 TEST(CommandRouter, ALearnCommitOnADifferentChannelThanTheStreamIsRefused) {

@@ -21,6 +21,18 @@ enum class BuzzerPattern {
 };
 
 /*
+ * A pattern's name -> the pattern, for spec 3.6's `BUZZ` action, whose single
+ * parameter is `pattern` and is stored as a string.
+ *
+ * The accepted spelling is the enumerator name without the `k` prefix
+ * (`"KeyAccepted"`), which is what spec 7.2's table writes and what the buzzer
+ * test drives the whole list from. An unknown or null name returns `kNone`,
+ * which `Play` treats as "stop" -- so a value this build does not recognise is
+ * INERT rather than a different pattern than the one the user stored.
+ */
+BuzzerPattern BuzzerPatternFromName(const char *name);
+
+/*
  * The buzzer grammar. Spec 7.1 fixes the part at ~2.4 kHz with on/off gating
  * only, so every pattern is rhythm: a pulse train, never a melody.
  *

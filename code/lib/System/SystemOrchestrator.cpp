@@ -846,7 +846,32 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                     // hazard.
                     ReleaseKey(index);
                 }
-                buzzer_.Play(BuzzerPattern::kKeyAccepted);
+                // Spec 3.6 puts `BUZZ` in the FIRMWARE's column -- "local audible
+                // confirmation" -- and until now nothing executed it: the app
+                // explicitly skips it as "the firmware's half", and the firmware
+                // only ever looked at `kOutVoltage`, so a user could bind it and
+                // get nothing while the key was accepted anyway.
+                //
+                // It REPLACES KEY_ACCEPTED rather than joining it, and that is
+                // forced by the hardware: there is one buzzer and `Play` replaces
+                // rather than queues (spec 7.2), so playing both in one tick would
+                // mean whatever went second is the only thing heard. Since the user
+                // explicitly bound a pattern for this gesture, that pattern is what
+                // they asked for; KEY_ACCEPTED is the DEFAULT acknowledgement, and
+                // an explicit BUZZ overrides a default. (Playing BUZZ second was
+                // measured: it is exactly as silent, because KEY_ACCEPTED would be
+                // the one replaced.)
+                //
+                // An unknown pattern name parses to kNone, which `Play` treats as
+                // "stop". That would leave the press silent rather than
+                // acknowledged, so an unnameable pattern falls back to
+                // KEY_ACCEPTED: a value this build cannot honour is inert, not a
+                // different pattern AND not a missing acknowledgement.
+                const BuzzerPattern bound =
+                    (a.kind == ActionKind::kBuzzer) ? BuzzerPatternFromName(a.target)
+                                                    : BuzzerPattern::kKeyAccepted;
+                buzzer_.Play(bound == BuzzerPattern::kNone ? BuzzerPattern::kKeyAccepted
+                                                           : bound);
             } else {
                 // The button was RECOGNISED but its gesture is not bound, so there
                 // is no action to run. The device then behaves as a STOCK WHEEL:

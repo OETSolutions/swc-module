@@ -314,6 +314,12 @@ class AppViewModel(
                 val outcome = when (action.kind.wireName) {
                     "OUT_VOLTAGE", "OUT_RELEASE", "NONE", "BUZZ" ->
                         // The firmware's half of spec 3.6. It has already done it.
+                        //
+                        // BUZZ is included because the firmware executes it: spec
+                        // 3.6 puts it in the firmware's column, and it plays the
+                        // named §7.2 pattern (replacing the default KEY_ACCEPTED).
+                        // Skipping it here is what makes it the firmware's action
+                        // rather than a second, competing implementation.
                         null
                     else -> runOne(action)
                 }

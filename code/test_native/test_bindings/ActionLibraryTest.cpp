@@ -1,6 +1,7 @@
 #include "Bindings/ActionLibrary.h"
 #include <gtest/gtest.h>
 #include <cstring>
+#include "Feedback/BuzzerGrammar.h"
 
 namespace {
 Action OutVoltage(uint16_t mv) {
@@ -86,4 +87,57 @@ TEST(ActionLibrary, AKindOutsideTheSpecIsRefusedNotGuessed) {
     Action a{};
     a.kind = static_cast<ActionKind>(200);   // no such kind
     EXPECT_FALSE(ActionIsExecutable(a));
+}
+
+// --- spec 3.6's `BUZZ`: the pattern NAME -> a pattern ------------------------
+//
+// `BUZZ`'s one parameter is `pattern`, stored as a string, and spec 3.6 puts the
+// kind in the FIRMWARE's column. Nothing executed it until 2026-09-21: the app
+// skipped it as "the firmware's half" and the firmware only looked at
+// `kOutVoltage`, so a user could bind it and get nothing at all.
+
+TEST(ActionLibrary, ThePatternNamesTheBuzzerTableUsesParseBack) {
+    // The accepted spelling is the enumerator name minus the `k`, which is what
+    // spec 7.2's table writes. These are the same names
+    // BuzzerGrammarTest.EverySpecPatternCompletesAndReleasesTheLine drives.
+    EXPECT_EQ(BuzzerPatternFromName("KeyAccepted"), BuzzerPattern::kKeyAccepted);
+    EXPECT_EQ(BuzzerPatternFromName("KeyUnknown"), BuzzerPattern::kKeyUnknown);
+    EXPECT_EQ(BuzzerPatternFromName("LearnOk"), BuzzerPattern::kLearnOk);
+    EXPECT_EQ(BuzzerPatternFromName("FaultConfig"), BuzzerPattern::kFaultConfig);
+    EXPECT_EQ(BuzzerPatternFromName("OtaFail"), BuzzerPattern::kOtaFail);
+    EXPECT_EQ(BuzzerPatternFromName("BootOk"), BuzzerPattern::kBootOk);
+    EXPECT_EQ(BuzzerPatternFromName("FactoryReset"), BuzzerPattern::kFactoryReset);
+}
+
+TEST(ActionLibrary, AnUnknownPatternNameIsInertRatherThanADifferentPattern) {
+    // A name this build does not know must not silently become some other
+    // pattern: the user bound one pattern and would hear another. kNone is what
+    // `Play` treats as "stop", so the action is inert -- and a typo'd or
+    // hostile config cannot repurpose it.
+    EXPECT_EQ(BuzzerPatternFromName("NotAPattern"), BuzzerPattern::kNone);
+    EXPECT_EQ(BuzzerPatternFromName(""), BuzzerPattern::kNone);
+    EXPECT_EQ(BuzzerPatternFromName(nullptr), BuzzerPattern::kNone);
+    // The k-prefixed enumerator spelling is NOT the wire spelling (spec 3.6's
+    // parameter is the table's name), and must not be accepted silently.
+    EXPECT_EQ(BuzzerPatternFromName("kKeyAccepted"), BuzzerPattern::kNone);
+    // "None" is deliberately unnameable: a stored action that silences the
+    // buzzer is a different feature.
+    EXPECT_EQ(BuzzerPatternFromName("None"), BuzzerPattern::kNone);
+}
+
+TEST(ActionLibrary, EveryPatternTheEnumDefinesIsReachableByName) {
+    // The coverage check the parser's comment promises: a pattern added to the
+    // enum without a row in the name table would answer kNone, and a BUZZ
+    // binding naming it would be silently inert.
+    const char *kNames[] = {
+        "BootOk", "BootDegraded", "BootError", "KeyAccepted", "KeyUnknown",
+        "ProgramEnter", "ProgramStep", "ProgramSaved", "ProgramExit",
+        "ProgramCancel", "LearnPrompt", "LearnOk", "LearnReject", "FaultDac",
+        "FaultConfig", "FactoryReset", "OtaStart", "OtaOk", "OtaFail",
+    };
+    for (const char *n : kNames) {
+        EXPECT_NE(BuzzerPatternFromName(n), BuzzerPattern::kNone)
+            << "spec 7.2 pattern \"" << n << "\" is not reachable by name, so a "
+               "BUZZ action naming it would do nothing";
+    }
 }

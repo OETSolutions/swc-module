@@ -1,5 +1,7 @@
 #include "Feedback/BuzzerGrammar.h"
 
+#include <string.h>
+
 namespace {
 
 // Spec 7.2's table, transcribed. `reps` is a property of the named pattern, not
@@ -125,4 +127,48 @@ void BuzzerGrammar::Update(uint64_t now_ms) {
         started_ = false;
         pattern_ = BuzzerPattern::kNone;
     }
+}
+
+/*
+ * Spec 3.6's `BUZZ` parameter -> a pattern, or kNone for a name this build does
+ * not know.
+ *
+ * **The names are the enumerator names minus the `k` prefix**, which is the same
+ * spelling spec 7.2's table uses and the same one `BuzzerGrammarTest` drives
+ * `EverySpecPatternCompletesAndReleasesTheLine` from. That test's list is the
+ * coverage check: a pattern added to the enum without a row here answers kNone,
+ * and a `BUZZ` binding naming it would be silently inert.
+ *
+ * kNone ("stop", per the header) is deliberately NOT reachable by name: a stored
+ * action that silences the buzzer is a different feature, and admitting the name
+ * here would let a typo'd or hostile config do it.
+ */
+BuzzerPattern BuzzerPatternFromName(const char *name) {
+    if (name == nullptr) return BuzzerPattern::kNone;
+    struct Row { const char *name; BuzzerPattern p; };
+    static constexpr Row kRows[] = {
+        {"BootOk", BuzzerPattern::kBootOk},
+        {"BootDegraded", BuzzerPattern::kBootDegraded},
+        {"BootError", BuzzerPattern::kBootError},
+        {"KeyAccepted", BuzzerPattern::kKeyAccepted},
+        {"KeyUnknown", BuzzerPattern::kKeyUnknown},
+        {"ProgramEnter", BuzzerPattern::kProgramEnter},
+        {"ProgramStep", BuzzerPattern::kProgramStep},
+        {"ProgramSaved", BuzzerPattern::kProgramSaved},
+        {"ProgramExit", BuzzerPattern::kProgramExit},
+        {"ProgramCancel", BuzzerPattern::kProgramCancel},
+        {"LearnPrompt", BuzzerPattern::kLearnPrompt},
+        {"LearnOk", BuzzerPattern::kLearnOk},
+        {"LearnReject", BuzzerPattern::kLearnReject},
+        {"FaultDac", BuzzerPattern::kFaultDac},
+        {"FaultConfig", BuzzerPattern::kFaultConfig},
+        {"FactoryReset", BuzzerPattern::kFactoryReset},
+        {"OtaStart", BuzzerPattern::kOtaStart},
+        {"OtaOk", BuzzerPattern::kOtaOk},
+        {"OtaFail", BuzzerPattern::kOtaFail},
+    };
+    for (const Row &r : kRows) {
+        if (strcmp(r.name, name) == 0) return r.p;
+    }
+    return BuzzerPattern::kNone;
 }

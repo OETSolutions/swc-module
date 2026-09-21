@@ -22,10 +22,17 @@ Config ConfigDefault() {
     c.channel_count = kMaxChannels;
     for (uint8_t i = 0; i < kMaxChannels; ++i) {
         ChannelConfig &ch = c.channels[i];
-        // Disabled: nothing has been learned yet, so there is no ladder to
-        // classify against. The channel is still NAMED and its idle reference is
-        // still plausible, so the config validates -- see the header.
-        ch.enabled = false;
+        // ENABLED. Spec 3.4: `enabled` gates whether this channel's ladder is
+        // CLASSIFIED, not whether its bindings resolve. Nothing has been learned
+        // yet -- `count` is 0 -- and that is what the flag used to be made to
+        // stand in for, which was wrong: it made a config that serialises back
+        // to the app carry "off" for both channels, and (before the binding
+        // resolve was un-gated) it made every app-pushed binding unfindable on a
+        // fresh device, so a bound action was silently replaced by the
+        // pass-through default. A channel with no learned buttons is described
+        // by its zero `count`; a channel that is not present at all is described
+        // by `channel_count`.
+        ch.enabled = true;
         strncpy(ch.name, (i == 0) ? "SWC1" : "SWC2", sizeof(ch.name) - 1);
         ch.ladder.learned_idle_mv = 2835;   // spec 3.7's rail, measured at the pin
         ch.ladder.count = 0;

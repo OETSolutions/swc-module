@@ -15,9 +15,13 @@
  * It is deliberately NOT the same thing as the test fixture
  * `MockHalDefaultsConfig()`: that one carries spec 3.7's worked ladder so
  * classification tests have real button windows to match. This one is the
- * "nothing configured yet" device -- channels present but DISABLED, no learned
- * buttons -- which is a different config for a different purpose, not a second
- * copy of the same one.
+ * "nothing configured yet" device -- channels present and ENABLED, but with no
+ * learned buttons (`ladder.count == 0`) -- which is a different config for a
+ * different purpose, not a second copy of the same one. The channels are enabled
+ * because spec 3.4 scopes `enabled` to CLASSIFICATION: a channel with no learned
+ * buttons is described by its zero `count`, and a channel that is not present at
+ * all by `channel_count`. Shipping them disabled also made every binding the app
+ * pushed unfindable on a fresh device.
  *
  * It is a valid config (`ConfigValidate` accepts it): every channel is named and
  * its idle reference is a plausible ADC reading. That matters because the app

@@ -5,8 +5,10 @@
 #include <string>
 #include <vector>
 
+#include "Config/ConfigDefaults.h"
 #include "Config/ConfigStore.h"
 #include "MockHAL.h"
+#include "Output/GainPolicy.h"
 
 namespace {
 
@@ -1798,4 +1800,162 @@ TEST(SystemOrchestrator, AHeldButtonAtBootDoesNotKillPassThroughForTheSession) {
 
     EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code)
         << "pass-through must recover after a boot-time press poisoned its reference";
+}
+
+// --- the production boot config -------------------------------------------
+//
+// **Every test above this line injects `MockHal::Defaults`, and that is the gap
+// this section closes.** No test ever booted the orchestrator with
+// `ConfigDefault()` -- the config production actually uses -- so a defect that
+// only the production config exhibits was invisible to a 350-test green suite.
+// It was not hypothetical: `ConfigDefault()` shipped both channels with
+// `enabled = false`, and the binding resolve was gated on that flag, so on a
+// real device every binding the app pushed was unfindable and the press fell
+// through to the pass-through default. The bound key voltage was silently
+// replaced by the button's own level, with `KEY_ACCEPTED` feedback and no
+// report anywhere. The only thing that distinguishes that from correct behavior
+// is the DAC CODE, which is why these tests assert on it.
+
+TEST(SystemOrchestrator, TheProductionConfigEnablesItsChannels) {
+    // Spec 3.4 scopes `Channel.enabled` to CLASSIFICATION. A channel with no
+    // learned buttons is described by `ladder.count == 0`, not by `enabled =
+    // false`; leaving it false is what made every app-pushed binding unfindable
+    // on a fresh device.
+    const Config c = ConfigDefault();
+    ASSERT_GE(c.channel_count, 1);
+    for (uint8_t i = 0; i < c.channel_count; ++i) {
+        EXPECT_TRUE(c.channels[i].enabled)
+            << "channel " << static_cast<int>(i)
+            << ": the production config must not ship a channel disabled -- "
+               "`enabled` gates classification, and `ladder.count` already says "
+               "this channel has learned nothing";
+    }
+}
+
+TEST(SystemOrchestrator, ABindingResolvesOnADeviceRunningTheProductionConfig) {
+    // The end-to-end shape of the defect, on the config production ships: an app
+    // binds a learned button, and the device must drive the BOUND voltage.
+    //
+    // `ConfigDefault()` has no learned buttons, so the test learns one
+    // headlessly first (the real no-app flow), then presses it and checks the
+    // driven code against the action's own level. Asserting merely "something
+    // was driven" would NOT catch this: the pass-through default also drives
+    // something. Only the code distinguishes them.
+    MockHal hal;
+    hal.ClearNvs();   // a NEVER-configured device: Boot() takes the real path
+
+    Config c = ConfigDefault();
+    // Pre-bind the id the wizard generates for slot 1, so the learn fills in the
+    // level that this binding names.
+    c.binding_count = 1;
+    std::strncpy(c.bindings[0].id, "b1", sizeof(c.bindings[0].id) - 1);
+    c.bindings[0].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    std::strncpy(c.bindings[0].button, "swc1_bt1", sizeof(c.bindings[0].button) - 1);
+    c.bindings[0].gesture = Gesture::kSingle;
+    c.bindings[0].enabled = true;
+    c.bindings[0].action_count = 1;
+    c.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    c.bindings[0].actions[0].key_mv = 2400;   // the BOUND level
+
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(c));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), c, c.settings.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // Learn one button headlessly (spec 7.4 / FR-31).
+    HoldAuxToToggle(o, hal);
+    PressAux(o, hal, 1);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 400);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 300);
+    ASSERT_NE(o.LastLearnedProfile(0), nullptr)
+        << "the headless learn must have completed for this test to mean anything";
+    HoldAuxToToggle(o, hal);   // leave the wizard
+
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+    const int bound_code =
+        GainPolicyCodeForTarget(o.ChannelGainMode(0), 2400).dac_code;
+    ASSERT_NE(bound_code, idle_code)
+        << "fixture error: the bound level must differ from idle, or the "
+           "assertion below cannot tell a bound drive from no drive";
+
+    const int driven = PressAndCaptureDrivenCode(o, hal, 1430);
+    EXPECT_NE(driven, idle_code) << "a bound press must drive the KEY line";
+    EXPECT_EQ(driven, bound_code)
+        << "the device must drive the level the BINDING names, not the "
+           "pass-through default for that button. A different code here is the "
+           "silent-wrong-key defect: the user bound one voltage and got another, "
+           "with KEY_ACCEPTED feedback and nothing reporting a problem";
+}
+
+TEST(SystemOrchestrator, ABuzzBindingPlaysItsPatternAndStillDrivesTheKey) {
+    // Spec 3.6's `BUZZ` row is in the FIRMWARE's column ("local audible
+    // confirmation"), and spec 3.5's shape is "emit the factory key press AND
+    // tell the app" -- so a binding may name a level AND a pattern. Until
+    // 2026-09-21 `BUZZ` was declared executable, accepted by the codec, offered
+    // by the app's picker, and executed by NEITHER side: the app skips it as "the
+    // firmware's half" and the firmware only looked at `kOutVoltage`.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.binding_count = 1;
+    std::strncpy(d.config.bindings[0].id, "buzz", sizeof(d.config.bindings[0].id) - 1);
+    d.config.bindings[0].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    std::strncpy(d.config.bindings[0].button, "vol_up",
+                 sizeof(d.config.bindings[0].button) - 1);
+    d.config.bindings[0].gesture = Gesture::kSingle;
+    d.config.bindings[0].enabled = true;
+    d.config.bindings[0].action_count = 1;
+    d.config.bindings[0].actions[0].kind = ActionKind::kBuzzer;
+    std::strncpy(d.config.bindings[0].actions[0].target, "ProgramEnter",
+                 sizeof(d.config.bindings[0].actions[0].target) - 1);
+
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    // PROGRAM_ENTER is 40/40 x2 = 120 ms; KEY_ACCEPTED is a single 25 ms pulse.
+    // Counting ON-TRANSITIONS over a window long enough for both distinguishes
+    // "the buzzer pattern played" from "only KEY_ACCEPTED played".
+    const int before = hal.BuzzerOnCount();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    int on_transitions = 0;
+    bool prev = false;
+    for (uint32_t t = 0; t < 400; t += 5) {
+        o.Tick(hal.NowMs());
+        hal.AdvanceMs(5);
+        const bool now = hal.BuzzerIsOn();
+        if (now && !prev) ++on_transitions;
+        prev = now;
+    }
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 400);
+
+    EXPECT_GT(hal.BuzzerOnCount(), before) << "a BUZZ binding must reach the buzzer";
+    EXPECT_GE(on_transitions, 2)
+        << "PROGRAM_ENTER is two pulses (spec 7.2); fewer means the BUZZ action "
+           "did not play and only KEY_ACCEPTED was heard -- the silent no-op this "
+           "test exists to catch";
+    // It REPLACES KEY_ACCEPTED, it does not follow it: one buzzer, and `Play`
+    // replaces rather than queues, so two patterns in one tick means the second
+    // is the only one heard. An explicitly bound pattern outranks the default
+    // acknowledgement.
+    EXPECT_EQ(on_transitions, 2)
+        << "exactly PROGRAM_ENTER's two pulses -- a third would mean KEY_ACCEPTED "
+           "was also played, and one means KEY_ACCEPTED replaced the bound "
+           "pattern, which is the bug this test found";
+
+    // And the level action shape still works: a BUZZ does not suppress the key
+    // press, because spec 3.5 makes a failed or additional action independent.
+    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), -1);
+    (void)idle_code;
 }

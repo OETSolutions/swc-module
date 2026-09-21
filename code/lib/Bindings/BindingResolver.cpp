@@ -11,7 +11,14 @@ ResolvedAction BindingResolve(const Config &cfg, uint8_t channel_index,
     out.action = Action{};
     out.action.kind = ActionKind::kNone;   // inert by default, never uninitialised
     if (channel_index >= cfg.channel_count) return out;
-    if (!cfg.channels[channel_index].enabled) return out;
+    // NOT gated on `cfg.channels[channel_index].enabled`. Spec 3.4: `enabled`
+    // gates whether the channel's ladder is CLASSIFIED, not whether its bindings
+    // resolve -- that is `Binding.enabled`, checked per binding below. Gating here
+    // was a live defect: `ConfigDefault` ships every channel disabled, so this
+    // returned not-found for every binding on a fresh device, and the caller's
+    // spec-6.6-rule-4 fallback then presented the button's own level in place of
+    // the action the user bound -- a SILENTLY WRONG key voltage rather than no
+    // output at all.
     // Every count in a Config that arrives from storage is untrusted, and the
     // SAME rule applies to each: a count past its array is a corrupt config, so
     // refuse rather than index. `binding_count` is a uint8_t and `kMaxBindings`

@@ -328,6 +328,32 @@ LadderButton {
 nearest neighbouring button, capped by a configurable maximum. A hand-derived
 tolerance is the classic cause of "two buttons both trigger the same action".
 
+**`Channel.enabled` gates only whether this channel's learned ladder is
+CLASSIFIED, and it defaults to `true`.** It is not a binding gate, and it is not
+an opt-in for the output. The distinction matters because the two gates are easy
+to confuse:
+
+- `Binding.enabled = false` (§3.5) means "this binding does not match at all", so
+  a lower-priority source may claim the gesture. That check belongs to the
+  binding and lives in `BindingResolve`.
+- `Channel.enabled = false` means "this channel has no learned ladder to compare
+  against — do not try to classify its input". The default config's channels are
+  named and plausibly idle-referenced but have `count = 0`, which is precisely
+  that state. Because `channel_count` (§3.8) decides how many channels are
+  SERVICED at all, `enabled = false` is not the way to express "this input is
+  absent" — omitting the channel from `channel_count` is.
+
+Gating the binding resolve on `Channel.enabled` instead is a defect with a silent
+and severe symptom, and it was live in this firmware until 2026-09-21. A config
+written by `ConfigDefault` — which is what a fresh device replies to `config_get`,
+and what a headless learn is applied to — has every channel disabled. The
+resolver then returned "not found" for EVERY binding, so `SystemOrchestrator`
+took §6.6 rule 4's unbound branch and presented the button's own level as though
+a stock wheel. A user who had bound `vol_up SINGLE → 2400 mV` got the pass-through
+default for that button instead: **a different key voltage, with `KEY_ACCEPTED`
+feedback, and nothing anywhere reporting a problem.** It never surfaced as "no
+output", which is what made it invisible — the device looked like it was working.
+
 ### 3.5 Bindings and actions
 
 A binding is `(channel, button, gesture)` → ordered list of actions. Most will
@@ -371,7 +397,7 @@ which is precisely the split the user described.
 | `MEDIA` | `command` (`play`/`pause`/`next`/`prev`/`stop`) | Android | Media transport via `MediaSession<｜｜begin▁of▁sentence｜｜>`-style dispatch |
 | `VOLUME` | `target` (`media`/`call`/`ring`/`alarm`) | Android | Volume, including absolute set which stock SWC cannot do |
 | `SYSTEM` | `command` (`screen_off`/`night_mode`/`screenshot`/`open_settings`) | Android | Head-unit housekeeping |
-| `BUZZ` | `pattern` (named) | Firmware | Local audible confirmation, independent of the buzzer grammar |
+| `BUZZ` | `pattern` (named, §7.2 spelling — enumerator name without the `k`) | Firmware | Local audible confirmation. **Replaces the default `KEY_ACCEPTED`**, because there is one buzzer and `Play` replaces rather than queues; a pattern name this build does not know falls back to `KEY_ACCEPTED` rather than leaving the press silent |
 | `APP_RAW` | `command` | Android | Escape hatch: an app-defined command not yet promoted to a kind |
 
 **Every action carries at most two string params, and that is a budget

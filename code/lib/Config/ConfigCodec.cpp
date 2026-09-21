@@ -95,6 +95,16 @@ bool ConfigValidate(const Config &c) {
     if (c.settings.timings.long_press_ms <= c.settings.timings.double_press_off_ms) return false;
     if (c.settings.timings.send_duration_ms == 0) return false;
     if (c.settings.buzzer_level > 3 || c.settings.led_level > 3) return false;
+    // The maintenance window is BOUNDED, like every other timing above. A zero
+    // makes the close test (`now - last_activity >= timeout`) true on the tick
+    // the window opens, so maintenance would appear to work and instantly close
+    // -- FR-38's feature silently doing nothing. A `uint32` maximum (~49.7 days)
+    // is the opposite failure: the window never closes on its own, which is
+    // exactly the "device left unable to serve presses" state FR-38 exists to
+    // prevent. Neither is a value the user can mean, so it is refused rather than
+    // clamped -- the same answer `debounce_ms` and `send_duration_ms` give.
+    if (c.settings.maintenance_timeout_ms == 0) return false;
+    if (c.settings.maintenance_timeout_ms > kMaintenanceTimeoutMaxMs) return false;
 
     for (uint8_t ch = 0; ch < c.channel_count; ++ch) {
         const ChannelConfig &cc = c.channels[ch];

@@ -194,6 +194,21 @@ TEST(ConfigCodec, ValidationRejectsInconsistentConfigs) {
     c.settings.timings.debounce_ms = 0;
     EXPECT_FALSE(ConfigValidate(c)) << "zero debounce is not a configurable choice";
 
+    // The maintenance window is the one settings scalar with no coherence rule of
+    // its own, and both of its degenerate ends defeat the FR-38 guarantee. A zero
+    // makes `now - last_activity >= timeout` true on the opening tick, so the
+    // window opens and closes at once -- the feature appears to work and does
+    // nothing. A `uint32` maximum (~49.7 days) is "never closes", which is the
+    // device-left-unable-to-serve state FR-38 exists to prevent. Both are refused,
+    // like `debounce_ms` above and `send_duration_ms` beside it.
+    c = MakeConfig();
+    c.settings.maintenance_timeout_ms = 0;
+    EXPECT_FALSE(ConfigValidate(c)) << "a zero timeout closes the window immediately";
+    c.settings.maintenance_timeout_ms = kMaintenanceTimeoutMaxMs + 1;
+    EXPECT_FALSE(ConfigValidate(c)) << "a timeout past the ceiling never closes on its own";
+    c.settings.maintenance_timeout_ms = kMaintenanceTimeoutMaxMs;
+    EXPECT_TRUE(ConfigValidate(c)) << "the ceiling itself is a legal window";
+
     c = MakeConfig();
     c.settings.timings.long_press_ms = 100;
     c.settings.timings.double_press_off_ms = 500;

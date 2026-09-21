@@ -295,6 +295,12 @@ TEST(LearnSession, EveryCommittedProfileIsAcceptedByTheConfigValidator) {
             c.settings.gain_policy = GainPolicy::kAuto;
             c.settings.buzzer_level = 2;
             c.settings.led_level = 2;
+            // Every scalar the validator bounds must be set: `Config c{}` is
+            // zero-initialised, and `maintenance_timeout_ms = 0` is now refused
+            // (it would close the maintenance window on the tick it opens). The
+            // test is about the LEARNED PROFILE, so the rest of the config must be
+            // a valid one or a refusal here would be read as a learn defect.
+            c.settings.maintenance_timeout_ms = 300000;
             c.channel_count = 1;
             c.channels[0].enabled = true;
             std::strncpy(c.channels[0].name, "SWC1", sizeof(c.channels[0].name) - 1);

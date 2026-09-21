@@ -508,6 +508,17 @@ cast (magnitude for `uint32_t`/`uint64_t`, `0`–`3` for the levels via
 `ConfigValidate`), and `config_patch` (§4.3) applies the identical rule so the
 two writers of a config give one answer to "what is a legal value".
 
+**The bounded timing scalars are bounded in RANGE, not only in width.**
+`debounce_ms` and `send_duration_ms` refuse zero; the gesture timings are ordered
+against each other; `maintenance_timeout_ms` refuses zero AND anything above
+`kMaintenanceTimeoutMaxMs` (1 hour, `ConfigValidate`). The magnitude check alone
+is not a range check, and both ends of `maintenance_timeout_ms` defeat FR-38: a
+zero makes the close test (`now - last_activity >= timeout`) true on the tick the
+window opens, so maintenance appears to work and instantly closes, and a
+`uint32` maximum (~49.7 days) is "never closes" — the device-left-unable-to-serve
+state FR-38 exists to prevent. Neither is a value a user can mean, so both are
+refused rather than clamped, the same answer `debounce_ms` gives.
+
 **Measured (§3.8's method), and re-measured 2026-09-19 after a defect:** the
 structural worst case is every string field at its width above, 2 channels × 16
 buttons, 3 AUX, and 32 bindings × 2 actions. That is **22,407 B** as JSON →

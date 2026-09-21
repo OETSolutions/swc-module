@@ -18,6 +18,12 @@ constexpr int kBindingIdLen         = 16;   // slugs: "vol_up", "next"
 constexpr int kActionTargetLen      = 40;   // holds com.oetsolutions.swc.ACTION_NAVIGATE (34)
 constexpr int kDataPayloadLen       = 48;   // holds geo:40.7608,-111.8910?q=Home (28)
 
+// The maintenance window's ceiling (FR-38). One hour is far past spec 8.2's
+// 5-minute default and still bounds the window to something a user could plausibly
+// want; a `uint32` maximum would be ~49.7 days, which is "never closes" in
+// practice and is the state FR-38 exists to prevent.
+constexpr uint32_t kMaintenanceTimeoutMaxMs = 3600000u;
+
 // These four widths are NOT free. They are a budget input, together with
 // kMaxBindings and kMaxActionsPerBinding: the structural worst case -- every
 // string field at its declared maximum -- is what ConfigMaxSerializedSize()

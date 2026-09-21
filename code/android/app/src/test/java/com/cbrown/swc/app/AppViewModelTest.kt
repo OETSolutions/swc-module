@@ -788,6 +788,138 @@ class AppViewModelTest {
         )
     }
 
+
+    @Test
+    fun `an event on the second channel moves the bands and rail with the label`() = runTest {
+        // The live view is one channel at a time, and an `event` carries ONE
+        // channel's reading. The view used to take its LABEL from the pressing
+        // channel but its BANDS and RAIL from channel 0: a press on SWC2 relabeled
+        // the screen "SWC2" while still plotting the reading against SWC1's scale
+        // and matching it against SWC1's windows -- the wrong button, named
+        // confidently. The three must move together or not at all.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        val base = sampleConfig()
+        // SWC2 differs in every field the view draws: a different rail, a
+        // different button set, a different name.
+        val swc2 = base.channels[0].copy(
+            name = "SWC2",
+            ladder = base.channels[0].ladder.copy(
+                learnedIdleMv = 2801,
+                buttons = listOf(
+                    com.oetsolutions.swc.model.LadderButton("mute", "Mute", 1900, 100),
+                ),
+            ),
+        )
+        configRun(base.copy(channels = base.channels + swc2)).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        // A press on channel 1.
+        t.emit(frame("event", "channel" to "1", "button" to "\"mute\"",
+            "gesture" to "\"SINGLE\"", "t_ms" to "9", "level_mv" to "1900"))
+        advanceUntilIdle()
+
+        val ladder = vm.ladder.value
+        assertEquals("SWC2", ladder.channelName)
+        assertEquals("the rail must be SWC2's, not channel 0's", 2801, ladder.idleMv)
+        assertEquals("the buttons must be SWC2's", listOf("mute"), ladder.buttons.map { it.id })
+        assertEquals("and the reading must match SWC2's window", "mute", ladder.matched()?.id)
+    }
+
+    @Test
+    fun `an event naming no channel leaves the ladder on the last good one`() = runTest {
+        // A frame the firmware could not name a channel for must not blank the
+        // view: the reading is still real, and an empty ladder would look like a
+        // device that lost its learning.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+        configRun(sampleConfig()).forEach { t.emit(it) }
+        advanceUntilIdle()
+        val before = vm.ladder.value
+
+        t.emit(frame("event", "button" to "\"vol_up\"",
+            "gesture" to "\"SINGLE\"", "t_ms" to "9", "level_mv" to "1430"))
+        advanceUntilIdle()
+
+        assertEquals("an unnameable channel keeps the last ladder", before.idleMv,
+            vm.ladder.value.idleMv)
+        assertEquals(before.buttons.map { it.id }, vm.ladder.value.buttons.map { it.id })
+        assertEquals("but the reading still updates", 1430, vm.ladder.value.liveMv)
+    }
+
+
+    @Test
+    fun `a learn stream sample shows the run's channel scale`() = runTest {
+        // `ladder_sample` carries the run's `channel` (spec 4.3), and the learn
+        // screen is where a mis-scaled band matters MOST: the user decides whether
+        // their press was recognised by watching the reading move against the
+        // bands. A learn run on channel 1 streamed into a view still scaled to
+        // channel 0's rail and buttons, so a perfectly good SWC2 press looked like
+        // it landed on the wrong button.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        val base = sampleConfig()
+        val swc2 = base.channels[0].copy(
+            name = "SWC2",
+            ladder = base.channels[0].ladder.copy(
+                learnedIdleMv = 2801,
+                buttons = listOf(
+                    com.oetsolutions.swc.model.LadderButton("mute", "Mute", 1900, 100),
+                ),
+            ),
+        )
+        configRun(base.copy(channels = base.channels + swc2)).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        t.emit(frame("ladder_sample", "channel" to "1", "level_mv" to "1900", "n" to "40"))
+        advanceUntilIdle()
+
+        val ladder = vm.ladder.value
+        assertEquals("SWC2", ladder.channelName)
+        assertEquals("the learn stream's rail must be SWC2's", 2801, ladder.idleMv)
+        assertEquals(listOf("mute"), ladder.buttons.map { it.id })
+        assertEquals(1900, ladder.liveMv)
+    }
+
+    @Test
+    fun `a link_gap frame is counted, not dropped`() = runTest {
+        // Spec 4.3: the firmware emits `link_gap` when one of the app's outgoing
+        // frames was lost. The app defined `Frames.LINK_GAP` and handled it
+        // NOWHERE -- it was the one inbound type with no branch -- so a dropped
+        // frame vanished and a failed transfer could not be told from a refused
+        // one. The frame existing in the vocabulary and being unhandled is exactly
+        // the "detected but not reported" shape the frame was added to close.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(frame("link_gap", "expected_seq" to "4", "got_seq" to "7"))
+        advanceUntilIdle()
+
+        assertEquals("a lost frame must be reported to the user", 1, vm.link.value.lostFrames)
+    }
+
+    @Test
+    fun `successive link gaps accumulate rather than being overwritten`() = runTest {
+        // A cable that drops one frame in a thousand drops several over a session,
+        // and the COUNT is what tells the user the link is unreliable rather than
+        // their device. Overwriting would keep saying "1" while the transfer kept
+        // failing.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        repeat(3) { t.emit(frame("link_gap", "expected_seq" to "1", "got_seq" to "2")) }
+        advanceUntilIdle()
+
+        assertEquals(3, vm.link.value.lostFrames)
+    }
+
     @Test
     fun `a locally invalid config is refused before it is sent`() = runTest {
         // The same rule the firmware enforces, checked locally so the user gets the

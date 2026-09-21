@@ -891,7 +891,7 @@ device actually resolved rather than a hardcoded word. The app reads `config_sta
 | FW → App | `ack` | `for_seq`, `ok`, `err` | Every command is acked |
 | FW → App | `nack` | `for_seq`, `err`, `detail` | Explicit failure, with a machine-readable code |
 | FW → App | `log` | `level`, `msg` | Diagnostic line. `level` is a word (`INFO`/`WARN`), matched by the app like `gesture`. **Not gated by a flag:** the one producer is FR-18's clamp warning, which marks a config value the device refused to drive as written, and a warning the user can switch off is a warning they will never see. The app shows received lines on the link screen, bounded to the newest few |
-| FW → App | `link_gap` | `channel`, `button`, `gesture`, `expected_seq`, `got_seq` | An inbound frame's `seq` skipped ahead, so a frame was lost. Fire-and-forget, like `event` |
+| FW → App | `link_gap` | `channel`, `button`, `gesture`, `expected_seq`, `got_seq` | An inbound frame's `seq` skipped ahead, so a frame was lost. Fire-and-forget, like `event`. **The app must report it** rather than drop it: a lost `config_chunk` or `learn_commit` is otherwise indistinguishable from a command the device refused, and the user's only clue that their cable is dropping bytes |
 | App → FW | `config_get` | — | Request the whole config (replied as a chunked run, §4.2) |
 | App → FW | `config_begin` / `config_chunk` / `config_end` | total_len+crc32; offset+data; sha256 | The chunked transport that carries **both** `config_get` and `config_set` (§4.2) |
 | App → FW | `config_patch` | `path`, `value` | Single-field change, cheaper and less racy — fits one line |

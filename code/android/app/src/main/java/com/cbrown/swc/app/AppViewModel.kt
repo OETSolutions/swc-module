@@ -233,9 +233,21 @@ class AppViewModel(
                 val gesture = frame.fields["gesture"]?.jsonPrimitive?.content
                 val channel = frame.fields["channel"]?.jsonPrimitive?.intOrNull
                 if (gesture != null && level != null) {
+                    // The WHOLE view follows the pressing channel: its bands, its
+                    // rail and its name together. The screen is a single-channel
+                    // diagnostic, and an event carries ONE channel's reading, so a
+                    // view that relabeled itself (as this once did) while still
+                    // drawing channel 0's bands and rail would plot SWC2's reading
+                    // against SWC1's scale and `matched()` it against SWC1's
+                    // windows -- reporting the wrong button for a perfectly healthy
+                    // second wheel. The label and the bands must move together or
+                    // neither.
+                    val shown = ladderFor(client.config.value, channel)
                     _ladder.value = _ladder.value.copy(
                         liveMv = level,
-                        channelName = channelNameFor(channel),
+                        idleMv = shown.idleMv,
+                        channelName = shown.channelName,
+                        buttons = shown.buttons,
                         lastGesture = Gesture.fromWireName(gesture) ?: Gesture.NONE,
                         lastGestureButton = id,
                     )
@@ -267,10 +279,26 @@ class AppViewModel(
             // During a learn run the device streams the filtered level instead.
             // Same `level_mv` field name as `event`, deliberately: both frames
             // report the FR-3 filtered value, so the view reads one field name.
+            //
+            // The frame ALSO carries the run's `channel` (spec 4.3), and the view
+            // follows it exactly as it follows an `event`'s. Ignoring it was the
+            // same wrong-scale hazard as the `event` path had: a learn run on
+            // channel 1 streamed its readings into a view still scaled to channel
+            // 0's rail and buttons -- and this is the screen the user watches WHILE
+            // learning, so a mis-scaled band there is what makes them think their
+            // press landed on the wrong button. The channel is read as this frame's
+            // own field, never inherited from the last `event`.
             Frames.LADDER_SAMPLE -> {
                 val level = frame.fields["level_mv"]?.jsonPrimitive?.intOrNull
+                val channel = frame.fields["channel"]?.jsonPrimitive?.intOrNull
                 if (level != null && level > 0) {
-                    _ladder.value = _ladder.value.copy(liveMv = level)
+                    val shown = ladderFor(client.config.value, channel)
+                    _ladder.value = _ladder.value.copy(
+                        liveMv = level,
+                        idleMv = shown.idleMv,
+                        channelName = shown.channelName,
+                        buttons = shown.buttons,
+                    )
                 }
             }
 
@@ -292,13 +320,56 @@ class AppViewModel(
                 val cs = frame.fields["config_state"]?.jsonPrimitive?.content
                 if (cs != null) _link.value = _link.value.copy(configState = cs)
             }
+
+            // Spec 4.3's `link_gap`: the DEVICE lost one of the app's outgoing
+            // frames. The firmware tracks the app's `seq` and emits this when it
+            // skips ahead, so a dropped frame is not indistinguishable from a
+            // command the device ignored. This branch did not exist -- `link_gap`
+            // was the one inbound frame type the app had no handler for, while it
+            // DID define the constant -- so a lost `config_chunk` or `learn_commit`
+            // vanished: the transfer failed and nothing said the bytes never
+            // arrived, which is the "detected but not reported" failure the frame
+            // was added to prevent.
+            //
+            // Counted rather than overwritten: gaps accumulate, and a cable that
+            // drops one frame in a thousand will drop several over a session. The
+            // count is what tells the user their link is unreliable rather than
+            // their device.
+            Frames.LINK_GAP -> {
+                val n = _link.value.lostFrames + 1
+                _link.value = _link.value.copy(lostFrames = n)
+            }
         }
     }
 
-    private fun channelNameFor(index: Int?): String {
-        val channels = client.config.value.channels
-        if (index == null || index < 0 || index >= channels.size) return _ladder.value.channelName
-        return channels[index].name.ifEmpty { "SWC${index + 1}" }
+    /**
+     * The ladder the live view should draw: the named channel's, or the first
+     * channel's when no channel is named.
+     *
+     * The [LadderUiState] is single-channel by construction (one rail, one button
+     * list), so "which channel is on screen" is one choice made in one place
+     * rather than three fields that can disagree. `onConfig` shows the first
+     * channel; an `event` switches to the channel it came from. An index that
+     * names no channel leaves the last good ladder on screen rather than blanking
+     * it for a frame the firmware could not name.
+     */
+    private fun ladderFor(config: Config, index: Int?): LadderShown {
+        val channels = config.channels
+        val at = index ?: 0
+        val chosen = channels.getOrNull(at)
+            ?: return LadderShown(
+                idleMv = _ladder.value.idleMv,
+                channelName = _ladder.value.channelName,
+                buttons = _ladder.value.buttons,
+            )
+        return LadderShown(
+            idleMv = chosen.ladder.learnedIdleMv,
+            channelName = chosen.name.ifEmpty { "SWC${at + 1}" },
+            buttons = chosen.ladder.buttons.map { b: LadderButton ->
+                LearnedButton(id = b.id, name = b.name.ifEmpty { b.id },
+                    mvCenter = b.mvCenter, mvTolerance = b.mvTolerance)
+            },
+        )
     }
 
     /**
@@ -387,6 +458,19 @@ class AppViewModel(
 
 
     /**
+     * The three fields of [LadderUiState] that describe WHICH ladder is on screen.
+     *
+     * They travel as one value because they must move together: a view that took
+     * the name from one channel and the bands from another would draw a reading
+     * against the wrong scale. [ladderFor] is the only producer.
+     */
+    private data class LadderShown(
+        val idleMv: Int,
+        val channelName: String,
+        val buttons: List<LearnedButton>,
+    )
+
+    /**
      * The device's config became known (from a `config_get` reply run).
      *
      * This is what turns the empty screens into real ones: the ladder view gets
@@ -394,14 +478,11 @@ class AppViewModel(
      * that the config actually binds.
      */
     private fun onConfig(config: Config) {
-        val channel = config.channels.firstOrNull()
+        val shown = ladderFor(config, null)
         _ladder.value = _ladder.value.copy(
-            idleMv = channel?.ladder?.learnedIdleMv ?: _ladder.value.idleMv,
-            channelName = channel?.name?.ifEmpty { null } ?: _ladder.value.channelName,
-            buttons = channel?.ladder?.buttons.orEmpty().map { b: LadderButton ->
-                LearnedButton(id = b.id, name = b.name.ifEmpty { b.id },
-                    mvCenter = b.mvCenter, mvTolerance = b.mvTolerance)
-            },
+            idleMv = shown.idleMv,
+            channelName = shown.channelName,
+            buttons = shown.buttons,
         )
         _bindings.value = _bindings.value.copy(
             cells = buildCells(config),

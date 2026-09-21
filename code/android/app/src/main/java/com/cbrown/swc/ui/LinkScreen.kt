@@ -60,6 +60,20 @@ data class LinkUiState(
      * are the two the user must be told about.
      */
     val configState: String? = null,
+    /**
+     * How many frames the DEVICE reported missing on the link (spec 4.3's
+     * `link_gap`), or 0 if none.
+     *
+     * The firmware tracks the app's outgoing `seq` and emits a `link_gap` frame
+     * when it skips ahead, because a lost command is otherwise indistinguishable
+     * from a command the device ignored. The app defined the frame constant and
+     * then dropped the frame: it was the ONE inbound type with no handler, so a
+     * dropped `config_chunk` or `learn_commit` left the user with a transfer that
+     * went nowhere and nothing anywhere saying why. Counting them makes a flaky
+     * cable visible, which is the only way the user can tell "the device refused"
+     * from "the bytes never arrived".
+     */
+    val lostFrames: Int = 0,
 ) {
     /**
      * The config fault to show, or null when there is nothing to say.
@@ -137,6 +151,24 @@ fun LinkScreen(
                 Column(Modifier.padding(16.dp)) {
                     Text("Configuration problem", style = MaterialTheme.typography.titleMedium)
                     Text(warning, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
+        }
+
+        if (state.lostFrames > 0) {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3E0)),
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("Lost frames", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        "The adapter reported ${state.lostFrames} frame" +
+                            (if (state.lostFrames == 1) "" else "s") +
+                            " missing on the link. A command may not have reached the " +
+                            "device. Check the USB cable and try the operation again.",
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
                 }
             }
         }

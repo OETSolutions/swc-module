@@ -2190,3 +2190,62 @@ TEST(SystemOrchestrator, TheStoredTimingsAreWhatTheDeviceRunsWith) {
     EXPECT_NE(std::find(seen.begin(), seen.end(), "LONG"), seen.end())
         << "a hold past the user's long_press_ms must still fire LONG";
 }
+
+// --- Channel.enabled gates CLASSIFICATION (spec 3.4) -------------------------
+
+TEST(SystemOrchestrator, ADisabledChannelDoesNotClassifyItsLearnedLadder) {
+    // Spec 3.4: `Channel.enabled = false` means "this channel has no learned
+    // ladder to compare against -- do not try to classify its input". Three
+    // places DESCRIBED that (`ConfigDefault`'s comment, spec 3.4, and
+    // BindingResolver's "NOT gated on enabled" note) and none IMPLEMENTED it:
+    // a disabled channel with a learned ladder still classified and emitted
+    // `SINGLE@vol_up`, which would have driven the output.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.channels[0].enabled = false;   // but keep the learned ladder
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    std::vector<std::string> seen;
+    o.SetGestureSink(
+        [](void *ctx, const SystemOrchestrator::GestureEventRecord &ev) {
+            auto *v = static_cast<std::vector<std::string> *>(ctx);
+            if (ev.button_id != nullptr) v->push_back(ev.button_id);
+        },
+        &seen);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    seen.clear();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);   // a press on a learned window
+    PollFor(o, hal, 300);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 400);
+    EXPECT_TRUE(seen.empty()) << "a disabled channel must not classify its ladder";
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "a disabled channel must not drive the output either";
+}
+
+TEST(SystemOrchestrator, ADisabledChannelStillReleasesAKeyDrivenByTheBench) {
+    // The gate is on CLASSIFICATION, not on the safety releases: `test_key` can
+    // drive a disabled channel's line, and a pulse timeout must still release it.
+    // Gating the whole function would leave a bench-driven key held (FR-39).
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.channels[0].enabled = false;
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    ASSERT_TRUE(o.TestDriveKeyMv(0, 2400, 50, hal.NowMs()));
+    ASSERT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code) << "the bench drive must hold a key";
+    PollFor(o, hal, 200);
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "the pulse must still self-release on a disabled channel";
+}

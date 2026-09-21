@@ -704,6 +704,40 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
 
     const DacChannel key_ch = (index == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
 
+    // Spec 3.4: `Channel.enabled` gates whether this channel's LEARNED LADDER is
+    // classified -- "this channel has no learned ladder to compare against, do not
+    // try to classify its input". It is NOT a binding gate (that is
+    // `Binding.enabled`, checked per binding in `BindingResolve`) and NOT an
+    // opt-out from being serviced at all (that is `channel_count`).
+    //
+    // **Nothing read this flag until now**, in three places that DESCRIBED it and
+    // none that implemented it: `ConfigDefault`'s own comment, spec 3.4, and
+    // `BindingResolver.cpp` ("NOT gated on `cfg.channels[..].enabled` -- spec 3.4:
+    // `enabled` gates whether the channel's ladder is CLASSIFIED"). Measured
+    // before the fix: a channel with `enabled = false` and a learned ladder still
+    // classified, emitted `SINGLE@vol_up`, and would have driven the output.
+    //
+    // A disabled channel still runs the SAFETY releases below (a pulse timeout, or
+    // a rail fault releasing a key someone drove with `test_key`), because those
+    // are not classification. `level` is forced to kIdle so neither the pass-
+    // through branch nor the gesture machine can fire.
+    if (!cc.enabled) {
+        cs.reader.Update(now_ms);
+        const int sense_mv =
+            hal_->adc_read_mv(hal_->ctx, (index == 0) ? ADC_CH_KEY_SENSE1 : ADC_CH_KEY_SENSE2);
+        const int key_idle_now_mv = sense_mv * kSenseDividerRatio;
+        const bool rail_fault = (key_idle_now_mv < kKeyEnvelopeLowMv) ||
+                                (key_idle_now_mv > kKeyEnvelopeHighMv);
+        if (rail_fault) {
+            ReleaseKey(index);
+            cs.gestures.Reset();
+            ReportFault();
+            return;
+        }
+        if (cs.key_driven && now_ms >= cs.key_released_at_ms) ReleaseKey(index);
+        return;
+    }
+
     // Read the ladder THROUGH FR-3's noise filter, not as a single conversion.
     // A single noisy conversion can flip a classification, which is exactly the
     // failure FR-3 forbids; the median-of-32 window rejects it.

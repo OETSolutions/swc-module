@@ -303,3 +303,30 @@ TEST(ConfigCodec, EveryGainModeRoundTripsByItsOwnName) {
         EXPECT_EQ(out.channels[0].output.gain_mode, mode);
     }
 }
+
+TEST(ConfigCodec, AnIntegerFieldCarryingAFractionIsRefusedNotTruncated) {
+    // Truncating 750.9 to 750 is a config the device accepts and then behaves
+    // differently from what was sent -- the same wrong-value-accepted class as
+    // the uint32 wrap ReadU32 already guards against, one size smaller. The
+    // `config_patch` path refuses a fractional integer field; if the codec
+    // truncated it, the two paths would give two answers to one question.
+    const Config in = MakeConfig();
+    char a[kScratch] = {};
+    ASSERT_GT(ConfigEncodeJson(in, a, sizeof(a)), 0u);
+    std::string s(a);
+    const size_t at = s.find("\"long_press_ms\":");
+    ASSERT_NE(at, std::string::npos) << "the fixture must set this field";
+    const size_t num = s.find_first_of("0123456789", at);
+    const size_t end = s.find_first_not_of("0123456789", num);
+    s.replace(num, end - num, "750.9");  // a legal-looking value, one fraction over
+    Config out{};
+    EXPECT_FALSE(ConfigDecodeJson(s.c_str(), s.size(), &out))
+        << "a fractional integer field must be refused";
+
+    // And the integer form of the same field still decodes (the bound is not so
+    // tight it refuses a legal value).
+    std::string t(a);
+    t.replace(num, end - num, "751");
+    EXPECT_TRUE(ConfigDecodeJson(t.c_str(), t.size(), &out));
+    EXPECT_EQ(out.settings.timings.long_press_ms, 751u);
+}

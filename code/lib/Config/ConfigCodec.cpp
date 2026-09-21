@@ -226,6 +226,12 @@ bool ReadU32(const cJSON *obj, const char *key, uint32_t *out) {
     // larger number would otherwise wrap silently -- which is how
     // updated_at_ms's 1700000000000 became 3487969280 before this check.
     if (v->valuedouble > 4294967295.0) return false;
+    // An integer field carrying a fraction is refused, not truncated. Truncating
+    // 750.9 to 750 is a config the device accepts and then behaves differently
+    // from what was sent -- the same class of wrong-value-accepted as the wrap
+    // above, one size smaller. `config_patch` refuses a fraction for these same
+    // fields, so truncating here would be two answers to one question.
+    if (v->valuedouble != static_cast<double>(static_cast<uint32_t>(v->valuedouble))) return false;
     *out = static_cast<uint32_t>(v->valuedouble);
     return true;
 }
@@ -239,6 +245,9 @@ bool ReadU64(const cJSON *obj, const char *key, uint64_t *out) {
     // 2^53 is where a double stops representing consecutive integers, so above
     // it the value that arrived is not the value that was sent.
     if (v->valuedouble > 9007199254740992.0) return false;
+    // Same fraction rule as ReadU32: a timestamp is a whole number of ms, and
+    // truncating one would store a stamp the sender did not write.
+    if (v->valuedouble != static_cast<double>(static_cast<uint64_t>(v->valuedouble))) return false;
     *out = static_cast<uint64_t>(v->valuedouble);
     return true;
 }

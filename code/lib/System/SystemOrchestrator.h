@@ -352,6 +352,13 @@ private:
         // edge detector -- otherwise a held button re-arms the pulse every tick
         // after each release and emits a key every 200 ms.
         bool                pass_through_pressed = false;
+        // FR-25's per-channel wheel idle: the ratio's denominator with no config
+        // to pin one to. PER CHANNEL, because the two SWC inputs are independent
+        // wheels (FR-9) whose idles need not match -- a single device-wide
+        // reference taken from one channel reads every tick of the other as a
+        // press whenever their idles differ by more than kPassThroughPressDeltaMv,
+        // driving a phantom key with nothing held.
+        int                 pass_through_idle_mv = 0;
         // FR-12: one report and one KEY_UNKNOWN beep per unrecognised press, not
         // one per poll tick. A held level is unrecognised on every tick, so
         // without this latch a held press would emit 100 events/s and play a
@@ -425,12 +432,11 @@ private:
      * is the same normalization spec 6.3 already uses for the configured case.
      */
     bool pass_through_ = false;
-    // The WHEEL's live idle: the ratio numerator's denominator, and the only
-    // reference available with no config to pin one to.
-    int  pass_through_idle_mv_ = 0;
     // The HEAD UNIT's measured idle (spec 6.2 step 1), which the pass-through
-    // ratio is applied TO. Distinct from `pass_through_idle_mv_`: those are two
-    // different ladders, and conflating them maps every press to the wrong key.
+    // ratio is applied TO. The WHEEL's idle -- the ratio's denominator -- is
+    // PER CHANNEL (`ChannelState::pass_through_idle_mv`), because each SWC input
+    // is its own wheel with its own idle. Those are two different ladders, and
+    // conflating either pair maps every press to the wrong key.
     int  head_unit_idle_mv_ = 0;
 
     // Where a recognized gesture is reported (spec 4.3's `event`). Null until a

@@ -405,6 +405,88 @@ TEST(SystemOrchestrator, WithNoLadderReferencePassThroughIsDisabledRatherThanGue
     EXPECT_TRUE(o.SafeIdleEstablished()) << "and the safe idle must still hold";
 }
 
+// The pass-through reference is PER CHANNEL. It was one device-wide member
+// captured from SWC1 only, then self-healed inside `ServiceChannel` from
+// whichever channel's reading was higher -- so a second channel whose idle sat
+// more than `kPassThroughPressDeltaMv` above the first made the FIRST channel's
+// real idle look like a press, and a channel reading ~0 (a disconnected input,
+// the one-wheel-car case) did it unconditionally. Measured before the fix: two
+// idle channels at 2835/3300 drove a phantom key on channel 0 with nothing held.
+namespace {
+
+// A two-channel device with NO stored config, so Boot() selects pass-through.
+// Both channels are given a name and `enabled = true`, because
+// `ConfigDefault`'s values are what the real device boots with.
+SystemOrchestrator MakeUnconfiguredTwoChannel(MockHal &hal) {
+    Config c = ConfigDefault();
+    c.channel_count = 2;
+    hal.ClearNvs();
+    return SystemOrchestrator(&hal.InterfaceRef(), c, GestureTimingsDefault());
+}
+
+}  // namespace
+
+TEST(SystemOrchestrator, ATwoChannelDeviceWithUnequalIdlesDoesNotDriveAPhantomKey) {
+    MockHal hal;
+    auto o = MakeUnconfiguredTwoChannel(hal);
+    // SWC1 idles at the spec's rail; SWC2's wheel idles 465 mV higher -- a
+    // different ladder, well past the 300 mV press threshold.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_SWC2, 3300);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE2, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle0 = hal.LastDacCode(DAC_CH_KEY1);
+    // A phantom press is a BOUNDED PULSE that self-releases on `send_duration_ms`,
+    // so the final code returns to idle within 200 ms either way -- the write
+    // COUNT is what distinguishes "did not touch the line" from "drove a key and
+    // released it". Measured before the fix: 2 extra writes and code 2916.
+    const int writes0 = hal.DacWriteCount(DAC_CH_KEY1);
+
+    // NOTHING is pressed. Neither KEY line may move off its safe idle at all.
+    PollFor(o, hal, 300);
+    EXPECT_EQ(hal.DacWriteCount(DAC_CH_KEY1), writes0)
+        << "channel 1's higher idle must not read as a press on channel 0";
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle0);
+}
+
+TEST(SystemOrchestrator, ADisconnectedSecondChannelDoesNotDriveAPhantomKeyOnTheFirst) {
+    // The common one-wheel car: SWC2 is unconnected, so it reads ~0. Against a
+    // SHARED reference that is a large "press" and drove a key every tick.
+    MockHal hal;
+    auto o = MakeUnconfiguredTwoChannel(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_SWC2, 0);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE2, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int writes0 = hal.DacWriteCount(DAC_CH_KEY1);
+
+    PollFor(o, hal, 300);
+    EXPECT_EQ(hal.DacWriteCount(DAC_CH_KEY1), writes0)
+        << "an unconnected sibling input must not look like a press";
+}
+
+TEST(SystemOrchestrator, OneChannelWithoutAReferenceDoesNotDisableTheOtherChannelsPassThrough) {
+    // Spec 6.9's "disabled rather than guessed" is PER INPUT: one dead wheel must
+    // serve nothing while a healthy wheel still passes through.
+    MockHal hal;
+    auto o = MakeUnconfiguredTwoChannel(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_SWC2, -1);     // the HAL's error code: unreadable
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE2, kSenseFor5vHeadUnit);
+    o.Boot();
+    ASSERT_TRUE(o.PassThroughActive()) << "channel 0 still has a usable reference";
+    const int idle0 = hal.LastDacCode(DAC_CH_KEY1);
+
+    // A real press on the healthy channel still drives its key.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle0)
+        << "a dead sibling must not disable the healthy channel's pass-through";
+}
+
 TEST(SystemOrchestrator, AConfiguredDeviceDoesNotUsePassThrough) {
     // The inverse, and the more dangerous direction: a CONFIGURED device must
     // classify against its learned windows. If pass-through were ever left on, a

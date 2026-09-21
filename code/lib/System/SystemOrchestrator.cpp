@@ -265,30 +265,17 @@ void SystemOrchestrator::Boot() {
     //    command (FR-13), and before the per-channel state exists.
     EstablishSafeIdle();
 
-    if (pass_through_) {
-        // Channel 0's live ladder reading is the pass-through reference. Read it
-        // AFTER safe idle so the KEY line is already released and cannot be
-        // pulling the ladder; a reference taken while the output was driving
-        // would be a level the user is not holding.
-        const int live = hal_->adc_read_mv(hal_->ctx, ADC_CH_SWC1);
-        pass_through_idle_mv_ = (live > 0) ? live : 0;
-        if (pass_through_idle_mv_ <= 0) {
-            // No usable reference: the ladder is unpowered or unreadable. Pass-
-            // through is then impossible, and guessing a denominator would map
-            // every press to a voltage nothing defined. Serve nothing rather than
-            // drive a fabricated key.
-            //
-            // No logging here on purpose: this file is HOST-compiled (the native
-            // suite runs it), so it cannot call esp_log. The state is observable
-            // through PassThroughActive(), which is what a test and the link
-            // status both read.
-            pass_through_ = false;
-        }
-    }
-
     // 3. Now the per-channel state.
     channel_count_ = (config_.channel_count <= kMaxChannels) ? config_.channel_count
                                                              : kMaxChannels;
+    // FR-25's pass-through reference is captured PER CHANNEL, here and not before
+    // the loop, because the two SWC inputs are independent wheels (FR-9) with
+    // their own idles. A single device-wide reference taken from channel 0 made
+    // the SECOND channel's idle look like a press on the first whenever the two
+    // differed by more than kPassThroughPressDeltaMv -- a key driven every tick
+    // with nothing held, which is the phantom-key hazard FR-15/FR-39 exist to
+    // prevent. A disconnected second input (reading ~0) did it unconditionally.
+    bool any_reference = false;
     for (uint8_t i = 0; i < channel_count_; ++i) {
         ChannelState &cs = channels_[i];
         cs.classifier = PressClassifier(config_.channels[i].ladder, timings_);
@@ -307,7 +294,28 @@ void SystemOrchestrator::Boot() {
         // command with the loop off until its gain is measured on hardware, and
         // running a software loop against the hardware integrator is how you
         // build an oscillator.
+        //
+        // The live ladder reading is this channel's own pass-through reference.
+        // Read it AFTER safe idle so the KEY line is already released and cannot
+        // be pulling the ladder; a reference taken while the output was driving
+        // would be a level the user is not holding.
+        if (pass_through_) {
+            const int live = hal_->adc_read_mv(hal_->ctx, (i == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
+            cs.pass_through_idle_mv = (live > 0) ? live : 0;
+            if (cs.pass_through_idle_mv > 0) any_reference = true;
+        }
     }
+
+    // No usable reference on ANY channel: the ladders are unpowered or unreadable.
+    // Pass-through is then impossible, and guessing a denominator would map every
+    // press to a voltage nothing defined. Serve nothing rather than drive a
+    // fabricated key. (A channel with no reference of its own serves nothing while
+    // its siblings still pass through -- see ServiceChannel.)
+    //
+    // No logging here on purpose: this file is HOST-compiled (the native suite
+    // runs it), so it cannot call esp_log. The state is observable through
+    // PassThroughActive(), which is what a test and the link status both read.
+    if (pass_through_ && !any_reference) pass_through_ = false;
 
     // 4. Feedback for the load result. A recovered backup is degraded (the user
     //    should know their newest config was lost); a fallback is an error.
@@ -770,52 +778,69 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     // for 504 permille of the head unit's idle. The wheel's and the head unit's
     // resistances need not match, and this mapping does not care.
     if (pass_through_) {
-        // The LIVE ladder reading, unfiltered. The reference below was captured
-        // this same way at Boot, so comparing like with like needs no filter (and
-        // `cs.reader` must warm up for the configured path's debounce).
-        int level_now_mv =
-            hal_->adc_read_mv(hal_->ctx, (index == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
+        // This channel's own reference, or NONE. A channel whose ladder was
+        // unreadable at Boot drives nothing while its siblings still pass through
+        // (spec 6.9's "disabled rather than guessed" is per input -- one dead
+        // wheel must not disable the other). This does NOT return: the safety
+        // releases below (a pulse timeout, a rail fault) must still run for a
+        // channel this build never drove from a press, or a `test_key` pulse in
+        // flight would never be released.
+        if (cs.pass_through_idle_mv > 0) {
+            // The LIVE ladder reading, unfiltered. The reference below was
+            // captured this same way at Boot, so comparing like with like needs no
+            // filter (and `cs.reader` must warm up for the configured path's
+            // debounce).
+            const int level_now_mv =
+                hal_->adc_read_mv(hal_->ctx, (index == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
 
-        // Self-heal a reference captured while a button was held. It is read once
-        // at Boot; if the user was holding a button at power-on then it is a
-        // PRESSED level, which makes every later press look like "less off idle"
-        // and can suppress pass-through for the whole session. Seeing the line
-        // ABOVE the captured reference means the capture was a press -- no button
-        // pulls the ladder UP from true idle -- so adopt the higher value. Only
-        // the HIGHEST reading is ever adopted, so a press cannot drag the
-        // reference down the way a naive re-capture would.
-        if (level_now_mv > pass_through_idle_mv_) {
-            pass_through_idle_mv_ = level_now_mv;
-            cs.pass_through_pressed = false;
-        }
-        // `idle` is re-read AFTER the heal so a press in this same tick is not
-        // measured against the reference it just replaced.
-        const int idle = pass_through_idle_mv_;
+            // Self-heal a reference captured while a button was held. It is read
+            // once at Boot; if the user was holding a button at power-on then it is
+            // a PRESSED level, which makes every later press look like "less off
+            // idle" and can suppress pass-through for the whole session. Seeing the
+            // line ABOVE the captured reference means the capture was a press -- no
+            // button pulls the ladder UP from true idle -- so adopt the higher
+            // value. Only the HIGHEST reading is ever adopted, so a press cannot
+            // drag the reference down the way a naive re-capture would.
+            //
+            // PER CHANNEL: this heals only THIS channel's reference. Healing a
+            // shared one from whichever channel happened to read higher is what
+            // made a two-channel device drive a phantom key on the lower-idle
+            // channel.
+            if (level_now_mv > cs.pass_through_idle_mv) {
+                cs.pass_through_idle_mv = level_now_mv;
+                cs.pass_through_pressed = false;
+            }
+            // `idle` is re-read AFTER the heal so a press in this same tick is not
+            // measured against the reference it just replaced.
+            const int idle = cs.pass_through_idle_mv;
 
-        // FR-25 / spec 6.9: "a press is clearly off idle (> 300 mV from the
-        // wheel's idle)", read directly off the ADC rather than through the noisy
-        // median -- the reference was captured the same way, so like is compared
-        // with like. `level_mv`/`cs.reader` stay for the configured path, whose
-        // debounce genuinely needs the filter.
-        const bool pressed = (idle - level_now_mv) > kPassThroughPressDeltaMv;
-        // RISING EDGE only. The pulse self-releases on `send_duration_ms` below,
-        // so without this latch the very next tick would see the button still
-        // held, `key_driven` false, and re-arm -- the line would pulse once per
-        // send_duration instead of once per press, and a held button would emit a
-        // key every 200 ms forever. The edge also matches the configured path,
-        // where a SINGLE cannot fire twice without a release between.
-        const bool rising_edge = pressed && !cs.pass_through_pressed;
-        cs.pass_through_pressed = pressed;
+            // FR-25 / spec 6.9: "a press is clearly off idle (> 300 mV from the
+            // wheel's idle)", read directly off the ADC rather than through the
+            // noisy median -- the reference was captured the same way, so like is
+            // compared with like. `level_mv`/`cs.reader` stay for the configured
+            // path, whose debounce genuinely needs the filter.
+            const bool pressed = (idle - level_now_mv) > kPassThroughPressDeltaMv;
+            // RISING EDGE only. The pulse self-releases on `send_duration_ms`
+            // below, so without this latch the very next tick would see the button
+            // still held, `key_driven` false, and re-arm -- the line would pulse
+            // once per send_duration instead of once per press, and a held button
+            // would emit a key every 200 ms forever. The edge also matches the
+            // configured path, where a SINGLE cannot fire twice without a release
+            // between.
+            const bool rising_edge = pressed && !cs.pass_through_pressed;
+            cs.pass_through_pressed = pressed;
 
-        if (rising_edge && head_unit_idle_mv_ > 0) {
-            // The head unit's OWN idle is the denominator: the wheel asks for a
-            // fraction of a full-scale ladder position, and that fraction is then
-            // applied to the head unit's range. Using the output's safe-idle code
-            // instead would scale against 5200 mV and push low buttons into the
-            // clamp, which is the wrong key rather than a quieter one.
-            PresentLevel(index, level_mv, idle, sense_mv, now_ms, key_ch);
-        } else if (!pressed) {
-            ReleaseKey(index);
+            if (rising_edge && head_unit_idle_mv_ > 0) {
+                // The head unit's OWN idle is the denominator: the wheel asks for
+                // a fraction of a full-scale ladder position, and that fraction is
+                // then applied to the head unit's range. Using the output's
+                // safe-idle code instead would scale against 5200 mV and push low
+                // buttons into the clamp, which is the wrong key rather than a
+                // quieter one.
+                PresentLevel(index, level_mv, idle, sense_mv, now_ms, key_ch);
+            } else if (!pressed) {
+                ReleaseKey(index);
+            }
         }
         // No gesture state machine, no bindings, no buzzer pattern: there is
         // nothing configured to resolve against, and inventing feedback for an

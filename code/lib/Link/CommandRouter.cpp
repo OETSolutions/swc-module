@@ -535,7 +535,19 @@ void CommandRouter::HandleConfigPatch(const cJSON *root, uint32_t for_seq) {
     }
 
     Config c{};
-    if (store_->Load(&c) != ConfigLoadResult::kLoaded) c = ConfigDefault();
+    const ConfigLoadResult lr = store_->Load(&c);
+    if (lr == ConfigLoadResult::kFellBackToDefaults) {
+        // A patch is read-modify-write, so an unreadable config must NOT be
+        // patched over: doing so writes defaults plus one field, discarding the
+        // user's bindings, channels and settings. Measured before the fix: a
+        // patch over a corrupted config took 3 bindings to 0 with an `ack`.
+        // `kNoConfig` may still fall back -- a device that has never been
+        // configured has nothing to lose.
+        Nack(for_seq, "config_unreadable",
+             "the stored config could not be read; refusing to overwrite it");
+        return;
+    }
+    if (lr == ConfigLoadResult::kNoConfig) c = ConfigDefault();
 
     const double v = value->valuedouble;
     bool applied = true;

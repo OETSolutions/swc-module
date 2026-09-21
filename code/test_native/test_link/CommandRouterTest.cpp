@@ -1044,3 +1044,40 @@ TEST(CommandRouter, SilenceClosesAnOpenLearnStream) {
     EXPECT_FALSE(HasType(cap, "ladder_sample"))
         << "after the link goes quiet the learn stream must stop";
 }
+
+TEST(CommandRouter, AConfigPatchOverAnUnreadableConfigRefusesRatherThanOverwriting) {
+    // The SAME defect as the learn_commit one, in the sibling handler: a patch is
+    // read-modify-write, and `if (Load != kLoaded) c = ConfigDefault()` cannot
+    // tell "never configured" from "configured but unreadable". Measured before
+    // the fix: patching one scalar over a corrupted config took three bindings to
+    // zero and answered `ack`.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.binding_count = 3;
+    d.config.settings.timings.debounce_ms = 40;
+    ASSERT_TRUE(store.Save(d.config));
+    hal.CorruptNvsValue("cfg_a_0", 24);
+    hal.CorruptNvsValue("cfg_b_0", 24);
+    {
+        Config t{};
+        ASSERT_EQ(store.Load(&t), ConfigLoadResult::kFellBackToDefaults)
+            << "the fixture must actually be unreadable for this test to mean "
+               "anything";
+    }
+
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string p =
+        "{\"v\":1,\"seq\":1,\"type\":\"config_patch\",\"path\":\"settings.led_level\",\"value\":3}";
+    r.OnLine(p.c_str(), p.size());
+
+    ASSERT_TRUE(HasType(cap, "nack")) << "an unreadable config must be refused";
+    EXPECT_NE(cap.lines.back().find("config_unreadable"), std::string::npos);
+    EXPECT_FALSE(HasType(cap, "ack"));
+
+    // The store still holds the user's bytes, not defaults plus one field.
+    Config after{};
+    EXPECT_EQ(store.Load(&after), ConfigLoadResult::kFellBackToDefaults)
+        << "a refused patch must leave the stored bytes alone -- a load that now "
+           "SUCCEEDS means defaults were written over the user's config";
+}

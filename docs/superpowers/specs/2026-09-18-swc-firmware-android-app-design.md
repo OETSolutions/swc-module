@@ -1665,7 +1665,13 @@ AUX1 + buzzer/LED prompts (fallback, FR-31).
 - **`kFellBackToDefaults`** — something IS stored and could not be read (both slots corrupt, a CRC failure, a schema this build cannot interpret). Substituting defaults here and then SAVING destroys the user's entire config — bindings, the other channel, every setting — and reports success. Measured before this was fixed: three bindings replaced by zero from a single `learn_commit`, with an `ack`. The correct behavior is to **refuse and report** (`nack: config_unreadable`); the fault is the thing the user needs told.
 - **`kRecoveredFromBackup`** — the older slot is intact. Using it is correct, and `Load` has already done so.
 
-The same rule holds for every other path that reads-modifies-writes a config: `config_patch` already refuses an invalid result rather than writing it.
+The same rule holds for **every** path that reads-modifies-writes a config, and
+`config_patch` was the second place it was violated — an earlier version of this
+sentence claimed that path was already correct, and it was not. It refused an
+invalid *result*, which is a different check from refusing to build the patch on
+an unreadable *input*: `if (Load != kLoaded) c = ConfigDefault()` made a patch
+over a corrupt config write defaults plus one field. Measured: three bindings to
+zero, with an `ack`. It now refuses `config_unreadable` exactly as a learn does.
 
 **Rejection reasons are spoken aloud as distinct rhythms**, and MUST NOT be reported as persisted unless it was (`store.Save` returned true).** Both are normative, not implementation notes, because both fail *silently and late*:
 

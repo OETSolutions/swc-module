@@ -441,6 +441,40 @@ after a web-triggered run the page is unreachable for the duration and then retu
 The page also no longer reloads on click. A reload issued while the server is busy
 hangs for the whole test, which is exactly what "clicking does nothing" looked like.
 
+## Bench notes from the second session
+
+**AUX1 reading 0 mV was a jumper, not a fault.** A wire from J5.4 to GND reads exactly
+0 mV, which is the same reading a dead input would give — so the `p` menu probe was
+added (`gpio_set_pull_mode` + ADC, not `pinMode`/`digitalRead`) to tell "held down by
+the operator" from "held down by a fault". With the jumper removed all four inputs
+read 3173 mV.
+
+**The first version of that probe was itself wrong and nearly produced a false
+hardware verdict.** It used `pinMode()`/`digitalRead()` on pins that are attached to
+the ADC peripheral, where `digitalRead` does not reflect the pad — and it called
+known-good SWC1 "shorted". The tell was that it contradicted a pin that passes every
+other test. The probe now uses the ADC (the instrument that is trusted) and carries
+SWC1 as a built-in control.
+
+**Test 31 measured the release at the wrong moment.** It sampled "recovered" 250 ms
+after a single Continue press — while the operator was *still holding* the short — so
+it compared the shorted value with itself and failed a working board. Reported from
+the bench as "it's not testing the release at the right time and fails, even though
+the lines go low and high at the right time." It now prompts **twice** per input:
+short-and-hold, then remove-and-leave-open.
+
+**Both tasks were reading the same UART.** The serial menu handler on `loop()`'s task
+consumed the keystroke the waiting test was listening for, so ENTER appeared to do
+nothing and the test still timed out. `TestTask::WaitingForOperator()` now claims the
+input while a prompt is outstanding.
+
+**The LED sweep is per-LED now.** A report of "the status LED flashes but LED2 only
+goes solid then off" could not be attributed while both were driven together. The
+pins are also **read back** first, and they toggle identically (56 toggles, 28 cycles
+each) — so that difference is downstream of the MCU, and the likely cause is a
+marginal solder joint, which passes DC (solid light) and fails as the rate rises.
+Driving one at a time is what makes it visible per-LED.
+
 ## Known limits
 
 - **Tests 31 and 32 need the operator.** 31 skips (rather than passing) if no

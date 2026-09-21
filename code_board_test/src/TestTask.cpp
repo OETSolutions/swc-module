@@ -25,8 +25,11 @@ static volatile bool s_busy = false;
 // recursive mutex, which is already held on every path that touches it.
 static char s_prompt[160] = {0};
 static volatile bool s_continue = false;
+static volatile bool s_waiting = false;
 
 void SignalContinue() { s_continue = true; }
+
+bool WaitingForOperator() { return s_waiting; }
 
 const char *CurrentPrompt() { return s_prompt; }
 
@@ -56,17 +59,22 @@ bool AskOperator(const char *what, uint32_t timeout_ms)
     // cannot satisfy it silently.
     while (Serial.available()) Serial.read();
     s_continue = false;
+    // Claim the serial input: the loop task checks this and stops consuming, so the
+    // keystroke reaches THIS loop rather than being swallowed by the menu handler.
+    s_waiting = true;
 
     const uint32_t t0 = millis();
     while (millis() - t0 < timeout_ms) {
         if (Serial.available()) {
             while (Serial.available()) Serial.read();
             s_prompt[0] = '\0';
+            s_waiting = false;
             return true;
         }
         if (s_continue) {
             s_continue = false;
             s_prompt[0] = '\0';
+            s_waiting = false;
             return true;
         }
         vTaskDelay(pdMS_TO_TICKS(50));
@@ -75,6 +83,7 @@ bool AskOperator(const char *what, uint32_t timeout_ms)
     Log::Printf("  (no response within %u s -- continuing without it)",
                 (unsigned)(timeout_ms / 1000));
     s_prompt[0] = '\0';
+    s_waiting = false;
     return false;
 }
 

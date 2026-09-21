@@ -869,60 +869,85 @@ Outcome Test20_Leds()
     // no peripheral -- and at 60 Hz, well inside what a loop can do, it is accurate
     // enough for the purpose.
     // ---------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // Part 2: does the MCU actually toggle each pin?
+    //
+    // FIRST, before asking anyone to look at anything: prove the pins toggle by
+    // reading them back. A plain GPIO output reflects its driven level on read, so if
+    // a pin does not follow, the fault is on the MCU side (a pin that cannot be
+    // driven) and no amount of looking at the LED will explain it.
+    //
+    // This exists because a report came back as "the status LED flashes at increasing
+    // frequency, but LED2 only turns on solid then off" -- and both pins are driven by
+    // IDENTICAL code in the sweep below, so the two possible causes are very different
+    // and this is what separates them.
+    // ---------------------------------------------------------------------
     Log::Printf("");
-    Log::Printf("  part 2: pulse sweep, 1 Hz -> 60 Hz over ~2 s");
-    Log::Printf("    Expect: slow, distinct blinks at the start, MERGING into a");
-    Log::Printf("    steady dim glow by 60 Hz (above the flicker-merge rate).");
-    Log::Printf("    Both LEDs are driven together.");
+    Log::Printf("  part 2: pin readback (does the MCU toggle each pin at all?)");
+    bool pin_ok = true;
+    for (size_t i = 0; i < nrows; ++i) {
+        digitalWrite(rows[i].pin, LED_ON);  delayMicroseconds(200);
+        const int hi = digitalRead(rows[i].pin);
+        digitalWrite(rows[i].pin, LED_OFF); delayMicroseconds(200);
+        const int lo = digitalRead(rows[i].pin);
+        const bool ok = (hi == 1 && lo == 0);
+        pin_ok = pin_ok && ok;
+        Log::Printf("    %-14s drives HIGH(%d) LOW(%d)  %s", rows[i].name, hi, lo,
+                    ok ? "toggles" : "<-- PIN DOES NOT FOLLOW (MCU side)");
+    }
+    True(pin_ok, "both LED pins toggle under software control");
 
+    // ---------------------------------------------------------------------
+    // Part 3: the frequency sweep, EACH LED SEPARATELY.
+    //
+    // Driven one at a time rather than together, deliberately. A report of "D6
+    // flashes but D12 does not" cannot be attributed when both are driven at once --
+    // the observer has to watch two things in the same instant and can only report a
+    // difference. One at a time, each LED gets its own unambiguous sweep.
+    //
+    // A MARGINAL SOLDER JOINT IS THE SPECIFIC FAILURE THIS IS LOOKING FOR: such a
+    // joint passes DC happily (so the LED lights solid) but fails as the switching
+    // rate rises, because the joint's impedance matters more with every edge. That
+    // symptom -- solid at low rate, dark at high rate -- is a joint problem, not a
+    // firmware one, and it is exactly what a per-LED sweep makes visible.
+    // ---------------------------------------------------------------------
     const float f_lo = 1.0f, f_hi = 60.0f;
     const uint32_t sweep_ms = 2000;
-    const uint32_t t0 = millis();
-    uint32_t next_toggle = t0;
-    bool level = false;
-    int reported = 0;
 
-    while (millis() - t0 < sweep_ms) {
-        const uint32_t elapsed = millis() - t0;
-        const float t = (float)elapsed / (float)sweep_ms;
-        const float f = f_lo * powf(f_hi / f_lo, t);   // log sweep: 1 Hz -> 60 Hz
-
-        // Half a period between toggles. At the low end that is ~500 ms; at the top
-        // ~8 ms, which an unpaced loop reaches easily.
-        const uint32_t half_period = (uint32_t)(1000.0f / (2.0f * f) + 0.5f);
-
-        if (millis() >= next_toggle) {
-            level = !level;
-            for (size_t j = 0; j < nrows; ++j) {
-                digitalWrite(rows[j].pin, level ? LED_ON : LED_OFF);
-            }
-            next_toggle = millis() + (half_period ? half_period : 1);
-        }
-
-        // Report the rate at a few points so the log shows the sweep happened.
-        const int bucket = (int)(t * 4.0f);            // 5 buckets across the sweep
-        if (bucket > reported) {
-            reported = bucket;
-            Log::Printf("      %.1f Hz", f);
-        }
-    }
-
-    for (size_t j = 0; j < nrows; ++j) digitalWrite(rows[j].pin, LED_OFF);
-    Log::Printf("    sweep complete (1 Hz -> 60 Hz over %u ms)", sweep_ms);
-
-    // ---------------------------------------------------------------------
-    // Part 3: a slow full on/off/ramp so the operator can confirm each LED
-    // individually one last time, and leave both off.
-    // ---------------------------------------------------------------------
-    Log::Printf("");
-    Log::Printf("  part 3: each LED alone, slowly, so you can confirm which is which");
     for (size_t i = 0; i < nrows; ++i) {
-        Log::Printf("    %s only", rows[i].name);
-        digitalWrite(rows[i].pin, LED_ON);
-        delay(700);
+        Log::Printf("");
+        Log::Printf("  part 3: %s -- 1 Hz -> 60 Hz over ~2 s (WATCH THIS ONE)", rows[i].name);
+        Log::Printf("    Expect: distinct blinks at first, merging to a steady dim glow.");
+
+        const uint32_t t0 = millis();
+        uint32_t next_toggle = t0;
+        bool level = false;
+        int reported = 0;
+        int toggles = 0;
+
+        while (millis() - t0 < sweep_ms) {
+            const float t = (float)(millis() - t0) / (float)sweep_ms;
+            const float f = f_lo * powf(f_hi / f_lo, t);
+            const uint32_t half_period = (uint32_t)(1000.0f / (2.0f * f) + 0.5f);
+
+            if (millis() >= next_toggle) {
+                level = !level;
+                digitalWrite(rows[i].pin, level ? LED_ON : LED_OFF);
+                next_toggle = millis() + (half_period ? half_period : 1);
+                ++toggles;
+            }
+            const int bucket = (int)(t * 4.0f);
+            if (bucket > reported) { reported = bucket; Log::Printf("      %.1f Hz", f); }
+        }
         digitalWrite(rows[i].pin, LED_OFF);
-        delay(300);
+
+        // Count the toggles so the log says what was actually driven. If the LED did
+        // not follow this many transitions, that is a hardware answer.
+        Log::Printf("    drove %d toggles (%.0f complete cycles) -- %s", toggles,
+                    toggles / 2.0f, rows[i].name);
+        True(toggles > 40, "the sweep produced a real number of transitions");
     }
+
     for (size_t i = 0; i < nrows; ++i) digitalWrite(rows[i].pin, LED_OFF);
 
     // What the firmware can know: the pins were driven, in both polarities and over

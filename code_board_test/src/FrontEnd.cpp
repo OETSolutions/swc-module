@@ -21,6 +21,7 @@
 #include "Temp.h"
 #include "TestRunner.h"
 #include "TestTask.h"
+#include "driver/gpio.h"
 #include "tests/SetupPrompts.h"
 #include "swc_logic/Output.h"
 
@@ -683,6 +684,86 @@ static void PrintDacRaw()
     Dac::Release(2);
 }
 
+// The AUX pin probe, done with the ADC and the IDF GPIO pull API.
+//
+// THE FIRST VERSION OF THIS WAS INVALID and it is worth saying why, because it very
+// nearly produced a false hardware verdict. It used pinMode()+digitalRead() to test
+// whether each pin followed the internal pull -- but these pins are ATTACHED TO THE
+// ADC PERIPHERAL (we configured them with adc_oneshot), and while that attachment
+// holds, digitalRead does not reflect the pad. The tell was that it called SWC1
+// "stuck HIGH under pull-down" -- and SWC1 is a known-good pin that reads 3173 mV and
+// passes every loopback test. A probe that contradicts a known-good pin is a broken
+// probe.
+//
+// So the pull is applied with gpio_set_pull_mode(), which acts on the pad directly and
+// coexists with the ADC mux, and the RESULT is read with the ADC -- the instrument
+// that is actually trusted here.
+//
+// What it distinguishes, using the fact that the internal pull-up is ~45k against the
+// board's external 10k (R17/R18/R19):
+//
+//   * internal pull-up raises the reading  -> the pin is ALIVE and reachable. If it
+//     was low WITHOUT the pull, the external 10k pull-up is missing or open -- that is
+//     the difference between "R17 absent" and "shorted to GND".
+//   * internal pull-up changes NOTHING    -> something external is holding the node
+//     down hard (a short), or the pin is damaged.
+static void ProbeAuxPins()
+{
+    Log::Section("AUX PIN PROBE (internal pull-up via ADC)");
+
+    struct Row { Adc::Ch ch; uint8_t pin; const char *name; const char *ext; };
+    const Row rows[] = {
+        {Adc::kAux1, PIN_AUX1, "AUX1", "R17"},
+        {Adc::kAux2, PIN_AUX2, "AUX2", "R18"},
+        {Adc::kAux3, PIN_AUX3, "AUX3", "R19"},
+        {Adc::kSwc1, PIN_SWC1_ADC, "SWC1 (known good)", "R15"},
+    };
+
+    Log::Printf("  internal pull-up is ~45k; the board's external pull-up is 10k.");
+    Log::Printf("  If enabling the internal pull RAISES a low reading, the external 10k");
+    Log::Printf("  is missing/open. If it changes nothing, the node is shorted down.");
+    Log::Printf("");
+    Log::Printf("  %-18s %-12s %-12s %s", "pin", "pull off mV", "pull up mV", "verdict");
+
+    for (size_t i = 0; i < sizeof(rows) / sizeof(rows[0]); ++i) {
+        // Read with no internal pull (the resting state the board's own 10k sets).
+        gpio_set_pull_mode((gpio_num_t)rows[i].pin, GPIO_FLOATING);
+        delay(20);
+        uint32_t off = 0;
+        Adc::ReadAvgMv(rows[i].ch, 64, &off);
+
+        // Now add the ~45k internal pull-up.
+        gpio_set_pull_mode((gpio_num_t)rows[i].pin, GPIO_PULLUP_ONLY);
+        delay(20);
+        uint32_t on = 0;
+        Adc::ReadAvgMv(rows[i].ch, 64, &on);
+
+        // Restore to the ADC's normal (no-pull) state.
+        gpio_set_pull_mode((gpio_num_t)rows[i].pin, GPIO_FLOATING);
+        delay(10);
+
+        const long delta = (long)on - (long)off;
+        const char *verdict;
+        if (off > 2500) {
+            verdict = "rests HIGH already (external pull present)";
+        } else if (delta > 500) {
+            verdict = "RISES with the internal pull -> EXTERNAL PULL-UP MISSING/OPEN";
+        } else if (off < 200 && delta < 100) {
+            verdict = "held down hard -> SHORTED TO GND (or pin damaged)";
+        } else {
+            verdict = "partially pulled -> external path present but weak";
+        }
+        Log::Printf("  %-18s %-12u %-12u %s", rows[i].name, off, on, verdict);
+        if (i < 3 && delta > 500) {
+            Log::Printf("      -> check %s (10k to 3V3) and its solder joint", rows[i].ext);
+        }
+    }
+
+    Log::Printf("");
+    Log::Printf("  SWC1 is the control: it is known good, so if IT reports anything other");
+    Log::Printf("  than 'rests HIGH', this probe is not measuring what it thinks it is.");
+}
+
 static void PrintMenu()
 {
     Log::Printf("");
@@ -715,6 +796,7 @@ static void PrintMenu()
     Log::Printf("  r  = reset all outcomes       w  = web UI address");
     Log::Printf("  ?  = full detail for every test (what each needs)");
     Log::Printf("  h  = hardware info dump      d  = DAC raw read hexdump");
+    Log::Printf("  p  = AUX pin probe (internal pull-up/down differential)");
     Log::Rule('=');
     Log::Printf("");
 }
@@ -778,6 +860,11 @@ static bool s_greeted = false;
 static void ServiceSerial()
 {
     if (!Serial.available()) return;
+
+    // A test waiting for the operator OWNS the serial input. Both tasks read the same
+    // UART, so without this the menu handler consumes the keystroke the test is
+    // waiting for: it looks like ENTER does nothing and the test times out anyway.
+    if (TestTask::WaitingForOperator()) return;
 
     if (!s_greeted) {
         s_greeted = true;
@@ -864,6 +951,9 @@ static void ServiceSerial()
             break;
         case 'd': case 'D':
             PrintDacRaw();
+            break;
+        case 'p': case 'P':
+            ProbeAuxPins();
             break;
         default:
             break;

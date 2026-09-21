@@ -64,8 +64,9 @@ Outcome Test31_AuxManual()
     Log::Printf("  exactly like the SWC channels but with a 1k series resistor (R23-R25)");
     Log::Printf("  and a 10k pull-up (R17-R19). AUX1 is the one the product uses.");
     Log::Printf("");
-    Log::Printf("  For each input: short its J5 pin to J5.1 (GND), then press ENTER.");
-    Log::Printf("  The reading must COLLAPSE toward 0 mV and RECOVER when you remove it.");
+    Log::Printf("  For each input you will be asked TWICE: first to short its J5 pin to");
+    Log::Printf("  J5.1 (GND) and HOLD it, then to REMOVE the short and leave it open.");
+    Log::Printf("  The reading must COLLAPSE while held and RECOVER once removed.");
     Log::Printf("");
 
     bool all_ok = true;
@@ -78,50 +79,85 @@ Outcome Test31_AuxManual()
         uint32_t rest = 0;
         Adc::ReadAvgMv(rows[i].ch, 64, &rest);
         Log::Printf("  %s (%s): resting at %u mV", rows[i].name, rows[i].pin, rest);
-        char ask[120];
-        snprintf(ask, sizeof(ask),
-                 "Short %s (%s) to GND (J5.1), then continue", rows[i].name, rows[i].pin);
+        // TWO prompts, because the two measurements need the operator in two
+        // DIFFERENT states. The first version measured "recovered" 250 ms after a
+        // single Continue click -- while the operator was still holding the short --
+        // so the recovery check compared the shorted value with itself and failed a
+        // board that was working perfectly. Reported from the bench as: "it's not
+        // testing the release at the right time and fails, even though the lines go
+        // low and high at the right time."
+        char ask[140];
 
+        snprintf(ask, sizeof(ask),
+                 "SHORT %s (%s) to GND (J5.1) and HOLD it, then continue",
+                 rows[i].name, rows[i].pin);
         if (!TestTask::AskOperator(ask, 60000)) {
-            Log::Printf("    timed out -- %s was NOT exercised", rows[i].name);
-            Note("No response within %u s, so %s was not exercised. That is a SKIP, "
+            Log::Printf("    no response -- %s was NOT exercised", rows[i].name);
+            Note("No response within 60 s, so %s was not exercised. That is a SKIP, "
                  "not a pass: this test cannot prove anything without the stimulus.",
-                 (unsigned)60, rows[i].name);
+                 rows[i].name);
             ++skipped;
             continue;
         }
 
-        // Sample while the operator holds the short.
+        // Sampled WHILE the operator is holding the short.
         uint32_t shorted = 0;
         Adc::ReadAvgMv(rows[i].ch, 64, &shorted);
-        Log::Printf("    shorted: %u mV  (was %u mV)", shorted, rest);
+        Log::Printf("    holding the short: %u mV  (resting was %u mV)", shorted, rest);
 
-        // Then confirm it RECOVERS -- a pin that stays low after the short is removed
-        // is shorted to ground on the board, which is the failure this catches.
-        delay(250);
+        snprintf(ask, sizeof(ask),
+                 "NOW REMOVE the short from %s (%s) and leave it OPEN, then continue",
+                 rows[i].name, rows[i].pin);
+        const bool released_ok = TestTask::AskOperator(ask, 60000);
+        if (!released_ok) {
+            Log::Printf("    no response on the release step -- %s not fully exercised",
+                        rows[i].name);
+            ++skipped;
+            continue;
+        }
+
+        // Sampled AFTER they have released it.
         uint32_t after = 0;
         Adc::ReadAvgMv(rows[i].ch, 64, &after);
-        Log::Printf("    released again: %u mV", after);
+        Log::Printf("    after removing it: %u mV", after);
 
-        // The threshold is generous because the aux pin CLIPS at the 2.9 V ADC
-        // ceiling when nothing is attached (3173 mV measured), so "collapsed" means
-        // "came well off that rail", not "read a precise zero".
+        // The threshold is generous because the AUX pin CLIPS at the 2.9 V ADC
+        // ceiling when open (3173 mV measured), so "collapsed" means "came well off
+        // that rail", not "read a precise zero".
         const bool collapsed = (rest > 1500) && (shorted < 1200);
         const bool recovered = (after > 1500);
-        True(collapsed, "the input collapses when shorted to GND");
+
+        True(collapsed, "the input collapses while shorted to GND");
         if (!collapsed) {
-            Note("%s read %u mV while shorted to GND. If the short really was applied, "
-                 "suspect R%d (1k series) open, the pin open, or the short was not "
-                 "made. If it did NOT move at all, the node may be open-circuit.",
-                 rows[i].name, shorted, (int)(23 + i));
+            if (shorted == rest) {
+                Note("%s did not move at all when the short was applied (%u mV before "
+                     "and after). The most likely cause is that the short was not "
+                     "actually made -- check the jumper is on %s and J5.1. If you are "
+                     "sure it was applied, suspect R%d (1k series) open or the pin "
+                     "open-circuit; the AUX pin probe ('p' in the menu) will say "
+                     "whether the pin is alive.",
+                     rows[i].name, rest, rows[i].pin, (int)(23 + i));
+            } else {
+                Note("%s read %u mV while held to GND (resting %u mV). It moved, so the "
+                     "pin is live, but not far enough to call it collapsed -- suspect "
+                     "R%d (1k series) a long way off value.",
+                     rows[i].name, shorted, rest, (int)(23 + i));
+            }
             all_ok = false;
         }
-        True(recovered, "the input recovers when the short is removed");
+        True(recovered, "the input recovers after the short is removed");
         if (!recovered) {
             Note("%s stayed at %u mV after the short was removed. That means it is "
                  "pulled to GND on the board -- a solder bridge or a shorted clamp "
                  "diode (D%d).", rows[i].name, after, (int)(8 + i));
             all_ok = false;
+        }
+
+        // The collapse and recovery must be a real swing, not two similar readings.
+        if (collapsed && recovered) {
+            Log::Printf("    swing: %u mV -> %u mV -> %u mV", rest, shorted, after);
+            True((long)after - (long)shorted > 1000,
+                 "the reading swings by more than 1 V between held and released");
         }
     }
 

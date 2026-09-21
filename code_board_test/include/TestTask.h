@@ -55,6 +55,12 @@ bool Busy();
 // Set by the web front end when the operator presses Continue.
 void SignalContinue();
 
+// True while a test is waiting for the operator. The serial front end MUST check
+// this before consuming input: both tasks read the same UART, and without this the
+// loop task eats the keystroke the waiting test is listening for -- so a keystroke
+// appears to do nothing and the test times out despite the operator pressing ENTER.
+bool WaitingForOperator();
+
 // Ask the operator to do something, and wait. `what` is shown prominently on both
 // front ends. Returns true if they responded, false on timeout.
 bool AskOperator(const char *what, uint32_t timeout_ms);

@@ -169,7 +169,22 @@ class SwcClient(private val transport: SwcTransport) {
         }
         // Applied only now, on a verified run. Adopting the bytes earlier would let
         // a torn transfer become what the app believes the device holds.
-        _config.value = ConfigJson.decode(buf.toString(Charsets.UTF_8))
+        //
+        // Decoding is GUARDED, the same way `handle()` guards its own parse and for
+        // the same reason: the bytes passed both digests but a digest is not a
+        // schema -- a body that is valid JSON yet not an object (`[1,2,3]`) throws
+        // here, and an uncaught throw would escape `handle`, escape the collector,
+        // and end `run()` -- the link's only consumer. The app would go deaf for
+        // the rest of the session while the device kept talking, with no frame able
+        // to recover it.
+        val decoded = try {
+            ConfigJson.decode(buf.toString(Charsets.UTF_8))
+        } catch (e: Exception) {
+            _state.value = LinkState.Failed("config run was not a valid config")
+            finishConfigRun()
+            return
+        }
+        _config.value = decoded
         // A run that FAILED its checks still ENDS: the waiter must be released so
         // `getConfig` returns the (unchanged) local model rather than hanging on a
         // run that already finished. All three exits above release it too.

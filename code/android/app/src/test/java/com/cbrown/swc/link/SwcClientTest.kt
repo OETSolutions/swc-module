@@ -303,6 +303,41 @@ class SwcClientTest {
     }
 
     @Test
+    fun `a config run whose bytes are not a JSON object does not kill the link`() = runTest {
+        // A run can pass BOTH digests and still be undecodable: the crc32 and the
+        // sha256 are over the raw bytes, so any byte string whose digests the
+        // device computed correctly satisfies them, and the config is only
+        // required to be UTF-8 JSON by the ENCODER. A peer (or a device whose
+        // config slot is corrupt in a way it still digests) can deliver a body
+        // that parses as JSON but is not an object -- `parseToJsonElement` then
+        // succeeds, `.jsonObject` throws. `handle()` guards its OWN parse because
+        // "a malformed frame from a peer is not fatal to the link", but
+        // `endInboundConfig` decoded directly, so the throw escaped `handle`,
+        // escaped the collector, and ended `run()` -- the link's only consumer.
+        // The app then went deaf for the rest of the session while the device
+        // kept talking, and no frame could recover it.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+
+        // A body that is valid JSON, has valid digests, and is not an object.
+        val body = "[1,2,3]"
+        configRun(body).forEach { t.emit(it + "\n") }
+        runCurrent()
+
+        assertTrue("the run must be reported, not thrown",
+            client.state.value is LinkState.Failed)
+        assertEquals("the local model must be left alone", "", client.config.value.deviceId)
+
+        // The link must still be alive: a later good frame is handled, which it
+        // cannot be if the collector died on the throw.
+        t.emit("{\"v\":1,\"seq\":42,\"type\":\"hello\",\"protocol_v\":1,\"caps\":[]}\n")
+        runCurrent()
+        assertTrue("the link must survive a bad config run", client.state.value is LinkState.Connected)
+        job.cancel()
+    }
+
+    @Test
     fun `getConfig still gives up when the device never runs`() = runTest {
         // The other direction: waiting on the run must not become waiting
         // forever. A device that accepts the request and stays silent has to

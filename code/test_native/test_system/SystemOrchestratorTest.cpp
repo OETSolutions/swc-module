@@ -540,6 +540,130 @@ TEST(SystemOrchestrator, AnUnrecognizedPressDoesNotDriveTheOutput) {
         << "an unrecognized level must never drive the KEY line";
 }
 
+// --- the unbound-gesture pass-through: the no-app default --------------------
+//
+// The 2022 design's default was that a press PRESENTS the button: `lookup_single/
+// double/long_press_val` always mapped the key's own value to an output region,
+// and only the (then-stubbed) `program_alt_key` overrode it. The new firmware
+// instead did NOTHING for a recognised-but-unbound gesture -- it released the line
+// and played KEY_UNKNOWN. That is the silent no-app failure the user reported: a
+// fresh device learned by AUX1 alone has windows but no bindings (`ConfigDefault`
+// ships `binding_count = 0`, and every runtime binding otherwise comes from a
+// config the app pushes), so the learned ladder could never drive a key even
+// though the learn itself beeped LEARN_OK.
+//
+// The fixture's `vol_dn` (1785 mV) has a learned window but NO binding, which is
+// exactly the no-app shape: recognised, and unbound.
+
+namespace {
+// Hold a button and let its gesture resolve as a SINGLE.
+void PressButton(SystemOrchestrator &o, MockHal &hal, int mv) {
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, mv);
+    PollFor(o, hal, 100);          // press + debounce
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 700);          // release + resolve
+}
+}  // namespace
+
+TEST(SystemOrchestrator, AnUnboundGesturePresentsTheButtonRatherThanDoingNothing) {
+    // The core no-app requirement: with no binding for a recognised button's
+    // gesture, the device acts as a STOCK WHEEL and presents that button's own
+    // level. "It would be passed through."
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    PressButton(o, hal, 1785);     // vol_dn: learned (1785 +/- 120), and unbound
+
+    // The head unit must have been given a key -- the line left its idle.
+    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "an unbound gesture on a RECOGNISED button must present the button, "
+           "not silently do nothing -- this is the no-app product requirement";
+}
+
+TEST(SystemOrchestrator, TheUnboundGestureIsPresentedAsABoundedPulseThenReleased) {
+    // Spec 6.6 rule 2: one key event, not a held line. The head unit is
+    // gesture-blind, so a line held down is a different (and wrong) thing to it.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    PressButton(o, hal, 1785);
+    ASSERT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code);
+    // Hold long past send_duration_ms with the line back at idle: the pulse must
+    // have ENDED rather than being held for as long as the press lasted.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 400);
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "the present must be a bounded pulse, not a held key";
+}
+
+TEST(SystemOrchestrator, ARecognizedAndUnboundPressIsAcceptedNotBeepedUnknown) {
+    // KEY_UNKNOWN means "a press matched no learned window" (FR-12). This press
+    // DID match a window, so reporting it as unknown would tell the app a
+    // different story than what happened -- and would play the wrong tone at the
+    // driver.
+    //
+    // The two tones are BOTH single pulses, so counting buzzer drives cannot tell
+    // them apart (an earlier version of this test did exactly that and passed
+    // under a mutation that played the wrong one). They differ by DURATION:
+    // KEY_ACCEPTED is 25 ms on, KEY_UNKNOWN is 120 ms on (spec 7.2 / the grammar
+    // table). Measuring the on-time is what actually discriminates them.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    PollFor(o, hal, 400);          // let the boot announcement finish
+    ASSERT_FALSE(hal.BuzzerIsOn());
+
+    // Press, release, then wait out the double-press window: channel 0 DOES bind
+    // DOUBLE (on `next`) and LONG (on `vol_up`), so `BindingsFor` reports both and
+    // the unbound `vol_dn` press stays undecided until its ambiguity window closes.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1785);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    int on_ticks = 0;
+    for (uint32_t t = 0; t < 800; t += 5) {
+        o.Tick(hal.NowMs());
+        if (hal.BuzzerIsOn()) ++on_ticks;
+        hal.AdvanceMs(5);
+    }
+    // 5 ms cadence: the 25 ms accepted pulse is ~5 ticks, the 120 ms unknown pulse
+    // ~24. A threshold of 12 ticks (60 ms) sits between them with margin.
+    EXPECT_LE(on_ticks, 12)
+        << "the accepted tone (25 ms) must play, not the unknown tone (120 ms)";
+    EXPECT_GT(on_ticks, 0) << "a recognised press must be acknowledged at all";
+}
+
+TEST(SystemOrchestrator, AnUnrecognizedLevelStillDrivesNothingEvenWithTheFallback) {
+    // The boundary of the fallback: it applies to a button the ladder RECOGNISED.
+    // A level in no window is still FR-12's unknown -- reported with a null id and
+    // never guessed at -- so the fallback must not widen into "any off-idle press
+    // is presented", which would reintroduce the guess FR-12 forbids.
+    g_reported.clear();
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    o.SetGestureSink(&RecordGesture, nullptr);
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2400);   // in range, in NO window
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 700);
+
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "an UNRECOGNISED level must still drive nothing";
+    ASSERT_EQ(g_reported.size(), 1u);
+    EXPECT_EQ(g_reported[0].button_id, nullptr)
+        << "an unrecognised level must still report a null button";
+}
+
 TEST(SystemOrchestrator, AnUnrecognizedPressIsNotReportedRepeatedlyWhileHeld) {
     // One report per press. A held unrecognised level would otherwise emit an event
     // on every poll tick -- 100/s -- which is both a flooded link and a live view

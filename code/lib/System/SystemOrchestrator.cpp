@@ -610,6 +610,30 @@ void SystemOrchestrator::ReleaseKey(uint8_t index) {
     cs.key_driven = false;
 }
 
+bool SystemOrchestrator::PresentLevel(uint8_t index, int level_mv, int wheel_idle_mv,
+                                      int sense_mv, uint64_t now_ms, DacChannel key_ch) {
+    ChannelState &cs = channels_[index];
+    // With no head-unit idle there is nothing to map the ratio ONTO, and a
+    // fabricated denominator would land every press on a key nothing defined.
+    // Refuse rather than guess (spec 6.9's "disabled rather than guessed").
+    if (head_unit_idle_mv_ <= 0 || wheel_idle_mv <= 0) return false;
+
+    // The mapping is by RATIO, not by voltage (spec 6.9): the wheel's ladder and
+    // the head unit's need not have the same resistances, so copying the incoming
+    // millivolts across would land on the wrong key.
+    const MilliVolt target = static_cast<MilliVolt>(
+        (static_cast<long>(head_unit_idle_mv_) * level_mv) / wheel_idle_mv);
+    cs.servo.Target(gain_mode_[index], target);
+    cs.servo.Update(sense_mv);
+    hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());
+    cs.key_driven = true;
+    // Held for the recognition time, then released: the head unit must see ONE
+    // key event, not a line held down (spec 6.6 -- it is gesture-blind, so a held
+    // line is a different thing to it).
+    cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
+    return true;
+}
+
 void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     ChannelState &cs = channels_[index];
     const ChannelConfig &cc = config_.channels[index];
@@ -691,16 +715,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             // applied to the head unit's range. Using the output's safe-idle code
             // instead would scale against 5200 mV and push low buttons into the
             // clamp, which is the wrong key rather than a quieter one.
-            const MilliVolt target = static_cast<MilliVolt>(
-                (static_cast<long>(head_unit_idle_mv_) * level_mv) / idle);
-            cs.servo.Target(gain_mode_[index], target);
-            cs.servo.Update(sense_mv);
-            hal_->dac_set_code(hal_->ctx, key_ch, cs.servo.Code());
-            cs.key_driven = true;
-            // Held for the recognition time, then released: the head unit must see
-            // ONE key event, not a line held down (spec 6.6 -- it is
-            // gesture-blind, so a held line is a different thing to it).
-            cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
+            PresentLevel(index, level_mv, idle, sense_mv, now_ms, key_ch);
         } else if (!pressed) {
             ReleaseKey(index);
         }
@@ -802,11 +817,40 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                 }
                 buzzer_.Play(BuzzerPattern::kKeyAccepted);
             } else {
-                // FR-12: an unlearned press is never guessed at. The failure mode
-                // of a wrong guess is the radio doing something the driver did not
-                // ask for, which is worse than doing nothing.
-                ReleaseKey(index);
-                buzzer_.Play(BuzzerPattern::kKeyUnknown);
+                // The button was RECOGNISED but its gesture is not bound, so there
+                // is no action to run. The device then behaves as a STOCK WHEEL:
+                // it presents that button's own level, one bounded pulse. This is
+                // the 2022 design's default -- `lookup_single/double/long_press_val`
+                // always presented the key, and only `program_alt_key` overrode it --
+                // and it is what makes the no-app product work, because a fresh
+                // device learned by AUX1 alone has windows but no bindings
+                // (`ConfigDefault` ships `binding_count = 0`), and every runtime
+                // binding otherwise comes from a config the app pushes.
+                //
+                // Without this the learned ladder NEVER drove a key: the press
+                // resolved to nothing, the line was released, and KEY_UNKNOWN was
+                // played -- the exact silent failure the user reported, invisible
+                // because the learn itself beeped LEARN_OK.
+                //
+                // The head unit is gesture-blind, so it does not matter WHICH
+                // gesture landed here: single, double and long all present the same
+                // button, which is precisely what a stock wheel does. What a
+                // gesture MEANS is a binding; the default is that it means the
+                // button itself.
+                const uint8_t bi = ev.button_index;
+                const LadderProfile &ladder = config_.channels[index].ladder;
+                if (bi < ladder.count &&
+                    PresentLevel(index, ladder.buttons[bi].mv_center, ladder.learned_idle_mv,
+                                 sense_mv, now_ms, key_ch)) {
+                    buzzer_.Play(BuzzerPattern::kKeyAccepted);
+                } else {
+                    // No usable head-unit idle (or no such button): there is nothing
+                    // to map the level ONTO, and a fabricated denominator would land
+                    // on a key nothing defined. Release rather than guess, and say
+                    // so -- FR-12's direction.
+                    ReleaseKey(index);
+                    buzzer_.Play(BuzzerPattern::kKeyUnknown);
+                }
             }
         }
     }

@@ -1322,6 +1322,40 @@ Three rules follow, and they are normative:
 `SINGLE` is therefore not "delayed by design" — it is delayed by exactly the
 ambiguity that its button actually has, and no more.
 
+**4. A recognised button whose gesture is not bound PASSES THROUGH.** "Unbound"
+is `BindingResolve` returning `found == false` (§3.5) — no `Binding` in the
+top-level table names this `(channel, button, gesture)`. The device then behaves
+as a **stock wheel**: it presents that button's own level, one bounded pulse by
+ratio (§6.9's mapping), and reports `event` as usual. It is the same rule for
+`SINGLE`, `DOUBLE` and `LONG`, because the head unit is gesture-blind — it cannot
+tell them apart, so all three present the same button, which is exactly what the
+unmodified wheel does.
+
+This is the default the 2022 design shipped (`lookup_single/double/long_press_val`
+always mapped the key's own value; only `program_alt_key` overrode it), and it is
+what makes the no-app product work at all. **A fresh device learned by AUX1 alone
+has learned windows but an empty binding table** — `ConfigDefault` ships
+`binding_count = 0`, and every runtime binding otherwise comes from a config the
+Android app pushes. So a learned button with no app-pushed binding reaches here.
+Before this rule was stated, such a press resolved to nothing: the line was
+released and `KEY_UNKNOWN` played. The learned ladder **never drove a key**, and
+the failure was invisible because the learn itself beeped `LEARN_OK`.
+
+**Two things this rule is NOT**, because both would be the guess FR-12 forbids:
+
+- It does not apply to a level matching **no learned window** at all. That is
+  still FR-12's unknown: reported with a null `button`, released, and
+  `KEY_UNKNOWN` played. The window matched first; the binding is what is absent.
+- It does not apply when there is **no usable head-unit idle** to map the ratio
+  onto. A fabricated denominator would land every press on a key nothing defined,
+  so the device releases rather than drives — the same direction §6.9 takes.
+
+`enabled: false` on a binding is different from absent and is handled before this
+rule: a disabled binding is *not a match*, so the gesture falls through to this
+pass-through default, exactly as `BindingResolver.h` describes ("a disabled
+binding lets a lower-priority binding match" — and the stock wheel is that
+lower-priority source).
+
 **The local action runs first and unconditionally.** The app is an *enhancer*,
 not a dependency. If the USB link is down, the app has crashed, or the head unit
 is rebooting, every `OUT_VOLTAGE` binding still works. This is FR-42, and it is the
@@ -1583,60 +1617,70 @@ did not ask for, which is worse than doing nothing.
 
 The user's stated good part: *"hold down the button and then double/single/long
 press to set a function, buzzer sounds that escalate to indicate modes."*
-Preserved as a first-class flow, implemented properly this time (the old
-implementation was stubbed — see §2 of the plan).
 
-**Trigger: hold `AUX1` for ≥ 1.5 s.** This is a deliberate change from the
-obvious choice of the BOOT button:
+**Read that sentence literally, because it describes the 2022 interaction and not
+a modal menu.** In the 2022 firmware the modifier was the BOOTSEL button, read
+once per poll (`is_program_button_pressed = bootsel_button_is_pressed()`); the
+user **held the modifier**, performed the gesture on a wheel key, and released.
+The state machine reached `PROGRAM_ALT_KEY` when a wheel key's double- or
+long-press completed *while the modifier was held*, and called
+`program_alt_key(curr_key_val, curr_key, is_double_press)` — capturing **(level,
+button, gesture)** in one operation. The user's own restatement is exact:
+*"You just hold down the button, do the gesture, and then release the button."*
+
+**On this board the modifier is AUX1, not BOOT**, for the reasons below; the
+interaction is otherwise carried forward unchanged.
+
+**Why AUX1 replaces BOOT as the modifier:**
 
 - **BOOT (`IO0`) is recessed** behind a Ø5 hole in the lid, and is a *strapping
   pin* (§2.2) — a hold-at-power-on means ROM download mode, not a user action.
 - **AUX1 is a real, reachable analog input** on the `J5` terminal with its own
   conditioning (§2.4). The user can wire a momentary button to it and reach it.
-- It costs nothing to support the app path in parallel.
 
 ```
-PROGRAMMING MODE   (trigger: AUX1 held ≥ 1.5 s, or the app requests it)
-  1. Enter:      BEEP PROGRAM_ENTER — §7.2's 40/40 ×2, NOT a shave-and-a-haircut
-                 LED_STAT does the same 2-pulse cadence
-  2. Target:     the user presses the physical button to program
-                   SWC1's buttons → 1 beep slot, SWC2's → 2, AUX1–3 → 3/4/5
-                   (beep COUNT identifies the slot — there is no pitch)
-                 LED2 flick on press so the user sees it register
-  3. Gesture:    the user then performs the gesture to bind:
-                   single press  → SINGLE   (1 beep)
-                   double press  → DOUBLE   (2 beeps)
-                   hold ≥ long   → LONG     (3 beeps)
-                 ← this escalating count IS the "buzzer sounds that escalate"
-  4. Confirm:    BEEP PROGRAM_SAVED — §7.2's 40/20 ×4
-  5. More?       return to 2; exit with AUX1 held ≥ 1.5 s again
-                 BEEP PROGRAM_EXIT
+PROGRAMMING (modifier: AUX1 held)
+  1. Hold AUX1.                    BEEP PROGRAM_ENTER · LED_STAT alternate
+  2. Press the wheel button to     its gesture is now being assigned
+     program, and while STILL      (the button must be learnable — §7.4 —
+     holding AUX1 do the gesture:   and its id is what the binding names)
+       single press → SINGLE   (1 beep)   ┐
+       double press → DOUBLE   (2 beeps)  ├ each press re-beeps PROGRAM_STEP,
+       hold ≥ long  → LONG     (3 beeps)  ┘ the count IS the gesture
+  3. Release AUX1.                 BEEP PROGRAM_SAVED · (the binding is written)
+  4. Repeat from 1 for more, or do nothing — there is no modal state to leave.
 ```
 
-**The 2022 "shave-and-a-haircut" cadence is gone, and the reason is the same one
-that removed pitch.** This block previously specified a 3-short-plus-1-long
-`PROGRAM_ENTER` and a "2 equal beeps" save confirmation. Neither is in §7.2's
-table: `PROGRAM_ENTER` is 40/40 ×2 there, and the save confirmation is
-`PROGRAM_SAVED` (40/20 ×4). Two homes for one pattern is how a firmware
-implementation and a test come to disagree about what the device plays, so the
-table wins — it is the section that exists to define the patterns, and §7.5 is a
-description of a *flow* that consumes them.
+**The escalating beep count is the gesture**, which is how a fixed-pitch buzzer
+(§7.1) conveys which of the three the device heard — the count is the menu depth,
+and counting is clearer under road noise than the 2022 design's rising pitch.
 
-**Every pattern named in this flow is now a §7.2 row.** That is the check worth
+**There is no modal wizard, and that is the substantive correction this section
+needs.** An earlier revision of §7.5 described a modal `PROGRAMMING MODE` entered
+by an AUX1 hold and left by "AUX1 held ≥ 1.5 s again". That flow was unreachable
+as written and collided with §7.4: `LearnWizard::kEnterHoldMs` is 1500 ms and the
+maintenance window opens on the same hold reaching `kMaintenanceHoldMs` (3000 ms),
+so a *second* 1.5 s hold can never fire before maintenance escalates — one 1.5 s
+value cannot serve both entry and exit. The held-modifier interaction has no such
+problem: it is **stateless from the user's side**, so there is nothing to enter,
+nothing to leave, and nothing for the maintenance hold to collide with.
+
+**What a freshly-assigned gesture binds to is the pass-through default (§6.6 rule
+4), not a special case.** The on-device flow's job is to *learn the button*; what
+its gestures then DO is a `Binding`, and a button with no binding presents itself
+as a stock wheel. So a user who learns a button on AUX1 alone gets a working
+button immediately, and binds a *different* action later (from the app, §3.6) —
+which is the honest division of labour: the beeps handle "teach this button", and
+the app handles the long tail of actions no fixed-pitch buzzer can cycle through.
+
+**The full action library is far too large to cycle through by beeping**, so the
+on-device flow does not attempt it. `APP_INTENT`, `APP_LAUNCH` and the rest of
+§3.6's kinds are the app's interface; the device's own contribution to the no-app
+case is the pass-through default above.
+
+**Every pattern named in this flow is a §7.2 row.** That is the check worth
 applying to any future edit here: if a step names a pattern, the pattern must
 exist in the table above with the timings this step implies.
-
-
-**The beep count is the menu depth**, which is how a fixed-pitch buzzer conveys
-"how deep am I" — the old design used rising pitch for this, and pitch is not
-available (§7.1). Counting is arguably clearer under road noise anyway.
-
-The full action library is far too large to cycle through by beeping. **The
-on-device flow therefore edits a small, high-value subset** — "present this key
-value", "present the neighbouring key's value", "release", "do nothing" — and the
-Android app is the interface for the long tail (`APP_INTENT`, `APP_LAUNCH`, …).
-This is the honest division of labour: beeps for the three things a driver wants
-at the roadside, an app for the rest.
 
 
 ---
@@ -2460,8 +2504,8 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-28 | Learn-mode tests | N + D + B | Measured level, tolerance and rail are stored and match the bench instrument |
 | FR-29 | Learn-rejection tests | N | Noisy and too-close-to-existing samples are each rejected **with the correct distinct reason** |
 | FR-30 | Rail-renormalization test | N | A button learned at 3.3 V classifies correctly at 3.14 V and 3.47 V (±5 % regulator tolerance); the ratio `n` is unchanged across that sweep. A **separate** fault test asserts that a 3V3 sag to ≤20 % of the learned value is reported as a rail fault, not as idle. **Note:** this is a *+3V3* sweep, not the 11–14.8 V vehicle-rail sweep an earlier revision specified — no vehicle-rail term exists in the transfer function (§6.3). |
-| FR-31 | Headless-learn test | D + B | A full learn completes with no USB host attached, driven by AUX1 + buzzes. **Scope note:** this proves the wizard measures a LEVEL into a `LadderButton`; it does not cover §7.5's gesture-assignment flow, which is unimplemented (N-19) |
-| FR-31b | Headless programming test (the no-app bind) | D + B | **Absent — §7.5 is unimplemented.** A user with no app must be able to bind SINGLE/DOUBLE/LONG to a learned button using AUX1 + buzzer, and a press must then drive a key with no config ever pushed. Today a fresh device learned by AUX1 alone has windows but an empty binding table, so the learned ladder cannot drive a key (N-19) |
+| FR-31 | Headless-learn test | N + D + B | A full learn completes with no USB host attached, driven by AUX1 + buzzes, and the taught button then WORKS (classifies and presents, §6.6 rule 4). `test_system`'s `AHeadlessLearnStoresAButtonAndItClassifiesImmediately` and `AnUnboundGesturePresentsTheButtonRatherThanDoingNothing` cover the host half — the board portion confirms it on hardware |
+| FR-31b | No-app-button test (the unbound pass-through) | N + D + B | **A user with no app binds nothing and still has a working button.** §6.6 rule 4: a recognised but unbound gesture presents the button's own level (§6.9's ratio), so a fresh device learned by AUX1 alone drives a key with no config ever pushed (N-19, resolved 2026-09-21). `test_system` covers it on the host; the board portion confirms it end to end |
 | FR-32 | Radio-absent test | D + B | In normal mode, current draw and heap show WiFi/BLE never initialized |
 | FR-33 | Maintenance-entry tests | N + D | Of §8.2's triggers, the two that need no radio are wired and tested — the USB command and the 3 s AUX1 hold. The other two are **not**: `kConfigFlag` has no setting to read and `kNoConfigAtBoot` needs a reset-reason source, and neither trigger is reachable in this build (N-13) |
 | FR-34 | Provisioning test | D + A | The **real Espressif provisioning app** completes provisioning against this device. **Not runnable yet: nothing starts the radio** (N-15) |
@@ -2506,7 +2550,7 @@ ordered board and are called out in §12 as the critical path.
 | N-16 | **A production build has no readable console, and reflash-by-USB is unverified.** The S3 has ONE internal USB PHY shared by USB-Serial-JTAG (the console) and USB-OTG (TinyUSB CDC, the app link), so installing TinyUSB at boot moves the PHY and the console goes dark -- Espressif: "both controllers share a single internal PHY, allowing only one to operate at a time" and "during protocol stack initialization, the USB-PHY connection will automatically switch to USB-OTG" (verified 2026-09-20). Consequences: every `ESP_LOG*` line the firmware emits is unreadable at runtime, including `UsbLinkStart`'s own install-failure warning; and whether a reset still enters ROM download mode over USB is unverified, which decides whether reflashing needs the recessed BOOT button (§2.2) to be pressed. §4.1 previously claimed "both may be active at once", which this board cannot do. The console can be restored with a UART0 console on unused GPIO43/44 (needs header pins or test pads on a respin), or an external PHY (≥6 GPIOs). Decide which before finalising the PCB | **Before the board is finalised** for the hardware question; the download-mode check is §10.6 step 1 | Yes — it changes the pinout or the bring-up procedure |
 | N-17 | **The eFuse calibration path was unreachable until 2026-09-21, and its accuracy is still unverified.** `EspHal` created the curve-fitting handle and then converted every reading with `AdcRawToMilliVolts`, whose two branches return the same straight line — so the per-chip polynomial was computed and discarded, and `cali_degraded` reported healthy while the device used the linear scale §2.3 forbids. `adc_cali_raw_to_voltage` was called nowhere. Fixed: the eFuse value is now used when the handle exists, the linear line only for blank-eFuse parts. **Still open:** the resulting absolute accuracy against a bench reference (the spec's `D` marker on FR-2) — measure it before trusting learned windows, because a systematic millivolt offset shifts every button centre equally and would look like a correctly-learned ladder | With the board | No — v1 is correct without it, and the fallback already worked; but the *verification* is what FR-2's row cannot yet claim |
 | N-18 | **FR-3's settle gate is unread.** `AdcReader::Settled()` reports whether the median burst was a clean level or a mixture of old and new, and two code comments assert that classification waits for it — but `ServiceChannel` classifies on `Value()` unconditionally (`SystemOrchestrator.cpp`), and `Settled()` is referenced only by its own unit test. FR-3's matrix row proves the filter *can* settle within `debounce_ms`; it does not prove the classifier waits. Expected to be harmless, because the classifier's own `debounce_ms` (25 ms) covers the single mixed tick a real press produces — but "expected to be harmless" is a bench question, and gating classification changes when a key latches, so do not change it without a measured press on the real ladder | With the board | No — recorded for completeness, not a known fault |
-| N-19 | **§7.5's gesture-assignment programming is not implemented, and neither 1.5 s-AUX1 gesture is reachable from it.** Two different "AUX1 hold" flows are described in §7.4/§7.5 and conflated in the prose: §7.4's LEARN wizard (measure a button's level → a `LadderButton`) and §7.5's PROGRAMMING flow (assign SINGLE/DOUBLE/LONG to a target → a `Binding`), and §7.5 is the flow that carries the user's stated good part ("hold, then single/double/long, with escalating buzzer"). Only the former exists. `LearnWizard`'s states are `kSelectButton`/`kPrompt`/`kExit` — there is no gesture or target state; `PROGRAM_SAVED` is defined (`BuzzerGrammar.cpp`) and asserted in the grammar's own test but **played nowhere**; and `LearnWizard` plays `kLearnPrompt`/`kLearnOk` where §7.4's numbered list names `PROGRAM_STEP`/`PROGRAM_SAVED`. So the headless flow records level→`LadderButton` only, and `HandleLearnCommit` likewise creates no `Binding`. The consequence is the product consequence: **a fresh device learned by AUX1 alone ends with windows but an empty binding table**, so an unapp modified to send no config would emit `event{button:null}` and beep `KEY_UNKNOWN` — the learned ladder never drives a key. (`ConfigDefault` ships `binding_count = 0`; every runtime binding comes from a config the app pushes.) **Also unreachable as written:** §7.5's exit is "AUX1 held ≥ 1.5 s again", but `kEnterHoldMs` is 1500 ms and the maintenance window is entered on the same hold reaching 3000 ms, so a second 1.5 s hold can never fire before maintenance escalates. **Deliberately NOT coded without the user:** the shape (target selection, beep semantics, the default action for a freshly-assigned gesture) is a product decision, and the user's requirement is that this work with no app — so the first step is to confirm the intended flow, then implement it. Fixing §7.4's beep names and §7.5's exit trigger is part of the same change | Before the board arrives, as a decision; the implementation can follow | Yes — it is the core no-app product requirement, and one AUX1-hold gesture cannot serve both flows as written |
+| N-19 | **§7.5's no-app flow needed a rewrite, not a new subsystem — the fix is §6.6 rule 4 (resolved 2026-09-21).** The original §7.5 described a *modal* `PROGRAMMING MODE` (AUX1 hold to enter, "AUX1 held ≥ 1.5 s again" to leave) that both collided with §7.4 and was unreachable as written: `kEnterHoldMs` is 1500 ms and maintenance opens on the same hold reaching 3000 ms, so a second 1.5 s hold could never fire. The 2022 interaction the user described is *stateless* — hold the modifier (AUX1, standing in for the 2022 BOOTSEL), perform the gesture on a wheel key, release — so §7.5 is rewritten to that and **§6.6 gains rule 4: a recognised but UNBOUND gesture passes through** (presents the button's own level by ratio, §6.9), which is the 2022 default (`lookup_*_press_val`) and makes a headless-learned button work with no app and no config. Implemented in `SystemOrchestrator::PresentLevel` + the `found == false` branch; tests in `test_system` (`AnUnboundGesturePresentsTheButtonRatherThanDoingNothing` and siblings). **Residual, minor:** the beep COUNT for which gesture was heard (1/2/3 `PROGRAM_STEP` pulses) is described in §7.5 and plays from the learn wizard's own prompt path, but there is no distinct `PROGRAM_SAVED` on a *binding* write, because the on-device flow writes no `Binding` — the pass-through default needs none. Whether the device should also be able to author a `Binding` headlessly (rather than only present the button) is a v2 question, not a v1 requirement | Before the board arrives | **No — resolved.** The core no-app requirement (learn + use a button with no app) now holds |
 
 ### 12.2 Risks, ranked by expected damage
 
@@ -2567,6 +2611,6 @@ Recorded so a future reader knows which decisions were contingent:
 | Ladder decode | 1/3-of-range heuristic over 0..24 | Ratio-normalized windows, learned per vehicle | **Replaced** |
 | Gesture recognition | Stubbed (`check_is_double_press_key` / `check_is_long_press_key` both `return true`) | Deterministic, clock-injected state machine (§3.4) | **Replaced** — the old code could not have worked |
 | Persistence | None | Dual-slot A/B NVS with CRC (§3.8) | **Added** |
-| Programming UX (hold, then single/double/long, escalating buzzer) | Present in intent | Specified as first-class (§7.5) | **Specified, NOT built** — §7.5's gesture-assignment flow has no implementation; only §7.4's level-learning wizard exists. See open item N-19 |
+| Programming UX (hold, then single/double/long, escalating buzzer) | Present in intent | Specified as first-class (§7.5) | **Built (2026-09-21):** §7.5 is rewritten to the stateless held-modifier interaction the user described, and §6.6 rule 4 (unbound → pass-through) makes a headless-learned button work with no app. See N-19 |
 | Android link | Custom serial driver | NDJSON over TinyUSB CDC (§4) | **Kept, standardized** |
 | Timings | `MAX_DOUBLE_PRESS_OFF_MS 500`, `MIN_LONG_PRESS_MS 750`, `KEY_SEND_DURATION_MS 200` | Same defaults, now configurable and tested | **Kept** |

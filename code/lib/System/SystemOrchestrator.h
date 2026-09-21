@@ -341,6 +341,20 @@ private:
     // DAC code would let the next update pull the line back toward the released
     // key's voltage.
     void ReleaseKey(uint8_t index);
+    /*
+     * Present a ladder level on the head unit as ONE bounded pulse, by RATIO.
+     *
+     * This is spec 6.9's mapping, and it has two callers: the no-config
+     * pass-through (FR-25) and the unbound-gesture fallback below. Both are "the
+     * user pressed a button the config does not bind, so be the stock wheel".
+     *
+     * Returns false when there is no usable head-unit idle to map onto.
+     * Fabricating a denominator would land every press on a key nothing defined,
+     * so the caller must RELEASE rather than drive a guess -- the same direction
+     * FR-12 takes for an unrecognised level.
+     */
+    bool PresentLevel(uint8_t index, int level_mv, int wheel_idle_mv, int sense_mv,
+                      uint64_t now_ms, DacChannel key_ch);
     void ApplyLearnedProfile(int channel, const LadderProfile &profile);
     // Spec 4.3's `event`. Called at the moment of recognition, from inside
     // ServiceChannel's resolution branch, because a gesture can complete on any

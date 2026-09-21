@@ -2,8 +2,10 @@ package com.oetsolutions.swc.ui
 
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsNotEnabled
+import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithContentDescription
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.onNodeWithText
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
@@ -75,6 +77,25 @@ class LadderScreenTest {
         composeRule.setContent { LadderScreen(state = state(liveMv = null)) }
         composeRule.onNodeWithContentDescription("vol_up, not matched").assertExists()
         composeRule.onNodeWithText("Classified as: nothing").assertExists()
+    }
+
+    @Test
+    @Config(sdk = [34], qualifiers = "xhdpi")
+    fun `the ladder bands are placed in density-independent units`() {
+        // `BoxWithConstraints` exposes BOTH `constraints.maxWidth` (pixels) and the
+        // scope's `maxWidth` (dp). Reading the pixel one and then applying it with
+        // `.dp` scales every band by the density a second time, so on a real phone
+        // (~2.75x) the whole scale overflows. At the JVM default density of 1.0 the
+        // two units coincide, which is why every other test here passes either way.
+        // Run at xhdpi (density 2.0) so the mix-up is observable.
+        composeRule.setContent { LadderScreen(state = state(liveMv = 1430)) }
+        val scale = composeRule.onNodeWithTag("ladder-scale").getUnclippedBoundsInRoot()
+        val band = composeRule.onNodeWithTag("band-vol_up").getUnclippedBoundsInRoot()
+        val scaleWidth = (scale.right - scale.left).value
+        // The scale runs 0..idle left-to-right, so vol_up's band starts at
+        // (centre - tolerance)/idle of the way across, measured from the scale's left.
+        val expected = (1430 - 120) / 2835f * scaleWidth
+        assertEquals(expected, (band.left - scale.left).value, 1.0f)
     }
 
     @Test

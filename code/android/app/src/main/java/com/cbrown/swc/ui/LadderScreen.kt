@@ -130,17 +130,22 @@ fun LadderScreen(state: LadderUiState, modifier: Modifier = Modifier) {
         }
 
         if (state.idleMv > 0) {
-            BoxWithConstraints(Modifier.fillMaxWidth().height(120.dp)) {
-                val widthPx = constraints.maxWidth.toFloat()
+            BoxWithConstraints(Modifier.fillMaxWidth().height(120.dp).testTag("ladder-scale")) {
+                // `maxWidth` (the scope's Dp), NOT `constraints.maxWidth` (px):
+                // every consumer below applies the result through `.dp`, so the
+                // scale must be measured in dp or it is scaled by the density a
+                // second time. At density 1 the two agree, which is why a JVM test
+                // at the default density cannot see the difference.
+                val widthDp = maxWidth.value
                 // Position a millivolt reading on the rail. The scale runs 0..idle,
                 // so a lower voltage is further LEFT -- which is the same axis the
                 // firmware's ratio uses.
-                fun xOf(mv: Int): Float = (mv.toFloat() / state.idleMv) * widthPx
+                fun xOf(mv: Int): Float = (mv.toFloat() / state.idleMv) * widthDp
 
                 // The rail marker at the right edge, so the scale is legible.
                 Box(
                     Modifier
-                        .offset(x = (widthPx - 2f).dp)
+                        .offset(x = (widthDp - 2f).dp)
                         .width(2.dp)
                         .fillMaxHeight()
                         .background(Color(0xFF424242))

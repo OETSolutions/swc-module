@@ -499,6 +499,15 @@ below are load-bearing — widening any of them re-opens the partition arithmeti
 | `Binding.id`, `LadderButton.id`, `Binding.button` | **16** | Slugs, e.g. `vol_up`, `next` |
 | `ChannelConfig.name`, `LadderButton.name` | **16** | Display labels |
 
+**Integer fields carry integers.** Every field the model declares as an integer
+is refused by the codec if it arrives with a fractional part — not truncated.
+Truncation is the same wrong-value-accepted class as a wrap: `long_press_ms`
+sent as `750.9` would otherwise be stored as `750`, a config the device accepts
+and then behaves differently from what was sent. The bound is applied before the
+cast (magnitude for `uint32_t`/`uint64_t`, `0`–`3` for the levels via
+`ConfigValidate`), and `config_patch` (§4.3) applies the identical rule so the
+two writers of a config give one answer to "what is a legal value".
+
 **Measured (§3.8's method), and re-measured 2026-09-19 after a defect:** the
 structural worst case is every string field at its width above, 2 channels × 16
 buttons, 3 AUX, and 32 bindings × 2 actions. That is **22,407 B** as JSON →

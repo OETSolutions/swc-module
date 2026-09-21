@@ -67,9 +67,17 @@ typedef enum {
  * a power-mode change (spec 2.3: PD1:PD0 = 01 selects gain 1.82), and it is
  * made independently of any code write, so it is its own member.
  *
- * dac_set_code returns void deliberately (spec 6.8): the driver retries with
- * backoff internally and latches a fault on persistent failure; it never
- * drives a guessed code. There is no useful failure for a caller to branch on.
+ * dac_set_code returns void. **It does NOT retry, and it does NOT latch a fault,
+ * and an earlier version of this comment claimed both** (spec 6.8 asks for
+ * "retry with backoff; if persistent, release the line and report a fault").
+ * What is actually implemented is one synchronous `i2c_master_transmit` per
+ * write, with an `ESP_LOGE` on failure and nothing else -- there is no retry
+ * loop, no fault flag, or no accessor, and no consumer could ask for one,
+ * because this signature reports nothing. **A caller that needs to branch on a
+ * failed write is the thing this interface cannot express**; that is open item
+ * N-21, and changing the return type to `esp_err_t` is the fix. What IS
+ * honoured is the last clause: a failed write drives nothing rather than a
+ * guessed code. Do not read this comment as a description of working behavior.
  */
 typedef struct IHAL {
     int      (*adc_read_mv)(void *ctx, AdcChannel ch);

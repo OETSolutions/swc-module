@@ -164,9 +164,14 @@ static void HalDacSetCode(void *ctx, DacChannel ch, uint16_t code)
     frame[2] = (uint8_t)((code >> 8) & 0x0F);
     frame[3] = (uint8_t)(code & 0xFF);
 
-    // The driver retries internally on a bus fault and reports; IHAL's void
-    // return is deliberate (spec 6.8), so a persistent failure is logged here
-    // rather than pushed onto every call site.
+    // NO RETRY. An earlier version of this comment said "the driver retries
+    // internally on a bus fault" -- it does not. `i2c_master_transmit` is one
+    // synchronous transaction that delegates straight to
+    // `i2c_multi_buffer_transmit` (no loop), so a NACK or a timeout is logged
+    // once and the write is simply lost. Spec 6.8 asks for "retry with backoff;
+    // if persistent, release the line and report a fault"; only the log exists.
+    // IHAL's void return is what prevents a caller from acting on it, which is
+    // why the fix there is a signature change -- see open item N-21.
     esp_err_t err = i2c_master_transmit(g_state.dac, frame, sizeof(frame), 100);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "dac write failed: %s", esp_err_to_name(err));

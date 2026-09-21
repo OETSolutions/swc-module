@@ -28,22 +28,24 @@
 // I2C.
 #define SWC_I2C_FREQ_HZ    400000
 
-// The MCP4728's 7-bit address is set by its A0/A1/A2 strap pins.
+// The MCP4728's 7-bit address (datasheet DS22187E), set by its A0/A1/A2 strap
+// pins. ONE definition: the bring-up notes below say to change it "here and
+// nowhere else", and a second copy of this line made that untrue -- a bring-up
+// address correction would have landed on one and been silently overridden by
+// the other.
 //
 // SPEC ITEM N-4: this value is a bring-up MEASUREMENT, not a datasheet fact --
 // the strap is set by how the board ties those pins, and the spec lists it as
 // open (section 12.1). 0x60 is the all-low default, which is what a board with
 // the strap pins grounded produces. The bring-up log's step 2 records the
 // address read off the bus; if it differs, change it HERE and nowhere else.
-#define SWC_MCP4728_ADDR   0x60
-
-// MCP4728 I2C address (datasheet DS22187E).
-//   The Multi-Write *frame bytes* are NOT here. They are built by
-//   DacFrame::EncodeSet in DacFrame.h, which is host-testable -- EspHal.cpp is
-//   the one lib/ file the host build excludes, so a byte layout written inline
-//   in it is checked by no test. An earlier revision kept the command constants
-//   here, wrote a FOUR-byte frame inline, and shipped a DAC that was never
-//   addressed at all. See DacFrame.h's header comment.
+//
+// The Multi-Write *frame bytes* are NOT here. They are built by
+// DacFrame::EncodeSet in DacFrame.h, which is host-testable -- EspHal.cpp is
+// the one lib/ file the host build excludes, so a byte layout written inline
+// in it is checked by no test. An earlier revision kept the command constants
+// here, wrote a FOUR-byte frame inline, and shipped a DAC that was never
+// addressed at all. See DacFrame.h's header comment.
 #define SWC_MCP4728_ADDR   0x60
 
 // ADC attenuation. 12 dB is the only setting whose calibrated ceiling is 2.9 V

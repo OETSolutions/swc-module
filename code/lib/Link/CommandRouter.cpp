@@ -238,6 +238,24 @@ void CommandRouter::Process() {
 }
 
 void CommandRouter::ReplyStatus(uint32_t for_seq) {
+    EmitStatusBody(true, for_seq);
+}
+
+void CommandRouter::SendStatus() {
+    // The periodic keepalive replies to NOTHING, so it carries no `for_seq`.
+    //
+    // It used to pass the firmware's own outbound counter (`seq_sent_`). That
+    // made every unsolicited status look like the answer to whatever request
+    // happened to share that number: the app completes a pending request on a
+    // matching `for_seq`, and both counters start near zero, so a keepalive that
+    // landed between a nacked `config_chunk` and its own nack could complete the
+    // waiter first and report the refusal as success -- "config saved" for a
+    // config the device never accepted. `for_seq` is a reply field; an
+    // unsolicited frame must not guess at one.
+    EmitStatusBody(false, 0);
+}
+
+void CommandRouter::EmitStatusBody(bool with_for_seq, uint32_t for_seq) {
     const bool vbus = (hal_ != nullptr) && hal_->gpio_read(hal_->ctx, GPIO_VBUS_VALID);
     // `config_state` reports the CONFIG's state, not the output's. It used to be
     // derived from `SafeIdleEstablished()`, which answers "is the KEY line safe"
@@ -246,11 +264,17 @@ void CommandRouter::ReplyStatus(uint32_t for_seq) {
     // config from a lost one. The output's own state is `output_safe`, a
     // separate field, and neither name can now be read as the other.
     const char *cfg = (sys_ != nullptr) ? sys_->ConfigStateWord() : "unknown";
+    char reply_field[32];
+    if (with_for_seq) {
+        snprintf(reply_field, sizeof(reply_field), "\"for_seq\":%u,", static_cast<unsigned>(for_seq));
+    } else {
+        reply_field[0] = '\0';
+    }
     char body[288];
     snprintf(body, sizeof(body),
-             "\"for_seq\":%u,\"vbus_present\":%s,\"gain_mode\":\"%s\",\"uptime_ms\":%llu,"
+             "%s\"vbus_present\":%s,\"gain_mode\":\"%s\",\"uptime_ms\":%llu,"
              "\"config_state\":\"%s\",\"output_safe\":%s",
-             static_cast<unsigned>(for_seq), vbus ? "true" : "false",
+             reply_field, vbus ? "true" : "false",
              (sys_ != nullptr) ? (sys_->ChannelGainMode(0) == GainMode::kAmplified ? "amplified"
                                                                                   : "tracking")
                                : "unknown",
@@ -258,10 +282,6 @@ void CommandRouter::ReplyStatus(uint32_t for_seq) {
              cfg,
              ((sys_ != nullptr) && sys_->SafeIdleEstablished()) ? "true" : "false");
     Emit("status", body);
-}
-
-void CommandRouter::SendStatus() {
-    ReplyStatus(seq_sent_);
 }
 
 void CommandRouter::NoteSilenceIfStale(uint64_t now) {

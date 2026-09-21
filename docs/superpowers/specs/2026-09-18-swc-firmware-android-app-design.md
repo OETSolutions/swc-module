@@ -843,6 +843,19 @@ An interrupted run is discarded wholesale — a partial config is never applied.
 | FW → App | `hello` | `fw_version`, `hw_id`, `protocol_v`, `caps[]` | Sent on connect and on request |
 | FW → App | `event` | `channel`, `button`, `gesture`, `t_ms`, `level_mv` | **The core event.** Fired on every classified gesture |
 | FW → App | `status` | `vbus_present`, `gain_mode`, `config_state`, `output_safe`, `uptime_ms` (+ `rail_mv`, `temp_c`, `heap_free` — open, N-22) | Periodic + on change |
+| FW → App | `status` (reply) | the fields above **plus `for_seq`** | The answer to `ping`; a `for_seq` names the frame being answered |
+
+**The periodic `status` carries no `for_seq`; the `ping` reply does.** A
+`for_seq` names the frame a reply is answering, so only a reply may carry one.
+The periodic keepalive answers nothing, and the firmware used to fill its
+`for_seq` from its own outbound counter (`seq_sent_`) — which made an
+unsolicited `status` look like the answer to whichever command happened to share
+that number. Because the app resolves a pending request on a matching `for_seq`
+and both counters start near zero, a keepalive landing between a refused
+`config_chunk` and its own `nack` could complete the waiting app first and report
+the refusal as **success** — the "config the device is not running" lie the nack
+exists to prevent. The reply is distinguishable from the keepalive by exactly
+this field, so an app must not treat a bare `status` as an ack.
 
 **`config_state` is the CONFIG's state, and `output_safe` is the output's.** They
 were the same field, derived from `SafeIdleEstablished()`, so a device whose

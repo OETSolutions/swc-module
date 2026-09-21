@@ -7,7 +7,9 @@ import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.advanceUntilIdle
+import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertTrue
@@ -243,6 +245,50 @@ class SwcClientTest {
         // awaits forever is a spinner with no exit.
         val result = client.setConfig(sampleConfig(), timeoutMs = 100)
         assertTrue("expected a timeout, got $result", result is AckResult.Timeout)
+        job.cancel()
+    }
+
+    @Test
+    fun `getConfig returns as soon as the run ends, without waiting out its timeout`() = runTest {
+        // The firmware answers `config_get` with the chunked run itself, and no
+        // frame of that run carries a `for_seq`. Waiting on one therefore never
+        // matched, so `getConfig` returned only after its FULL timeout -- which is
+        // what `AppViewModel.connect()` did on every launch. A generous timeout
+        // with a fast run is what tells the two behaviors apart: the fix returns
+        // promptly, the bug blocks for the whole 15 s.
+        //
+        // `runCurrent`, not `advanceUntilIdle`: advancing would jump virtual time
+        // past the 15 s timeout and complete the call the wrong way, hiding the
+        // very bug this asserts against.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        val body = com.oetsolutions.swc.model.ConfigJson.encode(sampleConfig())
+
+        val call = launch { client.getConfig(timeoutMs = 15_000) }
+        runCurrent()
+        assertTrue("the request must go out", t.written.any { it.contains("\"type\":\"config_get\"") })
+
+        configRun(body).forEach { t.emit(it + "\n") }
+        runCurrent()
+
+        assertTrue("the run must resolve the call", call.isCompleted)
+        assertEquals(sampleConfig(), client.config.value)
+        job.cancel()
+    }
+
+    @Test
+    fun `getConfig still gives up when the device never runs`() = runTest {
+        // The other direction: waiting on the run must not become waiting
+        // forever. A device that accepts the request and stays silent has to
+        // time out, or the connect spinner never exits.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        val call = launch { client.getConfig(timeoutMs = 100) }
+        runCurrent()
+        advanceTimeBy(1_000)
+        assertTrue("must not hang on a silent device", call.isCompleted)
         job.cancel()
     }
 

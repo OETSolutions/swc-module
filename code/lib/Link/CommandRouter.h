@@ -129,11 +129,17 @@ private:
     // orchestrator's; the radio is device-only work elsewhere.
     void HandleMaintenanceEnter(uint32_t for_seq);
     void HandleMaintenanceExit(uint32_t for_seq);
-    // Replies to `ping`/`status` request and to `hello`.
+    // Replies to `ping`/`status` request: the same body as the periodic status,
+    // but carrying the `for_seq` that makes it a reply.
     void ReplyStatus(uint32_t for_seq);
     // Spec 4.4's periodic status. Private: it is an implementation of `Tick()`,
     // not part of the router's surface.
     void SendStatus();
+    // The single writer of the `status` body, parameterized by whether the frame
+    // is a REPLY (carrying `for_seq`) or the unsolicited periodic keepalive
+    // (carrying none -- `for_seq` names the frame being answered, and a keepalive
+    // answers nothing).
+    void EmitStatusBody(bool with_for_seq, uint32_t for_seq);
     void BeginConfigReplyRun();
 
     // A nack names the failing check, because "config is corrupt" is not

@@ -89,6 +89,20 @@ class SwcClient(private val transport: SwcTransport) {
     private var inboundLen = 0
     private var inboundCrc = 0L
 
+    // Signals the END of an inbound config run to a caller awaiting it.
+    //
+    // `getConfig` cannot wait on `for_seq`. The firmware answers `config_get`
+    // with the chunked run ITSELF, and no frame of that run
+    // (`config_begin`/`config_chunk`/`config_end`) carries a `for_seq` -- they
+    // ARE the reply, not a frame answering one. Waiting on a `for_seq` therefore
+    // never matched and every `getConfig` burned its whole timeout before
+    // returning, which is what `connect()` did on every launch.
+    private var configRunWaiter: CompletableDeferred<Unit>? = null
+
+    private fun finishConfigRun() {
+        configRunWaiter?.complete(Unit)
+    }
+
     private fun beginInboundConfig(frame: Frame) {
         val total = frame.fields["total_len"]?.jsonPrimitive?.intOrNull ?: 0
         inboundCrc = frame.fields["crc32"]?.jsonPrimitive?.longOrNull ?: 0L
@@ -126,6 +140,7 @@ class SwcClient(private val transport: SwcTransport) {
         inbound = null
         if (buf == null || inboundLen != buf.size) {
             _state.value = LinkState.Failed("config run ended early")
+            finishConfigRun()
             return
         }
         // The run carries a crc32 at the start and a sha256 at the end. Both are
@@ -133,16 +148,22 @@ class SwcClient(private val transport: SwcTransport) {
         // that produces a config the device is NOT running while looking plausible.
         if (crc32(buf) != inboundCrc) {
             _state.value = LinkState.Failed("config failed its crc32 check")
+            finishConfigRun()
             return
         }
         val want = frame.fields["sha256"]?.jsonPrimitive?.content ?: ""
         if (want.isNotEmpty() && sha256Hex(buf) != want) {
             _state.value = LinkState.Failed("config failed its sha256 check")
+            finishConfigRun()
             return
         }
         // Applied only now, on a verified run. Adopting the bytes earlier would let
         // a torn transfer become what the app believes the device holds.
         _config.value = ConfigJson.decode(buf.toString(Charsets.UTF_8))
+        // A run that FAILED its checks still ENDS: the waiter must be released so
+        // `getConfig` returns the (unchanged) local model rather than hanging on a
+        // run that already finished. All three exits above release it too.
+        finishConfigRun()
     }
 
     /** Feed everything the transport delivers. Call this from a collector on [SwcTransport.incoming]. */
@@ -360,9 +381,37 @@ class SwcClient(private val transport: SwcTransport) {
         return result
     }
 
-    /** Request the config and wait for the chunked run to fill [config]. */
+    /**
+     * Request the config and wait for the chunked run to fill [config].
+     *
+     * The wait is on the RUN's end, not on a `for_seq`. The firmware answers
+     * `config_get` with `config_begin`/`config_chunk`/`config_end` themselves
+     * (spec §4.2), and none of those carries a `for_seq` -- so awaiting one never
+     * matched and this always returned after its full timeout. Callers got the
+     * right config (the handlers fill [config] as the run lands) but blocked for
+     * 15 s doing it, which is exactly what `AppViewModel.connect()` does on launch.
+     *
+     * `config_get` is also not acked: §4.2's reply IS the run, so there is no
+     * `ack` to wait for and `request()` would time out twice over.
+     *
+     * The waiter is registered BEFORE the frame goes out, because the device may
+     * answer before `send` has even returned and the reader coroutine would
+     * otherwise complete a run with nobody listening.
+     *
+     * A run that fails its digest leaves [config] unchanged and raises
+     * `LinkState.Failed`; the caller sees the OLD model plus a failed link rather
+     * than a silent hang.
+     */
     suspend fun getConfig(timeoutMs: Long = 15_000): Config {
-        request(Frames.CONFIG_GET, timeoutMs)
+        val waiter = CompletableDeferred<Unit>()
+        configRunWaiter = waiter
+        try {
+            send(Frames.CONFIG_GET)
+            awaitOrNull(waiter, timeoutMs)
+        } finally {
+            // Cleared unconditionally: a later run must not complete THIS waiter.
+            configRunWaiter = null
+        }
         return _config.value
     }
 
@@ -393,10 +442,13 @@ class SwcClient(private val transport: SwcTransport) {
         body: (JsonObject) -> JsonObject = { it },
     ): AckResult = sendAndAwait(type, timeoutMs, body).second
 
-    private suspend fun awaitOrNull(
-        d: CompletableDeferred<Frame>,
+    // Generic in the awaited type: a request waits on a reply `Frame`, while
+    // `getConfig` waits on the chunked run finishing, which carries no frame of
+    // its own to hand back.
+    private suspend fun <T> awaitOrNull(
+        d: CompletableDeferred<T>,
         timeoutMs: Long,
-    ): Frame? = withTimeoutOrNullMillis(timeoutMs) { d.await() }
+    ): T? = withTimeoutOrNullMillis(timeoutMs) { d.await() }
 
     private suspend fun <T> withTimeoutOrNullMillis(ms: Long, block: suspend () -> T): T? =
         try {

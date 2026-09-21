@@ -242,6 +242,37 @@ TEST(CommandRouter, TheFirmwareSendsAPeriodicStatusWhileConnected) {
         << "the periodic frame is a `status`";
 }
 
+TEST(CommandRouter, ThePeriodicStatusCarriesNoForSeq) {
+    // The keepalive answers NOTHING, so it must not name a `for_seq`. It used to
+    // carry the firmware's own outbound counter, which made an unsolicited status
+    // look like the answer to whichever request happened to share that number.
+    // The app completes a pending request on a matching `for_seq` and both
+    // counters start near zero, so a keepalive landing between a refused
+    // `config_chunk` and its own nack could complete the waiter first and report
+    // the refusal as success -- "config saved" for a config never accepted.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    ASSERT_TRUE(HasType(cap, "status")) << "the ping reply is a status";
+    // The REPLY does carry one -- it is answering the ping.
+    EXPECT_NE(cap.lines[0].find("\"for_seq\":1"), std::string::npos);
+
+    r.Tick();              // seed the status clock
+    hal.AdvanceMs(2000);
+    r.Tick();              // the periodic status
+    ASSERT_EQ(cap.lines.size(), 2u) << "one ping reply, one periodic status";
+    EXPECT_NE(cap.lines.back().find("\"type\":\"status\""), std::string::npos);
+    EXPECT_EQ(cap.lines.back().find("\"for_seq\""), std::string::npos)
+        << "an unsolicited keepalive must not claim to answer a request";
+    // The body is otherwise unchanged -- the fields the app renders are still
+    // there, so the guard above did not drop the payload along with the field.
+    EXPECT_NE(cap.lines.back().find("\"config_state\""), std::string::npos);
+    EXPECT_NE(cap.lines.back().find("\"output_safe\""), std::string::npos);
+}
+
 TEST(CommandRouter, APeriodicStatusNeedsAConnectedLink) {
     // With no peer, a periodic status would fill the small TX buffer with frames
     // nothing drains, and the buffer would then refuse a real reply.

@@ -531,6 +531,35 @@ TEST(SystemOrchestrator, AChannelWithNoHeadUnitServesNothingWhileItsSiblingStill
         << "and its healthy sibling still passes through";
 }
 
+// A `test_key` pulse on a PASS-THROUGH device must survive its requested hold.
+// The pass-through branch released on any `!pressed` idle tick, which cut a
+// bench-driven key to zero -- measured, a 200 ms hold was released on the first
+// tick after it was driven, so the bench could not exercise the output at all on
+// an unconfigured board.
+TEST(SystemOrchestrator, ATestKeyPulseOnAPassThroughDeviceSurvivesItsHold) {
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);   // wheel idle: nothing pressed
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    ASSERT_TRUE(o.PassThroughActive()) << "precondition: this is the pass-through path";
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    ASSERT_TRUE(o.TestDriveKeyMv(0, 2400, 200, hal.NowMs()));
+    const int driven = hal.LastDacCode(DAC_CH_KEY1);
+    ASSERT_NE(driven, idle_code) << "the bench command drives the line";
+
+    // Still driven a third of the way through the hold, with nothing pressed.
+    PollFor(o, hal, 60);
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), driven)
+        << "the pass-through idle branch must not release a bench-driven key";
+
+    // And released once the hold elapses.
+    PollFor(o, hal, 300);
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "the hold still ends in a release";
+}
+
 TEST(SystemOrchestrator, AConfiguredDeviceDoesNotUsePassThrough) {
     // The inverse, and the more dangerous direction: a CONFIGURED device must
     // classify against its learned windows. If pass-through were ever left on, a

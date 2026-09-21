@@ -835,6 +835,12 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             // configured path, where a SINGLE cannot fire twice without a release
             // between.
             const bool rising_edge = pressed && !cs.pass_through_pressed;
+            // The FALLING edge ends a pass-through press. Testing `!pressed` alone
+            // released ANY driven line on any idle tick, including a `test_key`
+            // pulse this branch never started: measured, a 200 ms bench hold was
+            // cut to zero on a pass-through device, so the bench could not
+            // exercise the output at all on an unconfigured board.
+            const bool falling_edge = !pressed && cs.pass_through_pressed;
             cs.pass_through_pressed = pressed;
 
             if (rising_edge && head_unit_idle_mv_[index] > 0) {
@@ -845,7 +851,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                 // buttons into the clamp, which is the wrong key rather than a
                 // quieter one.
                 PresentLevel(index, level_mv, idle, sense_mv, now_ms, key_ch);
-            } else if (!pressed) {
+            } else if (falling_edge) {
                 ReleaseKey(index);
             }
         }

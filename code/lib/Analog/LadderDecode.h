@@ -96,9 +96,16 @@ ClassifyOutcome LadderClassify(const LadderProfile &profile, int level_mv, int i
  * Scaling is the correct transform, not ratio preservation in the abstract: the
  * ladder is a divider off +3V3, so a button's pin voltage (and its spread) scale
  * with the rail. Both `mv_center` and `mv_tolerance` therefore scale, which keeps
- * every relative permille window EXACTLY invariant -- `LadderRatioPermille` of a
- * scaled button against the scaled denominator returns the same permille, so
- * `LadderWindowsAreDistinguishable` cannot change under a rebase.
+ * every relative permille window invariant to within one permille -- the
+ * quantization of storing the result back into whole millivolts. That one
+ * permille matters only at the DISTINGUISHABILITY boundary: a profile whose two
+ * centres sit closer than the wider tolerance can tip across it, and
+ * `LadderWindowsAreDistinguishable` would then disagree before and after. It is
+ * not reachable from a real learn, which derives its tolerance from the measured
+ * spread and the nearest-neighbour gap (both tens of millivolts for any pair of
+ * real buttons), and a sweep of every such profile across the 2600-2900 mV rail
+ * band found no flip; the boundary is only reached by a profile whose buttons are
+ * a few millivolts apart, which a learn cannot produce.
  *
  * A non-positive `from_idle_mv` (a profile that has no reference yet -- a fresh
  * learn, or a channel with no learned ladder) is left untouched: there is no

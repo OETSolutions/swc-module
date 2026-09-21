@@ -1116,8 +1116,9 @@ void CommandRouter::HandleLearnCommit(const cJSON *root, uint32_t for_seq) {
     // them in the old frame under a new denominator. Classification reads them on
     // the wrong scale and the press lands in whichever window it now falls inside:
     // the WRONG button fires. Scaling both `mv_center` and `mv_tolerance` keeps
-    // every permille window exactly invariant, so nothing the validator or the
-    // classifier derives from ratios changes here.
+    // every permille window the same to within one permille (the quantization of
+    // writing whole millivolts), so nothing the validator or the classifier
+    // derives from ratios meaningfully changes here -- see `LadderProfileRebase`.
     LadderProfileRebase(lp, lp.learned_idle_mv, session_.LearnedIdleMv());
 
     // REPLACE IN PLACE when the id is already on the ladder, rather than always

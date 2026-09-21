@@ -162,10 +162,10 @@ TEST(LadderClassify, OverlappingWindowsResolveToTheNearestCentreNotTheFirstMatch
 TEST(LadderProfileRebase, ScalesCentresAndTolerancesAndPreservesEveryPermilleWindow) {
     // A profile has ONE denominator, so a re-learn on a moved rail must put every
     // button in the frame the profile is about to be stamped with. Scaling the
-    // centre and the tolerance TOGETHER is what makes the permille window exactly
-    // invariant: LadderRatioPermille of a scaled button against the scaled
-    // denominator is the same number, so nothing the classifier or the validator
-    // derives from ratios can change under a rebase.
+    // centre and the tolerance TOGETHER is what keeps the permille window the
+    // same: both scale with the rail, so `LadderRatioPermille` of a scaled button
+    // against the scaled denominator is the same number to within the one
+    // permille that rounding to whole millivolts costs.
     LadderProfile p = MakeProfile(kIdleMv);   // learned at 2835
     const int before_center = LadderRatioPermille(p.buttons[0].mv_center, kIdleMv);
     const int before_tol    = LadderRatioPermille(p.buttons[0].mv_tolerance, kIdleMv);

@@ -1640,6 +1640,7 @@ TEST(CommandRouter, ALearnTakenOnAMovedRailNormalizesToTheLiveIdle) {
            "2450 mV: two frames under one denominator makes classification read it "
            "on the wrong scale and fire the wrong button";
     EXPECT_EQ(LadderRatioPermille(sibling->mv_center, kMovedIdle), 864)
-        << "and rebasing must leave the sibling's permille window EXACTLY as it "
-           "was (both its centre and the denominator scale together)";
+        << "and rebasing must leave the sibling's permille window the same as it "
+           "was (its centre and the denominator scale together), to within the one "
+           "permille that rounding the millivolts costs";
 }

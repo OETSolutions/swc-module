@@ -232,6 +232,26 @@ void SystemOrchestrator::Boot() {
     // spec 6.3's ratio normalization needs.
     pass_through_ = (result == ConfigLoadResult::kNoConfig);
 
+    // The RUNTIME timings come from the loaded config, and re-deriving them here
+    // is load-bearing. The device path (`SystemOrchestratorCreate`) constructs
+    // with `ConfigDefault()`'s timings, and every channel's classifier and gesture
+    // machine is built from `timings_` in step 3 below -- so without this a user's
+    // `long_press_ms` / `double_press_off_ms` / `debounce_ms` / `send_duration_ms`
+    // were stored, reported in `config_get`, and SILENTLY IGNORED at runtime.
+    // Measured before the fix: a config with `long_press_ms = 1500` still fired
+    // LONG at the default 750 ms.
+    //
+    // `settings.timings` is the authority, not the constructor's argument. A
+    // caller that passes different timings (every host test, to drive the loop
+    // faster) is overridden by a stored config -- which is correct, because the
+    // stored config is what the device will run with, and a test that wants
+    // specific timings should store them.
+    timings_ = config_.settings.timings;
+    // Same reasoning for the maintenance window: the constructor hardcodes spec
+    // 8.2's 5-minute default, but a config may carry its own, and `Boot` is the
+    // only place that has the loaded config.
+    maintenance_ = MaintenanceMode(hal_, config_.settings.maintenance_timeout_ms);
+
     // Record what the load actually did, so `status`'s `config_state` carries the
     // CONFIG's state rather than the output's (see ConfigStateWord).
     switch (result) {

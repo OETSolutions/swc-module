@@ -2,6 +2,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -2133,4 +2134,59 @@ TEST(SystemOrchestrator, ReLearningTheSameSlotTwiceDoesNotDuplicateItsId) {
                 << "two buttons with one id make the id an ambiguous key";
         }
     }
+}
+
+// --- the stored config's TIMINGS are the runtime timings ---------------------
+
+TEST(SystemOrchestrator, TheStoredTimingsAreWhatTheDeviceRunsWith) {
+    // The device path constructs with `ConfigDefault()`'s timings, and every
+    // channel's classifier and gesture machine is built from `timings_` -- so a
+    // loaded config's own timings must be adopted in `Boot`, or a user's
+    // `long_press_ms` is stored, reported in `config_get`, and SILENTLY IGNORED.
+    // Measured before the fix: `long_press_ms = 1500` still fired LONG at 750 ms.
+    //
+    // The test drives the LONG boundary directly: hold a LONG-binding button for
+    // a time that is past the default 750 but short of the user's 1500, and
+    // require NO LONG. Then hold past 1500 and require one.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.settings.timings.long_press_ms = 1500;
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+
+    // The DEVICE construction: default timings at construction, config from NVS.
+    const Config boot = ConfigDefault();
+    SystemOrchestrator o(&hal.InterfaceRef(), boot, boot.settings.timings);
+    std::vector<std::string> seen;
+    o.SetGestureSink(
+        [](void *ctx, const SystemOrchestrator::GestureEventRecord &ev) {
+            auto *v = static_cast<std::vector<std::string> *>(ctx);
+            switch (ev.gesture) {
+                case Gesture::kSingle: v->push_back("SINGLE"); break;
+                case Gesture::kDouble: v->push_back("DOUBLE"); break;
+                case Gesture::kLong:   v->push_back("LONG");   break;
+                default: break;
+            }
+        },
+        &seen);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // Hold vol_up (which binds LONG) for 900 ms: under the user's 1500.
+    seen.clear();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 900);
+    EXPECT_EQ(std::find(seen.begin(), seen.end(), "LONG"), seen.end())
+        << "LONG fired before the user's long_press_ms (1500): the stored timings "
+           "were ignored and the default 750 was used";
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 400);
+
+    // Now hold past 1500 and require the LONG.
+    seen.clear();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 1700);
+    EXPECT_NE(std::find(seen.begin(), seen.end(), "LONG"), seen.end())
+        << "a hold past the user's long_press_ms must still fire LONG";
 }

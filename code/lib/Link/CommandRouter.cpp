@@ -990,6 +990,18 @@ void CommandRouter::HandleLearnCommit(const cJSON *root, uint32_t for_seq) {
         Nack(for_seq, "bad_param", "channel out of range");
         return;
     }
+    // The samples came from the STREAM's channel, so the write must land on that
+    // same channel -- a commit naming a different one would store channel 0's
+    // measured voltage on channel 1's ladder. Measured: learn_start(channel 0)
+    // then learn_commit(channel 1) returned `ack` and wrote a 1430 mV button onto
+    // channel 1 (whose own input was idle at 2835 mV). The frame's `channel` still
+    // has to be present and valid (the spec spells it that way and the app sends
+    // it), but the stream is the authority for WHERE the measurement belongs.
+    if (learn_open_ && channel != static_cast<uint8_t>(learn_channel_)) {
+        Nack(for_seq, "channel_mismatch",
+             "learn_commit's channel differs from the open learn stream's");
+        return;
+    }
 
     // The session was fed by `RecordLearnSample` on every `Process()` tick the
     // stream was open, which is what makes the spec's "accept the streamed

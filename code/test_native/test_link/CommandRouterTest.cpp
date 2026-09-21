@@ -1413,3 +1413,56 @@ TEST(CommandRouter, TheStreamedSamplesAreWhatALearnCommitAccepts) {
     EXPECT_STREQ(out.channels[0].ladder.buttons[0].id, "vol_dn");
     EXPECT_NEAR(out.channels[0].ladder.buttons[0].mv_center, 1430, 60);
 }
+
+TEST(CommandRouter, ALearnCommitOnADifferentChannelThanTheStreamIsRefused) {
+    // The session is fed from the STREAM's channel (`RecordLearnSample`), but the
+    // commit wrote to the channel it NAMED. Measured before the fix:
+    // learn_start(channel 0), a stream over channel 0's input, then
+    // learn_commit(channel 1) returned `ack` and stored channel 0's 1430 mV
+    // measurement on channel 1's ladder -- while channel 1's own input sat idle at
+    // 2835 mV. A wrong-channel write from a mismatched frame.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.channel_count = 2;
+    for (int i = 0; i < 2; ++i) {
+        // The fixture ships channel_count = 1, so channel 1 is default-built with
+        // an EMPTY name -- which `ConfigValidate` refuses, making the stored config
+        // undecodable (Save does not validate; Load's decode does).
+        std::strncpy(d.config.channels[i].name, (i == 0) ? "SWC1" : "SWC2",
+                     sizeof(d.config.channels[i].name) - 1);
+        d.config.channels[i].ladder.count = 0;
+        d.config.channels[i].ladder.learned_idle_mv = 2835;
+    }
+    d.config.binding_count = 0;
+    ASSERT_TRUE(store.Save(d.config));
+    { Config probe{}; ASSERT_EQ(store.Load(&probe), ConfigLoadResult::kLoaded)
+          << "the fixture must be loadable for this test to mean anything"; }
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    // Channel 0 pressed, channel 1 idle.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    hal.SetAdcMilliVolts(ADC_CH_SWC2, 2835);
+    for (int i = 0; i < 20; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+
+    const std::string ls = "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0}";
+    r.OnLine(ls.c_str(), ls.size());
+    for (int i = 0; i < 20; ++i) { r.Process(); hal.AdvanceMs(20); }
+
+    cap.lines.clear();
+    const std::string lc =
+        "{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":1,"
+        "\"button_id\":\"x\",\"name\":\"X\"}";
+    r.OnLine(lc.c_str(), lc.size());
+    ASSERT_TRUE(HasType(cap, "nack")) << "a channel mismatch must be refused, not acked";
+    EXPECT_NE(cap.lines.back().find("channel_mismatch"), std::string::npos);
+
+    // And NOTHING was written to either channel.
+    Config out{};
+    ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+    EXPECT_EQ(out.channels[0].ladder.count, 0u) << "no button may be stored from a refused commit";
+    EXPECT_EQ(out.channels[1].ladder.count, 0u)
+        << "channel 1 must not receive channel 0's measurement";
+}

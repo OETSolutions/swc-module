@@ -6,6 +6,7 @@
 #include "Link/Ndjson.h"
 #include "Link/UsbCdc.h"
 #include "MockHAL.h"
+#include "Update/OtaUsb.h"
 #include "Util/Base64.h"
 #include "Util/Sha256.h"
 
@@ -901,22 +902,36 @@ TEST(CommandRouter, AConfigPatchToAnUnknownPathIsRefusedAndChangesNothing) {
     EXPECT_NE(cap.lines.back().find("unknown_path"), std::string::npos);
 }
 
-TEST(CommandRouter, AKnownButUnimplementedCommandIsDistinguishedFromAnUnknownOne) {
-    // ota_* and maintenance_* are in the spec's vocabulary (so they are not
-    // unknown_type) but this build cannot execute them. Saying so is better than
-    // a silent no-op, which the app would read as success.
+TEST(CommandRouter, AKnownCommandIsDispatchedAndAnUnknownOneIsRefused) {
+    // Every command in the spec's vocabulary now has a handler, so a
+    // "known-but-unimplemented" case no longer exists -- `ota_*` WAS the last one
+    // (N-14) and is now wired to `OtaUsb`. What still matters is the distinction
+    // this test exists for: a KNOWN type reaches its handler (and a malformed one
+    // is refused for a FIELD reason, proving the handler ran), while an UNKNOWN
+    // type is `unknown_type` and never dispatched.
     //
-    // `learn_start` USED to be in this set and is now implemented (FR-5), so it
-    // is asserted separately below -- leaving it here would have made this test
-    // pass for the wrong reason the moment the learn path landed.
+    // `learn_start` USED to be in the unimplemented set and is now implemented
+    // (FR-5), so it is asserted separately below.
     MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
     CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
     cap.Attach(r);
+    // A bare `ota_begin` names neither `size` nor `sha256`, so the handler refuses
+    // it `bad_frame`. That the refusal is `bad_frame` rather than
+    // `not_implemented` is the assertion: the handler executed.
     const std::string ota = "{\"v\":1,\"seq\":1,\"type\":\"ota_begin\"}";
     r.OnLine(ota.c_str(), ota.size());
     ASSERT_TRUE(HasType(cap, "nack"));
-    EXPECT_NE(cap.lines.back().find("not_implemented"), std::string::npos);
+    EXPECT_NE(cap.lines.back().find("bad_frame"), std::string::npos)
+        << "ota_begin is implemented now, so a fieldless one is a bad_frame";
+    EXPECT_EQ(cap.lines.back().find("not_implemented"), std::string::npos);
     EXPECT_EQ(cap.lines.back().find("unknown_type"), std::string::npos);
+
+    // An unknown type is still refused as unknown, and never dispatched.
+    cap.lines.clear();
+    const std::string bogus = "{\"v\":1,\"seq\":2,\"type\":\"definitely_not_a_frame\"}";
+    r.OnLine(bogus.c_str(), bogus.size());
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("unknown_type"), std::string::npos);
 }
 
 TEST(CommandRouter, LearnStartOpensTheLiveStreamAndIsNotUnimplemented) {
@@ -2754,4 +2769,197 @@ TEST(CommandRouter, ANumericFieldOverflowingToInfinityIsRefusedNotCast) {
         "{\"v\":1,\"seq\":5,\"type\":\"config_chunk\",\"offset\":1e999,\"data_b64\":\"AAAA\"}";
     r.OnLine(chunk.c_str(), chunk.size());
     EXPECT_TRUE(HasType(cap, "nack")) << "an inf offset must be refused";
+}
+
+// ---------------------------------------------------------------------------
+// USB OTA frames (spec 9.3, N-14), wired to Update/OtaUsb.
+//
+// The gate itself is covered by test_update/OtaUsbTest.cpp; what these tests add
+// is the ROUTER half -- that the frames are dispatched to it, that a gap or an
+// overlap is refused rather than spliced, and that `hello` advertises `ota` only
+// because this dispatch exists (see HelloAdvertisesOtaOnlyIfTheDispatcherImplementsIt).
+// ---------------------------------------------------------------------------
+
+namespace {
+// The digest of a payload, through the same stream the device uses.
+std::string PayloadHash(const std::string &data) {
+    char hex[65];
+    Sha256Hex(reinterpret_cast<const uint8_t *>(data.data()), data.size(), hex);
+    return std::string(hex, 64);
+}
+
+void SendOtaBegin(CommandRouter &r, uint32_t seq, size_t size, const std::string &sha) {
+    const std::string line = "{\"v\":1,\"seq\":" + std::to_string(seq) +
+        ",\"type\":\"ota_begin\",\"size\":" + std::to_string(size) +
+        ",\"sha256\":\"" + sha + "\"}";
+    r.OnLine(line.c_str(), line.size());
+}
+
+void SendOtaChunk(CommandRouter &r, uint32_t seq, size_t off, const std::string &raw) {
+    const std::string line = "{\"v\":1,\"seq\":" + std::to_string(seq) +
+        ",\"type\":\"ota_chunk\",\"offset\":" + std::to_string(off) +
+        ",\"data_b64\":\"" + B64(raw) + "\"}";
+    r.OnLine(line.c_str(), line.size());
+}
+}  // namespace
+
+TEST(CommandRouter, OtaBeginOpensTheRunAndAcks) {
+    // A well-formed begin must open the run rather than nack. The digest is
+    // validated up front (spec 9.3), so a legal 64-hex one is required here.
+    OtaAbort();
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string img(4096, 'A');
+    SendOtaBegin(r, 1, img.size(), PayloadHash(img));
+    ASSERT_TRUE(HasType(cap, "ack")) << "a well-formed ota_begin must ack";
+    EXPECT_TRUE(OtaInProgress()) << "the run must be open for chunks to land";
+    OtaAbort();
+}
+
+TEST(CommandRouter, OtaBeginWithABadHashIsNackedNotSilentlyAccepted) {
+    OtaAbort();
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    SendOtaBegin(r, 1, 4096, "not-a-real-hash");
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("verify_failed"), std::string::npos);
+    EXPECT_FALSE(OtaInProgress());
+}
+
+TEST(CommandRouter, OtaBeginRejectsAnImageLargerThanTheSlot) {
+    // Spec 9.3: "The device MUST reject an image claiming the wrong size." The
+    // router refuses it before the cast, and the shared gate would refuse it
+    // again -- this asserts the router's own bound is live.
+    OtaAbort();
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    SendOtaBegin(r, 1, kAppSlotBytes + 1, PayloadHash("x"));
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("too_large"), std::string::npos);
+    EXPECT_FALSE(OtaInProgress());
+}
+
+TEST(CommandRouter, OtaChunkAtTheWrongOffsetIsRefusedAsAGap) {
+    // Spec 9.3 requires a gap or an overlap be rejected. A chunk whose offset is
+    // not the next expected byte would splice two images into one whose digest
+    // fails at the end for an unrelated-looking reason; refusing it NOW names the
+    // real cause. The run is aborted, not left open to keep accepting chunks.
+    OtaAbort();
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string img(4096, 'B');
+    SendOtaBegin(r, 1, img.size(), PayloadHash(img));
+    cap.lines.clear();
+
+    SendOtaChunk(r, 2, 100, std::string(64, 'B'));   // not offset 0
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("gap"), std::string::npos);
+    EXPECT_FALSE(OtaInProgress()) << "a spliced run must close, not keep accepting";
+}
+
+TEST(CommandRouter, OtaChunkWithNoRunOpenIsNacked) {
+    OtaAbort();
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    SendOtaChunk(r, 1, 0, std::string(64, 'C'));
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("no_run"), std::string::npos);
+}
+
+TEST(CommandRouter, OtaChunkWithoutAnOffsetIsRefusedAndClosesTheRun) {
+    // A malformed frame must not leave a run open that later chunks keep landing
+    // in, whichever layer sees the malformation.
+    OtaAbort();
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string img(1024, 'D');
+    SendOtaBegin(r, 1, img.size(), PayloadHash(img));
+    cap.lines.clear();
+
+    const std::string bad = "{\"v\":1,\"seq\":2,\"type\":\"ota_chunk\",\"data_b64\":\"AAAA\"}";
+    r.OnLine(bad.c_str(), bad.size());
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("bad_frame"), std::string::npos);
+    EXPECT_FALSE(OtaInProgress());
+}
+
+TEST(CommandRouter, OtaEndWithoutARunIsNacked) {
+    OtaAbort();
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string end = "{\"v\":1,\"seq\":1,\"type\":\"ota_end\"}";
+    r.OnLine(end.c_str(), end.size());
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("no_run"), std::string::npos);
+}
+
+TEST(CommandRouter, OtaEndOnAHostBuildReportsNotSupportedRatherThanInstalling) {
+    // The full happy path, ending where a host build must: the verification gate
+    // is reached and PASSED, and the commit still reports that this build cannot
+    // install anything. `ok:true` with `result:not_supported` is the honest
+    // answer -- claiming an install that never happened is the defect this
+    // asserts against.
+    OtaAbort();
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string img(2048, 'E');
+    SendOtaBegin(r, 1, img.size(), PayloadHash(img));
+    cap.lines.clear();
+    uint32_t seq = 2;
+    for (size_t off = 0; off < img.size(); off += kConfigWireChunkBytes) {
+        const size_t n = (img.size() - off < kConfigWireChunkBytes)
+                             ? (img.size() - off) : kConfigWireChunkBytes;
+        SendOtaChunk(r, seq++, off, img.substr(off, n));
+        ASSERT_TRUE(HasType(cap, "ack")) << "each wire-sized chunk must land";
+        cap.lines.clear();
+    }
+
+    const std::string end = "{\"v\":1,\"seq\":4,\"type\":\"ota_end\"}";
+    r.OnLine(end.c_str(), end.size());
+    ASSERT_TRUE(HasType(cap, "ack"));
+    EXPECT_NE(cap.lines.back().find("not_supported"), std::string::npos)
+        << "a host build must say it cannot install, not claim success";
+    EXPECT_FALSE(OtaInProgress());
+}
+
+TEST(CommandRouter, OtaEndRefusesATruncatedImage) {
+    // FR-36: a truncated image is refused at the end, and the run is closed.
+    OtaAbort();
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string img(4096, 'F');
+    SendOtaBegin(r, 1, img.size(), PayloadHash(img));
+    cap.lines.clear();
+    SendOtaChunk(r, 2, 0, img.substr(0, 2048));   // half the declared size
+    cap.lines.clear();
+    const std::string end = "{\"v\":1,\"seq\":3,\"type\":\"ota_end\"}";
+    r.OnLine(end.c_str(), end.size());
+    ASSERT_TRUE(HasType(cap, "nack"));
+    EXPECT_NE(cap.lines.back().find("verify_failed"), std::string::npos);
+    EXPECT_FALSE(OtaInProgress());
+}
+
+TEST(CommandRouter, OtaBeginWithAnInfSizeIsRefusedNotCast) {
+    // The same `1e999` -> +inf hazard the config handlers document: cJSON ignores
+    // ERANGE, so `size` can arrive non-finite, and the router's cast must not be
+    // reached with it. Refused, run not opened.
+    OtaAbort();
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string line =
+        "{\"v\":1,\"seq\":1,\"type\":\"ota_begin\",\"size\":1e999,"
+        "\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}";
+    r.OnLine(line.c_str(), line.size());
+    ASSERT_TRUE(HasType(cap, "nack")) << "an inf size must be refused";
+    EXPECT_FALSE(OtaInProgress());
 }

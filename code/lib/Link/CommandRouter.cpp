@@ -8,6 +8,7 @@
 #include "Config/ConfigDefaults.h"
 #include "Feedback/BuzzerGrammar.h"
 #include "Link/UsbCdc.h"
+#include "Update/OtaUsb.h"
 #include "Util/Base64.h"
 #include "Util/FwVersion.h"
 #include "Util/Sha256.h"
@@ -202,13 +203,17 @@ void CommandRouter::OnConnected() {
     // app can render immediately without asking.
     //
     // `caps` lists what this build can ACTUALLY do, not what the product will
-    // eventually do. It advertised "ota" while the dispatch below nacks every
-    // `ota_*` frame as `not_implemented` (spec open item N-14): a client that
-    // trusts `caps[]` would offer an update flow that cannot succeed. `ota`
-    // returns here the moment the router is wired to `OtaUsb`, and no earlier.
+    // eventually do. It used to OMIT "ota" while the dispatch below nacked every
+    // `ota_*` frame as `not_implemented` (spec open item N-14) -- a client that
+    // trusted `caps[]` would decline to offer an update flow that was in fact
+    // unavailable. `ota` is now advertised because the router IS wired to
+    // `OtaUsb`; the guard against re-drifting is the test
+    // `HelloAdvertisesOtaOnlyIfTheDispatcherImplementsIt`, which asserts this
+    // string against the dispatcher's real behaviour rather than against a second
+    // hardcoded copy.
     char body[192];
     snprintf(body, sizeof(body),
-             "\"fw_version\":\"%s\",\"hw_id\":\"SWC-S3\",\"protocol_v\":%u,\"caps\":[\"config\",\"learn\"]",
+             "\"fw_version\":\"%s\",\"hw_id\":\"SWC-S3\",\"protocol_v\":%u,\"caps\":[\"config\",\"learn\",\"ota\"]",
              FwVersionString(), static_cast<unsigned>(kNdjsonProtocolVersion));
     Emit("hello", body);
     BeginConfigReplyRun();
@@ -536,6 +541,12 @@ void CommandRouter::OnLine(const char *line, size_t len) {
         HandleMaintenanceEnter(h.seq);
     } else if (strcmp(h.type, "maintenance_exit") == 0) {
         HandleMaintenanceExit(h.seq);
+    } else if (strcmp(h.type, "ota_begin") == 0) {
+        HandleOtaBegin(root, h.seq);
+    } else if (strcmp(h.type, "ota_chunk") == 0) {
+        HandleOtaChunk(root, h.seq);
+    } else if (strcmp(h.type, "ota_end") == 0) {
+        HandleOtaEnd(h.seq);
     } else if (strcmp(h.type, "time_sync") == 0) {
         // Accepted and acked: the firmware has no RTC and no wall-clock use, so
         // storing it would be a field nothing reads. Acking is honest -- the
@@ -545,9 +556,10 @@ void CommandRouter::OnLine(const char *line, size_t len) {
         snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(h.seq));
         Emit("ack", body);
     } else {
-        // ota_* belong to a later task. They are KNOWN commands (so they are not
-        // "unknown_type"), but this build cannot yet execute them, and saying that
-        // is better than a silent no-op.
+        // Every known command now has a handler; this is reached only for a type
+        // that `IsKnownCommand` accepted and the dispatch above does not name,
+        // i.e. the two lists have drifted. Saying `not_implemented` names the
+        // frame rather than failing silently.
         Nack(h.seq, "not_implemented", h.type);
     }
 
@@ -942,6 +954,143 @@ void CommandRouter::HandleMaintenanceExit(uint32_t for_seq) {
     sys_->ExitMaintenance();
     char body[64];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
+    Emit("ack", body);
+}
+
+// Map the shared gate's reason onto a wire word. The app matches on the WORD
+// (spec 4.3), so two spellings of one cause is a lookup that misses with no
+// error anywhere -- which is why this is one function and not three `snprintf`s
+// at the call sites.
+namespace {
+const char *OtaErrWord(OtaResult r) {
+    switch (r) {
+        case OtaResult::kOk:            return "ok";
+        case OtaResult::kNotStarted:    return "no_run";
+        case OtaResult::kAlreadyStarted:return "run_open";
+        case OtaResult::kTooLarge:      return "too_large";
+        case OtaResult::kVerifyFailed:  return "verify_failed";
+        case OtaResult::kFlashFailed:   return "flash_failed";
+        case OtaResult::kSetBootFailed: return "set_boot_failed";
+        case OtaResult::kNotSupported:  return "not_supported";
+    }
+    return "unknown";
+}
+}  // namespace
+
+/*
+ * USB OTA (spec 9.3). A THIN adapter: every byte goes through `Update/OtaUsb`,
+ * which owns the verification gate and the single commit point. This layer only
+ * parses the frame, enforces the same range-first ordering the config transport
+ * uses, and turns the result into an ack or a nack.
+ *
+ * **Nothing here re-implements a check.** Spec 9's design rule is that the
+ * checksum, slot-writing, rollback and health-confirmation logic exists exactly
+ * once and takes a byte stream; a second implementation of the verification path
+ * is how one route ends up less safe than the others. `OtaUsb` and `OtaWifi`
+ * therefore call the SAME `OtaBegin`/`OtaChunk`/`OtaEnd`.
+ */
+void CommandRouter::HandleOtaBegin(const cJSON *root, uint32_t for_seq) {
+    const cJSON *size = Num(root, "size");
+    const cJSON *sha = Str(root, "sha256");
+    if (size == nullptr || sha == nullptr) {
+        Nack(for_seq, "bad_frame", "ota_begin needs size and sha256");
+        return;
+    }
+    // RANGE FIRST, the same ordering `config_begin` documents: the integrality
+    // test below casts to `size_t`, and casting a value outside its range
+    // (including the `+inf` a `1e999` literal overflows to, since cJSON ignores
+    // `ERANGE`) is UNDEFINED BEHAVIOUR. The negated form is NaN-safe.
+    const double sz = size->valuedouble;
+    if (!(sz >= 0.0 && sz <= static_cast<double>(kAppSlotBytes))) {
+        // `OtaBegin` would refuse this too, as `kTooLarge`, but refusing here
+        // keeps the cast below defined -- which is the whole reason for the
+        // ordering rule rather than a duplicated bound.
+        Nack(for_seq, "too_large", "image size exceeds the app slot");
+        return;
+    }
+    if (sz != static_cast<double>(static_cast<size_t>(sz))) {
+        Nack(for_seq, "bad_frame", "size must be a whole number of bytes");
+        return;
+    }
+    const OtaResult r = OtaBegin(static_cast<size_t>(sz), sha->valuestring, kAppSlotBytes);
+    if (r != OtaResult::kOk) {
+        Nack(for_seq, OtaErrWord(r), "the image was refused");
+        return;
+    }
+    // An ack carries the run's progress so the app can show real progress and
+    // resume a partial transfer (spec 9.3), rather than having to track it.
+    char body[64];
+    snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
+    Emit("ack", body);
+}
+
+void CommandRouter::HandleOtaChunk(const cJSON *root, uint32_t for_seq) {
+    const cJSON *off = Num(root, "offset");
+    const cJSON *data = Str(root, "data_b64");
+    if (off == nullptr || data == nullptr) {
+        OtaAbort();
+        Nack(for_seq, "bad_frame", "ota_chunk needs offset and data_b64");
+        return;
+    }
+    const double od = off->valuedouble;
+    // Range first, for the same UB reason as `config_chunk`. The upper bound is
+    // the slot, not the config staging buffer.
+    if (!(od >= 0.0 && od <= static_cast<double>(kAppSlotBytes))) {
+        OtaAbort();
+        Nack(for_seq, "bad_offset", "offset out of range");
+        return;
+    }
+    if (od != static_cast<double>(static_cast<size_t>(od))) {
+        OtaAbort();
+        Nack(for_seq, "bad_frame", "offset must be a whole number of bytes");
+        return;
+    }
+    // **`offset` is what makes a gap or an overlap detectable, and spec 9.3
+    // requires both be rejected.** `OtaBytesWritten()` is the running byte count
+    // the USB path has accepted, so a chunk whose offset is not exactly there is
+    // out of order: refused AND the run aborted, because a spliced image is one
+    // whose digest will fail at the end anyway -- aborting now names the real
+    // cause instead of a `verify_failed` an hour later.
+    if (static_cast<size_t>(od) != OtaBytesWritten()) {
+        OtaAbort();
+        Nack(for_seq, "gap", "chunk offset is not the next expected byte");
+        return;
+    }
+
+    uint8_t decoded[kConfigWireChunkBytes];
+    size_t dn = 0;
+    // `Base64Decode` refuses output that does not fit `decoded`, so a chunk whose
+    // decoded form exceeds the wire bound fails HERE rather than being truncated.
+    if (!Base64Decode(data->valuestring, strlen(data->valuestring), decoded, sizeof(decoded), &dn)) {
+        OtaAbort();
+        Nack(for_seq, "bad_frame", "data_b64 is not valid base64 or exceeds the wire bound");
+        return;
+    }
+    if (dn > 0) {
+        const OtaResult r = OtaChunk(decoded, dn);
+        if (r != OtaResult::kOk) {
+            Nack(for_seq, OtaErrWord(r), "the chunk was refused");
+            return;
+        }
+    }
+    char body[64];
+    snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
+    Emit("ack", body);
+}
+
+void CommandRouter::HandleOtaEnd(uint32_t for_seq) {
+    const OtaResult r = OtaEnd();
+    if (r != OtaResult::kOk && r != OtaResult::kNotSupported) {
+        Nack(for_seq, OtaErrWord(r), "the image failed verification or could not be committed");
+        return;
+    }
+    // **A host build reaches here with `kNotSupported`** (it has no partitions),
+    // and reporting that honestly is what keeps a host test from asserting on an
+    // install that never happened. The ack therefore carries the result word so
+    // the app can distinguish "installed" from "this build cannot install".
+    char body[96];
+    snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true,\"result\":\"%s\"",
+             static_cast<unsigned>(for_seq), OtaErrWord(r));
     Emit("ack", body);
 }
 

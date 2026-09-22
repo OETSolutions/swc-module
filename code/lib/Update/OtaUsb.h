@@ -27,6 +27,23 @@ enum class OtaResult {
     kNotSupported,      // no OTA support compiled in for this target
 };
 
+/*
+ * The image-size ceiling: one app slot, 0x1E0000 = 1920 KiB (`partitions.csv`).
+ *
+ * ONE definition, because three callers need the same bound and they must not
+ * disagree: the USB path (a peer-declared `size`), the WiFi path (`size_bytes`
+ * from the manifest), and `check_size.py` (the built `firmware.bin`). A second
+ * copy is how one path accepts an image another refuses -- the classic
+ * one-side-weaker defect the shared verify gate exists to prevent.
+ *
+ * It is a COMPILE-TIME constant rather than a runtime `partition->size` read
+ * because the host build has no partition table, and the bound is what the host
+ * tests exercise. On the device the slot really is this size, so the two agree;
+ * `esp_ota_begin` independently refuses anything larger, so this is the earlier
+ * of two checks rather than the only one.
+ */
+constexpr size_t kAppSlotBytes = 1920u * 1024u;
+
 // Starts a run. Validates the size and hash up front, exactly as ImageVerify
 // does, so a bad image is refused before anything is written.
 OtaResult OtaBegin(size_t image_size, const char *sha256_hex, size_t max_size);

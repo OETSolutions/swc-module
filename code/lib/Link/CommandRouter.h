@@ -165,6 +165,13 @@ private:
     // orchestrator's; the radio is device-only work elsewhere.
     void HandleMaintenanceEnter(uint32_t for_seq);
     void HandleMaintenanceExit(uint32_t for_seq);
+    // USB OTA (spec 9.3, FR-36/FR-41). The frames are thin adapters over
+    // `Update/OtaUsb`: `ota_begin` opens the run, `ota_chunk` appends and feeds
+    // the verifier, `ota_end` verifies and (only then) commits. Neither path
+    // re-implements the gate -- the WiFi path calls the same three functions.
+    void HandleOtaBegin(const cJSON *root, uint32_t for_seq);
+    void HandleOtaChunk(const cJSON *root, uint32_t for_seq);
+    void HandleOtaEnd(uint32_t for_seq);
     // Replies to `ping`/`status` request: the same body as the periodic status,
     // but carrying the `for_seq` that makes it a reply.
     void ReplyStatus(uint32_t for_seq);

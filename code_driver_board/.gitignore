@@ -1,0 +1,10 @@
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+
+# Editor / OS
+.vscode/
+.DS_Store
+*.swp
+compile_commands.json

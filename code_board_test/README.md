@@ -166,7 +166,7 @@ attached, and that grouping is the recommended order.
 | **9** | stage-4 jumpers | 27–28 | press shaping, full sweep |
 | **10** | jumpers as each step asks | 29 | connector continuity |
 | **11** | both jumpers | 30 | endurance (minutes) |
-| **12** | a jumper + something warm | 31–32 | AUX under manual stimulus, RT1's curve |
+| **12** | 3 test wires + something warm | 31–32 | AUX driven automatically, RT1's curve |
 
 **The one jumper that matters most** is stage 4. Two wires:
 
@@ -223,8 +223,8 @@ that is the diagnosis, not a board fault.
 | 28 | Full pass-through sweep | both jumpers | whole chain, both modes, command-tracking |
 | 29 | Connector continuity map | jumpers | all 5 inputs alive; outputs independent |
 | 30 | Endurance | both jumpers | repeatability, write errors, **self-heating** |
-| 31 | AUX under manual stimulus | jumper, as asked | each AUX input **collapses and recovers** under a GND short |
-| 32 | RT1 temperature scale | something warm | **two-point beta** — the curve, not one plausible reading |
+| 31 | **AUX1-AUX3 driven low and released** | 3 test wires (see below) | each input **collapses and recovers**, unattended |
+| 32 | RT1 temperature scale | something warm (optional) | **two-point beta** — the curve, not one plausible reading |
 
 Run them in the numbered order on a fresh board — the early tests establish the
 preconditions (power, DAC, ADC calibration) that the later ones are read through.
@@ -353,6 +353,30 @@ suite**; three files in one directory would collide on `_main`, `setUp` and
 `tearDown`.
 
 ---
+
+## Test 31's rig: three wires, then it runs unattended
+
+```
+   J5.4 (AUX1)  <-->  IO16 / TP5
+   J5.3 (AUX2)  <-->  IO21 / TP6
+   J5.2 (AUX3)  <-->  IO43 / TP7
+```
+
+With those fitted, test 31 **drives its own stimulus**: pulling the spare pin LOW
+pulls the AUX input to GND through the wire (the "button pressed" state), and
+floating it lets the board's own 10 kΩ pull-up set the level (released). No operator
+prompts, ~340 ms instead of ~180 s.
+
+Without the wires it reports **SKIP** rather than failing, and with only some fitted
+it reports **WARN** naming which ones responded — an input with no wire simply reads
+its own pull-up level, which is why "resting" alone never proves anything.
+
+**IO43 is safe to drive here.** It is traditionally UART0 TX, but this build sets
+`ARDUINO_USB_MODE=1`, so the console is the USB peripheral and UART0 is free. (An
+earlier note in test 3 claimed driving it would corrupt the console; that was written
+for a build using the UART console and was stale — corrected.) Test 3 now also
+excepts the three stimulus pins from its pull-down check, because the AUX inputs' own
+10 kΩ pull-ups legitimately win against an internal pull-down.
 
 ## Findings from the first bring-up (2026-09-21)
 

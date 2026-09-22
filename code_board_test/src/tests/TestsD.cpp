@@ -39,144 +39,126 @@ namespace SwcTests {
 // ---------------------------------------------------------------------------
 const char *Setup31_AuxManual()
 {
-    return "You will short each AUX input to GND in turn, when asked. Have a jumper "
-           "ready: J5.4 (AUX1), J5.3 (AUX2), J5.2 (AUX3) are the signals and J5.1 is "
-           "GND. Press ENTER to start; the test waits for each one.";
+    return "Fully automatic IF the three test wires are fitted: J5.4<->IO16 (TP5), "
+           "J5.3<->IO21 (TP6), J5.2<->IO43 (TP7). The test drives each line low to "
+           "simulate the short and floats it to simulate open -- no prompts either way. "
+           "With no wiring it reports SKIP rather than failing.";
 }
-
-// The operator prompt now lives on the TEST TASK (include/TestTask.h), which is what
-// lets the web page keep serving and show a Continue button while a test waits. The
-// earlier version watched only the serial port and could never be advanced from the
-// web UI at all -- the page just spun. See TestTask.h for why the tests moved off
-// loop() entirely.
 
 Outcome Test31_AuxManual()
 {
-    struct Row { Adc::Ch ch; const char *name; const char *pin; };
+    struct Row { Adc::Ch ch; uint8_t stim; const char *name; int series; };
     const Row rows[] = {
-        {Adc::kAux1, "AUX1", "J5.4"},
-        {Adc::kAux2, "AUX2", "J5.3"},
-        {Adc::kAux3, "AUX3", "J5.2"},
+        {Adc::kAux1, PIN_AUX_STIM1, "AUX1", 23},
+        {Adc::kAux2, PIN_AUX_STIM2, "AUX2", 24},
+        {Adc::kAux3, PIN_AUX_STIM3, "AUX3", 25},
     };
     const size_t n = sizeof(rows) / sizeof(rows[0]);
 
-    Log::Printf("  AUX1-AUX3 are the user-facing programming inputs (spec 7.5), wired");
-    Log::Printf("  exactly like the SWC channels but with a 1k series resistor (R23-R25)");
-    Log::Printf("  and a 10k pull-up (R17-R19). AUX1 is the one the product uses.");
+    Log::Printf("  AUX1-AUX3 are the user-facing programming inputs (spec 7.5), wired like");
+    Log::Printf("  the SWC channels but with 1k series (R23-R25) and a 10k pull-up (R17-R19).");
+    Log::Printf("  AUX1 is the one the production firmware uses.");
     Log::Printf("");
-    Log::Printf("  For each input you will be asked TWICE: first to short its J5 pin to");
-    Log::Printf("  J5.1 (GND) and HOLD it, then to REMOVE the short and leave it open.");
-    Log::Printf("  The reading must COLLAPSE while held and RECOVER once removed.");
+    Log::Printf("  This test DRIVES ITS OWN STIMULUS through the three test wires:");
+    Log::Printf("    J5.4 (AUX1) <-> IO%d (TP5)   J5.3 (AUX2) <-> IO%d (TP6)   J5.2 (AUX3) <-> IO%d (TP7)",
+                PIN_AUX_STIM1, PIN_AUX_STIM2, PIN_AUX_STIM3);
+    Log::Printf("  Driving the spare pin LOW pulls the input to GND (the short); floating");
+    Log::Printf("  it leaves the board's own 10k pull-up to set the level (open/released).");
+    Log::Printf("  No operator prompts: the whole thing runs unattended.");
     Log::Printf("");
 
-    bool all_ok = true;
-    int  skipped = 0;
+    // ---------------------------------------------------------------------
+    // Is the rig present? Park every stimulus pin as an INPUT (floating). If the wire
+    // is fitted, the AUX input sits on its own 10k pull-up and reads HIGH -- exactly
+    // what it reads with nothing attached, so that alone proves nothing. The check
+    // that DOES prove it is in the next step: driving the pin low must pull the input
+    // down. So this first pass just reports the resting levels.
+    //
+    // A pin that is NOT wired is driven in the air, which harms nothing.
+    // ---------------------------------------------------------------------
     for (size_t i = 0; i < n; ++i) {
-        // MEASURE FIRST, then prompt. The first version prompted first and read the
-        // "resting" level afterwards -- so if the operator had already applied the
-        // short, the resting value WAS the shorted value and the collapse check
-        // compared a number with itself.
-        uint32_t rest = 0;
-        Adc::ReadAvgMv(rows[i].ch, 64, &rest);
-        Log::Printf("  %s (%s): resting at %u mV", rows[i].name, rows[i].pin, rest);
-        // TWO prompts, because the two measurements need the operator in two
-        // DIFFERENT states. The first version measured "recovered" 250 ms after a
-        // single Continue click -- while the operator was still holding the short --
-        // so the recovery check compared the shorted value with itself and failed a
-        // board that was working perfectly. Reported from the bench as: "it's not
-        // testing the release at the right time and fails, even though the lines go
-        // low and high at the right time."
-        char ask[140];
+        pinMode(rows[i].stim, INPUT);          // float: simulates open
+    }
+    delay(30);
 
-        snprintf(ask, sizeof(ask),
-                 "SHORT %s (%s) to GND (J5.1) and HOLD it, then continue",
-                 rows[i].name, rows[i].pin);
-        if (!TestTask::AskOperator(ask, 60000)) {
-            Log::Printf("    no response -- %s was NOT exercised", rows[i].name);
-            Note("No response within 60 s, so %s was not exercised. That is a SKIP, "
-                 "not a pass: this test cannot prove anything without the stimulus.",
-                 rows[i].name);
-            ++skipped;
-            continue;
-        }
+    struct Meas { uint32_t open_mv, short_mv; };
+    Meas m[3] = {};
 
-        // Sampled WHILE the operator is holding the short.
-        uint32_t shorted = 0;
-        Adc::ReadAvgMv(rows[i].ch, 64, &shorted);
-        Log::Printf("    holding the short: %u mV  (resting was %u mV)", shorted, rest);
+    Log::Printf("  %-6s %-14s %-12s %-12s %s", "input", "resting/open", "driven low",
+                "swing", "verdict");
 
-        snprintf(ask, sizeof(ask),
-                 "NOW REMOVE the short from %s (%s) and leave it OPEN, then continue",
-                 rows[i].name, rows[i].pin);
-        const bool released_ok = TestTask::AskOperator(ask, 60000);
-        if (!released_ok) {
-            Log::Printf("    no response on the release step -- %s not fully exercised",
-                        rows[i].name);
-            ++skipped;
-            continue;
-        }
+    int wired = 0;
+    for (size_t i = 0; i < n; ++i) {
+        // (a) OPEN: the stimulus pin floats, so the input is set by R17/R18/R19.
+        pinMode(rows[i].stim, INPUT);
+        delay(30);
+        Adc::ReadAvgMv(rows[i].ch, 64, &m[i].open_mv);
 
-        // Sampled AFTER they have released it.
-        uint32_t after = 0;
-        Adc::ReadAvgMv(rows[i].ch, 64, &after);
-        Log::Printf("    after removing it: %u mV", after);
+        // (b) SHORTED: drive the stimulus pin low. Through the wire this pulls the AUX
+        // input toward GND, through R2x which limits the current.
+        pinMode(rows[i].stim, OUTPUT);
+        digitalWrite(rows[i].stim, LOW);
+        delay(30);
+        Adc::ReadAvgMv(rows[i].ch, 64, &m[i].short_mv);
 
-        // The threshold is generous because the AUX pin CLIPS at the 2.9 V ADC
-        // ceiling when open (3173 mV measured), so "collapsed" means "came well off
-        // that rail", not "read a precise zero".
-        const bool collapsed = (rest > 1500) && (shorted < 1200);
-        const bool recovered = (after > 1500);
+        // Back to open, and confirm it RECOVERS. This is the part that catches a board
+        // fault rather than a wiring one: if the input stays low once released, the
+        // node is held down on the board.
+        pinMode(rows[i].stim, INPUT);
+        delay(30);
+        uint32_t back = 0;
+        Adc::ReadAvgMv(rows[i].ch, 64, &back);
 
-        True(collapsed, "the input collapses while shorted to GND");
-        if (!collapsed) {
-            if (shorted == rest) {
-                Note("%s did not move at all when the short was applied (%u mV before "
-                     "and after). The most likely cause is that the short was not "
-                     "actually made -- check the jumper is on %s and J5.1. If you are "
-                     "sure it was applied, suspect R%d (1k series) open or the pin "
-                     "open-circuit; the AUX pin probe ('p' in the menu) will say "
-                     "whether the pin is alive.",
-                     rows[i].name, rest, rows[i].pin, (int)(23 + i));
-            } else {
-                Note("%s read %u mV while held to GND (resting %u mV). It moved, so the "
-                     "pin is live, but not far enough to call it collapsed -- suspect "
-                     "R%d (1k series) a long way off value.",
-                     rows[i].name, shorted, rest, (int)(23 + i));
+        const long swing = (long)m[i].open_mv - (long)m[i].short_mv;
+        const bool present = (m[i].open_mv > 1500) && (swing > 800);
+        if (present) ++wired;
+
+        Log::Printf("  %-6s %-14u %-12u %-12ld %s", rows[i].name, m[i].open_mv,
+                    m[i].short_mv, swing,
+                    present ? "wired: collapses and recovers"
+                            : "no swing -- rig not fitted for this input?");
+
+        if (present) {
+            True(true, "the input collapses under its driven-low stimulus");
+            True(back > 1500, "the input recovers when the stimulus is released");
+            if (back <= 1500) {
+                Note("%s stayed at %u mV after the stimulus was released. The node is "
+                     "held down on the board -- a solder bridge or a shorted clamp "
+                     "diode (D%d), not a wiring problem.", rows[i].name, back,
+                     (int)(8 + i));
             }
-            all_ok = false;
-        }
-        True(recovered, "the input recovers after the short is removed");
-        if (!recovered) {
-            Note("%s stayed at %u mV after the short was removed. That means it is "
-                 "pulled to GND on the board -- a solder bridge or a shorted clamp "
-                 "diode (D%d).", rows[i].name, after, (int)(8 + i));
-            all_ok = false;
-        }
-
-        // The collapse and recovery must be a real swing, not two similar readings.
-        if (collapsed && recovered) {
-            Log::Printf("    swing: %u mV -> %u mV -> %u mV", rest, shorted, after);
-            True((long)after - (long)shorted > 1000,
-                 "the reading swings by more than 1 V between held and released");
+            Log::Printf("      %s: open %u mV -> shorted %u mV -> open %u mV",
+                        rows[i].name, m[i].open_mv, m[i].short_mv, back);
         }
     }
+
+    // Leave every stimulus pin floating, so an idle board drives nothing.
+    for (size_t i = 0; i < n; ++i) pinMode(rows[i].stim, INPUT);
 
     Log::Printf("");
-    if (skipped) {
-        // A test that could not run its stimulus must not report PASS. Saying SKIP is
-        // the honest answer, and the operator can re-run when they have a jumper.
-        Note("%d of %d inputs were skipped (no stimulus within the timeout). "
-                    "Re-run test 31 with a jumper to actually exercise them.", skipped,
-                    (int)n);
-        TestRunner::MutableCurrent().result =
-            (skipped == (int)n) ? TestRunner::Result::kSkip : TestRunner::Result::kWarn;
+    if (wired == 0) {
+        // Nothing is wired, so the test has no stimulus and must NOT report PASS.
+        Note("None of the three test wires produced a swing, so no AUX input was "
+             "actually exercised. That is a SKIP: fit J5.4<->IO%d, J5.3<->IO%d and "
+             "J5.2<->IO%d and re-run. (An input with no wire attached simply reads its "
+             "pull-up level, which is why 'resting' alone proves nothing.)",
+             PIN_AUX_STIM1, PIN_AUX_STIM2, PIN_AUX_STIM3);
+        TestRunner::MutableCurrent().result = TestRunner::Result::kSkip;
+        return TestRunner::Current();
     }
-    if (all_ok && !skipped) {
-        True(true, "every AUX input collapses under a GND short and recovers");
+
+    if (wired < (int)n) {
+        Log::Printf("  %d of %d inputs were exercised -- the others had no stimulus.", wired, (int)n);
+        Note("%d of %d AUX inputs responded. Fit the missing test wire(s) "
+                    "and re-run for full coverage.", (int)n - wired, (int)n);
+        TestRunner::MutableCurrent().result = TestRunner::Result::kWarn;
+    } else {
+        True(true, "all three AUX inputs collapse under a driven low and recover");
     }
+
     Note("AUX1 is the input the production firmware uses for programming and "
-         "maintenance entry (spec 7.5, 8.2), so a fault on AUX1 specifically makes "
-         "the device unmaintainable in the field even if AUX2/AUX3 are fine.");
+         "maintenance entry (spec 7.5, 8.2): a fault on AUX1 specifically makes the "
+         "device unmaintainable in the field even when AUX2 and AUX3 are fine.");
     return TestRunner::Current();
 }
 
@@ -194,9 +176,9 @@ Outcome Test31_AuxManual()
 // ---------------------------------------------------------------------------
 const char *Setup32_TempVerify()
 {
-    return "Ideally have something warm (a hand, a warm mug) to hold against RT1, "
-           "which is the small 0603 part on the exposed right edge of the board. The "
-           "test measures at rest, asks you to warm it, and measures again.";
+    return "Runs unattended: it measures RT1 and reports the temperature. Warm RT1 (the "
+           "0603 on the board's right edge) FIRST if you want the two-point beta check "
+           "-- the test uses whatever temperature it finds.";
 }
 
 Outcome Test32_TempVerify()

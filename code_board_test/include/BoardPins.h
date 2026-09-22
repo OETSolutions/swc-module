@@ -51,6 +51,36 @@
 #define PIN_SPARE_RXD0   44    // TP8, ROM UART0 RX
 
 // ---------------------------------------------------------------------------
+// The AUX stimulus pins -- TEST RIG, not board hardware.
+// ---------------------------------------------------------------------------
+// Test 31 exercises AUX1-AUX3 by pulling each one to GND, and it used to do that by
+// asking the operator to fit a jumper for every input, twice. That was slow, fiddly,
+// and produced six prompts per run. With a wire from each AUX input to one of these
+// spare test points, the board drives its own stimulus and the test runs unattended.
+//
+// The operator's wiring:
+//
+//     J5.4 (AUX1)  <->  IO16 (TP5)
+//     J5.3 (AUX2)  <->  IO21 (TP6)
+//     J5.2 (AUX3)  <->  IO43 (TP7)
+//
+// DRIVING LOW simulates the button/short (the input is pulled to GND through the
+// wire). FLOATING (INPUT, no pull) simulates it being open, which is the released
+// state -- the board's own 10k pull-up then sets the level, exactly as it does with
+// nothing attached.
+//
+// IO43 is TP7, traditionally "UART0 TX". This build sets ARDUINO_USB_MODE=1, so the
+// console is the USB peripheral and UART0 is free -- verified in platformio.ini.
+// Driving it is safe HERE and would not be on a build using the UART console.
+#define PIN_AUX_STIM1    16    // TP5, wired to J5.4 (AUX1)
+#define PIN_AUX_STIM2    21    // TP6, wired to J5.3 (AUX2)
+#define PIN_AUX_STIM3    43    // TP7, wired to J5.2 (AUX3)
+
+// How AUX_STIMx relates to the AUX channels, in one place.
+#define AUX_STIM_FOR(idx) ((idx) == 0 ? PIN_AUX_STIM1 : \
+                           (idx) == 1 ? PIN_AUX_STIM2 : PIN_AUX_STIM3)
+
+// ---------------------------------------------------------------------------
 // LED polarity, and why it is a constant rather than an inline HIGH/LOW
 // ---------------------------------------------------------------------------
 // The netlist shows D6/D12 with cathode on the LED net and anode off it, and the

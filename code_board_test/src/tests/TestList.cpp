@@ -165,8 +165,8 @@ const TestRunner::Test kTests[] = {
       nullptr, Test30_Endurance,
       "Integrator stability, DAC repeatability, NTC drift over a sustained run" },
 
-    { 31, "AUX1-AUX3 under manual GND stimulus",
-      "a jumper, applied as each step asks (J5.4/J5.3/J5.2 to J5.1)",
+    { 31, "AUX1-AUX3 driven low and released",
+      "test wires: J5.4<->IO16 (TP5), J5.3<->IO21 (TP6), J5.2<->IO43 (TP7)",
       Setup31_AuxManual, Test31_AuxManual,
       "R23-R25 1k series, R17-R19 10k pull-ups, D8-D10 clamps -- collapse and recovery" },
 

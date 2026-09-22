@@ -202,21 +202,38 @@ Outcome Test03_SpareGpio()
                     fl[i] ? "yes (good)" : "stable");
     }
 
-    // Each pin must follow the internal pull in both directions. A pin stuck high
-    // with a pull-down on it is shorted to 3V3; stuck low with a pull-up is shorted
-    // to GND or has a dead driver.
+    // Each pin must follow the internal pull in both directions -- EXCEPT the three
+    // that test 31 may have wired to the AUX inputs. Those have a 10k pull-up to +3V3
+    // on them (R17/R18/R19), which an internal pull-down (~45k) cannot beat, so they
+    // read high under both. That is the test rig, not a fault, and calling it one
+    // would fail a healthy board every time the AUX wires are fitted.
+    static const uint8_t kMaybeAuxWired[] = {PIN_AUX_STIM1, PIN_AUX_STIM2, PIN_AUX_STIM3};
+
     char failed[128] = {0};
     for (size_t i = 0; i < kSpareCount; ++i) {
+        bool is_stim_pin = false;
+        for (size_t k = 0; k < sizeof(kMaybeAuxWired); ++k) {
+            if (kSpare[i] == kMaybeAuxWired[k]) is_stim_pin = true;
+        }
         if (hi[i] != 1) {
             snprintf(failed, sizeof(failed), "%s does not follow a pull-up (reads low)", kSpareName[i]);
             True(false, failed);
         }
         if (lo[i] != 0) {
-            snprintf(failed, sizeof(failed), "%s does not follow a pull-down (reads high)", kSpareName[i]);
-            True(false, failed);
+            if (is_stim_pin) {
+                // Expected when the AUX test rig is fitted: an external 10k pull-up
+                // holds the pin high against the internal pull-down.
+                Log::Printf("  [note] %s does not follow a pull-down -- expected if it is "
+                            "wired to an AUX input (that input's 10k pull-up wins)",
+                            kSpareName[i]);
+            } else {
+                snprintf(failed, sizeof(failed), "%s does not follow a pull-down (reads high)", kSpareName[i]);
+                True(false, failed);
+            }
         }
     }
-    True(failed[0] == '\0', "every spare pin follows both internal pulls");
+    True(failed[0] == '\0', "every spare pin follows both internal pulls "
+                            "(AUX-wired pins excepted, and noted)");
 
     // Pairwise bridge check: with pull-ups on all six, a bridged pair cannot be
     // distinguished by level alone, so drive each pin low in turn and see whether
@@ -242,8 +259,11 @@ Outcome Test03_SpareGpio()
     // current and is a noise source.
     for (size_t i = 0; i < kSpareCount; ++i) pinMode(kSpare[i], INPUT_PULLUP);
 
-    Note("IO43/IO44 (TP7/TP8) are the ROM UART and are NOT driven here -- doing so "
-         "would corrupt the console this tool prints to.");
+    Note("IO43/IO44 (TP7/TP8) are the ROM UART0 pins. They are NOT driven here, but "
+         "not because driving them would be unsafe: this build sets ARDUINO_USB_MODE=1, "
+         "so the console is the USB peripheral and UART0 is free (test 31 does use "
+         "IO43 as a stimulus). They are excluded from THIS test because a pin whose "
+         "level can be changed by an attached jumper is not a useful bridge check.");
     return TestRunner::Current();
 }
 

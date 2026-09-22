@@ -175,9 +175,10 @@ detail is in the auto-memory index (`MEMORY.md`) under the N-numbers.
 
 | Item | What's missing |
 | --- | --- |
-| **OTA (both paths)** | `ota_begin`/`ota_chunk`/`ota_end` are in the spec's frame table and nacked `not_implemented`. `OtaUsb`/`OtaWifi` are stubs on host; `ImageVerify` + the single `OtaCommit` gate exist and are tested — **the caller is what's missing.** |
+| **OTA — USB path** | ✅ **WIRED 2026-09-24 (N-14).** The router dispatches `ota_begin`/`ota_chunk`/`ota_end` to `OtaUsb`, `hello` advertises `"ota"`, the app's Update screen pushes a picked file with a progress bar. **Still board-gated:** the `esp_ota_*` flash write itself — verify on hardware with a deliberately CORRUPT image first. |
+| **OTA — WiFi path** | `OtaWifi` exists and shares the gate, but its caller is the maintenance page's `/api/ota/upload`, which needs the radio (below). |
 | **Maintenance radio** | `BleProvisioning`, `WebPage`, `WebPageAssets` are implemented, tested, and **never started**. FR-32's whole point is the radio exists only inside the maintenance window. A user entering maintenance today gets a window with no radio behind it. |
-| **Release check** | `ReleaseCheck` is pure logic, tested, no caller. Nothing compares a release against the running version. `hello`'s `caps` correctly omits `"ota"` (it *is* a promise). |
+| **Release check** | `ReleaseCheck` is pure logic, tested, no caller. Nothing compares a release against the running version. |
 | **DAC fault path** | FR-13's read-back, §6.8's retry/backoff/latch, and a `FAULT_DAC` emitter are absent (`kFaultDac` has no caller). |
 | **NTC temperature** | FR-1's "sample the NTC continuously" is unimplemented — the ADC temp channel is read by nothing, no B3380 conversion, so `temp_c_at_learn` is always 0 (N-67). |
 | **AUX bindings are inert** | AUX1–3 are declared bindable inputs (spec §3.5, model, validator, app) but **no firmware path services a binding on them** (AUX1 is only the learn/maintenance trigger). An AUX binding is acked and never fires. |

@@ -1,6 +1,7 @@
 package com.oetsolutions.swc.ui
 
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
 import androidx.compose.ui.test.getUnclippedBoundsInRoot
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -125,14 +126,34 @@ class UpdateScreenHonestyTest {
     }
 
     @Test
-    fun `the two update paths are visibly unavailable, not silently inert`() {
-        // Both are unimplemented: the USB path needs the `ota_*` frames the firmware
-        // answers with `not_implemented`, and the WiFi path opens a maintenance page
-        // that does not exist. A live-looking button that does nothing cannot be
-        // told from a broken one, so the screen says so.
+    fun `the USB push is live and the WiFi path still says it is not`() {
+        // The USB path is IMPLEMENTED now (the firmware serves the `ota_*` frames,
+        // N-14), so its button is live. The WiFi path still opens a maintenance page
+        // whose radio is not started (N-15), so that one stays disabled and says so.
+        // A live-looking button that does nothing cannot be told from a broken one,
+        // which is why the distinction is asserted rather than left implicit.
         show(UpdateUiState())
-        rule.onNodeWithText("Push a file over USB (not yet)").assertIsNotEnabled()
+        rule.onNodeWithText("Push a file over USB").assertIsEnabled()
         rule.onNodeWithText("Update over WiFi (not yet)").assertIsNotEnabled()
+    }
+
+    @Test
+    fun `a push in progress disables the button and shows how far it has got`() {
+        show(UpdateUiState(pushInProgress = true, pushSent = 512, pushTotal = 1024))
+        rule.onNodeWithText("Sending…").assertIsNotEnabled()
+        rule.onNodeWithText("512 / 1024 bytes").assertExists()
+    }
+
+    @Test
+    fun `a completed push tells the user nothing was bricked`() {
+        show(UpdateUiState(pushResult = PushResult.Installed))
+        rule.onNodeWithText("Reboot", substring = true).assertExists()
+    }
+
+    @Test
+    fun `a refused push says the device is unaffected`() {
+        show(UpdateUiState(pushResult = PushResult.Refused("bad size")))
+        rule.onNodeWithText("still running", substring = true).assertExists()
     }
 
     @Test

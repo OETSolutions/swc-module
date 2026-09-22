@@ -8,6 +8,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Text
@@ -44,7 +45,32 @@ data class UpdateUiState(
      * are gone; when an async check lands (N-12) this becomes real again.
      */
     val inProgress: Boolean = false,
+
+    /**
+     * The USB push's own state (spec §9.3), kept separate from [status] because the
+     * two are different questions: [status] is "is there a newer release", this is
+     * "is an image being written right now". Only these drive the push button.
+     */
+    val pushInProgress: Boolean = false,
+    /** Bytes sent and total, for a real progress bar rather than a spinner. */
+    val pushSent: Int = 0,
+    val pushTotal: Int = 0,
+    /** The outcome of the last push, stated plainly. Null until one has run. */
+    val pushResult: PushResult? = null,
 )
+
+/** The outcome of a USB firmware push, as the user needs to read it. */
+sealed interface PushResult {
+    /** The image verified and committed; the device offers a reboot. */
+    data object Installed : PushResult
+    /**
+     * The build has no partitions (a host/dev image), or the device refused the
+     * image. `reason` names which.
+     */
+    data class Refused(val reason: String) : PushResult
+    /** The transfer started but did not finish. The device kept its old image. */
+    data class Failed(val reason: String) : PushResult
+}
 
 /**
  * The update screen.
@@ -100,13 +126,44 @@ fun UpdateScreen(
         Button(onClick = onCheck, enabled = !state.inProgress, modifier = Modifier.testTag("check-updates")) {
             Text(if (state.inProgress) "Checking…" else "Check for updates")
         }
-        // The two update paths are DISABLED because neither is implemented: the USB
-        // push needs the `ota_*` frames (the firmware answers `not_implemented`) and
-        // the WiFi path opens the device's own maintenance page, which does not
-        // exist yet. A button that looks live and does nothing is indistinguishable
-        // from a button that is broken, so the state is shown rather than implied.
-        OutlinedButton(onClick = onPushOverUsb, enabled = false) {
-            Text("Push a file over USB (not yet)")
+        // The USB push is LIVE now that the firmware serves the `ota_*` frames
+        // (N-14). It is disabled only while a push is already running, so a second
+        // tap cannot open a second run the device would refuse as `run_open`.
+        //
+        // The WiFi path stays disabled: it opens the device's own maintenance page,
+        // and the radio is not started yet (open item N-15). A button that looks live
+        // and does nothing is indistinguishable from one that is broken, so the state
+        // is shown rather than implied -- but the USB button IS live and says so.
+        OutlinedButton(
+            onClick = onPushOverUsb,
+            enabled = !state.pushInProgress && !state.inProgress,
+            modifier = Modifier.testTag("push-over-usb"),
+        ) {
+            Text(if (state.pushInProgress) "Sending…" else "Push a file over USB")
+        }
+        if (state.pushInProgress && state.pushTotal > 0) {
+            val fraction = state.pushSent.toFloat() / state.pushTotal.toFloat()
+            LinearProgressIndicator(
+                progress = { fraction },
+                modifier = Modifier.fillMaxWidth().testTag("push-progress"),
+            )
+            Text(
+                "${state.pushSent} / ${state.pushTotal} bytes",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        state.pushResult?.let { result ->
+            val (ok, text) = describePush(result)
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(
+                    containerColor = if (ok) Color(0xFFE8F5E9) else Color(0xFFFFEBEE)
+                ),
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text(text, style = MaterialTheme.typography.bodyMedium)
+                }
+            }
         }
         OutlinedButton(onClick = onUpdateOverWifi, enabled = false) {
             Text("Update over WiFi (not yet)")
@@ -153,4 +210,19 @@ internal fun describeStatus(status: UpdateStatus): Pair<String, String> = when (
     is UpdateStatus.Failed -> "Could not check" to
         "${status.reason} — the device is unaffected and still running " +
         "whatever it was running before."
+}
+
+/** A push outcome as (is-good-news, one sentence). */
+internal fun describePush(result: PushResult): Pair<Boolean, String> = when (result) {
+    PushResult.Installed ->
+        true to ("The update is installed. Reboot the adapter to run it — it will " +
+            "only become active after the device proves it can still drive the output.")
+
+    is PushResult.Refused ->
+        false to ("The device refused the image: ${result.reason}. Nothing was " +
+            "changed and it is still running the version it had.")
+
+    is PushResult.Failed ->
+        false to ("The update did not finish: ${result.reason}. The device kept its " +
+            "current version and is working normally.")
 }

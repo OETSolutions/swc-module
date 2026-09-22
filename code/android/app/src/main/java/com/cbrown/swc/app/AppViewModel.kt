@@ -20,6 +20,7 @@ import com.oetsolutions.swc.ui.BindingUiState
 import com.oetsolutions.swc.ui.LadderUiState
 import com.oetsolutions.swc.ui.LearnedButton
 import com.oetsolutions.swc.ui.LinkUiState
+import com.oetsolutions.swc.ui.PushResult
 import com.oetsolutions.swc.ui.UpdateStatus
 import com.oetsolutions.swc.ui.UpdateUiState
 import kotlinx.coroutines.CoroutineScope
@@ -894,6 +895,51 @@ class AppViewModel(
                             "for updates (spec §9.5). Open the device's maintenance page " +
                             "over WiFi to check there."
                     )
+                },
+            )
+        }
+    }
+
+    /**
+     * Push a firmware image over USB (spec §9.3). `image` is the file the user
+     * picked; [UpdateUiState.pushResult] carries the outcome back to the screen.
+     *
+     * The push is guarded so a second tap cannot open a second run the device
+     * would refuse as `run_open` — the same shape as `maintenanceBusy`. Progress
+     * comes from the client's per-chunk callback, so the bar reflects real acks
+     * rather than a timer.
+     *
+     * A `not_supported` refusal is reported distinctly: a host/dev image has no
+     * partitions to write, so the honest message is "this device cannot install
+     * over USB", not a generic failure.
+     */
+    fun pushFirmwareOverUsb(image: ByteArray) {
+        if (_update.value.pushInProgress) return
+        scope.launch {
+            _update.value = _update.value.copy(
+                pushInProgress = true,
+                pushSent = 0,
+                pushTotal = image.size,
+                pushResult = null,
+            )
+            val result = try {
+                client.pushFirmware(image, onProgress = { sent, _ ->
+                    _update.value = _update.value.copy(pushSent = sent)
+                })
+            } catch (e: Exception) {
+                AckResult.Nacked("link", e.message ?: "the link failed")
+            }
+            _update.value = _update.value.copy(
+                pushInProgress = false,
+                pushResult = when (result) {
+                    is AckResult.Ok -> PushResult.Installed
+                    is AckResult.Nacked -> when (result.err) {
+                        "not_supported" ->
+                            PushResult.Refused("this build has no update slot to write")
+                        else -> PushResult.Refused("${result.err} (${result.detail})")
+                    }
+                    AckResult.Timeout ->
+                        PushResult.Failed("the device stopped answering mid-transfer")
                 },
             )
         }

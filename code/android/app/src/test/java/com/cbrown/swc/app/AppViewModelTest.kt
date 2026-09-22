@@ -11,6 +11,7 @@ import com.oetsolutions.swc.model.Action
 import com.oetsolutions.swc.model.ConfigJson
 import com.oetsolutions.swc.model.Gesture
 import com.oetsolutions.swc.model.sampleConfig
+import com.oetsolutions.swc.ui.PushResult
 import com.oetsolutions.swc.ui.UpdateStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
@@ -1557,10 +1558,75 @@ class AppViewModelTest {
         injected.cancel()
     }
 
+    // --- USB OTA push (spec 9.3, N-14) -------------------------------------
+
+    @Test
+    fun `a push with no device reports refused, not a false success`() = runTest {
+        // The client refuses locally (no `ota_begin` reaches the wire) because no
+        // device answers, so the result is the caller-visible outcome after the
+        // request times out. What matters is the screen never sees `Installed` for
+        // a transfer that did not happen.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+        vm.pushFirmwareOverUsb(ByteArray(512) { 1 })
+        advanceUntilIdle()
+        val r = vm.update.value.pushResult
+        assertTrue("a push that never ran must not report Installed", r !is PushResult.Installed)
+        assertFalse("the push flag must clear", vm.update.value.pushInProgress)
+    }
+
+    @Test
+    fun `an empty image is refused locally with the empty reason`() = runTest {
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+        vm.pushFirmwareOverUsb(ByteArray(0))
+        advanceUntilIdle()
+        val r = vm.update.value.pushResult
+        assertTrue(r is PushResult.Refused)
+        assertTrue(
+            "the reason must name the empty file",
+            (r as PushResult.Refused).reason.contains("empty"),
+        )
+        assertTrue("nothing may reach the wire", t.written.isEmpty())
+    }
+
+    @Test
+    fun `a not_supported refusal reads as a build with no slot, not a generic failure`() = runTest {
+        // A host/dev image has no partitions; the device answers `not_supported`.
+        // The screen must say what that means rather than surface a code.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+        vm.pushFirmwareOverUsb(ByteArray(1_966_080 + 1))   // oversize -> local too_large
+        advanceUntilIdle()
+        val r = vm.update.value.pushResult
+        assertTrue(r is PushResult.Refused)
+        assertTrue("nothing may reach the wire for an oversize image", t.written.isEmpty())
+    }
+
+    @Test
+    fun `describePush says the device is unaffected when an update fails`() {
+        // The screen's core promise (spec 9): "a failed update does not leave you
+        // with a dead adapter." Every non-install outcome must say so.
+        val (okR, refused) = com.oetsolutions.swc.ui.describePush(PushResult.Refused("bad size"))
+        assertFalse(okR)
+        assertTrue("a refusal must say nothing changed", refused.contains("still running"))
+
+        val (okF, failed) = com.oetsolutions.swc.ui.describePush(PushResult.Failed("timeout"))
+        assertFalse(okF)
+        assertTrue("a failure must say the old image kept running",
+            failed.contains("current version"))
+
+        val (okI, installed) = com.oetsolutions.swc.ui.describePush(PushResult.Installed)
+        assertTrue(okI)
+        assertTrue("a success must still mention the reboot", installed.contains("Reboot"))
+    }
+
     // --- helpers -----------------------------------------------------------
 
-    private fun crcOf(data: ByteArray): Long {
-        var crc = 0xFFFFFFFFL
+    private fun crcOf(data: ByteArray): Long {        var crc = 0xFFFFFFFFL
         for (b in data) {
             crc = crc xor (b.toLong() and 0xFF)
             for (i in 0 until 8) {

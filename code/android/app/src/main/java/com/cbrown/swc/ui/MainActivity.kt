@@ -2,7 +2,9 @@ package com.oetsolutions.swc.ui
 
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -16,8 +18,10 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.runtime.collectAsState
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.lifecycleScope
@@ -26,7 +30,9 @@ import com.oetsolutions.swc.app.AppViewModel
 import com.oetsolutions.swc.link.SwcClient
 import com.oetsolutions.swc.link.UsbSerialTransport
 import com.oetsolutions.swc.model.Action
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 /** The four top-level screens. */
 enum class Screen(val label: String) {
@@ -98,6 +104,11 @@ fun AppRoot(model: AppViewModel) {
     val ladder by model.ladder.collectAsState()
     val bindings by model.bindings.collectAsState()
     val update by model.update.collectAsState()
+    // The USB-OTA file picker (spec §9.3). The bytes are read on the UI thread
+    // activity's resolver and handed straight to the view model, which owns the
+    // chunked push. A firmware image is ~1.5 MB, well inside what a one-shot read
+    // can hold (there is no PSRAM on the device, but this is the phone).
+    val picker = rememberFirmwarePicker { bytes -> model.pushFirmwareOverUsb(bytes) }
     AppScaffold(
         link = link,
         ladder = ladder,
@@ -109,6 +120,7 @@ fun AppRoot(model: AppViewModel) {
         onCheck = model::checkForUpdates,
         onEnterMaintenance = model::enterMaintenance,
         onExitMaintenance = model::exitMaintenance,
+        onPushOverUsb = picker::launch,
     )
 }
 
@@ -125,6 +137,7 @@ fun AppRoot() = AppScaffold(
     onCheck = {},
     onEnterMaintenance = {},
     onExitMaintenance = {},
+    onPushOverUsb = {},
 )
 
 @Composable
@@ -139,6 +152,7 @@ private fun AppScaffold(
     onCheck: () -> Unit,
     onEnterMaintenance: () -> Unit,
     onExitMaintenance: () -> Unit,
+    onPushOverUsb: () -> Unit,
 ) {
     var screen by remember { mutableStateOf(Screen.LINK) }
     Scaffold(
@@ -180,14 +194,52 @@ private fun AppScaffold(
                 Screen.UPDATE -> UpdateScreen(
                     state = update,
                     onCheck = onCheck,
-                    // Both paths are unimplemented and the screen disables those
-                    // buttons, so these callbacks cannot fire. Left as explicit
-                    // no-ops rather than wired to something that would pretend to
-                    // start an update.
-                    onPushOverUsb = {},
+                    // The USB push is live (N-14); the WiFi path still opens the
+                    // device's maintenance page, and the radio is not started yet
+                    // (open item N-15), so the screen keeps that button disabled.
+                    onPushOverUsb = onPushOverUsb,
                     onUpdateOverWifi = {},
                 )
             }
         }
     }
+}
+
+/**
+ * A launcher for the firmware-file picker, with the read done off the UI thread.
+ *
+ * `ActivityResultContracts.GetContent` with the wildcard MIME keeps the file
+ * provider in charge of what is selectable, so a user can hand us a `.bin` from
+ * anywhere (Downloads, Drive, a USB stick). The bytes are read on
+ * `Dispatchers.IO` — a firmware image is over a megabyte, and reading it inline
+ * would jank the frame that started the picker.
+ *
+ * A null URI (the user backed out) or a failed read is dropped silently rather
+ * than surfaced: it is a cancellation, not an error the user needs to be told
+ * about. A file that is READ but the wrong size is caught downstream by the
+ * client's local refusal, which names the real problem.
+ */
+@Composable
+internal fun rememberFirmwarePicker(onPicked: (ByteArray) -> Unit): FirmwarePicker {
+    val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val launcher = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent()
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        scope.launch {
+            val bytes = withContext(Dispatchers.IO) {
+                runCatching {
+                    context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                }.getOrNull()
+            }
+            if (bytes != null) onPicked(bytes)
+        }
+    }
+    return remember(launcher) { FirmwarePicker { launcher.launch("*/*") } }
+}
+
+/** A one-method handle to the firmware picker, so screens can hold a stable callback. */
+internal fun interface FirmwarePicker {
+    fun launch()
 }

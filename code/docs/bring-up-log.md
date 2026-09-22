@@ -1281,3 +1281,58 @@ disabling the sag guard fails exactly that test. `ARailSagDuringAPressReleasesTh
 still covers the deep-sag release, so the fix's two halves are each held by a test
 that fails without it. Native suite 503 → 504. Device build clean (RAM 44.0%,
 Flash 19.7%).
+
+## USB OTA was unreachable — the router refused the frames it was built to carry
+
+Found/fixed 2026-09-24 (spec open item N-14). `OtaUsb` implemented the whole
+run — the verify gate, the chunk accumulation, the single commit point — and
+`CommandRouter` nacked every `ota_begin`/`ota_chunk`/`ota_end` as
+`not_implemented`, so no host could start one. `hello` had **correctly** stopped
+advertising `"ota"` (a capability the router could not honour), which meant the
+product's flagship in-car update path — the one the user asked for first, the one
+that needs no WiFi and no maintenance page — was unreachable in a shipped-looking
+tree. A green host suite did not notice, because the missing edge was the router
+dispatch, not a library.
+
+**This was deliberately left for the board, and the board is now here.** The
+earlier note on the item said "Do NOT wire the router to `OtaUsb` before the board
+exists" — the wiring is small, and it switches on the only path in this project
+that can brick a device. With the boards in hand the wiring is done, and the
+remaining risk (the `esp_ota_*` flash write) is left where it belongs: on the
+bench, to be proved with a deliberately corrupt image before the write is trusted.
+
+**The fix is a thin adapter, not a second implementation.** The three handlers
+call the same `OtaBegin`/`OtaChunk`/`OtaEnd` the WiFi path calls, because spec 9's
+rule is that the checksum, slot-writing and commit logic exists exactly once and
+takes a byte stream — a second implementation of the verification path is how one
+route ends up less safe than the others. The router layer only parses the frame,
+applies the same range-first ordering the config transport already uses (cJSON
+ignores `ERANGE`, so `size: 1e999` arrives as `+inf` and a bare cast of it is UB),
+and turns the result into an ack or a nack.
+
+Two requirements spec 9.3 states are now enforced and were not before: an image
+larger than the slot is refused **before any byte is written**, and any chunk
+whose offset is not the next expected byte is refused as a `gap` (and the run
+aborted) — a spliced image would otherwise fail its digest at the end for a reason
+that points nowhere near the cause. `kAppSlotBytes` (1920 KiB) is now the one home
+for the slot bound, shared by the router, `OtaWifiInstall` and `check_size.py`, and
+pinned against the app's mirror by `check_app_limits.py`.
+
+`hello` advertises `"ota"` again, and the guard against re-drifting is
+`HelloAdvertisesOtaOnlyIfTheDispatcherImplementsIt` — it asserts the caps string
+against the dispatcher's real behaviour rather than a second hardcoded copy, so
+the two cannot disagree silently.
+
+Nine router tests cover begin/chunk/end, the gap, a bad hash, an oversize image, an
+`inf` size, a chunk with no run, and a truncated run. The host cannot run the
+`ESP_PLATFORM` flash write, so `OtaEnd` reports `result:not_supported` rather than
+claiming an install — asserted, so a host test cannot build on a lie that nothing
+was installed.
+
+**The app half** is `SwcClient.pushFirmware` plus the Update screen: a file picker
+(read off the UI thread), a progress bar driven by the per-chunk acks, and a
+`PushResult` that says whether the image installed, was refused, or failed — every
+non-install outcome stating that the device kept its old image, which is the
+screen's core promise (spec 9). Six client tests and eight screen/view-model tests.
+Android 120 → 133; native 504 → 514.
+

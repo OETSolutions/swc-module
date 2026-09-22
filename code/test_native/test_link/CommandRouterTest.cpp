@@ -4,6 +4,7 @@
 #include "Config/ConfigDefaults.h"
 #include "Config/ConfigStore.h"
 #include "Link/Ndjson.h"
+#include "Link/UsbCdc.h"
 #include "MockHAL.h"
 #include "Util/Base64.h"
 #include "Util/Sha256.h"
@@ -31,6 +32,11 @@ bool HasType(const Capture &c, const char *type) {
     }
     return false;
 }
+
+// The sense reading that yields a 4980 mV KEY idle -- a 5 V head unit, which
+// selects gain 1.82. Needed by the tests that drive a REAL orchestrator behind
+// the router, so the output stage is in the state a 5 V head unit puts it in.
+constexpr int kSenseFor5vHeadUnit = 2490;
 
 std::string B64(const std::string &raw) {
     char enc[8192];
@@ -99,6 +105,36 @@ TEST(CommandRouter, ConnectEmitsHelloWithTheProtocolVersion) {
     EXPECT_NE(cap.lines[0].find("\"v\":1"), std::string::npos);
 }
 
+// `caps` must name only what this build can actually do. It advertised "ota"
+// while the dispatcher nacked every `ota_*` frame as `not_implemented` (spec open
+// item N-14), so a client trusting `caps[]` would offer an update flow that can
+// never succeed. The assertion is written against the DISPATCHER's behaviour, not
+// against a hardcoded string: it starts an `ota_begin` and requires the reply to
+// contradict the advertisement, so the two cannot drift apart again -- wiring the
+// router to `OtaUsb` will make this test fail until `caps` is updated too.
+TEST(CommandRouter, HelloAdvertisesOtaOnlyIfTheDispatcherImplementsIt) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    r.OnConnected();
+    ASSERT_TRUE(HasType(cap, "hello"));
+    const bool advertises_ota = cap.lines[0].find("\"ota\"") != std::string::npos;
+
+    cap.lines.clear();
+    const std::string begin =
+        "{\"v\":1,\"seq\":2,\"type\":\"ota_begin\",\"size_bytes\":1000,"
+        "\"sha256\":\"0000000000000000000000000000000000000000000000000000000000000000\"}";
+    r.OnLine(begin.c_str(), begin.size());
+    // A refusal is an `nack` whose "err" is `not_implemented` (that is a nack
+    // REASON, not a frame type, so `HasType` cannot see it).
+    const bool dispatcher_refuses =
+        HasType(cap, "nack") && cap.lines.back().find("\"err\":\"not_implemented\"") != std::string::npos;
+
+    EXPECT_EQ(advertises_ota, !dispatcher_refuses)
+        << "hello's caps[] and the dispatcher disagree about OTA: advertised="
+        << advertises_ota << " refused=" << dispatcher_refuses;
+}
+
 TEST(CommandRouter, ConnectBeginsTheConfigRunSoTheAppCanRenderImmediately) {
     MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
     CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
@@ -164,7 +200,8 @@ TEST(CommandRouter, TheDefaultConfigRoundTripsThroughTheWire) {
     // ConfigValidate did not check device_id. A config that cannot survive its
     // own round trip is worse than an invalid one: it looks fine until the app
     // echoes it back.
-    const Config c = ConfigDefault();
+    Config c{};
+    ConfigDefault(&c);
     EXPECT_TRUE(ConfigValidate(c));
 
     char buf[ConfigMaxSerializedSize() + 1];
@@ -174,6 +211,49 @@ TEST(CommandRouter, TheDefaultConfigRoundTripsThroughTheWire) {
     Config out{};
     EXPECT_TRUE(ConfigDecodeJson(buf, n, &out));
     EXPECT_STREQ(out.device_id, c.device_id);
+}
+
+TEST(CommandRouter, ConfigDefaultFullyOverwritesItsOutParameter) {
+    // `ConfigDefault(&out)` is the shape that replaces the by-value factory, and
+    // it is what keeps an 8,912-byte object off the 3,584-byte main task's stack
+    // (see tools/check_stack_usage.py). The risk that comes with an out-parameter
+    // is the opposite of the risk that came with a return value: a return value
+    // cannot leave stale fields behind, but a function that fills `*out` field by
+    // field can. So this starts from a config that differs from the default in
+    // every region -- id, settings, a learned button, bindings, aux -- and
+    // asserts the result is the DEFAULT and not a blend.
+    Config c = MockHalDefaultsConfig();
+    ASSERT_NE(c.channel_count, 0);
+    ASSERT_GT(c.binding_count, 0u) << "the fixture must differ from the default";
+    ASSERT_GT(c.channels[0].ladder.count, 0u);
+
+    ConfigDefault(&c);
+
+    // Channel 0's ladder is EMPTY in the default (nothing learned yet) -- the
+    // most likely field to survive a partial overwrite, and the one whose
+    // survival would be worst (it would report learned buttons on a fresh board).
+    EXPECT_EQ(c.channels[0].ladder.count, 0u);
+    EXPECT_EQ(c.binding_count, 0u);
+    EXPECT_STREQ(c.device_id, "SWC-0000");
+    EXPECT_EQ(c.channel_count, kMaxChannels);
+    EXPECT_TRUE(ConfigValidate(c));
+
+    // The ARRAY ENTRIES behind the zeroed counts must be cleared too. A count
+    // field gates its array, so stale entries there are unread today -- which is
+    // exactly why they are worth asserting: the contract is "out IS the default",
+    // and a leftover binding or button that only a zero count hides is a live
+    // hazard the first time anything reads the array before the count.
+    EXPECT_EQ(c.bindings[0].id[0], '\0');
+    EXPECT_EQ(c.bindings[0].action_count, 0);
+    EXPECT_EQ(c.channels[0].ladder.buttons[0].mv_center, 0);
+    EXPECT_EQ(c.channels[0].ladder.buttons[0].id[0], '\0');
+}
+
+TEST(CommandRouter, ConfigDefaultToleratesANullOutParameter) {
+    // A null pointer is a caller bug, not a crash: this is called from a boot
+    // path that reboots on failure, so aborting in a library call would take the
+    // device down rather than report the misuse.
+    ConfigDefault(nullptr);
 }
 
 TEST(CommandRouter, AnEmptyDeviceIdIsRefusedRatherThanBecomingUnreadable) {
@@ -448,6 +528,160 @@ TEST(CommandRouter, ASetConfigOnlyTakesEffectAfterTheAck) {
     // The ACK must be the LAST thing said about the run.
     ASSERT_FALSE(cap.lines.empty());
     EXPECT_NE(cap.lines.back().find("\"type\":\"ack\""), std::string::npos);
+}
+
+TEST(CommandRouter, ACommittedConfigRunsImmediatelyThroughTheWire) {
+    // The wiring half of spec 4.2's "committed means persisted AND running": the
+    // handler must hand the config it just saved to the orchestrator.
+    // `ApplyConfig` existing and being correct is worth nothing if the three write
+    // paths never reach it, and nothing else in this suite would notice.
+    //
+    // The observable is the `long_press_ms` the RUNNING machine actually uses: the
+    // router's own reply cannot show it, because the reply is about storage.
+    // `vol_up` binds LONG in the default fixture, so a hold past the threshold
+    // reports LONG -- and the threshold itself is what the push changes.
+    //
+    // The device boots on the DEFAULT 750, so 900 ms fires LONG there. The push
+    // raises it to 1500, and THEN 900 ms must not. A router that only persisted
+    // leaves the 750 in force and the post-push hold fires LONG anyway.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;                       // vol_up binds LONG at 750
+    d.config.settings.timings.long_press_ms = 750;
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    std::vector<std::string> seen;
+    sys.SetGestureSink(
+        [](void *ctx, const SystemOrchestrator::GestureEventRecord &ev) {
+            auto *v = static_cast<std::vector<std::string> *>(ctx);
+            if (ev.gesture == Gesture::kLong) v->push_back("LONG");
+        },
+        &seen);
+    auto hold_ms = [&](uint32_t ms) {
+        seen.clear();
+        hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+        for (uint32_t t = 0; t < ms; t += 10) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+        hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+        for (uint32_t t = 0; t < 400; t += 10) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    };
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    // Precondition: at the boot threshold, 900 ms IS a long press.
+    hold_ms(900);
+    ASSERT_FALSE(seen.empty()) << "the fixture must bind LONG, or this proves nothing";
+
+    Config pushed = d.config;
+    pushed.settings.timings.long_press_ms = 1500;
+    ASSERT_TRUE(ConfigValidate(pushed));
+    SendConfigChunked(r, /*seq=*/7, EncodeConfig(pushed));
+    ASSERT_TRUE(HasType(cap, "ack")) << "the push must be accepted for this to mean anything";
+
+    hold_ms(900);
+    EXPECT_TRUE(seen.empty())
+        << "LONG fired at 900 ms AFTER a push that raised long_press_ms to 1500: "
+           "config_end persisted the config but did NOT apply it, so the running "
+           "device still uses the boot threshold";
+
+    hold_ms(1700);
+    EXPECT_FALSE(seen.empty()) << "a hold past the pushed long_press_ms must still fire LONG";
+}
+
+TEST(CommandRouter, ARefusedConfigLeavesTheRunningConfigAlone) {
+    // The other direction, and the one a careless "just call ApplyConfig" fix gets
+    // wrong: a config the device REFUSED must change nothing -- not the stored copy
+    // and not the running one. Applying before the save (or applying a config that
+    // never validated) would make a rejected push take effect, which is precisely
+    // the failure spec 4.2's "rejection leaves the previous config intact in both
+    // places" names.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.settings.timings.long_press_ms = 750;
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    std::vector<std::string> seen;
+    sys.SetGestureSink(
+        [](void *ctx, const SystemOrchestrator::GestureEventRecord &ev) {
+            auto *v = static_cast<std::vector<std::string> *>(ctx);
+            if (ev.gesture == Gesture::kLong) v->push_back("LONG");
+        },
+        &seen);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    // A config that DECODES but fails validation -- patched into the encoded
+    // bytes, because the encoder refuses to emit an invalid one. The patch RAISES
+    // long_press_ms, so if the refusal leaked into the running state it would be
+    // visible as a hold that stops firing LONG.
+    const std::string good = EncodeConfig(MockHalDefaultsConfig());
+    const std::string needle = "\"long_press_ms\":750";
+    const size_t pos = good.find(needle);
+    ASSERT_NE(pos, std::string::npos) << good;
+    std::string invalid_json = good;
+    invalid_json.replace(pos, needle.size(), "\"long_press_ms\":500");
+    SendConfigChunked(r, /*seq=*/8, invalid_json);
+    ASSERT_TRUE(HasType(cap, "nack")) << "precondition: the push must be refused";
+
+    // The running config is untouched: the ORIGINAL 750 is still in force, so a
+    // 900 ms hold still fires LONG.
+    seen.clear();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    for (uint32_t t = 0; t < 900; t += 10) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    EXPECT_NE(std::find(seen.begin(), seen.end(), "LONG"), seen.end())
+        << "a REFUSED config reached the running device: the 750 threshold should "
+           "still be in force, so a 900 ms hold must fire LONG";
+}
+
+TEST(CommandRouter, AConfigPatchAppliesImmediately) {
+    // `config_patch` is the second write path and the one a browser-driven setup
+    // uses, so it needs its own assertion rather than riding on config_end's.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.settings.timings.long_press_ms = 750;
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    std::vector<std::string> seen;
+    sys.SetGestureSink(
+        [](void *ctx, const SystemOrchestrator::GestureEventRecord &ev) {
+            auto *v = static_cast<std::vector<std::string> *>(ctx);
+            if (ev.gesture == Gesture::kLong) v->push_back("LONG");
+        },
+        &seen);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    auto hold_ms = [&](uint32_t ms) {
+        seen.clear();
+        hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+        for (uint32_t t = 0; t < ms; t += 10) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+        hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+        for (uint32_t t = 0; t < 400; t += 10) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    };
+
+    hold_ms(900);
+    ASSERT_FALSE(seen.empty()) << "precondition: 900 ms is long at the boot threshold";
+
+    const std::string patch =
+        "{\"v\":1,\"seq\":5,\"type\":\"config_patch\","
+        "\"path\":\"settings.timings.long_press_ms\",\"value\":1500}";
+    r.OnLine(patch.c_str(), patch.size());
+    ASSERT_TRUE(HasType(cap, "ack")) << "the patch must be accepted for this to mean anything";
+
+    hold_ms(900);
+    EXPECT_TRUE(seen.empty())
+        << "LONG fired at 900 ms after a patch that raised long_press_ms to 1500: "
+           "config_patch persisted the change but did NOT apply it";
+
+    hold_ms(1700);
+    EXPECT_FALSE(seen.empty()) << "a hold past the patched long_press_ms must fire LONG";
 }
 
 TEST(CommandRouter, AConfigRunIsStagedAndNothingIsCommittedUntilTheEnd) {
@@ -1036,7 +1270,235 @@ TEST(CommandRouter, ALearnCommitOverAnUnreadableConfigRefusesRatherThanOverwriti
            "SUCCEEDS means defaults were written over the user's config";
 }
 
+// --- a config recovered from the backup slot is a REAL config ----------------
+
+/*
+ * Build a store whose newest slot is torn so `Load` reports
+ * `kRecoveredFromBackup`, and hand back the config it recovers to.
+ *
+ * The device that did this is RUNNING that config: `Boot` accepts both
+ * `kLoaded` and `kRecoveredFromBackup`, and spec 6.8's whole point is that the
+ * other slot becomes authoritative after a tear. So anything that answers "what
+ * config does the device have" must agree with `Boot` and not answer
+ * `== kLoaded`.
+ */
+namespace {
+Config MakeAStoreThatRecoveredFromItsBackupSlot(MockHal &hal, ConfigStore &store) {
+    Config live = MockHalDefaultsConfig();
+    // A distinctive field, so "the recovered config" is distinguishable from
+    // anything the default path could synthesize. ONLY the device id changes:
+    // the fixture must stay VALID, because `ConfigDecodeJson` runs
+    // `ConfigValidate` -- so e.g. trimming `ladder.count` while the fixture's
+    // bindings still name the dropped button would make the RECOVERED slot fail
+    // to decode and `Load` would fall through to defaults, i.e. the test would
+    // pass for the wrong reason.
+    std::strncpy(live.device_id, "SWC-RECOVERED", sizeof(live.device_id) - 1);
+    // `ASSERT_*` cannot be used from a value-returning helper (gtest requires a
+    // void return), so these are EXPECTs; the caller's later assertion on
+    // `kRecoveredFromBackup` is what proves the fixture is what it claims.
+    EXPECT_TRUE(store.Save(live));       // slot A, seq 1: the copy that survives
+
+    Config newer = MockHalDefaultsConfig();
+    std::strncpy(newer.device_id, "SWC-NEWER", sizeof(newer.device_id) - 1);
+    EXPECT_TRUE(store.Save(newer));      // slot B, seq 2: the newest slot
+
+    // `kRecoveredFromBackup` is ROT in the newest slot, not a torn write: the
+    // store writes the payload before the sequence, so a tear leaves the OLDER
+    // slot as "newest" and reads as `kLoaded`. Reaching the recovery path needs
+    // the sequence to have advanced (it has -- slot B is newest) and slot B's own
+    // bytes to be unreadable. Rot its header chunk; the store then falls back to
+    // slot A, which is spec 6.8's whole point.
+    hal.CorruptNvsValue("cfg_b_0", 3);
+
+    Config check{};
+    EXPECT_EQ(store.Load(&check), ConfigLoadResult::kRecoveredFromBackup)
+        << "the fixture must actually be recovered-from-backup for this to mean anything";
+    return live;
+}
+}  // namespace
+
+TEST(CommandRouter, AConfigGetReportsARecoveredBackupRatherThanDefaults) {
+    // The device is running the config it recovered from the backup slot, so
+    // `config_get` must report THAT -- the reply is the app's whole picture of
+    // the device. Reporting defaults instead draws an empty grid over a
+    // configured device, and the app's next save then overwrites the recovered
+    // config with those defaults, losing the user's bindings and both ladders.
+    // Measured before the fix: the reply carried the default device id and an
+    // empty ladder while `Boot` was running the recovered one.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    const Config live = MakeAStoreThatRecoveredFromItsBackupSlot(hal, store);
+
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    const std::string get = "{\"v\":1,\"seq\":1,\"type\":\"config_get\"}";
+    r.OnLine(get.c_str(), get.size());
+    DrainReplies(r);
+
+    // Reassemble the chunked reply and decode it, exactly as the app does.
+    uint8_t raw[65536] = {};
+    for (const auto &l : cap.lines) {
+        const size_t p = l.find("\"data_b64\":\"");
+        if (p == std::string::npos) continue;
+        const size_t start = p + 12;
+        const size_t end = l.find('"', start);
+        const std::string b64 = l.substr(start, end - start);
+        const size_t op = l.find("\"offset\":");
+        ASSERT_NE(op, std::string::npos) << l;
+        const size_t off = static_cast<size_t>(std::stoul(l.substr(op + 9)));
+        uint8_t decoded[kConfigWireChunkBytes];
+        size_t dn = 0;
+        ASSERT_TRUE(Base64Decode(b64.c_str(), b64.size(), decoded, sizeof(decoded), &dn)) << l;
+        ASSERT_LE(off + dn, sizeof(raw));
+        memcpy(raw + off, decoded, dn);
+    }
+    Config out{};
+    ASSERT_TRUE(ConfigDecodeJson(reinterpret_cast<const char *>(raw), sizeof(raw), &out))
+        << "the reply must be a decodable config";
+
+    EXPECT_STREQ(out.device_id, live.device_id)
+        << "the reply must carry the RECOVERED config, not synthesized defaults";
+    EXPECT_EQ(out.channels[0].ladder.count, live.channels[0].ladder.count)
+        << "a recovered ladder must reach the app, or the grid is empty over a "
+           "configured device";
+}
+
+TEST(CommandRouter, ALearnStartOnARecoveredDeviceSeedsTheRecoveredLadder) {
+    // The neighbour set a learn checks against comes from the same load. Reading
+    // only `kLoaded` left it EMPTY on a recovered device, so a re-measure could
+    // land on top of a button that is really there and the classifier could no
+    // longer tell the two windows apart.
+    //
+    // The observable is the REJECTION. The recovered ladder carries `vol_up` at
+    // 1430 mV. A learn of `vol_dn` measured at `vol_up`'s own centre must be
+    // refused as `too_close_to_existing` when the recovered ladder seeds the
+    // session; with an empty seed it commits a second button on the same level.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MakeAStoreThatRecoveredFromItsBackupSlot(hal, store);
+
+    MockHal::Defaults d;
+    d.config = MockHalDefaultsConfig();
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    // At the recovered ladder's `vol_up` centre, i.e. inside a real neighbour's
+    // window -- which is the ONE thing the seed exists to catch.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    for (int i = 0; i < 20; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+
+    const std::string ls =
+        "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0,\"button_id\":\"vol_dn\"}";
+    r.OnLine(ls.c_str(), ls.size());
+    ASSERT_TRUE(HasType(cap, "ack")) << "learn_start must open the stream";
+
+    for (int i = 0; i < 30; ++i) { r.Process(); hal.AdvanceMs(10); }
+
+    cap.lines.clear();
+    const std::string lc =
+        "{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":0,"
+        "\"button_id\":\"vol_dn\",\"name\":\"Volume Down\"}";
+    r.OnLine(lc.c_str(), lc.size());
+    ASSERT_TRUE(HasType(cap, "nack"))
+        << "a measurement inside a recovered button's window must be refused; an "
+           "`ack` here means the recovered ladder was not seeded as neighbours";
+    EXPECT_NE(cap.lines.back().find("too_close_to_existing"), std::string::npos)
+        << "the reason must name the neighbour, got: " << cap.lines.back();
+}
+
 // --- link liveness (spec 4.4) ------------------------------------------------
+
+TEST(CommandRouter, ALearnCommitRefusesAnEmptyOrOversizedIdOrName) {
+    // `Str` returns the item for `""` -- a valid JSON string with a non-null
+    // `valuestring` -- so a present-but-EMPTY id or name passed the
+    // "is it there?" guard, was copied into the stored button, and persisted
+    // (`LearnSession::Commit` and `ConfigStore::Save` both accept it). The next
+    // boot's `ConfigDecodeJson` refuses the empty string, so `Load` returns
+    // `kFellBackToDefaults` and the user loses EVERY binding, both channels and
+    // all settings, reported only as a corrupt config.
+    //
+    // The oversized case is the same hazard by a different route: the copy is an
+    // `snprintf` into a `char[kLadderIdLen]`/`kLadderNameLen`, so an over-long
+    // value would be SILENTLY TRUNCATED -- a stored button whose id no longer
+    // matches the binding the user wrote.
+    //
+    // Both must be REFUSED before the write, and the stored config must be left
+    // untouched.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.channels[0].ladder.count = 0;
+    d.config.channels[0].ladder.learned_idle_mv = 2835;
+    // The bindings go too: they name ladder buttons, so a ladder with `count = 0`
+    // leaves them pointing at inputs nothing holds -- `ConfigValidate` refuses
+    // that, `Save` therefore refuses, and the fixture would be an EMPTY store
+    // rather than the readable one this test needs.
+    d.config.binding_count = 0;
+    ASSERT_TRUE(store.Save(d.config));
+
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    for (int i = 0; i < 20; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+
+    auto run_a_learn = [&](const std::string &commit) {
+        cap.lines.clear();
+        const std::string ls =
+            "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0,\"button_id\":\"vol_dn\"}";
+        r.OnLine(ls.c_str(), ls.size());
+        for (int i = 0; i < 30; ++i) { r.Process(); hal.AdvanceMs(10); }
+        cap.lines.clear();
+        r.OnLine(commit.c_str(), commit.size());
+    };
+
+    // An EMPTY id.
+    run_a_learn("{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":0,"
+                "\"button_id\":\"\",\"name\":\"Volume Down\"}");
+    ASSERT_TRUE(HasType(cap, "nack")) << "an empty button_id must be refused";
+    EXPECT_NE(cap.lines.back().find("bad_param"), std::string::npos)
+        << "got: " << cap.lines.back();
+
+    // An EMPTY name.
+    run_a_learn("{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":0,"
+                "\"button_id\":\"vol_dn\",\"name\":\"\"}");
+    ASSERT_TRUE(HasType(cap, "nack")) << "an empty name must be refused";
+    EXPECT_NE(cap.lines.back().find("bad_param"), std::string::npos)
+        << "got: " << cap.lines.back();
+
+    // A button_id at exactly the LADDER id width (16) -- refused, not truncated.
+    // The id is 16 chars, so `snprintf` into `char[16]` would keep 15 and NUL.
+    run_a_learn("{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":0,"
+                "\"button_id\":\"0123456789abcdef\",\"name\":\"Volume Down\"}");
+    ASSERT_TRUE(HasType(cap, "nack"))
+        << "a button_id at the width must be refused rather than silently truncated";
+    EXPECT_NE(cap.lines.back().find("bad_param"), std::string::npos)
+        << "got: " << cap.lines.back();
+
+    // A name at the LADDER name width (16).
+    run_a_learn("{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":0,"
+                "\"button_id\":\"vol_dn\",\"name\":\"0123456789abcdef\"}");
+    ASSERT_TRUE(HasType(cap, "nack"))
+        << "a name at the width must be refused rather than silently truncated";
+    EXPECT_NE(cap.lines.back().find("bad_param"), std::string::npos)
+        << "got: " << cap.lines.back();
+
+    // Nothing was written by any of the four: the stored ladder is still empty.
+    Config out{};
+    ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+    EXPECT_EQ(out.channels[0].ladder.count, 0u)
+        << "a refused learn_commit must not have persisted a button";
+
+    // And a legitimate id ONE below the width DOES commit -- so the guard bounds
+    // the value rather than refusing the field outright.
+    run_a_learn("{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":0,"
+                "\"button_id\":\"0123456789abcde\",\"name\":\"Volume Down\"}");
+    ASSERT_TRUE(HasType(cap, "ack")) << "a 15-character id must be accepted";
+    ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+    ASSERT_EQ(out.channels[0].ladder.count, 1u);
+    EXPECT_STREQ(out.channels[0].ladder.buttons[0].id, "0123456789abcde");
+}
 
 TEST(CommandRouter, AnAbandonedConfigRunIsReapedAfterTenSecondsOfSilence) {
     // Spec 4.4: "After 10 s of silence the firmware considers the link down."
@@ -1315,6 +1777,97 @@ TEST(CommandRouter, StatusGainModeReflectsTheOrchestratorsResolvedMode) {
         << cap.lines.back();
 }
 
+TEST(CommandRouter, StatusGainModeIsChannelZeroOnlyAndTheFrameSaysSo) {
+    // The status frame carries ONE `gain_mode` for the whole device, taken from
+    // channel 0 (`ChannelGainMode(0)`), but the mode is PER CHANNEL -- FR-14
+    // selects it per channel from `gain_policy`, and the two head-unit inputs are
+    // independent (spec 6.2 samples `/SENSEn` per channel), so a 3 V channel and a
+    // 5 V channel on the same device legitimately resolve to 1.00 and 1.82 at
+    // once. The field name and spec 4.3 ("`gain_mode` is the mode the device
+    // actually resolved") both read as a device-wide fact, which the wire cannot
+    // carry. Nothing on the app side reads the field, so no user is misled today;
+    // this test exists so the limitation is asserted rather than latent, and so a
+    // future reader adding a consumer sees it.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.channel_count = 2;
+    // Deliberately OPPOSITE concrete modes, so "channel 0 only" is observable: if
+    // the emitter ever reported a device-wide value, or channel 1, this fails.
+    d.config.channels[0].output.gain_mode = GainMode::kTracking;    // gain 1.00
+    d.config.channels[1].output.gain_mode = GainMode::kAmplified;   // gain 1.82
+    std::strncpy(d.config.channels[1].name, "SWC2", sizeof(d.config.channels[1].name) - 1);
+    d.config.channels[1].ladder.learned_idle_mv = 2835;
+    d.config.channels[1].ladder.count = 1;
+    d.config.channels[1].ladder.buttons[0] = {"NEXT", "Next", 2145, 110, 3300, 235, 200, 99};
+    d.config.channels[1].output.idle_dac_code = 4095;
+    d.config.channels[1].enabled = true;
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 2490);   // head unit present, ch 0
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE2, 2490);   // and ch 1
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    ASSERT_EQ(sys.ChannelGainMode(0), GainMode::kTracking) << "fixture: ch0 tracking";
+    ASSERT_EQ(sys.ChannelGainMode(1), GainMode::kAmplified) << "fixture: ch1 amplified";
+
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    ASSERT_TRUE(HasType(cap, "status"));
+    const std::string &s = cap.lines.back();
+    // Channel 0's mode, and only one gain_mode field -- the two channels cannot
+    // both be described by this frame.
+    EXPECT_NE(s.find("\"gain_mode\":\"tracking\""), std::string::npos)
+        << "the frame reports channel 0's resolved mode; got: " << s;
+    const size_t first = s.find("\"gain_mode\"");
+    ASSERT_NE(first, std::string::npos);
+    EXPECT_EQ(s.find("\"gain_mode\"", first + 1), std::string::npos)
+        << "exactly one gain_mode field is emitted, so it cannot describe both "
+           "channels; got: " << s;
+}
+
+TEST(CommandRouter, StatusReportsTheTransportsLossCounters) {
+    // N-24 and its inbound twin. `UsbCdc::DroppedFrames()` documented itself as
+    // "the failure this class exists to prevent, so it must be observable" while
+    // a unit test was its only reader, and `RxOverflows()` did not even have that
+    // claim. A refused OUTBOUND frame fails entirely inside the transport (the
+    // sink returns void), so the router cannot learn about one at the `Send`
+    // call: the only channel it has to a user is a frame it emits. What is under
+    // test is therefore the counter's REACHABILITY, not its correctness.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    // A transport with no raw write, so nothing drains it: `Send` fills the TX
+    // buffer and then refuses. The router's sink is the Capture, NOT this
+    // transport, so the status frame always reaches the test.
+    UsbCdc cdc;
+    cdc.Init(nullptr, nullptr, nullptr, nullptr);
+    char big[512];
+    std::memset(big, 'x', sizeof(big) - 1);
+    big[sizeof(big) - 1] = '\0';
+    while (cdc.Send(big, sizeof(big) - 1)) { /* fill to capacity */ }
+    ASSERT_GT(cdc.DroppedFrames(), 0u) << "fixture: the transport must have refused";
+
+    // The wiring `LinkBind` performs. Without this call the counters exist and
+    // reach nobody -- which was the whole of N-24.
+    r.SetLossCounters(&cdc);
+
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    ASSERT_TRUE(HasType(cap, "status"));
+    const std::string &s = cap.lines.back();
+
+    const std::string needle = "\"tx_dropped\":";
+    const size_t at = s.find(needle);
+    ASSERT_NE(at, std::string::npos)
+        << "the status must carry the transport's outbound-loss count; got: " << s;
+    const unsigned long reported = std::strtoul(s.c_str() + at + needle.size(), nullptr, 10);
+    EXPECT_EQ(reported, cdc.DroppedFrames())
+        << "the reported count must be the transport's own; got: " << s;
+    EXPECT_NE(s.find("\"rx_overflows\":0"), std::string::npos)
+        << "a quiet inbound side reports zero; got: " << s;
+}
+
 // --- config_patch value bounds (spec 4.3: a patch is one field) --------------
 
 TEST(CommandRouter, AConfigPatchRefusesAValueTheCodecWouldRefuse) {
@@ -1369,6 +1922,60 @@ TEST(CommandRouter, AConfigPatchStillAcceptsAnInRangeValueAtTheBoundary) {
     Config out{};
     ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
     EXPECT_EQ(out.settings.timings.long_press_ms, 900u);
+}
+
+TEST(CommandRouter, APatchCanSetEverySettingsScalarIncludingTheMaintenanceWindow) {
+    // The handler's own comment scopes it to "`settings.*` scalars only", and the
+    // table covered every one EXCEPT `maintenance_timeout_ms` -- so a client could
+    // patch every timing and both feedback levels but not the maintenance window.
+    // This pins the full set, which is what the comment claims, and is what makes
+    // a future added scalar fail here rather than go silently unpatchable.
+    struct Case { const char *path; const char *value; };
+    const Case cases[] = {
+        {"settings.timings.debounce_ms", "30"},
+        {"settings.timings.double_press_off_ms", "450"},
+        {"settings.timings.long_press_ms", "700"},
+        {"settings.timings.send_duration_ms", "250"},
+        {"settings.buzzer_level", "1"},
+        {"settings.led_level", "0"},
+        {"settings.maintenance_timeout_ms", "120000"},
+    };
+    for (const Case &c : cases) {
+        MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+        ASSERT_TRUE(store.Save(MockHalDefaultsConfig()));
+        CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+        cap.Attach(r);
+        const std::string patch = std::string("{\"v\":1,\"seq\":1,\"type\":\"config_patch\",\"path\":\"") +
+                                  c.path + "\",\"value\":" + c.value + "}";
+        r.OnLine(patch.c_str(), patch.size());
+        EXPECT_TRUE(HasType(cap, "ack")) << c.path << " must be a patchable settings scalar";
+        EXPECT_FALSE(HasType(cap, "unknown_path")) << c.path << " is in the handler's declared scope";
+    }
+}
+
+TEST(CommandRouter, APatchOfTheMaintenanceWindowIsRangeChecked) {
+    // The new path is not a bypass of the range rule the others follow: zero and
+    // a value past `kMaintenanceTimeoutMaxMs` are both refused (ConfigValidate),
+    // leaving the stored config untouched -- the same contract as
+    // `AConfigPatchRefusesAValueTheCodecWouldRefuse`.
+    const char *bad[] = {"0", "3600001"};
+    for (const char *v : bad) {
+        MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+        Config before = MockHalDefaultsConfig();
+        before.settings.maintenance_timeout_ms = 300000;
+        ASSERT_TRUE(store.Save(before));
+        CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+        cap.Attach(r);
+        const std::string patch =
+            std::string("{\"v\":1,\"seq\":1,\"type\":\"config_patch\",\"path\":"
+                        "\"settings.maintenance_timeout_ms\",\"value\":") + v + "}";
+        r.OnLine(patch.c_str(), patch.size());
+        EXPECT_FALSE(HasType(cap, "ack")) << "maintenance_timeout_ms=" << v << " must be refused";
+        Config out{};
+        ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+        EXPECT_EQ(out.settings.maintenance_timeout_ms, 300000u)
+            << "a refused patch must not have written the value";
+    }
 }
 
 TEST(CommandRouter, AChannelIndexWithAFractionIsRefusedNotRounded) {
@@ -1496,6 +2103,86 @@ TEST(CommandRouter, TheStreamedSamplesAreWhatALearnCommitAccepts) {
     // separates the two quantities.
     EXPECT_EQ(out.channels[0].ladder.buttons[0].learned_at_rail_mv, kNominalRailMv)
         << "the recorded rail must be the nominal +3V3 rail, not the wheel's idle";
+}
+
+TEST(CommandRouter, ALearnCommitAppliesImmediately) {
+    // The third write path (spec 4.2/7.3, and the headless equivalent already did
+    // this via `ApplyLearnedProfile`). The app's learn screen is gone after the
+    // `ack`, so a device that re-derived its classifier only at the next boot would
+    // leave the user with a button they just measured doing nothing.
+    //
+    // The observable is the just-learned button RESOLVING: `mute` is seeded on the
+    // ladder at 2000 mV, and the learn re-measures it to 1430. A press at 1430 is
+    // unrecognised before and must resolve after, with no reboot.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    // One seeded button, FAR from the level the learn will measure, so the two
+    // windows cannot overlap and the before/after are unambiguous.
+    d.config.channels[0].ladder.learned_idle_mv = 2835;
+    d.config.channels[0].ladder.count = 1;
+    d.config.channels[0].ladder.buttons[0] =
+        {"mute", "Mute", 2000, 60, 3300, 235, 200, 98};
+    d.config.binding_count = 1;
+    std::snprintf(d.config.bindings[0].id, sizeof(d.config.bindings[0].id), "lb");
+    std::snprintf(d.config.bindings[0].button, sizeof(d.config.bindings[0].button), "mute");
+    d.config.bindings[0].channel = static_cast<uint8_t>(BindingChannel::kSwc1);
+    d.config.bindings[0].gesture = Gesture::kSingle;
+    d.config.bindings[0].enabled = true;
+    d.config.bindings[0].action_count = 1;
+    d.config.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    d.config.bindings[0].actions[0].key_mv = 2400;
+    ASSERT_TRUE(ConfigValidate(d.config));
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    std::vector<std::string> ids;
+    sys.SetGestureSink(
+        [](void *ctx, const SystemOrchestrator::GestureEventRecord &ev) {
+            auto *v = static_cast<std::vector<std::string> *>(ctx);
+            if (ev.button_id != nullptr) v->push_back(ev.button_id);
+        },
+        &ids);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    auto tap_at = [&](int mv) {
+        ids.clear();
+        hal.SetAdcMilliVolts(ADC_CH_SWC1, mv);
+        for (uint32_t t = 0; t < 100; t += 10) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+        hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+        for (uint32_t t = 0; t < 400; t += 10) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    };
+
+    // Before the learn, 1430 is not a window: no button is reported.
+    tap_at(1430);
+    EXPECT_TRUE(ids.empty())
+        << "the seeded ladder must not recognize 1430, or this proves nothing";
+
+    // Stream and commit `mute` at 1430 mV -- an id already on the ladder, which the
+    // commit REPLACES in place.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    for (int i = 0; i < 20; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    const std::string ls = "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0}";
+    r.OnLine(ls.c_str(), ls.size());
+    ASSERT_TRUE(HasType(cap, "ack")) << "learn_start must open the stream";
+    for (int i = 0; i < 30; ++i) { cap.lines.clear(); r.Process(); hal.AdvanceMs(10); }
+    cap.lines.clear();
+    const std::string lc =
+        "{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":0,"
+        "\"button_id\":\"mute\",\"name\":\"Mute\"}";
+    r.OnLine(lc.c_str(), lc.size());
+    ASSERT_TRUE(HasType(cap, "ack"))
+        << "the commit must be accepted for this to mean anything: "
+        << (cap.lines.empty() ? "(nothing)" : cap.lines.back());
+
+    // The button the user just measured must resolve NOW -- no reboot.
+    tap_at(1430);
+    EXPECT_NE(std::find(ids.begin(), ids.end(), std::string("mute")), ids.end())
+        << "the just-learned button did not resolve: learn_commit persisted the "
+           "profile but did not apply it, so the running classifier still holds the "
+           "old window and calls the level the user just measured unrecognised";
 }
 
 TEST(CommandRouter, ALearnCommitOnADifferentChannelThanTheStreamIsRefused) {
@@ -1643,4 +2330,428 @@ TEST(CommandRouter, ALearnTakenOnAMovedRailNormalizesToTheLiveIdle) {
         << "and rebasing must leave the sibling's permille window the same as it "
            "was (its centre and the denominator scale together), to within the one "
            "permille that rounding the millivolts costs";
+}
+
+TEST(CommandRouter, ALearnCommitWithAnEmptyButtonIdIsRefused) {
+    // `Str` returns the item for `""` -- a valid JSON string with a non-null
+    // `valuestring` -- so a present-but-EMPTY id passed the "required" guard and
+    // was copied into the stored button. Neither `LearnSession::Commit` nor
+    // `ConfigStore::Save` validates it, so it persisted; the next boot's decode
+    // refuses the empty string, `Load` falls back to defaults, and the user loses
+    // the WHOLE config (both channels, every binding) reported only as corrupt.
+    // Tests missed it because every learn_commit they send has a real id.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+    cap.lines.clear();
+    const std::string lc =
+        "{\"v\":1,\"seq\":1,\"type\":\"learn_commit\",\"channel\":0,"
+        "\"button_id\":\"\",\"name\":\"\"}";
+    r.OnLine(lc.c_str(), lc.size());
+    ASSERT_TRUE(HasType(cap, "nack")) << "an empty id/name must be refused";
+    EXPECT_NE(cap.lines.back().find("bad_param"), std::string::npos);
+}
+
+TEST(CommandRouter, ALearnCommitAfterAStopStillRefusesTheWrongChannel) {
+    // The channel guard keyed on `learn_open_`, but `learn_stop` is the SPECIFIED
+    // flow (spec 4.3: start, stream, stop, commit), and it clears `learn_open_`
+    // while leaving the measured samples in the session. So the ordinary flow
+    // defeated the guard: learn_start(0) -> stream -> learn_stop ->
+    // learn_commit(1) wrote channel 0's measurement onto channel 1's ladder.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.channel_count = 2;
+    for (int i = 0; i < 2; ++i) {
+        // Channel 1 is default-built with an empty NAME, which ConfigValidate
+        // refuses -- making the stored config undecodable. Name both.
+        std::strncpy(d.config.channels[i].name, (i == 0) ? "SWC1" : "SWC2",
+                     sizeof(d.config.channels[i].name) - 1);
+        d.config.channels[i].ladder.count = 0;
+        d.config.channels[i].ladder.learned_idle_mv = 2835;
+    }
+    d.config.binding_count = 0;
+    ASSERT_TRUE(store.Save(d.config));
+    { Config probe{}; ASSERT_EQ(store.Load(&probe), ConfigLoadResult::kLoaded); }
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    hal.SetAdcMilliVolts(ADC_CH_SWC2, 2835);
+    for (int i = 0; i < 20; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+
+    const std::string ls = "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0}";
+    r.OnLine(ls.c_str(), ls.size());
+    for (int i = 0; i < 20; ++i) { r.Process(); hal.AdvanceMs(20); }
+    const std::string lst = "{\"v\":1,\"seq\":2,\"type\":\"learn_stop\"}";
+    r.OnLine(lst.c_str(), lst.size());
+
+    cap.lines.clear();
+    const std::string lc =
+        "{\"v\":1,\"seq\":3,\"type\":\"learn_commit\",\"channel\":1,"
+        "\"button_id\":\"x\",\"name\":\"X\"}";
+    r.OnLine(lc.c_str(), lc.size());
+    ASSERT_TRUE(HasType(cap, "nack"))
+        << "a stop between the stream and the commit must not defeat the guard";
+    EXPECT_NE(cap.lines.back().find("channel_mismatch"), std::string::npos);
+    Config out{};
+    ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+    EXPECT_EQ(out.channels[1].ladder.count, 0u)
+        << "channel 1 must not receive channel 0's measurement";
+}
+
+TEST(CommandRouter, ALearnCommitClosesTheStream) {
+    // The commit ends the learn run, so the device must stop streaming and stop
+    // accumulating. Leaving it open kept emitting `ladder_sample` and fed
+    // `session_` post-press idle readings, so a duplicate commit re-ran over idle
+    // samples and a client that committed and went quiet left the device streaming
+    // forever.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    d.config.channels[0].ladder.count = 0;
+    d.config.binding_count = 0;
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    for (int i = 0; i < 20; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    const std::string ls = "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0}";
+    r.OnLine(ls.c_str(), ls.size());
+    for (int i = 0; i < 20; ++i) { r.Process(); hal.AdvanceMs(20); }
+    const std::string lc =
+        "{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":0,"
+        "\"button_id\":\"vol_up\",\"name\":\"Vol Up\"}";
+    r.OnLine(lc.c_str(), lc.size());
+    ASSERT_TRUE(HasType(cap, "ack")) << "the commit should be accepted";
+
+    cap.lines.clear();
+    for (int i = 0; i < 20; ++i) { r.Process(); hal.AdvanceMs(20); }
+    EXPECT_FALSE(HasType(cap, "ladder_sample"))
+        << "the stream must stop once the button is committed";
+}
+
+TEST(CommandRouter, TheTwoIdentifyPatternsDoNotDoTheSameThing) {
+    // `pattern` is the frame's field and the two values mean different things --
+    // `flash` borrows LED_STAT, `buzz` sounds the buzzer. They were both routed to
+    // one call that did BOTH, an "accepts a field and ignores it" defect: a user
+    // asking for buzz-only (they are at the wheel, not the box) also got the LED
+    // burst. Asserted by the observable consequence over the WHOLE flash window,
+    // not the call and not a short sample -- the flash pattern does not write on
+    // its first tick, so a brief poll cannot tell the two apart.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    sys.SetUsbConnected(true);
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+    const uint32_t window = SystemOrchestrator::kIdentifyFlashMs + 300;
+
+    // buzz: the buzzer sounds, the LEDs are untouched.
+    for (int i = 0; i < 10; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    const int led_before = hal.GpioWriteCount(GPIO_LED_STAT);
+    const int buzz_before = hal.BuzzerOnCount();
+    const std::string buzz = "{\"v\":1,\"seq\":1,\"type\":\"identify\",\"pattern\":\"buzz\"}";
+    r.OnLine(buzz.c_str(), buzz.size());
+    EXPECT_TRUE(HasType(cap, "ack"));
+    for (uint32_t e = 0; e < window; e += 10) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    EXPECT_GT(hal.BuzzerOnCount(), buzz_before) << "buzz must sound the buzzer";
+    EXPECT_EQ(hal.GpioWriteCount(GPIO_LED_STAT), led_before)
+        << "buzz must NOT drive the LEDs -- that is `flash`'s job, and collapsing "
+           "the two patterns is what this test exists to prevent";
+
+    // flash: the LEDs move. This half is what makes the test bite, because it
+    // proves the window is long enough to have caught a stray flash above.
+    const int led2 = hal.GpioWriteCount(GPIO_LED_STAT);
+    const std::string flash = "{\"v\":1,\"seq\":2,\"type\":\"identify\",\"pattern\":\"flash\"}";
+    r.OnLine(flash.c_str(), flash.size());
+    EXPECT_TRUE(HasType(cap, "ack"));
+    for (uint32_t e = 0; e < window; e += 10) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    EXPECT_GT(hal.GpioWriteCount(GPIO_LED_STAT), led2)
+        << "flash must drive LED_STAT over its burst";
+}
+
+TEST(CommandRouter, SilenceDiscardsAPartlySentConfigGetReply) {
+    // Spec 4.4: after 10 s of silence the link is DOWN, and a run that belongs to
+    // the link goes with it. The `config_get` reply is such a run: `Process`
+    // emits one chunk per call and gates ONLY on `reply_open_` (not on
+    // `connected_`), so a reply left open past the end of its link streams the
+    // rest of a config to nobody -- filling the TX buffer until a real reply is
+    // refused. The silence reap closed the `config_set` run but not this one;
+    // `OnDisconnected` closed both, and that drift is the defect.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    r.OnConnected();
+    DrainReplies(r);                 // the hello-time auto-reply finishes
+    cap.lines.clear();
+
+    const std::string get = "{\"v\":1,\"seq\":1,\"type\":\"config_get\"}";
+    r.OnLine(get.c_str(), get.size());
+    r.Process();                     // config_begin goes out
+    ASSERT_TRUE(HasType(cap, "config_begin")) << "the reply run must have started";
+    EXPECT_FALSE(HasType(cap, "config_end")) << "and must NOT be finished yet";
+    cap.lines.clear();
+
+    hal.AdvanceMs(10001);
+    r.Tick();                        // the reap
+    for (int i = 0; i < 8; ++i) r.Process();
+    EXPECT_FALSE(HasType(cap, "config_chunk"))
+        << "after the link is down the rest of the reply must not be emitted";
+    EXPECT_FALSE(HasType(cap, "config_end"));
+}
+
+TEST(CommandRouter, ACommitAfterTheLinkDroppedHasNoSessionToCommit) {
+    // Spec 4.4: reconnect is stateless. The learn SESSION -- the samples and the
+    // channel -- belongs to the app session that opened it, so it must not
+    // outlive the link. Measured before the fix: a stream, a disconnect, then a
+    // `learn_commit` with NO `learn_start` committed the previous session's
+    // measurement and stamped `learned_idle_mv` from a rail measured before the
+    // drop. The reap must empty the session, not merely close the stream.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+    r.OnConnected();
+    DrainReplies(r);
+
+    // A real streamed measurement on channel 0. 2400 mV is deliberately clear of
+    // the fixture's three buttons (1430/1785/2145 mV, tolerance 120) and of the
+    // idle, so a session that SURVIVED the link drop would commit it successfully
+    // -- which is what makes this test bite. A level that collided with an
+    // existing button would be refused either way and mask the defect.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2400);
+    for (int i = 0; i < 20; ++i) { sys.Tick(hal.NowMs()); hal.AdvanceMs(10); }
+    const std::string ls =
+        "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0,\"button_id\":\"brand_new\"}";
+    r.OnLine(ls.c_str(), ls.size());
+    for (int i = 0; i < 20; ++i) { r.Process(); hal.AdvanceMs(20); }
+
+    // The link drops without a transport event, the way a radio going quiet does.
+    hal.AdvanceMs(10001);
+    r.Tick();
+    cap.lines.clear();
+
+    const std::string lc =
+        "{\"v\":1,\"seq\":2,\"type\":\"learn_commit\",\"channel\":0,"
+        "\"button_id\":\"brand_new\",\"name\":\"Brand New\"}";
+    r.OnLine(lc.c_str(), lc.size());
+    EXPECT_TRUE(HasType(cap, "nack")) << "a commit with no session must be refused";
+    EXPECT_FALSE(HasType(cap, "ack"));
+
+    Config out{};
+    ASSERT_EQ(store.Load(&out), ConfigLoadResult::kLoaded);
+    // The dead session's measurement must not have become a fourth button. With
+    // the session discarded the commit is refused and the ladder is untouched;
+    // had the reap left the session behind, this commit would have appended
+    // `brand_new` at ~2400 mV.
+    ASSERT_EQ(out.channels[0].ladder.count, 3);
+    for (uint8_t i = 0; i < out.channels[0].ladder.count; ++i) {
+        EXPECT_STRNE(out.channels[0].ladder.buttons[i].id, "brand_new")
+            << "the dead session's samples must not have been written to the config";
+    }
+}
+
+TEST(CommandRouter, ACommitWithNoLearnStartEverNamesNoSession) {
+    // `learn_channel_` must START at the `-1` "no session" sentinel, not `0`. The
+    // guard in `HandleLearnCommit` refuses `no_session` on `learn_channel_ < 0`
+    // BEFORE comparing the frame's channel to the session's, so a default of `0`
+    // let `learn_commit{channel:0}` clear BOTH guards on a router that had never
+    // seen a `learn_start`, run `session_.Commit` on an empty session, and answer
+    // `learn_rejected: too_few_samples`. That names a sample count as the cause of
+    // a refusal whose real cause is that no stream was ever opened -- the
+    // un-actionable reason FR-29 forbids -- and it pointed the user at "press the
+    // button more" when the fix is "start a learn first".
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+    r.OnConnected();
+    DrainReplies(r);
+    cap.lines.clear();
+
+    // Channel 0 -- the value the old initializer held, so this is the frame that
+    // was misreported. Nothing else about the frame is wrong: the id and name are
+    // legal, so every guard AFTER `no_session` would pass it.
+    const std::string lc =
+        "{\"v\":1,\"seq\":1,\"type\":\"learn_commit\",\"channel\":0,"
+        "\"button_id\":\"never_started\",\"name\":\"Never Started\"}";
+    r.OnLine(lc.c_str(), lc.size());
+
+    ASSERT_TRUE(HasType(cap, "nack")) << "a commit with no learn ever started must be refused";
+    EXPECT_FALSE(HasType(cap, "ack"));
+    // The REASON is the assertion: `too_few_samples` is the specific wrong answer
+    // a `0` initializer produced, and it is a `nack` either way, so a test that
+    // only checked for `nack` would not bite.
+    bool named_no_session = false;
+    bool named_too_few_samples = false;
+    for (const auto &l : cap.lines) {
+        if (l.find("\"err\":\"no_session\"") != std::string::npos) named_no_session = true;
+        if (l.find("too_few_samples") != std::string::npos) named_too_few_samples = true;
+    }
+    EXPECT_TRUE(named_no_session)
+        << "the reason must name the absent session; got: " << cap.lines.back();
+    EXPECT_FALSE(named_too_few_samples)
+        << "a sample count must NOT be blamed for a commit that never had a stream: "
+        << cap.lines.back();
+}
+
+TEST(CommandRouter, LearnStopNamesTheStreamToClose) {
+    // `learn_stop` used to `(void)root`, so `learn_stop{channel:1}` closed channel
+    // 0's open stream and acked -- the peer could not target a stream and silently
+    // stopped the wrong one, while the sibling `learn_commit` guards the same
+    // field with `channel_mismatch`. A stop that names the OPEN stream closes it;
+    // one that names another channel is refused.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    r.OnConnected();
+    DrainReplies(r);
+
+    const std::string ls = "{\"v\":1,\"seq\":1,\"type\":\"learn_start\",\"channel\":0}";
+    r.OnLine(ls.c_str(), ls.size());
+    cap.lines.clear();
+
+    // The WRONG channel must not close it.
+    const std::string wrong = "{\"v\":1,\"seq\":2,\"type\":\"learn_stop\",\"channel\":1}";
+    r.OnLine(wrong.c_str(), wrong.size());
+    EXPECT_TRUE(HasType(cap, "nack")) << "stopping another channel must be refused";
+    EXPECT_TRUE(HasType(cap, "nack")) << "and must name the mismatch";
+    // The stream is still open, so Process keeps streaming.
+    cap.lines.clear();
+    r.Process();
+    EXPECT_TRUE(HasType(cap, "ladder_sample"))
+        << "the refused stop must NOT have closed the stream";
+
+    // The RIGHT channel closes it.
+    cap.lines.clear();
+    const std::string right = "{\"v\":1,\"seq\":3,\"type\":\"learn_stop\",\"channel\":0}";
+    r.OnLine(right.c_str(), right.size());
+    EXPECT_TRUE(HasType(cap, "ack"));
+    cap.lines.clear();
+    r.Process();
+    EXPECT_FALSE(HasType(cap, "ladder_sample"))
+        << "the matching stop must close the stream";
+}
+
+TEST(CommandRouter, AConfigRunRefusesAFractionalLengthOrOffset) {
+    // The SAME rule `NumToU32` and the codec's `ReadU32` enforce, at the last two
+    // numbers that bypassed it: a byte count is an integer, and a bare
+    // `static_cast<size_t>` truncates. `total_len: 500.9` was acked as 500 and
+    // `offset: 9.5` satisfied the contiguity test at 9 -- the frame said one thing
+    // and the device did another.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    cap.lines.clear();
+
+    const std::string begin =
+        "{\"v\":1,\"seq\":2,\"type\":\"config_begin\",\"total_len\":500.9,\"crc32\":0}";
+    r.OnLine(begin.c_str(), begin.size());
+    ASSERT_TRUE(HasType(cap, "nack")) << "a fractional total_len must be refused";
+    EXPECT_NE(cap.lines.back().find("bad_frame"), std::string::npos);
+    cap.lines.clear();
+
+    // A valid begin, then a fractional offset: refused rather than truncated.
+    SendConfigBegin(r, 3, 16, 0);
+    cap.lines.clear();
+    const std::string chunk =
+        "{\"v\":1,\"seq\":4,\"type\":\"config_chunk\",\"offset\":9.5,\"data_b64\":\"AAAA\"}";
+    r.OnLine(chunk.c_str(), chunk.size());
+    ASSERT_TRUE(HasType(cap, "nack")) << "a fractional offset must be refused";
+    EXPECT_NE(cap.lines.back().find("bad_frame"), std::string::npos);
+}
+
+TEST(CommandRouter, RebootRefusesAnUnimplementableBootloaderTarget) {
+    // The frame once declared `boot_target: app/bootloader`, but nothing downstream
+    // could act on the difference -- the HAL's reboot is a bare `esp_restart()`,
+    // and entering the ROM download loader is a power-on/BOOT-pin event, not a
+    // software call. A target the device cannot honour is an accepted field whose
+    // value changes nothing, reported as success (the "accepted field that is
+    // ignored" class); it is refused by name instead.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    r.OnConnected();
+    DrainReplies(r);
+    cap.lines.clear();
+
+    const std::string bl =
+        "{\"v\":1,\"seq\":1,\"type\":\"reboot\",\"boot_target\":\"bootloader\"}";
+    r.OnLine(bl.c_str(), bl.size());
+    ASSERT_TRUE(HasType(cap, "nack")) << "bootloader must be refused, not acked";
+    EXPECT_FALSE(HasType(cap, "ack"));
+    EXPECT_NE(cap.lines.back().find("bad_target"), std::string::npos);
+
+    // `app` is the honoured target and is still acked.
+    cap.lines.clear();
+    const std::string ap = "{\"v\":1,\"seq\":2,\"type\":\"reboot\",\"boot_target\":\"app\"}";
+    r.OnLine(ap.c_str(), ap.size());
+    EXPECT_TRUE(HasType(cap, "ack")) << "the app target must still reboot";
+}
+
+TEST(CommandRouter, ANumericFieldOverflowingToInfinityIsRefusedNotCast) {
+    // cJSON's `parse_number` runs `strtod` and ignores `ERANGE`, so a JSON number
+    // literal that overflows `double` arrives as `+inf` (`{"total_len":1e999}`
+    // parses to `valuedouble == inf`; verified against the pinned 1.7.19 parser).
+    // Casting `inf` to an integer type is UNDEFINED BEHAVIOUR. `HandleTestKey`'s
+    // bounds test performed the cast FIRST (`static_cast<int>(mvd)` inside the
+    // comparison), so `key_mv: 1e999` reached UB before the bounds were consulted;
+    // the fix checks the range in a form that rejects a non-finite value before
+    // any cast (`!(v >= low && v <= high)`).
+    //
+    // **This test is a REGRESSION GUARD, not a mutation-detector, and saying so
+    // matters.** On x86-64 the pre-fix cast-first form also REJECTED `inf` -- the
+    // UB happened to produce a value that failed the equality test -- so reverting
+    // the fix does not fail this test (checked). What the fix removes is UB a
+    // different compiler/optimisation level could exploit (it is free to assume a
+    // cast is in range and delete the guard). The value of the test is that the
+    // refusal is now pinned for the reachable input, so a future edit that starts
+    // ACCEPTING `inf` is caught; it cannot prove the UB is gone.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    cap.lines.clear();
+
+    // key_mv: the old guard cast inside the comparison itself.
+    const std::string tk =
+        "{\"v\":1,\"seq\":2,\"type\":\"test_key\",\"channel\":0,\"key_mv\":1e999}";
+    r.OnLine(tk.c_str(), tk.size());
+    ASSERT_TRUE(HasType(cap, "nack")) << "an inf key_mv must be refused";
+    EXPECT_FALSE(HasType(cap, "ack"));
+    cap.lines.clear();
+
+    // total_len.
+    const std::string begin =
+        "{\"v\":1,\"seq\":3,\"type\":\"config_begin\",\"total_len\":1e999,\"crc32\":0}";
+    r.OnLine(begin.c_str(), begin.size());
+    ASSERT_TRUE(HasType(cap, "nack")) << "an inf total_len must be refused";
+    cap.lines.clear();
+
+    // offset, on a valid open run.
+    SendConfigBegin(r, 4, 16, 0);
+    cap.lines.clear();
+    const std::string chunk =
+        "{\"v\":1,\"seq\":5,\"type\":\"config_chunk\",\"offset\":1e999,\"data_b64\":\"AAAA\"}";
+    r.OnLine(chunk.c_str(), chunk.size());
+    EXPECT_TRUE(HasType(cap, "nack")) << "an inf offset must be refused";
 }

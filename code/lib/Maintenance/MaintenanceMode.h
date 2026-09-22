@@ -26,10 +26,23 @@
  * `EspHal.c`.
  */
 
-// Why the window opened. Distinct values because the caller's shutdown path
-// differs: a USB command should get an acknowledgement, an AUX1 hold gets a
-// buzzer, and booting with no config is the one case that must explain itself on
-// the LED.
+/*
+ * Why the window opened, for a caller that wants to say so.
+ *
+ * **No production code branches on this, and the two values that need a source
+ * the board does not have are never produced.** The USB command and the 3 s AUX1
+ * hold are wired; `kConfigFlag` needs a setting that does not exist and
+ * `kNoConfigAtBoot` needs a reset-reason source `IHAL` does not expose, so both
+ * are unreachable (N-13). The only reader in the tree is `Trigger()` below, whose
+ * caller is a test. An earlier version of this comment claimed the values were
+ * distinct "because the caller's shutdown path differs: a USB command should get
+ * an acknowledgement, an AUX1 hold gets a buzzer, and booting with no config is
+ * the one case that must explain itself on the LED" -- none of which is
+ * implemented, and none of which spec 8.2 requires: the window opens on
+ * `LED_STAT`'s double-flash for every trigger, identical to the app-opened case
+ * (N-61). The distinction is available for the per-trigger feedback the spec does
+ * not yet ask for; it is not a promise that the feedback exists.
+ */
 enum class MaintenanceTrigger {
     kNone = 0,
     kUsbCommand,
@@ -56,9 +69,37 @@ public:
 
     bool Active() const { return active_; }
 
-    // Bumps the activity clock, so a user actively working in the web UI or
-    // typing a PoP is not kicked out mid-task.
+    /*
+     * Bumps the activity clock, so a user actively working in the web UI or
+     * typing a PoP is not kicked out mid-task.
+     *
+     * **Nothing calls this in the current build, so the window is a fixed
+     * deadline from `Enter` rather than the "5 minutes of inactivity" spec 8.2 and
+     * FR-38 describe.** The activity source is an HTTP request or a PoP entry, and
+     * the web server and radio that would produce one do not exist yet (N-15). The
+     * direction is safe -- a window that closes early serves a press again sooner,
+     * which is what FR-38 wants -- but it is a gap, not the intended behaviour, and
+     * it is recorded as N-35 rather than left for a reader to infer from a call
+     * site that is not there. See `SystemOrchestrator::Tick`.
+     */
     void NoteActivity(uint64_t now_ms);
+
+    /*
+     * Adopt a new timeout WITHOUT touching the live window.
+     *
+     * A config arriving over the link carries its own `maintenance_timeout_ms`,
+     * and the obvious `maintenance_ = MaintenanceMode(hal, new_timeout)` is a
+     * bug: the freshly constructed object is INACTIVE, so applying a config while
+     * the provisioning web page is open would silently tear the window down
+     * mid-provision. The radio is brought up and taken down by the caller on
+     * `Active()` TRANSITIONS, so that state change is the one a user would have
+     * to explain as "the setup page vanished while I was typing a password".
+     *
+     * Applies to the window in progress too: the new config's timeout is what the
+     * device is running, and leaving the old one in force until re-entry would
+     * make two answers to "how long is the window".
+     */
+    void SetTimeout(uint32_t timeout_ms) { timeout_ms_ = timeout_ms; }
 
     // Advances the timeout. Closes the window once `timeout_ms` has elapsed
     // since the last activity.

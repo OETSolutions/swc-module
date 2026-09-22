@@ -156,8 +156,127 @@ class ConfigCodecTest {
     }
 
     @Test
+    fun `validation refuses an over-width binding id and ladder button id`() {
+        // Both ids are `char[16]` on the firmware side -- `kBindingIdLen` for
+        // `Binding.id`, `kLadderIdLen` for `LadderButton.id` -- and `ReadStr`
+        // REFUSES a value at or over the width rather than truncating. The check is
+        // `length < N`, so exactly N characters must be refused: that boundary is
+        // the whole point of a width mirror, and it is what N-44 got wrong when the
+        // app DERIVED a 16-char binding id and then refused its own edit.
+        val idAtWidth = "x".repeat(16)
+        val idUnderWidth = "x".repeat(15)
+
+        fun problemsWith(bindings: List<Binding>, buttons: List<LadderButton>) =
+            ConfigJson.problems(
+                sampleConfig().copy(
+                    bindings = bindings,
+                    channels = listOf(
+                        sampleConfig().channels[0].copy(
+                            ladder = sampleConfig().channels[0].ladder.copy(buttons = buttons),
+                        ),
+                    ),
+                )
+            )
+
+        val goodButton = sampleConfig().channels[0].ladder.buttons.first()
+        val bindingAtWidth = Binding(
+            idAtWidth, BindingChannel.SWC1, goodButton.id, Gesture.SINGLE, true,
+            listOf(Action(ActionKind.OUT_VOLTAGE, keyMv = 2000)),
+        )
+
+        assertTrue(
+            "a 16-char binding id is at the width and must be refused: " +
+                "${problemsWith(listOf(bindingAtWidth), listOf(goodButton))}",
+            problemsWith(listOf(bindingAtWidth), listOf(goodButton))
+                .any { it.contains("under 16 chars") },
+        )
+        assertTrue(
+            "a 15-char binding id is under the width and must be accepted",
+            problemsWith(
+                listOf(bindingAtWidth.copy(id = idUnderWidth)),
+                listOf(goodButton),
+            ).isEmpty(),
+        )
+        assertTrue(
+            "a 16-char ladder button id is at the width and must be refused: " +
+                "${problemsWith(emptyList(), listOf(goodButton.copy(id = idAtWidth)))}",
+            problemsWith(emptyList(), listOf(goodButton.copy(id = idAtWidth)))
+                .any { it.contains("under 16 chars") },
+        )
+        assertTrue(
+            "a 15-char ladder button id is under the width and must be accepted",
+            problemsWith(emptyList(), listOf(goodButton.copy(id = idUnderWidth))).isEmpty(),
+        )
+    }
+
+    @Test
     fun `a valid sample config has no problems`() {
         assertEquals(emptyList<String>(), ConfigJson.problems(sampleConfig()))
+    }
+
+    /**
+     * The firmware's `ConfigValidate` bounds these and the app did not, so a
+     * config could pass the app's local gate and then be nacked by the device at
+     * decode -- losing the whole save with the offending field UNNAMED. Each
+     * check here mirrors a specific firmware rule; if the firmware's rule moves,
+     * this test is the reminder that the app's copy moved too.
+     */
+    @Test
+    fun `the app refuses the fields the firmware refuses`() {
+        val base = sampleConfig()
+        fun problemsWith(settings: DeviceSettings, channels: List<ChannelConfig>) =
+            ConfigJson.problems(base.copy(settings = settings, channels = channels))
+
+        // maintenance_timeout_ms: bounded on both ends (kMaintenanceTimeoutMaxMs).
+        assertTrue(
+            "a >max maintenance window must be refused, not sent to be nacked",
+            problemsWith(
+                base.settings.copy(maintenanceTimeoutMs = K_MAINTENANCE_TIMEOUT_MAX_MS + 1),
+                base.channels,
+            ).any { it.contains("maintenance_timeout_ms") },
+        )
+        assertTrue(
+            "a zero maintenance window would close instantly",
+            problemsWith(base.settings.copy(maintenanceTimeoutMs = 0), base.channels)
+                .any { it.contains("maintenance_timeout_ms") },
+        )
+        // buzzer_level / led_level are 0..3.
+        assertTrue(
+            "buzzer_level above 3 is refused by the firmware",
+            problemsWith(base.settings.copy(buzzerLevel = 4), base.channels)
+                .any { it.contains("buzzer_level") },
+        )
+        assertTrue(
+            "led_level above 3 is refused by the firmware",
+            problemsWith(base.settings.copy(ledLevel = 4), base.channels)
+                .any { it.contains("led_level") },
+        )
+        // channel_count == 0 is refused (ConfigValidate).
+        assertTrue(
+            "a config with no channels is refused by the firmware",
+            problemsWith(base.settings, emptyList()).any { it.contains("1 channel") },
+        )
+        // send_duration_ms: bounded on both ends (kSendDurationMaxMs). The top end
+        // is how long the KEY line is DRIVEN, so an unbounded value is a phantom
+        // press the user cannot release (FR-15/FR-39).
+        assertTrue(
+            "a >max send_duration_ms must be refused, not sent to be nacked",
+            problemsWith(
+                base.settings.copy(
+                    timings = base.settings.timings.copy(
+                        sendDurationMs = (K_SEND_DURATION_MAX_MS + 1).toInt(),
+                    ),
+                ),
+                base.channels,
+            ).any { it.contains("send_duration_ms") },
+        )
+        assertTrue(
+            "a zero send_duration_ms would drive the line for no time at all",
+            problemsWith(
+                base.settings.copy(timings = base.settings.timings.copy(sendDurationMs = 0)),
+                base.channels,
+            ).any { it.contains("send_duration_ms") },
+        )
     }
 
     @Test

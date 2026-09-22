@@ -58,6 +58,17 @@ typedef enum {
  * The only interface between logic and silicon. Every module above lib/HAL
  * takes an IHAL* so it can be exercised on the host with MockHal.
  *
+ * nvs_get / nvs_set return contracts, stated HERE because they are the one part
+ * of this interface every implementation must agree on exactly and no host test
+ * can check EspHal against them:
+ *   - nvs_set returns **0 on success, nonzero on failure** (mock returns 0;
+ *     `ConfigStore` tests `!= 0`). EspHal returned `len` on success once, which
+ *     made every device write read as a failure.
+ *   - nvs_get returns the **number of bytes read on success, -1 if the key is
+ *     absent OR the caller's buffer is smaller than the stored value**. It never
+ *     truncates: IDF's nvs_get_blob rejects an undersized buffer with
+ *     ESP_ERR_NVS_INVALID_LENGTH rather than shortening it.
+ *
  * now_ms/now_us are part of the HAL on purpose: every timing rule in the spec
  * (500ms double-press window, 750ms long-press threshold, 200ms key send,
  * 5-minute maintenance timeout) is a tested rule, and the only way to test a
@@ -67,23 +78,31 @@ typedef enum {
  * a power-mode change (spec 2.3: PD1:PD0 = 01 selects gain 1.82), and it is
  * made independently of any code write, so it is its own member.
  *
- * dac_set_code returns void. **It does NOT retry, and it does NOT latch a fault,
- * and an earlier version of this comment claimed both** (spec 6.8 asks for
- * "retry with backoff; if persistent, release the line and report a fault").
- * What is actually implemented is one synchronous `i2c_master_transmit` per
- * write, with an `ESP_LOGE` on failure and nothing else -- there is no retry
- * loop, no fault flag, or no accessor, and no consumer could ask for one,
- * because this signature reports nothing. **A caller that needs to branch on a
- * failed write is the thing this interface cannot express**; that is open item
- * N-21, and changing the return type to `esp_err_t` is the fix. What IS
- * honoured is the last clause: a failed write drives nothing rather than a
- * guessed code. Do not read this comment as a description of working behavior.
+ * dac_set_code returns void. **It does NOT retry** (spec 6.8 asks for "retry with
+ * backoff"; one synchronous `i2c_master_transmit` and an `ESP_LOGE` is what is
+ * implemented), and changing the return type to `esp_err_t` is the fix -- open
+ * item N-21. What IS honoured is the last clause: a failed write drives nothing
+ * rather than a guessed code. Do not read this comment as a description of
+ * working behavior.
+ *
+ * **`dac_faulted` exists because a void write is not a checkable one, and FR-37
+ * needs a checkable one.** The rollback health-gate must confirm the device "can
+ * drive the DAC" before cancelling a pending rollback; with a void write there is
+ * no signal to branch on, so the gate in `app_main` evaluated a condition that
+ * was constant-true (see open item N-21's sibling, and `OutputVerified`).
+ * `dac_faulted` LATCHES: true once ANY DAC write has failed since boot, and it is
+ * never cleared, because spec 7.3's reboot-only rule applies to a hardware
+ * condition that does not fix itself. It is an accessor rather than a return
+ * value so the existing void-write call sites do not all have to change.
  */
 typedef struct IHAL {
     int      (*adc_read_mv)(void *ctx, AdcChannel ch);
     void     (*dac_set_code)(void *ctx, DacChannel ch, uint16_t code);
     void     (*dac_power_mode)(void *ctx, DacChannel ch, DacPowerMode mode);
     void     (*dac_ldac)(void *ctx, bool assert);
+    // True once any DAC write has failed since boot. Never cleared. The one
+    // falsifiable signal that the output is actually reachable (FR-13/FR-37).
+    bool     (*dac_faulted)(void *ctx);
     void     (*gpio_write)(void *ctx, GpioPin pin, bool level);
     bool     (*gpio_read)(void *ctx, GpioPin pin);
     void     (*buzzer_on)(void *ctx, bool on);

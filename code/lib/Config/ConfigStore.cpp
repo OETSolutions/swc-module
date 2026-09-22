@@ -111,9 +111,7 @@ ConfigLoadResult ConfigStore::Load(Config *out) {
     const char newest = SlotForSequence(seq);
     size_t len = 0;
     if (ReadSlot(newest, g_blob, sizeof(g_blob), &len)) {
-        Config c{};
-        if (ConfigDecodeBlob(g_blob, len, &c)) {
-            *out = c;
+        if (ConfigDecodeBlob(g_blob, len, out)) {
             loaded_seq_ = seq;
             return ConfigLoadResult::kLoaded;
         }
@@ -125,9 +123,7 @@ ConfigLoadResult ConfigStore::Load(Config *out) {
     // they read as kLoaded with the previous config.
     const char older = OtherSlot(newest);
     if (ReadSlot(older, g_blob, sizeof(g_blob), &len)) {
-        Config c{};
-        if (ConfigDecodeBlob(g_blob, len, &c)) {
-            *out = c;
+        if (ConfigDecodeBlob(g_blob, len, out)) {
             loaded_seq_ = seq - 1u;
             return ConfigLoadResult::kRecoveredFromBackup;
         }

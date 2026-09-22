@@ -3,15 +3,34 @@
 #include <stdint.h>
 
 constexpr int kAdcMaxRawS3       = 4095;
+// Spec 3.2's `MilliVolt` bound: the calibrated ceiling of any pin reading at
+// 12 dB attenuation. This is the ONE home for that fact. It was spelled three
+// times -- here, and as an anonymous-namespace `kAdcCeilingMv` in BOTH
+// `LadderDecode.cpp` and `LearnSession.cpp` -- with nothing comparing them, so a
+// re-tune of one would silently disagree with the ADC's own endpoint. Both files
+// now read this through `LadderDecode.h`, which includes it.
 constexpr int kAdcFullScaleMv12dB = 2900;
 
 // Spec 3.2: curve-fitting calibration is eFuse-backed and per-chip. It is NOT
 // universally available -- adc_cali_create_scheme_curve_fitting() returns
 // ESP_ERR_NOT_SUPPORTED on modules with blank eFuses, and the spec requires the
 // firmware to fall back to a documented linear approximation *and report that
-// it did*, rather than silently mis-scaling every reading. Carrying the source
-// on the struct is what makes "report" possible; a caller that never checks it
-// is the silent-fallback fault the spec names.
+// it did*, rather than silently mis-scaling every reading.
+//
+// **The production report does NOT go through `source` below, and an earlier
+// comment here claimed it did** ("Carrying the source on the struct is what makes
+// 'report' possible; a caller that never checks it is the silent-fallback fault
+// the spec names"). That sentence was false: the reported flag is EspHal's own
+// `g_state.cali_degraded`, set from the same `supported` local in `InitCalibration`
+// and surfaced through `EspHalCalibrationIsDegraded` to the boot path. The
+// `source` field has ONE reader in the whole tree, `CalibrationCurveTest`, so it is
+// informational rather than load-bearing.
+//
+// That leaves TWO homes for one fact (this field and EspHal's flag), which is the
+// duplicate-home shape this project keeps re-finding. Today they cannot disagree --
+// both are derived from the same `supported` value on adjacent lines -- but a
+// re-tune of one would be silent. Recorded as spec open item N-64; the durable fix
+// is for EspHal to report `g_state.curve.source` and drop its parallel bool.
 enum class CalibrationSource { kEFuseCurveFit, kLinearFallback };
 
 // Two-point calibration, which is the shape the ESP-IDF curve-fit calibration

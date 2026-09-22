@@ -40,7 +40,7 @@ inline constexpr char kAsset_index_html[] =
     "<h1>SWC adapter &mdash; maintenance</h1>\n"
     "\n"
     "<p class=\"warn\">\n"
-    "  Maintenance mode ends automatically after 5 minutes of inactivity, and the\n"
+    "  Maintenance mode ends automatically after its configured timeout, and the\n"
     "  device serves your steering wheel again. Nothing here is needed for normal\n"
     "  operation.\n"
     "</p>\n"

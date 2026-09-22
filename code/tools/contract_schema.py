@@ -83,9 +83,22 @@ FRAMES = [
     # a learned-button property rather than a classification output, so there is
     # nothing honest to send. See spec 4.3's notes on `event`.
     Frame("event",         "fw2app", "channel,button,gesture,t_ms,level_mv"),
-    Frame("status",        "fw2app", "vbus_present,gain_mode,rail_mv,temp_c,uptime_ms,heap_free,config_state"),
+    # `tx_dropped`/`rx_overflows` are the DEVICE transport's own loss counters
+    # (N-24 and its inbound twin). They are declared because the app now reads
+    # them; the router's emit site is asserted against this row in both
+    # directions by test_frame_field_lists_match_the_router, so the row cannot
+    # drift back to the N-22 phantom-field shape.
+    Frame("status",        "fw2app", "vbus_present,gain_mode,uptime_ms,config_state,output_safe,tx_dropped,rx_overflows"),
     Frame("ladder_sample", "fw2app", "channel,level_mv,n"),
-    Frame("ack",           "fw2app", "for_seq,ok,err"),
+    # `ack` carries `for_seq` and `ok` -- and `mv_center`/`mv_tolerance` on the
+    # ONE ack that has them, `learn_commit`'s (CommandRouter::HandleLearnCommit),
+    # where the derived window is the answer the learn screen exists to read. It
+    # does NOT carry `err`: every ack is `ok:true` and every failure is a `nack`,
+    # so an `err` on this row names a field no firmware writes -- the same
+    # phantom-field shape as N-22's `status` row. The list below is asserted
+    # against the router's actual emit sites (test_frame_field_lists_match_the_router),
+    # so it cannot drift back.
+    Frame("ack",           "fw2app", "for_seq,ok,mv_center,mv_tolerance"),
     Frame("nack",          "fw2app", "for_seq,err,detail"),
     Frame("log",           "fw2app", "level,msg"),
     Frame("link_gap",      "fw2app", "channel,button,gesture,expected_seq,got_seq"),

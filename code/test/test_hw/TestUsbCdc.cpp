@@ -54,14 +54,14 @@ static void HostSink(void *ctx, const char *line, size_t len)
     (void)len;
 }
 
-void setUp(void)
+static void swc_setup(void)
 {
     raw_write_calls = 0;
     raw_bytes_accepted = 0;
     cdc.Init(&DeviceRawWrite, NULL, &HostSink, NULL);
 }
 
-void tearDown(void)
+static void swc_teardown(void)
 {
 }
 

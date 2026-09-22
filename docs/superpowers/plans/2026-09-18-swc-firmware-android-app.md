@@ -6259,12 +6259,18 @@ Key requirements, each a specific ESP-IDF choice:
   `adc_cali_raw_to_voltage()` from a bare handle. On `ESP_ERR_NOT_SUPPORTED`
   (blank eFuses, spec §3.2) the selected curve is
   `CalibrationSource::kLinearFallback`, and the HAL must **report** that rather
-  than proceed silently. Use the mechanisms the spec already defines — a `log`
-  frame (§4.3) at init, and a `BOOT_DEGRADED` boot (§7.2), the same class of
-  condition as a config fallback. Do not add a field to the status frame for
-  this; §4.3's payload is fixed. `adc_read_mv` converts the raw sample with
-  `AdcRawToMilliVolts(cal, raw)` and returns `-1` on a driver error — never a
-  fabricated zero, because zero is a legal reading.
+  than proceed silently. **The report is a `BOOT_DEGRADED` boot (§7.2), the same
+  class of condition as a config fallback** — announced via a flag the caller
+  hands to `SystemOrchestratorCreate(hal, degraded)` (`EspHalCalibrationIsDegraded()`),
+  which `Boot` folds into the boot pattern; the init-time device console `ESP_LOGW`
+  names the cause. **A `log` FRAME at init is not possible and an earlier revision
+  of this step wrongly required one:** the log sink is registered by
+  `UsbLinkStart`, which runs AFTER `SystemOrchestratorCreate`, so at boot there is
+  no link and no sink — a frame "at init" has no transport. Do not add a field to
+  the status frame for this; §4.3's payload is fixed. `adc_read_mv` converts the
+  raw sample with `AdcRawToMilliVolts(cal, raw)` **when no eFuse handle exists**,
+  and returns `-1` on a driver error — never a fabricated zero, because zero is a
+  legal reading.
   *This is the only consumer of Task 4.* Without this wiring `CalibrationCurve`
   is dead code and the spec's mandatory-fallback requirement is unimplemented.
 - **DAC:** `i2c_master` on `SWC_PIN_I2C_SDA`/`SCL` at 400 kHz. The MCP4728 write
@@ -8835,6 +8841,14 @@ Each screen's job, stated as what the user must be able to tell:
   four failure states as **distinct, actionable messages**: no USB permission,
   cable present but no device, version mismatch (with both versions shown), and
   device in maintenance. A generic "connection error" is not acceptable here.
+  Three further failure surfaces belong on this screen for the same reason, and
+  each was found by audit rather than by the plan (see §11.1's N-24 and N-45):
+  the frames the app itself discarded (`link_gap`), and — **separately, because
+  the fix is at the other end** — the frames the *device's* transport refused
+  (`tx_dropped`, `rx_overflows`), and the app-side actions the device asked for
+  and this phone could not run (`actionProblems`). A diagnostic produced and
+  rendered nowhere is indistinguishable from no diagnostic at all; that is the
+  shape all three of these had.
 - **`LadderScreen`** — the live ladder: the rail voltage, every learned button as
   a marker at its derived ratio with its tolerance as a band, and the current
   reading moving in real time. **The user must be able to see which button the
@@ -8999,8 +9013,8 @@ workflow pins the JDK; a committed `org.gradle.java.home` would be machine-speci
 Every gate in spec §10.5, enforced on every push.
 
 **Files:**
-- Create: `code/.github/workflows/firmware.yml`
-- Create: `code/.github/workflows/android.yml`
+- Create: `.github/workflows/firmware.yml` — at the REPO ROOT, per spec §10.1
+- Create: `.github/workflows/android.yml` — likewise
 
 - [ ] **Step 1: Write `firmware.yml`**
 
@@ -9113,7 +9127,7 @@ than raising the threshold.
 - [ ] **Step 4: Commit**
 
 ```bash
-git add code/.github/workflows/firmware.yml code/.github/workflows/android.yml \
+git add .github/workflows/firmware.yml .github/workflows/android.yml \
         code/tools/check_size.py
 git commit -m "Add CI gates for host tests, contract sync, and the app size budget
 
@@ -9273,7 +9287,25 @@ thing a bring-up session should do is prove an image round-trips.
 | FR-14 | 5, 13 | FR-28 | 16 | FR-42 | 13 |
 
 Spec sections with a task: §2 (1, 14), §3 (8), §4 (10, 15), §6 (3–7, 13), §7
-(12, 16), §8 (18), §9 (17, 18), §10 (22, 23, 24). **No gaps.**
+(12, 16), §8 (18), §9 (17, 18), §10 (22, 23, 24).
+
+**One row above is wrong, and the "no gaps" claim that used to close this
+paragraph rested on it.** `FR-17` (temperature compensation) is mapped here to
+**Task 13**, but Task 13's body contains nothing about it — the words "temp",
+"compensation" and "FR-17" do not appear anywhere in its steps, and no task does
+implement it. Spec §6.4 ends "FR-17 is therefore **not satisfied**", FR-17's own
+requirement row says "**NOT IMPLEMENTED in v1**", and spec §11's matrix carries
+`—` in FR-17's test column, glossed "**Absent.**" — the same three-way
+contradiction open item N-41 corrected in the spec's coverage statement, here in
+the companion document. The test-discipline note at the top of this plan already
+lists FR-17 among the requirements that once "had no test at all", so the
+traceability row contradicts the plan's own opening as well. Recorded as an
+extension of **N-41** rather than a new item: it is that one defect, in the second
+place it was written. What FR-17 *does* have is the recorded inputs — `temp_c_at_learn`
+(Task 9) and `temp_comp_enabled` (Task 8) are stored and round-tripped — which is
+why it was easy to assume a task owned it; the correction function and the
+coefficient are the missing parts, and N-9 owns them. So: **41 of 42 rows map to
+a task that implements them**; FR-17 maps to a task that only records its inputs.
 
 **2. Placeholder scan.** No "TBD", no "implement later", no "similar to Task N".
 Tasks 7, 8, 15, 16, 18 and 21 contain prose specifications for parts where the

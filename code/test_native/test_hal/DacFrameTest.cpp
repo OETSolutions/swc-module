@@ -99,15 +99,21 @@ TEST(DacFrame, PowerDownCodeMapsEveryHalMode) {
 
 TEST(DacFrame, MapsEachHalChannelToItsOutputAndRejectsTheRest) {
     uint8_t sel = 0xFF;
-    EXPECT_TRUE(DacFrame::SelectForChannel(DAC_CH_KEY1, &sel));
+    EXPECT_TRUE(DacFrame::SelectForChannel(static_cast<uint8_t>(DAC_CH_KEY1), &sel));
     EXPECT_EQ(sel, DacFrame::kChannelA);
-    EXPECT_TRUE(DacFrame::SelectForChannel(DAC_CH_ADJ1, &sel));
+    EXPECT_TRUE(DacFrame::SelectForChannel(static_cast<uint8_t>(DAC_CH_ADJ1), &sel));
     EXPECT_EQ(sel, DacFrame::kChannelB);
-    EXPECT_TRUE(DacFrame::SelectForChannel(DAC_CH_KEY2, &sel));
+    EXPECT_TRUE(DacFrame::SelectForChannel(static_cast<uint8_t>(DAC_CH_KEY2), &sel));
     EXPECT_EQ(sel, DacFrame::kChannelC);
-    EXPECT_TRUE(DacFrame::SelectForChannel(DAC_CH_ADJ2, &sel));
+    EXPECT_TRUE(DacFrame::SelectForChannel(static_cast<uint8_t>(DAC_CH_ADJ2), &sel));
     EXPECT_EQ(sel, DacFrame::kChannelD);
     // An out-of-range value must be refused so the caller drops the write
-    // rather than addressing a garbage channel.
-    EXPECT_FALSE(DacFrame::SelectForChannel((DacChannel)99, &sel));
+    // rather than addressing a garbage channel. 99 is passed as its ORDINAL: a
+    // `DacChannel` holding 99 is a value outside the enumerator range, and loading
+    // it in the switch is undefined behaviour (UBSan: "load of value 99, which is
+    // not a valid value for type 'DacChannel'"), so this defensive case could not
+    // be tested without executing UB before the parameter became an integer.
+    EXPECT_FALSE(DacFrame::SelectForChannel(99, &sel));
+    EXPECT_FALSE(DacFrame::SelectForChannel(static_cast<uint8_t>(DAC_CH_COUNT), &sel))
+        << "the sentinel past the last channel must be refused too";
 }

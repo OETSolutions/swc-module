@@ -122,6 +122,10 @@ class SwcClient(private val transport: SwcTransport) {
         inboundLen = 0
         if (inbound == null) {
             _state.value = LinkState.Failed("device offered a ${total}-byte config")
+            // Release any `getConfig` waiter. Every other failure path in
+            // `endInboundConfig` calls this; without it the waiter hangs its full
+            // 15 s timeout instead of resolving, which reads as a dead link.
+            finishConfigRun()
         }
     }
 
@@ -136,7 +140,17 @@ class SwcClient(private val transport: SwcTransport) {
             inbound = null
             return
         }
-        if (offset < 0 || offset + bytes.size > buf.size) {
+        // The bound is written so the comparison itself cannot overflow. `offset`
+        // comes from the peer as an arbitrary JSON integer, and `offset +
+        // bytes.size` in `Int` arithmetic WRAPS for a large one: with
+        // `offset = Int.MAX_VALUE` the sum goes negative, the guard reads false,
+        // and `copyInto` below throws `IndexOutOfBoundsException` -- which escapes
+        // `handle()`, escapes the `frames` collector, and ends `run()`, the link's
+        // only consumer. That is the same "the app goes deaf for the rest of the
+        // session while the device keeps talking" failure `handle()`'s parse guard
+        // and `endInboundConfig`'s decode guard both exist to prevent, so the
+        // arithmetic has to be safe BEFORE it is compared.
+        if (offset < 0 || bytes.size > buf.size - offset) {
             _state.value = LinkState.Failed("chunk ran past the declared length")
             inbound = null
             return
@@ -237,11 +251,20 @@ class SwcClient(private val transport: SwcTransport) {
             return
         }
 
-        // Captured BEFORE the dispatch: a failure this frame is about to report (a
-        // bad config digest, a short run) must STICK, and clearing it below would
-        // erase the very error the frame was describing. Only a failure that
-        // predates this frame -- i.e. an earlier malformed line -- is recovered.
-        val failedBeforeThisFrame = _state.value is LinkState.Failed
+        // Captured BEFORE the dispatch, by IDENTITY: a failure this frame is about to
+        // report (a bad digest, a short run, an out-of-range length) must STICK, and
+        // clearing it below would erase the very error the frame was describing.
+        //
+        // **Why identity and not `is Failed`.** The old guard read the state AFTER
+        // dispatch (`failedBeforeThisFrame && _state.value is LinkState.Failed`),
+        // which cannot tell a STALE failure from one this very frame just raised --
+        // both read as Failed. A frame that started on a failed link AND set a new
+        // failure (e.g. an out-of-range `config_begin`, refused inside the dispatch
+        // on an otherwise well-formed frame) therefore erased its own error and the
+        // link reported `Connected` while every config load was silently rejected.
+        // Every failure path assigns a FRESH `LinkState.Failed(...)`, so a changed
+        // reference means "this frame wrote a new state" and must be left alone.
+        val stateBefore = _state.value
 
         when (type) {
             Frames.HELLO -> {
@@ -260,7 +283,8 @@ class SwcClient(private val transport: SwcTransport) {
         }
 
         // A well-formed frame means the peer is talking to us again, so a failure
-        // from an EARLIER frame is cleared.
+        // from an EARLIER frame is cleared -- but ONLY when this frame did not write
+        // a state of its own (`===`, see above).
         //
         // Without this, a FAILED state was terminal until the next `hello`, which
         // arrives only on reconnect -- so ONE malformed line (a torn write during
@@ -274,7 +298,7 @@ class SwcClient(private val transport: SwcTransport) {
         // VersionMismatch is deliberately NOT cleared: the disagreement is a
         // property of the peer, not a transient, and spec 4.5 requires the app to
         // stop talking rather than carry on best-effort.
-        if (failedBeforeThisFrame && _state.value is LinkState.Failed) {
+        if (stateBefore is LinkState.Failed && _state.value === stateBefore) {
             _state.value = LinkState.Connected
         }
 
@@ -310,6 +334,14 @@ class SwcClient(private val transport: SwcTransport) {
         timeoutMs: Long,
         body: (JsonObject) -> JsonObject,
     ): Pair<Int, AckResult> {
+        // Spec 4.5: on a protocol-version mismatch the app must STOP TALKING, not
+        // carry on best-effort. [sendLocked] is the hard guarantee nothing reaches
+        // the transport; this early return is what keeps a mismatch from also
+        // parking every caller on a full timeout waiting for a reply that a
+        // deliberate silence will never produce.
+        if (_state.value is LinkState.VersionMismatch) {
+            return seq to AckResult.Nacked("version_mismatch", "app stopped talking")
+        }
         val deferred = CompletableDeferred<Frame>()
         val n = writeLock.withLock {
             val allocated = seq + 1
@@ -335,6 +367,13 @@ class SwcClient(private val transport: SwcTransport) {
 
     /** The body of [send], already under [writeLock]. */
     private suspend fun sendLocked(type: String, body: (JsonObject) -> JsonObject) {
+        // Spec 4.5: once the peer's protocol version is known to differ, NOTHING
+        // goes out. Placed here rather than only at each public method because this
+        // is the single choke point every write passes through, so a future sender
+        // cannot reintroduce best-effort traffic by forgetting one check. The device
+        // would reject a mismatched frame anyway, but sending it at all is what
+        // §4.5 rules out.
+        if (_state.value is LinkState.VersionMismatch) return
         val n = ++seq
         val base = JsonObject(
             mapOf(
@@ -433,6 +472,13 @@ class SwcClient(private val transport: SwcTransport) {
      * than a silent hang.
      */
     suspend fun getConfig(timeoutMs: Long = 15_000): Config {
+        // Spec 4.5: on a version mismatch the app stops talking, and [sendLocked]
+        // will not put `config_get` on the wire. But the REQUEST must not be
+        // registered either: with no frame out, no run can ever end it, so the
+        // waiter below would park the caller for its full timeout on a silence the
+        // app chose. Return the (unchanged) local model at once, exactly as
+        // `sendAndAwait` does for the reply-bearing requests.
+        if (_state.value is LinkState.VersionMismatch) return _config.value
         val waiter = CompletableDeferred<Unit>()
         configRunWaiters.add(waiter)
         try {
@@ -489,6 +535,13 @@ class SwcClient(private val transport: SwcTransport) {
         }
 
     fun close() = transport.close()
+
+    /**
+     * Re-enumerate and reopen the transport, then report whether the device is
+     * reachable. Delegates straight through; the client has no state of its own to
+     * rebuild because `run()` keeps consuming `incoming` for the life of the app.
+     */
+    suspend fun reopen() = transport.reopen()
 
     // ------------------------------------------------------------- helpers
 

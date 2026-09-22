@@ -85,3 +85,62 @@ GainDecision GainPolicyCodeForTarget(GainMode mode, int target_key_mv) {
     }
     return d;
 }
+
+MilliVolt GainPolicyMapWheelLevelToHeadUnit(int head_unit_idle_mv, int level_mv,
+                                            int wheel_idle_mv) {
+    // No denominator (or no numerator): nothing can be said, so nothing is asked
+    // for. `PresentLevel` refuses on the same condition before calling here.
+    if (wheel_idle_mv <= 0 || head_unit_idle_mv <= 0 || level_mv <= 0) return 0;
+
+    // `long`, because the numerator is a product of two millivolt-scale values.
+    const long mapped =
+        (static_cast<long>(head_unit_idle_mv) * level_mv) / wheel_idle_mv;
+
+    // SATURATE before narrowing. `static_cast<MilliVolt>` on a value over 65535
+    // reduces it mod 65536, and roughly half of the wrapped values land back in
+    // [1800, 5200] -- a valid-looking target the downstream clamp cannot see,
+    // i.e. a wrong key voltage driven at the head unit. The ceiling is where an
+    // over-large ratio would have ended up anyway.
+    if (mapped > kOutputCeilingMv) return kOutputCeilingMv;
+    if (mapped < 0) return 0;
+    return static_cast<MilliVolt>(mapped);
+}
+
+int GainPolicyClampCommand(int target_key_mv, int head_unit_idle_mv, bool *clamped) {
+    if (clamped != nullptr) *clamped = false;
+
+    // Spec 6.2: the command band is `[floor, V_KEY_idle - kCommandHeadroomMv]`.
+    // The ceiling is the head unit's own resting level minus the headroom, and
+    // ABOVE it the sink FET can only be turned off -- "the release behavior, not a
+    // command". Without this the envelope clamp is the only bound, so a target
+    // between the line's idle and 5200 mV is written to the DAC and reported as a
+    // driven key while the radio receives nothing at all.
+    const int ceiling = (head_unit_idle_mv > 0)
+                            ? (head_unit_idle_mv - kCommandHeadroomMv)
+                            : kOutputCeilingMv;
+
+    // BELOW this the servo cannot reach: the floor is `GainPolicyCodeForTarget`'s
+    // own lower clamp, which the trim loop may exceed by `max_total_codes`. The
+    // trim loop is DISABLED in v1 (spec 6.5), so the open-loop floor is the real
+    // bound here rather than a guess at the loop's authority.
+    const int floor = kOutputFloorMv;
+
+    // An EMPTY band: a head unit idling near the floor leaves no level below its
+    // own rest that the servo can still drive. `head_unit_idle_mv - 200 < 1800`
+    // happens for any head unit measuring under 2.0 V -- the 3 V range's own low
+    // end. There is no command to make, so this reports ABSENT (0) rather than a
+    // clamped number, and the caller releases instead of driving a level that is
+    // either above the line's rest or below the servo's floor. Silently pinning the
+    // target to the floor would be the guess FR-12 forbids.
+    if (ceiling < floor) {
+        if (clamped != nullptr) *clamped = (target_key_mv != 0);
+        return 0;
+    }
+
+    int out = target_key_mv;
+    if (out > ceiling) out = ceiling;
+    if (out < floor) out = floor;
+
+    if (clamped != nullptr) *clamped = (out != target_key_mv);
+    return out;
+}

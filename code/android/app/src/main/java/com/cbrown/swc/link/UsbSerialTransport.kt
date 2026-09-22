@@ -107,7 +107,21 @@ class UsbSerialTransport(private val context: Context) : SwcTransport {
         // as a raw control transfer. This is the one place the class speaks CDC
         // rather than generic USB, and getting it wrong is silent -- the port opens,
         // nothing errors, and no frame ever arrives.
-        conn.setControlLineState(iface.id, dtr = true)
+        //
+        // **It must name the COMMUNICATION interface, not the data interface.**
+        // CDC 1.2 §6.3.12 puts this request on the communication interface, and the
+        // device side enforces that: TinyUSB's `cdcd_control_xfer_cb` matches the
+        // request's `wIndex` against `p_cdc->itf_num`, which is the communication
+        // interface number (`cdc_device.c`; TUD_CDC_DESCRIPTOR emits comm = n,
+        // data = n+1). Addressed to the data interface the `wIndex` matches no CDC
+        // instance, the request STALLs, `tud_cdc_line_state_cb` never fires, and the
+        // firmware's `CdcLineStateCallback` never records an open -- so `hello` is
+        // never sent, the app never leaves `Disconnected`, and the config reply run
+        // never starts. The failure is exactly the silence the comment above warns
+        // about: everything enumerates, nothing errors, no frame arrives.
+        val commId = cdcCommunicationInterfaceId(device, iface.id)
+            ?: return LinkProblem.NotOurDevice(device.deviceName)
+        conn.setControlLineState(commId, dtr = true)
         connection = conn
         dataInterface = iface
         epIn = inEp
@@ -167,6 +181,31 @@ class UsbSerialTransport(private val context: Context) : SwcTransport {
             if (inEp != null && outEp != null) return Triple(iface, inEp, outEp!!)
         }
         return null
+    }
+
+    /**
+     * The CDC communication interface the data interface [dataId] is paired with.
+     *
+     * SET_CONTROL_LINE_STATE is a request on the **communication** interface (CDC
+     * 1.2 §6.3.12), and the device side enforces it: TinyUSB matches `wIndex`
+     * against the CDC instance's communication interface number, so sending it to
+     * the data interface stalls and the line state is never delivered. The pair is
+     * identified by the CDC Union functional descriptor, which names the
+     * communication interface and its subordinate data interface -- but Android's
+     * USB host API does not expose class-specific descriptors, so the association
+     * cannot be read here.
+     *
+     * Delegates the choice to [cdcCommunicationInterfaceId], which is a plain
+     * function over (id, class) pairs so the rule is testable on the JVM with no
+     * Android at all. That matters here: the failure this guards against is silent
+     * (see [selectControlLineInterface]).
+     */
+    private fun cdcCommunicationInterfaceId(device: UsbDevice, dataId: Int): Int? {
+        val ids = (0 until device.interfaceCount).map { i ->
+            val iface = device.getInterface(i)
+            iface.id to iface.interfaceClass
+        }
+        return selectControlLineInterface(ids, dataId)
     }
 
     private suspend fun awaitPermission(device: UsbDevice): Boolean {
@@ -246,6 +285,14 @@ class UsbSerialTransport(private val context: Context) : SwcTransport {
         }
     }
 
+    override suspend fun reopen(): LinkProblem? {
+        // Release whatever is held BEFORE re-enumerating: a stale connection to a
+        // device that was unplugged would otherwise be kept, and `openDevice`
+        // would fail for the wrong reason. `close` is idempotent by contract.
+        close()
+        return open()
+    }
+
     override fun close() {
         reader?.cancel()
         reader = null
@@ -269,4 +316,39 @@ class UsbSerialTransport(private val context: Context) : SwcTransport {
     private companion object {
         const val READ_TIMEOUT_MS = 200
     }
+}
+
+/**
+ * Which interface id `SET_CONTROL_LINE_STATE` must be addressed to.
+ *
+ * **This is the interface the request belongs on, and getting it wrong is silent.**
+ * CDC 1.2 §6.3.12 makes `SET_CONTROL_LINE_STATE` a class request on the
+ * **communication** interface, and the device side enforces it: TinyUSB's
+ * `cdcd_control_xfer_cb` matches the request's `wIndex` against `p_cdc->itf_num`,
+ * the CDC instance's communication interface number (`cdc_device.c`), stalling the
+ * request when it matches no instance. Addressed to the **data** interface it
+ * matches nothing, the request stalls, `tud_cdc_line_state_cb` never fires, and the
+ * firmware's DTR callback never records the open -- so `hello` is never sent, the
+ * app never leaves `Disconnected`, and the whole config round trip never starts.
+ * Nothing errors at any point; the link is simply, permanently silent.
+ *
+ * [interfaces] is `(id, interfaceClass)` for every interface on the device, in
+ * enumeration order, and [dataId] is the data interface the transport claimed.
+ * `TUD_CDC_DESCRIPTOR` emits the pair as `(commId, commId + 1)`, so the
+ * communication interface is normally the one immediately preceding the data
+ * interface; a composite device with more than one CDC instance is why the
+ * relation is checked rather than assumed. Falling back to the first communication
+ * interface covers the same ordering when the data interface happens not to sit at
+ * `commId + 1`, and null means the device exposes no communication interface at all
+ * -- there is then no correct target, and the caller refuses the device rather than
+ * sending the request somewhere that would stall.
+ */
+internal fun selectControlLineInterface(interfaces: List<Pair<Int, Int>>, dataId: Int): Int? {
+    var firstComm: Int? = null
+    for ((id, cls) in interfaces) {
+        if (cls != UsbConstants.USB_CLASS_COMM) continue
+        if (firstComm == null) firstComm = id
+        if (id == dataId - 1) return id
+    }
+    return firstComm
 }

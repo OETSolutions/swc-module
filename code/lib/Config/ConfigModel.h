@@ -24,6 +24,16 @@ constexpr int kDataPayloadLen       = 48;   // holds geo:40.7608,-111.8910?q=Hom
 // practice and is the state FR-38 exists to prevent.
 constexpr uint32_t kMaintenanceTimeoutMaxMs = 3600000u;
 
+// The key-hold ceiling (FR-15/FR-39). `send_duration_ms` is how long the KEY line
+// is DRIVEN, so a `uint32` maximum (~49.7 days) is a phantom key press the user
+// cannot end -- the exact hazard FR-39 exists to prevent. The same reasoning that
+// bounds `maintenance_timeout_ms` bounds this: the check must be a RANGE, not just
+// the magnitude check that refuses a value past the width. Ten seconds is far past
+// any real head unit's press recognition (spec 3.7's default is 200 ms) and still
+// something a user could mean; `test_key`'s own hold is bounded at 1 s for the
+// identical reason.
+constexpr uint32_t kSendDurationMaxMs = 10000u;
+
 // These four widths are NOT free. They are a budget input, together with
 // kMaxBindings and kMaxActionsPerBinding: the structural worst case -- every
 // string field at its declared maximum -- is what ConfigMaxSerializedSize()
@@ -132,3 +142,15 @@ struct Config {
     Binding         bindings[kMaxBindings]; // TOP-LEVEL join table (spec 3.1/3.5)
     uint8_t         binding_count;
 };
+
+// `sizeof(Config)` is a load-bearing number in this project, not an implementation
+// detail. It is what makes the by-value shape a stack overflow -- holding one in a
+// local, or returning one from a factory, is an 8 KB frame on a 3,584 B task -- and
+// it is the arithmetic every stack-safety comment on those factories quotes. It is
+// pinned HERE so the COMPILER keeps it true: `tools/check_stack_usage.py` reads this
+// literal rather than carrying its own copy, so there is one home for the number and
+// the gate cannot quote a value the model no longer has. A field added or widened
+// trips this on purpose -- re-measure the stack budget (spec 6.x) and the NVS budget
+// in ConfigCodec.h together with it, then update the number.
+static_assert(sizeof(Config) == 8912,
+              "sizeof(Config) changed: re-measure the stack and NVS budgets, then update this");

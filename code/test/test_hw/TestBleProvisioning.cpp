@@ -26,12 +26,12 @@
 
 static IHAL *hal = NULL;
 
-void setUp(void)
+static void swc_setup(void)
 {
     hal = EspHalInit();
 }
 
-void tearDown(void)
+static void swc_teardown(void)
 {
 }
 

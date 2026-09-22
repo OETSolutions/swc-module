@@ -129,4 +129,37 @@ class BindingScreenTest {
 
         assertEquals("an empty required parameter must not be committed", emptyList<Action?>(), edits)
     }
+
+    @Test
+    fun `the picker refuses OUT_VOLTAGE until its key_mv is given`() {
+        // **OUT_VOLTAGE was the one kind the parameter gate missed.** Its parameter
+        // is a NUMBER (`key_mv`), not the `target` string, and `needsParam` is false
+        // for it -- so the gate `!needsParam || target.isNotEmpty()` was
+        // `!false || ...`, always true. Apply was enabled with the field empty and
+        // committed `keyMv = 0`, which `ConfigJson.problems()` then refused
+        // ("OUT_VOLTAGE needs a key_mv") -- disabling Save for the WHOLE config
+        // with a message naming an ordinal binding id the grid never shows, so the
+        // user could not tell which cell was wrong.
+        val edits = mutableListOf<Action?>()
+        rule.setContent {
+            BindingScreen(
+                state = BindingUiState(cells = listOf(cell())),
+                onEdit = { _, a -> edits += a },
+                onSave = {},
+            )
+        }
+
+        rule.onNodeWithText("Not bound").performClick()
+        rule.onNodeWithTag("kind-picker").performClick()
+        rule.onNodeWithText(ActionKind.OUT_VOLTAGE.wireName).performClick()
+        // Nothing typed yet: applying must commit nothing at all.
+        rule.onNodeWithText("Apply").performClick()
+        assertEquals("an empty key_mv must not be committed", emptyList<Action?>(), edits)
+
+        // And a value outside the uint16 the firmware decodes must be refused too,
+        // rather than nacking the whole save at decode.
+        rule.onNodeWithTag("key-mv-field").performTextInput("70000")
+        rule.onNodeWithText("Apply").performClick()
+        assertEquals("an out-of-range key_mv must not be committed", emptyList<Action?>(), edits)
+    }
 }

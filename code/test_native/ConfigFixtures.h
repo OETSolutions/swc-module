@@ -29,7 +29,7 @@ inline Config MakeConfig() {
     c.settings.buzzer_level = 2;
     c.settings.led_level = 2;
     c.settings.temp_comp_enabled = true;
-    c.settings.maintenance_timeout_ms = 300000;   // spec 5-minute maintenance window
+    c.settings.maintenance_timeout_ms = 300000;   // spec 8.2's default window
     c.channel_count = 1;
     c.channels[0].enabled = true;
     std::strncpy(c.channels[0].name, "SWC1", sizeof(c.channels[0].name) - 1);

@@ -22,6 +22,45 @@
         android:name="android.hardware.usb.host"
         android:required="true" />
 
+    <!--
+      Package visibility (Android 11+, API 30+), and the app targets 34.
+
+      `ActionRunner` decides whether an `APP_LAUNCH` / `APP_INTENT` binding can
+      fire by ASKING about the package (getLaunchIntentForPackage,
+      queryIntentActivities). Since Android 11 those queries are FILTERED: an app
+      the user bound a button to is invisible to the query unless it is visible
+      automatically or declared here, so the query returns null and the app
+      reports "not installed" for an app that is installed and launchable.
+
+      That is the sharp edge: starting an activity does NOT need visibility.
+      Per developer.android.com/training/package-visibility/automatic, "you can
+      start another app's activity using either an implicit or explicit intent
+      regardless of whether that app is visible to your app". So the query was
+      the ONLY thing failing; the launch it gated would have worked. Without this
+      element `APP_LAUNCH` and `APP_INTENT` are dead for every targeted app that
+      is not automatically visible, which is most of them.
+
+      WHAT IS DECLARED: an intent signature, which makes every installed app
+      matching it visible. A <package> entry cannot cover these, because the
+      target is the user's choice at runtime (any package for `APP_LAUNCH`, any
+      action for `APP_INTENT`), so there is no fixed name to list. The broadest
+      available option is QUERY_ALL_PACKAGES, which is a Google Play
+      policy-gated permission not granted to an ordinary utility app, so the
+      intent-signature route is both the narrower and the shippable one.
+
+      The MAIN/LAUNCHER pair is the load-bearing one: getLaunchIntentForPackage
+      resolves exactly that intent, so declaring it is what makes an arbitrary
+      installed app discoverable for `APP_LAUNCH`. It also covers `APP_INTENT`
+      for launcher-style actions; the app additionally falls back to an explicit
+      package intent for a launch, which needs no visibility at all.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.MAIN" />
+            <category android:name="android.intent.category.LAUNCHER" />
+        </intent>
+    </queries>
+
     <application
         android:label="SWC"
         android:allowBackup="false"

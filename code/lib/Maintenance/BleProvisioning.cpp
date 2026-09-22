@@ -64,7 +64,32 @@ bool ProvisioningAllowsSec0(bool allow_insecure_provisioning) {
 }
 
 bool BleProvisioning::Start(const uint8_t mac[6], const ProvSecurity &sec) {
-    allow_insecure_ = sec.allow_insecure;
+    active_ = false;
+    sec0_ = false;
+
+    // Spec 8.3 option 3: Sec0 exists ONLY behind the explicit flag, and it is
+    // consulted through `ProvisioningAllowsSec0` rather than by reading the field
+    // directly. An unauthenticated provisioning window is a radio-range takeover,
+    // so the decision lives in one named, testable place.
+    if (sec.allow_insecure) {
+        sec0_ = ProvisioningAllowsSec0(sec.allow_insecure);
+    }
+
+    if (!sec0_ && !sec.sec1) {
+        // Neither Sec1 nor a permitted Sec0: there is no security mode this
+        // session can use. Refusing is the only safe answer -- arming anyway would
+        // publish a window whose Sec1 PoP nothing will check.
+        return false;
+    }
+
+    if (sec0_) {
+        // No Proof-of-Possession exists in Sec0. The short name still comes from
+        // the MAC so several bench units stay distinguishable.
+        pop_[0] = '\0';
+        DeviceIdShort(mac, name_, sizeof(name_));
+        active_ = true;
+        return true;
+    }
 
     if (mode_ == PopMode::kFixedBench) {
         // A fixed PoP is a bench convenience. It is a compile-and-call-site
@@ -87,6 +112,7 @@ bool BleProvisioning::Start(const uint8_t mac[6], const ProvSecurity &sec) {
 
 void BleProvisioning::Stop() {
     active_ = false;
+    sec0_ = false;
     pop_[0] = '\0';
     name_[0] = '\0';
 }

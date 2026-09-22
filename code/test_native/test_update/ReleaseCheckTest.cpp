@@ -83,6 +83,27 @@ TEST(ReleaseCheck, AMalformedManifestIsRefusedNotPartlyApplied) {
         &info, "0.11.0"), ReleaseCheckResult::kMalformed);
 }
 
+TEST(ReleaseCheck, AFractionalSizeIsRefusedRatherThanTruncated) {
+    // `size_bytes` is a BYTE COUNT, and every sibling reader of an integer field
+    // in this tree refuses a fraction rather than truncating it -- `ConfigCodec`'s
+    // `ReadU32`/`ReadU64` and `CommandRouter`'s `NumToU32`/`NumToU8` all carry the
+    // same rule with the same reasoning: truncating 750.9 to 750 accepts a value
+    // the sender did not write and the receiver then acts on. `ReadSize` was the
+    // one reader that cast a bare `static_cast<size_t>`, so `size_bytes: 1543210.9`
+    // was accepted as 1543210.
+    //
+    // The consequence is not a wrong-accepted image (OtaEnd still requires an exact
+    // byte count AND the digest) but a permanent, unexplained failure: the manifest
+    // declares a size no real image has, so every download of a correct image ends
+    // in `kSizeMismatch`, which names neither the manifest nor the field.
+    const char *m = R"({"latest_version":"1.0.0",
+      "firmware":{"version":"1.0.0","url":"https://x/y.bin","size_bytes":1543210.9,
+                  "sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}})";
+    ReleaseInfo info{};
+    EXPECT_EQ(ReleaseCheckParse(m, &info, "0.1.0"), ReleaseCheckResult::kMalformed)
+        << "a byte count carrying a fraction is a malformed manifest, not 1543210";
+}
+
 TEST(ReleaseCheck, ANonHttpsUrlIsRefused) {
     // Plain http is not a lesser preference, it is a downgrade attack: an
     // attacker on the path substitutes the image, and the SHA-256 does not help

@@ -56,6 +56,24 @@ CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_MBEDTLS_HARDWARE_AES=n
 CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
 
+# The trust anchor for the WiFi OTA path (spec 9.5). `OtaWifi` attaches
+# `esp_crt_bundle_attach`, and IDF's mbedtls component gates BOTH
+# `esp_crt_bundle.c` and its include path on CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
+# (components/mbedtls/CMakeLists.txt:117) -- so with the symbol unset, OtaWifi.cpp
+# stops compiling and the failure names neither the key nor spec 9.5.
+#
+# It defaults `y`, which is why this worked before and why nothing caught it: the
+# value lived only in the gitignored generated `sdkconfig.esp32s3`, so a clean
+# build under a changed default (or a future IDF) would silently drop it. Pinned
+# here for the same reason CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is: `defaults` is
+# the only tracked, authoritative file.
+#
+# NOTE this is the DEFAULT bundle, not a pinned CA -- it authenticates the channel
+# but any of the ~200 stock roots can vouch for the image. Pinning a CA is open
+# item N-62.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+
 # --- ADC -------------------------------------------------------------------
 # NOTE: there is deliberately NO ADC calibration key here, because on this
 # target there is no such Kconfig symbol to set.
@@ -75,3 +93,21 @@ CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
 # Coredump partition exists (partitions.csv). Reset in release; gdbstub in dev.
 CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT=y
 CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH=y
+
+# --- App rollback (FR-37) --------------------------------------------------
+# **This key was MISSING, and without it FR-37's rollback did not exist.**
+# `partitions.csv` has the A/B slots (ota_0/ota_1 + otadata), and `main.cpp` calls
+# `esp_ota_mark_app_valid_cancel_rollback()` on the confirmed-healthy path -- but
+# that call is an explicit no-op unless the BOOTLOADER is built with this option
+# (IDF 5.5.5, `components/bootloader/Kconfig.app_rollback`: the flag is what makes
+# the bootloader start a freshly-updated app in `ESP_OTA_IMG_PENDING_VERIFY` and
+# revert after a boot-loop). Default OFF, so an image that boots into a crash loop
+# would have spun forever with no fallback -- while `UpdateScreen` tells the user
+# "a failed or interrupted update does not leave you with a dead adapter" and
+# `hello.caps` advertises `ota`. Spec 9.4/FR-37 make A/B rollback a hard
+# requirement, and this is the single flag that decides whether it happens.
+#
+# `defaults` is the ONLY place this can live: `sdkconfig.esp32s3` is a gitignored
+# build artifact (code/.gitignore:27), so a value set only there does not survive a
+# clean build.
+CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE=y

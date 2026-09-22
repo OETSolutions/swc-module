@@ -2,7 +2,14 @@
 
 #include <stdint.h>
 
+#include "Analog/CalibrationCurve.h"
 #include "HAL/IHAL.h"
+
+// The ADC's calibrated ceiling is `kAdcFullScaleMv12dB` (CalibrationCurve.h) --
+// the one home for "the largest pin reading possible at 12 dB". It is pulled in
+// here because this file and `LearnSession.cpp` both range-check readings against
+// it, and both used to carry their OWN anonymous-namespace copy of the literal:
+// two more homes for one fact, compared by nothing. Read the shared name.
 
 // MilliVolt comes from IHAL.h -- spec 3.2's value type, a pin voltage in
 // millivolts, 0-2900 (the ADC's calibrated ceiling). It was declared locally
@@ -19,6 +26,17 @@ constexpr int kLadderMaxButtons = 16;
 // (spec 3.5's width table). Widening them overflows the partition.
 constexpr int kLadderIdLen   = 16;
 constexpr int kLadderNameLen = 16;
+
+// The band either side of the idle reference that counts as IDLE rather than a
+// button: `LadderClassify` returns `kIdle` for ratio in
+// [1000 - kIdleMarginPermille, 1000 + kIdleMarginPermille]. It is EXPORTED
+// because `LearnSession::Commit` must refuse to learn a button the classifier
+// would call idle -- otherwise a learn commits a DEAD button (LEARN_OK, persisted,
+// never fires) whenever its mean lands in the band the two disagree about. The
+// learn gate used to carry its own narrower 20 permille margin, so a learn at
+// ratio 970-979 passed every gate while `LadderClassify` returned `kIdle` for its
+// own centre. One home, and learn reads it: the two can no longer drift.
+constexpr int kIdleMarginPermille = 30;
 
 // The board's nominal +3V3 rail, which is what `learned_at_rail_mv` records
 // (spec 3.4/FR-30). There is no rail SENSE channel on this board (AdcChannel

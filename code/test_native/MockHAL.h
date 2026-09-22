@@ -43,7 +43,15 @@ public:
     // --- analog ------------------------------------------------------------
     void SetAdcMilliVolts(AdcChannel ch, int mv) { adc_mv_[static_cast<int>(ch)] = mv; }
     void ReleaseInputs();
-    int AdcReadMv(AdcChannel ch) { return adc_mv_[static_cast<int>(ch)]; }
+    int AdcReadMv(AdcChannel ch) {
+        ++adc_reads_[static_cast<int>(ch)];
+        return adc_mv_[static_cast<int>(ch)];
+    }
+    // How many times a channel has been converted. Exists so a test can assert
+    // that a channel is NEVER read -- which is the observable half of open item
+    // N-67: `ADC_CH_TEMP` is mapped in EspHal and converted by nothing, so FR-1's
+    // "sample ... the NTC continuously" has no implementation to point at.
+    int AdcReadCount(AdcChannel ch) const { return adc_reads_[static_cast<int>(ch)]; }
 
     void DacSetCode(DacChannel ch, uint16_t code);
     // NOTE: the type name must be qualified as ::DacPowerMode from here on.
@@ -53,6 +61,11 @@ public:
     // member *name* is fixed by the harness API, so the type is qualified.
     void DacPowerMode(DacChannel ch, ::DacPowerMode mode);
     void DacLdac(bool assert) { ldac_asserted_ = assert; }
+    // FR-37's falsifiable signal. `FailNextDacWrite` arms exactly one failure so
+    // a test can drive the health gate to NO -- the case the gate previously
+    // could not reach, because it read a constant-true condition.
+    void FailNextDacWrite() { fail_next_dac_write_ = true; }
+    bool DacFaulted() const { return dac_failed_; }
     uint16_t LastDacCode(DacChannel ch) const;
     ::DacPowerMode LastDacPowerMode(DacChannel ch) const;
     int DacWriteCount(DacChannel ch) const;
@@ -113,6 +126,7 @@ private:
     static void DacSetCodeThunk(void *ctx, DacChannel ch, uint16_t code);
     static void DacPowerModeThunk(void *ctx, DacChannel ch, ::DacPowerMode m);
     static void DacLdacThunk(void *ctx, bool assert);
+    static bool DacFaultedThunk(void *ctx);
     static void GpioWriteThunk(void *ctx, GpioPin pin, bool level);
     static bool GpioReadThunk(void *ctx, GpioPin pin);
     static void BuzzerOnThunk(void *ctx, bool on);
@@ -131,10 +145,13 @@ private:
     // was therefore entering the learn wizard by accident, and a test that passed
     // was passing for a reason unrelated to what it was named for.
     int adc_mv_[ADC_CH_COUNT] = {};
+    int adc_reads_[ADC_CH_COUNT] = {};
     uint16_t dac_code_[DAC_CH_COUNT] = {};
     ::DacPowerMode dac_mode_[DAC_CH_COUNT] = {};
     int dac_writes_[DAC_CH_COUNT] = {};
     bool ldac_asserted_ = false;
+    bool dac_failed_ = false;
+    bool fail_next_dac_write_ = false;
     bool gpio_out_[GPIO_COUNT] = {};
     bool gpio_in_[GPIO_COUNT] = {};
     int gpio_writes_[GPIO_COUNT] = {};

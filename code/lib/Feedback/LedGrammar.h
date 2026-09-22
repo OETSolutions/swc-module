@@ -43,6 +43,19 @@ public:
     void Set2(Led2Pattern p);
     void Update(uint64_t now_ms);
 
+    /*
+     * Adopt a new feedback level WITHOUT disturbing the patterns in flight.
+     *
+     * A config that arrives over the link carries `settings.led_level`, and the
+     * obvious `leds_ = LedGrammar(hal_, new_level)` is a bug: the freshly
+     * constructed object has `stat_ == kOff`, so it SILENTLY CANCELS whatever is
+     * showing -- and the learn wizard, which owns both LEDs as its prompts while it
+     * runs, sets its pattern once on entry and does not re-set it per tick. A config
+     * push landing mid-learn would blank the prompt the user is reading. Same
+     * reasoning as `BuzzerGrammar::SetLevel`.
+     */
+    void SetLevel(uint8_t level) { level_ = level; }
+
 private:
     IHAL    *hal_;
     uint8_t  level_;

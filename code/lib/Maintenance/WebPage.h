@@ -39,10 +39,14 @@ bool WebTokenMatches(const char *presented, const char *expected);
 // caller can answer 404 rather than serving the index page for every URL (which
 // would silently make a typo'd API call return HTML).
 //
-// The asset struct is completed by including the generated `WebPageAssets.h`.
-// This header deliberately does NOT include it: the generated file is large and
-// changes on every page edit, so pulling it in here would recompile every
-// consumer of the token helpers for a CSS tweak.
+// The asset struct is defined by the generated `WebPageAssets.h`, which this
+// header includes unconditionally -- the comment here used to claim the opposite
+// ("deliberately does NOT include it") while the `#include` sat three lines below
+// it, so a reader trusting the comment would not know where `WebAsset` comes
+// from. The generated file has to be included for the declarations below to
+// compile at all; keeping it here rather than in the .cpp is what lets a caller
+// name `WebAsset` and `kWebAssetCount`. The cost is that a CSS tweak recompiles
+// the token helpers too, which is acceptable for a single small page.
 #include "Maintenance/WebPageAssets.h"
 const WebAsset *WebPageFind(const char *path);
 

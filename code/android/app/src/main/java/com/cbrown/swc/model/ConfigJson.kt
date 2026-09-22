@@ -306,6 +306,11 @@ object ConfigJson {
     fun problems(c: Config): List<String> {
         val out = mutableListOf<String>()
         if (c.deviceId.isEmpty()) out += "device_id must not be empty"
+        // At least one channel, and not more than the max -- the firmware refuses
+        // `channel_count == 0` (`ConfigValidate`), and an app that only bounded
+        // the upper end would send a config with no channels that the device then
+        // rejects at decode, losing the whole save.
+        if (c.channels.isEmpty()) out += "at least 1 channel"
         if (c.channels.size > K_MAX_CHANNELS) out += "at most $K_MAX_CHANNELS channels"
         if (c.bindings.size > K_MAX_BINDINGS) out += "at most $K_MAX_BINDINGS bindings"
         if (c.aux.size > K_MAX_AUX_BUTTONS) out += "at most $K_MAX_AUX_BUTTONS aux buttons"
@@ -317,12 +322,30 @@ object ConfigJson {
             out += "long_press_ms must be above the double-press window"
 
         if (t.sendDurationMs <= 0) out += "send_duration_ms must be greater than zero"
+        // Bounded at the top end too (kSendDurationMaxMs): this is how long the KEY
+        // line is DRIVEN, so a value near the uint32 maximum pins a phantom press
+        // the user cannot release (FR-39). The firmware refuses it in RANGE; without
+        // the matching check here the app passes it and the device nacks the whole
+        // save with the offending field unnamed.
+        if (t.sendDurationMs > K_SEND_DURATION_MAX_MS)
+            out += "send_duration_ms must be at most $K_SEND_DURATION_MAX_MS"
+        // Feedback levels are 0..3 (the firmware refuses > 3), and the maintenance
+        // window is bounded on BOTH ends. None of these had a check, so a config
+        // carrying, say, `maintenance_timeout_ms = 4_000_000` passed the app's
+        // local gate and was then nacked by the device with the field unnamed.
+        if (c.settings.buzzerLevel !in 0..3) out += "buzzer_level must be 0 to 3"
+        if (c.settings.ledLevel !in 0..3) out += "led_level must be 0 to 3"
+        if (c.settings.maintenanceTimeoutMs <= 0)
+            out += "maintenance_timeout_ms must be greater than zero"
+        if (c.settings.maintenanceTimeoutMs > K_MAINTENANCE_TIMEOUT_MAX_MS)
+            out += "maintenance_timeout_ms must be at most $K_MAINTENANCE_TIMEOUT_MAX_MS"
 
         c.bindings.forEach { b ->
             // The firmware copies into a fixed char[16]; a longer value is
             // refused by validation rather than truncated (spec 3.5), so the
             // check belongs here where the user can see it.
-            if (b.id.length >= 16) out += "binding '${b.id}': id must be under 16 chars"
+            if (b.id.length >= K_BINDING_ID_LEN)
+                out += "binding '${b.id}': id must be under $K_BINDING_ID_LEN chars"
             if (b.actions.size > K_MAX_ACTIONS_PER_BINDING)
                 out += "binding '${b.id}': at most $K_MAX_ACTIONS_PER_BINDING actions"
             b.actions.forEach { a ->
@@ -346,8 +369,8 @@ object ConfigJson {
         }
         c.channels.forEachIndexed { i, ch ->
             ch.ladder.buttons.forEach { btn ->
-                if (btn.id.length >= 16)
-                    out += "channel $i button '${btn.id}': id must be under 16 chars"
+                if (btn.id.length >= K_LADDER_ID_LEN)
+                    out += "channel $i button '${btn.id}': id must be under $K_LADDER_ID_LEN chars"
                 if (btn.mvTolerance == 0)
                     out += "channel $i button '${btn.id}': mv_tolerance must not be zero"
             }

@@ -68,6 +68,7 @@ MockHal::MockHal() {
     iface_.dac_set_code   = &MockHal::DacSetCodeThunk;
     iface_.dac_power_mode = &MockHal::DacPowerModeThunk;
     iface_.dac_ldac       = &MockHal::DacLdacThunk;
+    iface_.dac_faulted    = &MockHal::DacFaultedThunk;
     iface_.gpio_write     = &MockHal::GpioWriteThunk;
     iface_.gpio_read      = &MockHal::GpioReadThunk;
     iface_.buzzer_on      = &MockHal::BuzzerOnThunk;
@@ -104,9 +105,17 @@ void MockHal::ReleaseInputs() {
 }
 
 void MockHal::DacSetCode(DacChannel ch, uint16_t code) {
-    const int i = static_cast<int>(ch);
-    dac_code_[i] = code;
-    ++dac_writes_[i];
+    ++dac_writes_[static_cast<int>(ch)];
+    if (fail_next_dac_write_) {
+        // The write FAILED, so it landed nothing -- mirroring EspHal, where a
+        // failed `i2c_master_transmit` means the channel is not updated. Leaving
+        // the previous code in place (rather than storing `code`) is what lets a
+        // test distinguish "attempted" from "reached the part".
+        fail_next_dac_write_ = false;
+        dac_failed_ = true;
+        return;
+    }
+    dac_code_[static_cast<int>(ch)] = code;
 }
 
 void MockHal::DacPowerMode(DacChannel ch, ::DacPowerMode mode) {
@@ -207,6 +216,9 @@ void MockHal::DacPowerModeThunk(void *ctx, DacChannel ch, ::DacPowerMode m) {
 }
 void MockHal::DacLdacThunk(void *ctx, bool assert) {
     static_cast<MockHal *>(ctx)->ldac_asserted_ = assert;
+}
+bool MockHal::DacFaultedThunk(void *ctx) {
+    return static_cast<MockHal *>(ctx)->dac_failed_;
 }
 void MockHal::BuzzerOnThunk(void *ctx, bool on) {
     static_cast<MockHal *>(ctx)->BuzzerOn(on);

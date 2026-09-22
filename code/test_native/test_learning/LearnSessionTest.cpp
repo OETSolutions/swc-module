@@ -8,6 +8,7 @@
 #include <cstring>
 #include <set>
 #include <string>
+#include <utility>
 
 namespace {
 // Spec 3.4's worked-example rail and the ~23.5 C the ladder was learned at.
@@ -53,8 +54,43 @@ TEST(LearnSession, ASteadyLevelCommitsAndRecordsEverythingLearnIsTheSourceOf) {
     EXPECT_EQ(s.LearnedIdleMv(), 2835);
 }
 
-TEST(LearnSession, TheIdAndNameAreLeftToTheCallerNotInvented) {
-    LearnSession s;
+// A learn must not commit a button the CLASSIFIER would call idle -- that is a
+// DEAD button: `LearnSession::Commit` returns kNone, the wizard beeps LEARN_OK,
+// the profile persists, and the button never fires because `LadderClassify`
+// returns kIdle for its own centre. The two used to carry SEPARATE idle margins
+// (learn 20 permille, classifier 30), so a mean at ratio 970-979 slipped through
+// every gate. This pins the boundary to the CLASSIFIER's constant (`kIdleMarginPermille`),
+// so a learn at exactly (1000 - margin) is refused and one just below is accepted.
+TEST(LearnSession, ALearnInsideTheClassifiersIdleBandIsRefusedNotCommittedDead) {
+    const int idle = 2835;
+    // At the boundary of the classifier's idle band: idle * (1000 - margin) / 1000.
+    const int at_band = static_cast<int>(
+        (static_cast<long long>(idle) * (1000 - kIdleMarginPermille)) / 1000);
+    {
+        LearnSession s;
+        s.Start(LadderProfile{});
+        uint64_t t = 1000;
+        Feed(s, at_band, idle, 30, t);
+        LadderButton out{};
+        EXPECT_EQ(s.Commit(&out), LearnReject::kAtIdle)
+            << "a mean at the classifier's idle edge would commit a button that "
+               "LadderClassify calls kIdle -- a dead button with a LEARN_OK beep";
+    }
+    // One permille below the band is a real (if tight) button and must commit.
+    const int below = static_cast<int>(
+        (static_cast<long long>(idle) * (1000 - kIdleMarginPermille - 2)) / 1000);
+    {
+        LearnSession s;
+        s.Start(LadderProfile{});
+        uint64_t t = 1000;
+        Feed(s, below, idle, 30, t);
+        LadderButton out{};
+        EXPECT_EQ(s.Commit(&out), LearnReject::kNone)
+            << "outside the idle band the learn must still commit";
+    }
+}
+
+TEST(LearnSession, TheIdAndNameAreLeftToTheCallerNotInvented) {    LearnSession s;
     s.Start(LadderProfile{});
     uint64_t t = 1000;
     Feed(s, 1430, 2835, 30, t);
@@ -77,24 +113,33 @@ TEST(LearnSession, TheNoiseGateIsAPermilleOfIdleNotAnAbsoluteMillivolt) {
     // Spec 6.3: the ladder is a divider off +3V3, so a "clean" hold's spread
     // scales with the rail. An absolute (mV) gate gives different answers at
     // different rails for the same PROPORTIONAL wobble.
-    const auto commit_with = [](int idle, int lo) {
+    //
+    // The samples wobble around a CLEARLY PRESSED centre (~790 permille of idle),
+    // not around the idle itself: the property under test is the noise gate, and a
+    // straddle-the-idle construction would be refused first by the at-idle gate
+    // (whose band `kIdleMarginPermille` this test does not mean to exercise). An
+    // earlier version DID straddle idle, and only passed because its mean ratio was
+    // 973 -- just outside the too-narrow idle band then in force; the band and the
+    // learn gate now share one constant, so the samples are moved off it.
+    const auto commit_with = [](int idle, int lo, int hi) {
         LearnSession s;
         s.Start(LadderProfile{});
         uint64_t t = 1000;
         for (int i = 0; i < 30; ++i) {
-            s.AddSample((i % 2) ? lo : idle - 1, idle, kRailMv, kTempTenths, t);
+            s.AddSample((i % 2) ? lo : hi, idle, kRailMv, kTempTenths, t);
             t += 10;
         }
         LadderButton out{};
         return s.Commit(&out);
     };
-    // ~53 permille of wobble: accepted at a low and a high idle alike.
-    EXPECT_EQ(commit_with(2400, 2272), LearnReject::kNone);
-    EXPECT_EQ(commit_with(2800, 2651), LearnReject::kNone);
+    // ~53 permille of wobble about a ~790 permille press: accepted at a low and a
+    // high idle alike, because the gate is on the RATIO.
+    EXPECT_EQ(commit_with(2400, 1836, 1963), LearnReject::kNone);
+    EXPECT_EQ(commit_with(2800, 2143, 2291), LearnReject::kNone);
     // ~66 permille at a LOW idle, i.e. only 159 mV: too noisy. An absolute 170 mV
     // gate ACCEPTS this, which is the defect -- the same relative wobble would be
     // rejected at a high rail and accepted here.
-    EXPECT_EQ(commit_with(2400, 2240), LearnReject::kTooNoisy)
+    EXPECT_EQ(commit_with(2400, 1820, 1979), LearnReject::kTooNoisy)
         << "the noise gate must reject on the ratio, not an absolute millivolt";
 }
 
@@ -162,10 +207,10 @@ TEST(LearnSession, EachRejectionHasADistinctWireReason) {
     // actionable for a user holding a button with one hand in a car.
     const LearnReject all[] = {LearnReject::kTooNoisy, LearnReject::kTooCloseToExisting,
                                LearnReject::kAtIdle, LearnReject::kOutOfRange,
-                               LearnReject::kTooFewSamples};
+                               LearnReject::kTooFewSamples, LearnReject::kNoIdleReference};
     std::set<std::string> reasons;
     for (LearnReject r : all) reasons.insert(LearnRejectReason(r));
-    EXPECT_EQ(reasons.size(), 5u) << "every rejection needs its own reason string";
+    EXPECT_EQ(reasons.size(), 6u) << "every rejection needs its own reason string";
     for (const auto &r : reasons) EXPECT_FALSE(r.empty());
     // And kNone is not one of them: success must not share a string with a
     // failure, or a caller matching on the string cannot tell them apart.
@@ -285,6 +330,58 @@ TEST(LearnSession, AWindowThatWouldMakeTheProfileInvalidIsRefusedAtCommit) {
            "every learned button at the next boot";
 }
 
+TEST(LearnSession, ACommittedProfileAlwaysCarriesTheIdleItsCallerWillStore) {
+    // The property the test below ASSUMES but did not actually exercise: the
+    // profile the callers store is `existing` + the new button + `LearnedIdleMv()`
+    // stamped as `learned_idle_mv`. That test builds its profile from
+    // `ExistingWith(...)` (a fixed non-zero idle) and never stamps the session's
+    // OWN reference -- so it validates an idle that came from the fixture, not the
+    // one `Commit` produced. A session whose sampled idle was 0 therefore slipped
+    // past it: `Commit` substituted a nominal 2835 mV for its ratio math, returned
+    // kNone, and the caller then stamped `learned_idle_mv = 0`, which
+    // `LadderProfileIsValid` refuses -- so `ConfigStore::Save` persisted a config
+    // the next boot could not load and the user lost every learned button.
+    //
+    // The fresh-channel case is the one that reaches it, and it is the common one:
+    // a device with a brand-new channel is learned from an EMPTY existing profile,
+    // so nothing else can make the commit invalid first. Run both shapes.
+    const LadderProfile kFresh{};
+    for (int idle = 0; idle <= 2900; idle += 100) {
+        for (const LadderProfile &existing : {kFresh, ExistingWith("vol_up", 1430, 120)}) {
+            LearnSession s;
+            s.Start(existing);
+            uint64_t t = 1000;
+            Feed(s, 1785, idle, 30, t);   // a clear, clean press at this idle
+            LadderButton out{};
+            const LearnReject r = s.Commit(&out);
+            if (r != LearnReject::kNone) continue;   // refusing is always allowed
+
+            LadderProfile stored = existing;
+            out.id[0] = '\0';
+            std::strncpy(out.id, "swc1_bt2", sizeof(out.id) - 1);
+            stored.buttons[stored.count++] = out;
+            stored.learned_idle_mv = s.LearnedIdleMv();   // what the callers stamp
+            EXPECT_TRUE(LadderProfileIsValid(stored))
+                << "idle=" << idle << " existing_count=" << (int)existing.count
+                << ": committed a profile whose stored learned_idle_mv ("
+                << s.LearnedIdleMv() << ") the validator refuses";
+        }
+    }
+}
+
+TEST(LearnSession, ALearnWithNoIdleReferenceIsRefusedNotCommitted) {
+    // The named case of the property above. A zero idle reaches here whenever the
+    // idle reading is unreadable (a channel whose live idle is 0, or a
+    // `ladder_sample` reporting 0 for a stale reading), and it must be a REFUSAL
+    // with a specific reason -- not a commit that persists an unloadable config.
+    LearnSession s;
+    s.Start(LadderProfile{});
+    uint64_t t = 1000;
+    Feed(s, 1430, 0, 30, t);
+    LadderButton out{};
+    EXPECT_EQ(s.Commit(&out), LearnReject::kNoIdleReference);
+}
+
 TEST(LearnSession, EveryCommittedProfileIsAcceptedByTheConfigValidator) {
     // The general form of the test above, and the invariant that actually matters:
     // sweep the neighbour distance and the spread, and assert that whatever the
@@ -340,4 +437,104 @@ TEST(LearnSession, EveryCommittedProfileIsAcceptedByTheConfigValidator) {
                    "cannot load";
         }
     }
+}
+
+// The frame the seeded siblings are converted into is fixed by the first sample
+// that carries a USABLE IDLE, not by the first sample period.
+//
+// The rebase's gate used to be `!have_sample_ && idle_mv > 0` -- "the first
+// sample, if it happened to carry an idle". A session whose opening reading had
+// no idle (an ADC conversion that failed on the first prompt tick; `AddSample`
+// records whatever idle it is handed, and 0 is a legal argument) therefore never
+// rebased, while a LATER sample's idle became `learned_idle_mv_` -- the
+// denominator the caller stamps onto the profile. So the commit was measured in
+// the live frame while its seeded siblings stayed in the stored frame: exactly
+// the two-frames-in-one-comparison failure the rebase exists to prevent, and it
+// showed up as the too-close gate firing on a SIBLING THAT IS NOT CLOSE.
+//
+// Measured: with the old gate, `idle_on_first=false` returned
+// `kTooCloseToExisting` for a learn the correct code commits, because the
+// unrebased sibling's stored centre (1358) equals the live reading while the
+// rebased one is 68 mV away.
+TEST(LearnSession, ARebaseHappensOnTheFirstSampleWithAnIdleNotTheFirstSample) {
+    LadderProfile seeded{};
+    seeded.learned_idle_mv = 2835;
+    seeded.count = 1;
+    // Stored in the 2835 frame. Its rebased position at 2693 is 1290, i.e. 68 mV
+    // from the level this learn measures -- distinguishable, so the learn must be
+    // accepted. Left UNREBASED its centre is 1358, which is ON the measured level,
+    // so the too-close gate fires.
+    seeded.buttons[0].mv_center = 1358;
+    seeded.buttons[0].mv_tolerance = 40;
+
+    const LearnReject with_idle_first = [&] {
+        LearnSession s;
+        s.Start(seeded);
+        s.AddSample(1358, 2693, kRailMv, kTempTenths, 0);   // idle present
+        for (int i = 0; i < 40; ++i) {
+            s.AddSample(1358, 2693, kRailMv, kTempTenths, 1000 + i * 20);
+        }
+        LadderButton out{};
+        return s.Commit(&out);
+    }();
+
+    const LearnReject idle_absent_first = [&] {
+        LearnSession s;
+        s.Start(seeded);
+        s.AddSample(1358, 0, kRailMv, kTempTenths, 0);      // ADC gave no idle
+        for (int i = 0; i < 40; ++i) {
+            s.AddSample(1358, 2693, kRailMv, kTempTenths, 1000 + i * 20);
+        }
+        LadderButton out{};
+        return s.Commit(&out);
+    }();
+
+    EXPECT_EQ(with_idle_first, LearnReject::kNone);
+    EXPECT_EQ(idle_absent_first, LearnReject::kNone)
+        << "an opening sample with no idle must not skip the rebase; the later "
+           "sample's idle is the denominator the caller stores, so the seeded "
+           "siblings have to be converted into THAT frame or the too-close gate "
+           "compares across two frames and refuses a learn that is fine";
+}
+
+// The idle reference is ONE sample's value for BOTH its consumers -- the frame
+// the seeded siblings are rebased into, and the denominator `Commit` stamps.
+//
+// Those were two policies. The rebase gate took the FIRST usable idle while
+// `learned_idle_mv_` was overwritten on EVERY sample (last-writer-wins), so a
+// session whose idle drifted mid-hold rebased the siblings into one frame and
+// divided the committed ratio by another -- the same two-frames failure the test
+// above covers, reached from the other side. And a later reading of 0 (a tick
+// where the ADC is unreadable, which is what the `-1` sentinel's callers pass
+// through as 0) RESET the denominator, refusing a learn that had seen a
+// perfectly good reference at the start.
+TEST(LearnSession, TheRebaseFrameAndTheCommitDenominatorAreTheSameIdle) {
+    // Idle 2835 for the first half of the hold, 1500 for the second. The level
+    // never moves, so this is a clean press by every other measure.
+    const auto run = [](bool trailing_zero) {
+        LearnSession s;
+        s.Start(LadderProfile{});
+        uint64_t t = 1000;
+        for (int i = 0; i < 15; ++i) { s.AddSample(1430, 2835, kRailMv, kTempTenths, t); t += 10; }
+        for (int i = 0; i < 15; ++i) {
+            const int idle = (trailing_zero && i > 0) ? 0 : 1500;
+            s.AddSample(1430, idle, kRailMv, kTempTenths, t);
+            t += 10;
+        }
+        LadderButton out{};
+        return std::make_pair(s.Commit(&out), s.LearnedIdleMv());
+    };
+
+    const auto drifted = run(/*trailing_zero=*/false);
+    EXPECT_EQ(drifted.first, LearnReject::kNone);
+    EXPECT_EQ(drifted.second, 2835)
+        << "the denominator must be the SAME idle the rebase used (the first "
+           "usable one), not the last sample's -- two policies put the stored "
+           "siblings in one frame and the committed ratio in another";
+
+    const auto zeroed = run(/*trailing_zero=*/true);
+    EXPECT_EQ(zeroed.first, LearnReject::kNone)
+        << "an unreadable tick late in the hold must not discard a reference the "
+           "session already latched";
+    EXPECT_EQ(zeroed.second, 2835);
 }

@@ -345,3 +345,19 @@ TEST(ConfigCodec, AnIntegerFieldCarryingAFractionIsRefusedNotTruncated) {
     EXPECT_TRUE(ConfigDecodeJson(t.c_str(), t.size(), &out));
     EXPECT_EQ(out.settings.timings.long_press_ms, 751u);
 }
+
+TEST(ConfigCodec, ValidationRefusesASendDurationThatWouldPinTheKeyLine) {
+    // `send_duration_ms` is how long the KEY line is DRIVEN (FR-15), so its upper
+    // end is not a style choice -- a `uint32` maximum (~49.7 days) is a phantom
+    // key press the user cannot end, the exact hazard FR-39 exists to prevent. It
+    // was the one timing scalar bounded only by its WIDTH: `ReadU32` refuses a
+    // value past u32, but the u32 maximum itself passed, and so did a patch of
+    // `1e10` that `NumToU32` had already wrapped into range.
+    Config c = MakeConfig();
+    c.settings.timings.send_duration_ms = 0;
+    EXPECT_FALSE(ConfigValidate(c)) << "a zero hold is not a configurable choice";
+    c.settings.timings.send_duration_ms = kSendDurationMaxMs + 1;
+    EXPECT_FALSE(ConfigValidate(c)) << "a hold past the ceiling pins the key line";
+    c.settings.timings.send_duration_ms = kSendDurationMaxMs;
+    EXPECT_TRUE(ConfigValidate(c)) << "the ceiling itself is a legal hold";
+}

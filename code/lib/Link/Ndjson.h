@@ -25,7 +25,12 @@ constexpr size_t kNdjsonTypeLen = 24;
  * mode; an asserted single copy is not.
  *
  * The writer previously hardcoded the literal `"v":1` while Task 15 separately
- * wanted a constant of this name, which is the same fact spelled twice.
+ * wanted a constant of this name, which is the same fact spelled twice. The
+ * literal had in fact survived in ONE place -- the oversize error frame in
+ * `NdjsonWriter::Write` -- because that branch is reached only by a body too
+ * large to emit and nothing was asserting the envelope it produced. Every frame
+ * the writer can emit now stamps this constant; the oversize test checks the
+ * version, not just the type, so a future hardcoded copy is caught.
  */
 constexpr uint8_t kNdjsonProtocolVersion = 1;
 

@@ -27,6 +27,66 @@ const val K_ACTION_TARGET_LEN = 40
 const val K_DATA_PAYLOAD_LEN = 48
 const val K_CONFIG_SCHEMA_VERSION = 1
 
+/**
+ * The binding-id width, mirroring `kBindingIdLen` (ConfigModel.h). `Binding.id`
+ * and `Binding.button` are both `char[kBindingIdLen]`, and `ReadStr` refuses any
+ * value at or over the width (truncation is unreachable), so the device's rule is
+ * `length < 16` for both.
+ *
+ * It was a bare `16` literal at the check site until 2026-09-23, and
+ * `check_app_limits.py` pinned only the target/payload widths — so a re-tune of
+ * `kBindingIdLen` on either side would have gone unnoticed. The failure has two
+ * directions and both are silent: a larger firmware width makes the app refuse ids
+ * the device would store (the N-44 shape — the gate forecloses its own edit), and a
+ * smaller one lets the app send an id the device refuses at decode, which nacks the
+ * WHOLE save with the field unnamed.
+ */
+const val K_BINDING_ID_LEN = 16
+
+/**
+ * The ladder-button-id width, mirroring `kLadderIdLen` (LadderDecode.h).
+ * `LadderButton.id` is `char[kLadderIdLen]` — a SEPARATE constant from
+ * [K_BINDING_ID_LEN], even though both are 16 today. A binding's `button` field
+ * copies a ladder id into a `kBindingIdLen` array, so the two are compared
+ * field-by-field against the same 16; keeping them as two constants means a
+ * re-tune of one alone is caught rather than silently applied to both.
+ */
+const val K_LADDER_ID_LEN = 16
+
+/**
+ * The maintenance window's upper bound, mirroring `kMaintenanceTimeoutMaxMs`
+ * (ConfigModel.h). A `uint32` maximum would be ~49.7 days, i.e. a window that
+ * never closes on its own — the "device left unable to serve presses" state FR-38
+ * exists to prevent. The firmware refuses it; the app must refuse it too, or the
+ * whole save is nacked at decode with the offending field unnamed.
+ */
+const val K_MAINTENANCE_TIMEOUT_MAX_MS = 3_600_000L
+
+/**
+ * The key-hold ceiling, mirroring `kSendDurationMaxMs` (ConfigModel.h).
+ *
+ * `send_duration_ms` is how long the KEY line stays DRIVEN, so a value near the
+ * `uint32` maximum (~49.7 days) is a phantom key press the user cannot release —
+ * the hazard FR-39 exists to prevent. The firmware refuses it in RANGE, not just
+ * by magnitude; the app must too, or the whole save is nacked at decode with the
+ * field unnamed — the same drift [K_MAINTENANCE_TIMEOUT_MAX_MS] guards against.
+ */
+const val K_SEND_DURATION_MAX_MS = 10_000L
+
+/**
+ * The `key_mv` range for an `OUT_VOLTAGE` action, mirroring the firmware's
+ * `uint16` field and spec 6.2's output envelope.
+ *
+ * The firmware decodes `key_mv` with `ReadU16` (ConfigCodec.cpp), so a value above
+ * 65535 is refused at decode and nacks the WHOLE save with the field unnamed — and
+ * 0 is separately refused in range by `ValidateAction` ("OUT_VOLTAGE needs a
+ * key_mv"), because 0 means "absent" rather than a reachable level. The picker's
+ * Apply gate uses these so it cannot commit a value `ConfigJson.problems()` would
+ * then reject on the user's behalf.
+ */
+const val K_KEY_MV_MIN = 1
+const val K_KEY_MV_MAX = 65535
+
 /** Spec 3.5: `SWC1 | SWC2 | AUX1 | AUX2 | AUX3 | ANY`. `ANY` is a real value. */
 @Serializable
 enum class BindingChannel(val wireName: String) {

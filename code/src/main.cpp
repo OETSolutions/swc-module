@@ -71,35 +71,49 @@ extern "C" void app_main(void)
     }
 
     if (EspHalCalibrationIsDegraded()) {
-        // Reported, not silent (spec 3.2). The orchestrator also plays
-        // BOOT_DEGRADED for this class of condition.
+        // Reported, not silent (spec 3.2). This console log names the cause at
+        // init; the orchestrator ALSO plays BOOT_DEGRADED for this class of
+        // condition, and the flag below is how it learns -- the buzzer is the
+        // signal a user at the bench hears with no host attached. It is passed
+        // rather than read inside the orchestrator because the orchestrator's
+        // translation unit is host-compiled and cannot name EspHal.
         ESP_LOGW(TAG, "ADC calibration degraded: linear approximation in use");
     }
 
     // Create establishes the safe idle output before returning (FR-13), which is
     // why the link is started only after this call and never before it.
-    SystemOrchestrator *sys = SystemOrchestratorCreate(hal);
+    SystemOrchestrator *sys = SystemOrchestratorCreate(hal, EspHalCalibrationIsDegraded());
     if (sys == NULL) {
         ESP_LOGE(TAG, "orchestrator alloc failed; cannot reach safe idle. Rebooting.");
         vTaskDelay(pdMS_TO_TICKS(5000));
         esp_restart();
     }
-    if (!SystemOrchestratorSafeIdle(sys)) {
-        ESP_LOGE(TAG, "safe idle NOT established -- output state is unverified");
+    if (!SystemOrchestratorOutputVerified(sys)) {
+        ESP_LOGE(TAG, "output NOT verified -- safe idle unestablished or a DAC write failed");
         // Deliberately NOT marked valid: see the mark-valid call below.
     }
 
     // FR-37: mark valid only once the device has PROVEN it can do its job --
-    // the safe idle is established and the output is reachable. Marking this at
-    // the top of app_main would confirm an image that boots but cannot drive the
-    // DAC, stranding the user with a bricked-but-"valid" device and no rollback.
+    // the safe idle is established AND the output is actually reachable. Marking
+    // this at the top of app_main would confirm an image that boots but cannot
+    // drive the DAC, stranding the user with a bricked-but-"valid" device and no
+    // rollback.
     //
-    // This is the line that decides whether a bad image is recoverable, so the
-    // condition above it matters more than the call itself. `esp_ota_mark_app_
-    // valid_cancel_rollback` is a no-op when the running image was not started
-    // from a pending-verify state (the normal case after a successful boot), so
-    // calling it unconditionally on the good path is correct.
-    if (SystemOrchestratorSafeIdle(sys)) {
+    // **The condition must be able to be FALSE, and that is the whole point.**
+    // It used to read `SystemOrchestratorSafeIdle()`, which returns
+    // `safe_idle_established_` -- a flag assigned `true` once, at the end of an
+    // `EstablishSafeIdle()` that returns void and cannot fail. The gate was a
+    // compile-time constant `true` on the device path, so spec §9.8's "an image
+    // that boots but cannot drive the DAC is not healthy" was exactly the case it
+    // could not detect: a dead I2C bus still cancelled the pending rollback.
+    // `SystemOrchestratorOutputVerified` folds in the HAL's latched
+    // `dac_faulted`, which a failed `i2c_master_transmit` sets and nothing
+    // clears -- that is the signal the gate needed to be able to say NO.
+    //
+    // `esp_ota_mark_app_valid_cancel_rollback` is a no-op when the running image
+    // was not started from a pending-verify state (the normal case after a
+    // successful boot), so calling it unconditionally on the good path is correct.
+    if (SystemOrchestratorOutputVerified(sys)) {
         const esp_err_t mark = esp_ota_mark_app_valid_cancel_rollback();
         if (mark != ESP_OK) {
             // Not fatal: the device works, it just will not be treated as

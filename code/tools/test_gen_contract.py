@@ -170,6 +170,64 @@ def test_router_inbound_commands_are_all_in_the_contract():
         f"router accepts commands absent from the contract: {sorted(missing)}")
 
 
+# `for_seq` is the one field a frame may carry ONLY as a reply (spec 4.3: the
+# periodic `status` answers nothing and carries none; the `ping` reply does). It
+# is therefore allowed to be absent from an emit site and is excluded from the
+# "declared fields must have a producer" direction below.
+_REPLY_ONLY_FIELDS = {"for_seq"}
+
+
+def _router_emitted_fields():
+    """The JSON keys each frame type actually carries on the wire.
+
+    Read from the router itself rather than from a second hand-kept list, because
+    a hand-kept list is exactly what went stale: `status`'s schema row named
+    three fields (`rail_mv`, `temp_c`, `heap_free`) that no firmware writes
+    (spec N-22), and `ack`'s named an `err` that no ack emits while omitting the
+    two fields `learn_commit`'s ack DOES carry. Both were invisible because
+    nothing compared the row to a producer.
+
+    Each `Emit("X", body)` is attributed to the `snprintf` that built `body`,
+    found by scanning back to the nearest `char ` declaration (the buffer's) --
+    the bodies are local and adjacent, and every emit site builds its body
+    immediately above it.
+    """
+    text = _read("lib/Link/CommandRouter.cpp")
+    key = re.compile(r'\\"([a-z_0-9]+)\\"\s*:')
+    out = {}
+    for m in re.finditer(r'Emit\("(\w+)"', text):
+        start = text.rfind("char ", 0, m.start())
+        start = max(start, text.rfind("\nvoid", 0, m.start()),
+                    text.rfind("\n}\n", 0, m.start()))
+        out.setdefault(m.group(1), set()).update(key.findall(text[start:m.start()]))
+    return out
+
+
+def test_frame_field_lists_match_the_router():
+    # The schema's `fields` column is the app's field vocabulary. Assert it in
+    # BOTH directions against the router's emit sites, so the two failure shapes
+    # that actually happened are each a failing test:
+    #   - a field declared but never emitted (N-22's `rail_mv`/`temp_c`/`heap_free`,
+    #     and `ack`'s `err`) is a field the app reads and never receives;
+    #   - a field emitted but never declared (`learn_commit`'s `mv_center`/
+    #     `mv_tolerance`) is a value the device sends and the app has no name for.
+    emitted = _router_emitted_fields()
+    for f in contract_schema.FRAMES:
+        if f.direction not in ("fw2app", "both"):
+            continue
+        declared = {x for x in f.fields.split(",") if x}
+        actual = emitted.get(f.name, set())
+        undeclared = actual - declared
+        assert not undeclared, (
+            f"`{f.name}` emits fields the contract does not declare: "
+            f"{sorted(undeclared)} -- the app cannot name them")
+        producerless = declared - actual - _REPLY_ONLY_FIELDS
+        assert not producerless, (
+            f"`{f.name}` declares fields no firmware writes: "
+            f"{sorted(producerless)} -- the app would read a field that never "
+            f"arrives (the N-22 shape)")
+
+
 def test_generated_header_matches_the_checked_in_copy(tmp_path):
     out = tmp_path / "swc_contract.h"
     subprocess.run([sys.executable, str(HERE / "gen_contract.py"), "--out", str(out)],

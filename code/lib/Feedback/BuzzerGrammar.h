@@ -49,6 +49,19 @@ public:
     void Update(uint64_t now_ms);
     bool Busy() const { return playing_; }
 
+    /*
+     * Adopt a new feedback level WITHOUT disturbing a pattern in flight.
+     *
+     * A config that arrives over the link carries `settings.buzzer_level`, and the
+     * obvious `buzzer_ = BuzzerGrammar(hal_, new_level)` is a bug: the freshly
+     * constructed object has `pattern_ == kNone`, so it SILENTLY CANCELS whatever
+     * is playing. The learn wizard owns the buzzer as its prompt while it runs, and
+     * a config push can land mid-learn -- the user's prompt would stop with no
+     * explanation. Same reasoning as `LedGrammar::SetLevel` and
+     * `MaintenanceMode::SetTimeout`.
+     */
+    void SetLevel(uint8_t level) { level_ = level; }
+
 private:
     // Whether `level_ == 0` may suppress this pattern. Spec 7.2: OFF silences
     // everything except BOOT_ERROR and FAULT_*. A device that cannot serve

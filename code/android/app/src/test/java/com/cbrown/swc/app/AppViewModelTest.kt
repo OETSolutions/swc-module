@@ -1,6 +1,7 @@
 package com.oetsolutions.swc.app
 
 import com.oetsolutions.swc.link.Frame
+import com.oetsolutions.swc.link.LinkProblem
 import com.oetsolutions.swc.link.LinkState
 import com.oetsolutions.swc.link.SwcClient
 import com.oetsolutions.swc.link.SwcTransport
@@ -13,6 +14,9 @@ import com.oetsolutions.swc.model.sampleConfig
 import com.oetsolutions.swc.ui.UpdateStatus
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.launch
@@ -57,6 +61,14 @@ class AppViewModelTest {
         suspend fun emit(text: String) = flow.emit(text.toByteArray())
         fun lastType(): String = written.lastOrNull()
             ?.let { Regex("\"type\":\"([^\"]+)\"").find(it)?.groupValues?.get(1) } ?: ""
+
+        /** Counts re-enumerations, so the retry test can prove one happened. */
+        var reopened = 0
+        var reopenProblem: LinkProblem? = null
+        override suspend fun reopen(): LinkProblem? {
+            ++reopened
+            return reopenProblem
+        }
     }
 
     /**
@@ -412,8 +424,16 @@ class AppViewModelTest {
             vm.bindings.value.cells.first { it.buttonId == "next" && it.gesture == "SINGLE" }
                 .action?.kind)
         // ...and the failure is stated rather than swallowed.
-        assertTrue("a refused save must report a problem, got ${vm.bindings.value.problems}",
-            vm.bindings.value.problems.isNotEmpty())
+        assertNotNull("a refused save must state the failure",
+            vm.bindings.value.saveError)
+        // **And it must NOT gate the Save button.** A runtime nack is not a
+        // validation problem, but it used to be written into `problems` -- the very
+        // field the screen reads as `enabled = problems.isEmpty()` -- so a timeout
+        // disabled Save while the pending edit still showed in its cell. The user
+        // could not retry, and the only recovery was to edit an unrelated cell.
+        assertTrue("a save failure must leave the button usable for a retry, " +
+            "got problems=${vm.bindings.value.problems}",
+            vm.bindings.value.problems.isEmpty())
     }
 
     @Test
@@ -508,6 +528,64 @@ class AppViewModelTest {
             buttons.contains("next"))
         assertTrue("and the still-valid edit must survive: $buttons",
             buttons.contains("vol_up"))
+    }
+
+    @Test
+    fun `an edit on a headless-learned button produces an id the device accepts`() = runTest {
+        // The app DERIVES a binding id as `"${button}-${gesture}"`. A button id
+        // that came from the headless learn (the ONLY production learn path -- no
+        // app, no host) is `swc1_bt<n>`, so slot 10 and up derive
+        // `swc1_bt10-SINGLE`: EXACTLY 16 characters, which is `ConfigModel.h`'s
+        // `kBindingIdLen` and therefore refused by `ConfigJson.problems()`
+        // ("id must be under 16 chars"). The refusal is not a warning -- it
+        // disables the Save button, so the user's edit to that button can never be
+        // sent at all. The app was generating an id its own validator rejects.
+        val t = FakeTransport()
+        var saved: com.oetsolutions.swc.model.Config? = null
+        val vm = AppViewModel(SwcClient(t), scope = vmScope(), saveConfig = { c -> saved = c; true })
+        started(vm)
+
+        val base = sampleConfig()
+        // A ladder the AUX1 wizard built: slot 10's generated slug, a real id the
+        // device stores and the app's grid shows.
+        val learned = base.copy(
+            channels = listOf(
+                base.channels[0].copy(
+                    ladder = base.channels[0].ladder.copy(
+                        buttons = base.channels[0].ladder.buttons +
+                            com.oetsolutions.swc.model.LadderButton(
+                                "swc1_bt10", "Button 10", 1700, 110, 3300, 235, 200, 98,
+                            ),
+                    ),
+                ),
+            ),
+            bindings = emptyList(),
+        )
+        configRun(learned).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        val cell = vm.bindings.value.cells
+            .first { it.buttonId == "swc1_bt10" && it.gesture == "SINGLE" }
+        vm.editBinding(cell, com.oetsolutions.swc.model.Action(ActionKind.OUT_VOLTAGE, keyMv = 2000))
+        advanceUntilIdle()
+
+        assertTrue(
+            "an edit on a headless-learned button must not be refused by the app's own " +
+                "id-width check: ${vm.bindings.value.problems}",
+            vm.bindings.value.problems.isEmpty(),
+        )
+
+        vm.save()
+        advanceUntilIdle()
+
+        assertNotNull("the save must reach the device", saved)
+        val added = saved!!.bindings
+            .firstOrNull { it.button == "swc1_bt10" && it.gesture == Gesture.SINGLE }
+        assertNotNull("the edited cell must appear as a binding in what is sent", added)
+        assertTrue(
+            "the derived binding id must fit kBindingIdLen: '${added!!.id}'",
+            added.id.length < 16,
+        )
     }
 
     @Test
@@ -921,6 +999,38 @@ class AppViewModelTest {
     }
 
     @Test
+    fun `a learn stream sample of zero blanks the reading rather than holding the last`() = runTest {
+        // `EmitLadderSample` emits `level_mv: 0` as the device's "NO READING" --
+        // there is no orchestrator to sample, or the conversion is unreadable or
+        // stale -- and its own comment states the contract: "0 mV is unambiguous:
+        // it is below the ladder's floor, so the app renders it as 'no reading'
+        // rather than as a real level."
+        //
+        // The app did the opposite: `level > 0` dropped the frame entirely, so the
+        // last real millivolt reading stayed on screen. During a learn -- the one
+        // screen the user watches to decide whether a press was recognised -- that
+        // is a number the device has already abandoned, and it is indistinguishable
+        // from a live one. The frame carries no `no reading` flag of its own, so a
+        // reading that never blanks is exactly the stale-value lie the producer's
+        // comment exists to prevent.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+        configRun(sampleConfig()).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        t.emit(frame("ladder_sample", "channel" to "0", "level_mv" to "1900", "n" to "10"))
+        advanceUntilIdle()
+        assertEquals("the real reading is shown first", 1900, vm.ladder.value.liveMv)
+
+        t.emit(frame("ladder_sample", "channel" to "0", "level_mv" to "0", "n" to "11"))
+        advanceUntilIdle()
+        assertEquals(
+            "a zero must blank the reading, not leave the stale one on screen",
+            null, vm.ladder.value.liveMv)
+    }
+
+    @Test
     fun `a link_gap frame is counted, not dropped`() = runTest {
         // Spec 4.3: the firmware emits `link_gap` when one of the app's outgoing
         // frames was lost. The app defined `Frames.LINK_GAP` and handled it
@@ -952,6 +1062,44 @@ class AppViewModelTest {
         advanceUntilIdle()
 
         assertEquals(3, vm.link.value.lostFrames)
+    }
+
+    @Test
+    fun `the device's own loss counters reach the screen`() = runTest {
+        // N-24 and its inbound twin. Both transport counters existed on the device
+        // and were read by nothing but a unit test -- `DroppedFrames` even
+        // documented itself as "the failure this class exists to prevent, so it
+        // must be observable", while no user could observe it. The router now
+        // reports them in `status`; this asserts the other half, that the app
+        // STORES them rather than parsing past them.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(frame("status", "tx_dropped" to "2", "rx_overflows" to "1"))
+        advanceUntilIdle()
+
+        assertEquals("outbound losses must reach the screen", 2, vm.link.value.deviceTxDropped)
+        assertEquals("inbound overflows must reach the screen", 1, vm.link.value.deviceRxOverflows)
+    }
+
+    @Test
+    fun `a status without the loss counters leaves them alone`() = runTest {
+        // The fields are cumulative on the device and absent from an older
+        // firmware's `status`. Absent must mean "unchanged", not "reset to zero":
+        // zeroing would erase the evidence of a loss the user is looking at, on
+        // the very next 2 s keepalive.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(frame("status", "tx_dropped" to "2", "rx_overflows" to "1"))
+        advanceUntilIdle()
+        t.emit(frame("status"))   // a frame carrying no loss fields at all
+        advanceUntilIdle()
+
+        assertEquals(2, vm.link.value.deviceTxDropped)
+        assertEquals(1, vm.link.value.deviceRxOverflows)
     }
 
     @Test
@@ -1019,6 +1167,16 @@ class AppViewModelTest {
 
         assertTrue("a blocked action must be reported",
             vm.actionOutcomes.value.any { it.contains("refused") })
+        // ...AND REACH THE SCREEN. `actionOutcomes` was produced and read by no
+        // screen and not by `MainActivity`, so the failure was computed, worded
+        // and dropped: the user's evidence was a button that did nothing, which
+        // is the outcome this whole type exists to prevent. The link state is
+        // what `LinkScreen` renders, so the message must appear there too.
+        assertTrue(
+            "the failure must be mirrored into the state the Link screen renders: " +
+                "${vm.link.value.actionProblems}",
+            vm.link.value.actionProblems.any { it.contains("refused") },
+        )
     }
 
     @Test
@@ -1335,6 +1493,68 @@ class AppViewModelTest {
         t.emit("{\"v\":1,\"seq\":3,\"type\":\"ack\",\"for_seq\":$exitSeq,\"ok\":true}\n")
         advanceUntilIdle()
         assertFalse("an acked exit closes it", vm.link.value.maintenanceOpen)
+    }
+
+    @Test
+    fun `retry re-enumerates the bus rather than re-pinging a dead transport`() = runTest {
+        // **"Try again" could not recover anything.** It called `connect()`, which
+        // sends a `ping`; `UsbSerialTransport.write` returns early when no
+        // connection is open, so on the exact failure the button exists for -- the
+        // device was not plugged in when the app started, and nothing ever
+        // enumerated again -- the retry wrote nothing and re-reported the same
+        // problem forever.
+        val t = FakeTransport()
+        t.reopenProblem = LinkProblem.NoDevice
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        vm.retry()
+        advanceUntilIdle()
+
+        assertEquals("a retry must re-run enumeration", 1, t.reopened)
+        assertEquals(LinkProblem.NoDevice, vm.link.value.problem)
+
+        // Once the device appears, the same button must connect: the enumeration
+        // succeeds and a frame goes out.
+        t.reopenProblem = null
+        vm.retry()
+        advanceUntilIdle()
+        assertEquals(2, t.reopened)
+        assertNull("a successful reopen must clear the stale problem", vm.link.value.problem)
+        assertTrue("the retry must actually talk to the device now",
+            t.written.isNotEmpty())
+    }
+
+    @Test
+    fun `close cancels the view model's own scope so its collectors do not leak`() = runTest {
+        // The other half of `onDestroy`: it closed the transport but never cancelled
+        // the view model's coroutines, so the five collectors and the never-returning
+        // `client.run()` kept the whole object graph alive after the activity was
+        // gone. `client.run()` cannot stop on its own, so cancelling the scope is the
+        // only thing that ends it.
+        val t = FakeTransport()
+        val owned = CoroutineScope(SupervisorJob() + StandardTestDispatcher(testScheduler))
+        val vm = AppViewModel(SwcClient(t), scope = owned, ownsScope = true)
+        started(vm)
+
+        assertTrue("the harness scope must be live before close",
+            owned.isActive)
+        vm.close()
+        assertFalse("close must cancel a scope this view model owns", owned.isActive)
+    }
+
+    @Test
+    fun `close leaves an injected scope alive`() = runTest {
+        // The tests pass their own scope on the test scheduler; cancelling it would
+        // tear down the harness. Only a scope the view model created is its to end.
+        val t = FakeTransport()
+        val injected = vmScope()
+        val vm = AppViewModel(SwcClient(t), scope = injected, ownsScope = false)
+        started(vm)
+
+        vm.close()
+        assertTrue("an injected scope is the caller's to cancel", injected.isActive)
+        injected.cancel()
     }
 
     // --- helpers -----------------------------------------------------------

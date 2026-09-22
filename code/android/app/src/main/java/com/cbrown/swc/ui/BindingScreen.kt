@@ -32,6 +32,8 @@ import androidx.compose.ui.unit.dp
 import com.oetsolutions.swc.contract.ActionKind
 import com.oetsolutions.swc.model.Action
 import com.oetsolutions.swc.model.BindingChannel
+import com.oetsolutions.swc.model.K_KEY_MV_MAX
+import com.oetsolutions.swc.model.K_KEY_MV_MIN
 
 /**
  * The bindings grid: buttons × gestures, each cell a bound action.
@@ -142,6 +144,17 @@ fun BindingScreen(
                 }
             }
         }
+        // A save FAILURE, rendered separately from the validation problems above
+        // and deliberately NOT gating the button below: the user must be able to
+        // retry. See BindingUiState.saveError.
+        state.saveError?.let { err ->
+            Card(Modifier.fillMaxWidth()) {
+                Column(Modifier.padding(12.dp)) {
+                    Text("Save failed", style = MaterialTheme.typography.titleSmall)
+                    Text(err, style = MaterialTheme.typography.bodySmall)
+                }
+            }
+        }
         Button(onClick = onSave, enabled = state.problems.isEmpty()) { Text("Save to device") }
     }
 }
@@ -193,7 +206,26 @@ data class BindingCell(
 
 data class BindingUiState(
     val cells: List<BindingCell> = emptyList(),
+    /**
+     * VALIDATION problems: the local config cannot legally be sent. These are what
+     * gate [BindingScreen]'s Save button, because they are things the user can fix
+     * by editing a cell.
+     */
     val problems: List<String> = emptyList(),
+    /**
+     * The result of the last SAVE ATTEMPT: a nack, a timeout, a refused link.
+     *
+     * **Keep this separate from [problems], and never gate Save on it.** A runtime
+     * failure is not a validation failure, but it used to be written into the same
+     * `problems` list the button reads as `enabled = problems.isEmpty()`. A device
+     * nack or a timeout therefore DISABLED Save: the pending edit was still shown
+     * in the cell, so the user's change looked live, but they could not retry --
+     * "Try again" was a button that no longer existed. The only recovery was to
+     * edit an unrelated cell, which re-sent the same config.
+     *
+     * A save failure must be *shown* and must leave Save *enabled*.
+     */
+    val saveError: String? = null,
 )
 
 /**
@@ -214,6 +246,19 @@ fun ActionPicker(
     var payload by remember { mutableStateOf(current?.payload ?: "") }
     var keyMv by remember { mutableStateOf(current?.keyMv?.toString() ?: "") }
     var expanded by remember { mutableStateOf(false) }
+
+    // OUT_VOLTAGE carries its parameter as a NUMBER (`key_mv`) rather than in the
+    // `target` string, so `needsParam` alone does not describe what it needs and
+    // the Apply gate below has to ask for it separately. Without this the gate
+    // read `!needsParam || target.isNotEmpty()`, which for OUT_VOLTAGE is
+    // `!false || ...` -- always true. Apply was therefore enabled on an empty
+    // field and committed `keyMv = 0`, which `ConfigJson.problems()` refuses
+    // ("OUT_VOLTAGE needs a key_mv") -- disabling Save for the WHOLE config with a
+    // message naming an ordinal binding id the grid never shows, so the user could
+    // not tell which cell to fix.
+    val keyMvValue = keyMv.trim().toIntOrNull()
+    val keyMvOk = kind != ActionKind.OUT_VOLTAGE ||
+        (keyMvValue != null && keyMvValue in K_KEY_MV_MIN..K_KEY_MV_MAX)
 
     Column(modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Box {
@@ -271,13 +316,22 @@ fun ActionPicker(
                     )
                 )
             },
-            enabled = !kind.needsParam || target.isNotEmpty(),
+            // The gate must ask for whatever the KIND actually needs: a target
+            // string for the `needsParam` kinds, and a usable key_mv for
+            // OUT_VOLTAGE, whose parameter is a number. See `keyMvOk`.
+            enabled = (!kind.needsParam || target.isNotEmpty()) && keyMvOk,
         ) {
             Text("Apply")
         }
         if (kind.needsParam && target.isEmpty()) {
             Text(
                 "${kind.wireName} needs a ${kind.paramKey}",
+                style = MaterialTheme.typography.bodySmall,
+            )
+        }
+        if (!keyMvOk) {
+            Text(
+                "key_mv must be a whole number between $K_KEY_MV_MIN and $K_KEY_MV_MAX mV",
                 style = MaterialTheme.typography.bodySmall,
             )
         }

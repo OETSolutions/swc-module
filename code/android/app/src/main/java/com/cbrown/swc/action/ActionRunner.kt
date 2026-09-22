@@ -100,13 +100,32 @@ class ActionRunner(private val context: Context) {
     private fun launchPackage(pkg: String): ActionOutcome {
         if (pkg.isEmpty()) return ActionOutcome.NoHandler(pkg)
         val intent = context.packageManager.getLaunchIntentForPackage(pkg)
-            ?: return ActionOutcome.AppNotInstalled(pkg)
+        // **A null here is NOT "not installed".** `getLaunchIntentForPackage`
+        // honors Android 11's package-visibility filtering, so it returns null for
+        // an app that IS installed but is not visible to us. The manifest's
+        // `<queries>` widens what we can see, but it cannot be complete: the user
+        // picks the package at runtime, so a package we never declared stays
+        // invisible. Reporting [AppNotInstalled] on a null would tell the user to
+        // install something already installed -- and it would REPLACE a launch that
+        // works, because startActivity does not need visibility at all. So fall
+        // back to the explicit (package-named) intent, which needs no query and no
+        // visibility, and let the launch itself be the test.
+        val target = intent ?: Intent(Intent.ACTION_MAIN).apply {
+            addCategory(Intent.CATEGORY_LAUNCHER)
+            setPackage(pkg)
+        }
         // FLAG_ACTIVITY_NEW_TASK is required to start an activity from a
         // non-activity context, which is the only context this runs in.
-        intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        target.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         return try {
-            context.startActivity(intent)
+            context.startActivity(target)
             ActionOutcome.Ran
+        } catch (e: android.content.ActivityNotFoundException) {
+            // Only NOW does "not installed" have evidence: the system rejected the
+            // launch, so no activity exists for this package. This is the branch the
+            // old null-check was standing in for, and it is reachable only after
+            // actually trying.
+            ActionOutcome.AppNotInstalled(pkg)
         } catch (e: SecurityException) {
             // BAL hardening surfaces here: the system refuses a background activity
             // start. Reported as a security refusal so the user learns the role or
@@ -127,19 +146,16 @@ class ActionRunner(private val context: Context) {
         if (data.isNotEmpty()) intent.data = Uri.parse(data)
         intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
 
-        // Resolve BEFORE starting. `startActivity` throws ActivityNotFoundException
-        // for an unhandled intent, and a resolved check lets us say which of the two
-        // problems it is -- no such package, or no handler for the action.
-        val resolved = try {
-            context.packageManager.queryIntentActivities(intent, 0)
-        } catch (e: Exception) {
-            emptyList()
-        }
-        if (resolved.isEmpty()) return ActionOutcome.NoHandler(action)
-
         return try {
             context.startActivity(intent)
             ActionOutcome.Ran
+        } catch (e: android.content.ActivityNotFoundException) {
+            // The system found no handler for the action. The message is the same as
+            // the old pre-query version's, but the DETECTION is now the launch
+            // itself rather than `queryIntentActivities`, which Android 11's
+            // visibility filtering can empty out for an intent the system can in
+            // fact resolve -- reporting [NoHandler] for a perfectly good action.
+            ActionOutcome.NoHandler(action)
         } catch (e: SecurityException) {
             ActionOutcome.Blocked(
                 "Android refused to send $action from the background. Grant SWC " +

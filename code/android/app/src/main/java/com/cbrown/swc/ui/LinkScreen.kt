@@ -41,6 +41,16 @@ data class LinkUiState(
      * rest would show a state the app has no evidence for.
      */
     val maintenanceOpen: Boolean = false,
+    /**
+     * How long the device's maintenance window lasts, from the config's own
+     * `maintenance_timeout_ms` (spec 8.2 bounds it to `(0, K_MAINTENANCE_TIMEOUT_MAX_MS]`).
+     *
+     * Carried rather than written into the card's copy as a literal: the window is a
+     * SETTING, so a device configured for 20 minutes must not be described to the
+     * user as 5. Defaulted to the firmware's own 300000 so a screen rendered before
+     * the first config arrives still says something true.
+     */
+    val maintenanceTimeoutMs: Long = 300_000L,
     /** Set while the enter/exit request is in flight, so the button cannot double-fire. */
     val maintenanceBusy: Boolean = false,
     /** Why the last maintenance request did not take effect. Null when it did. */
@@ -74,6 +84,44 @@ data class LinkUiState(
      * from "the bytes never arrived".
      */
     val lostFrames: Int = 0,
+    /**
+     * Frames the DEVICE's transport refused: outbound (`tx_dropped`, its TX
+     * buffer was full) and inbound (`rx_overflows`, its staging ring overflowed).
+     *
+     * The other direction from [lostFrames]. Both counters existed on the device
+     * and were read by nothing but a unit test -- `DroppedFrames` even documents
+     * itself as "the failure this class exists to prevent, so it must be
+     * observable", while no user could observe it. An inbound overflow means a
+     * command the app sent was DISCARDED before the firmware parsed it, so the
+     * operation fails with no nack and no error: from the app's side it is
+     * indistinguishable from a device that ignored the request, which is exactly
+     * what `link_gap` was added for at the app-to-device boundary.
+     *
+     * Cumulative since the device BOOTED -- the transport increments them and
+     * never clears them, not even across a disconnect (spec 4.4 makes reconnect
+     * stateless for what is IN FLIGHT, and a loss count is a history, not flight
+     * state). So a non-zero value means "this cable has lost frames", not
+     * "something just broke", and the count keeps rising over a long session
+     * rather than resetting each time the app reconnects.
+     */
+    val deviceTxDropped: Int = 0,
+    val deviceRxOverflows: Int = 0,
+    /**
+     * App-side actions the device's press asked for and this app could not run.
+     *
+     * Spec 3.6 splits the library: the `OUT_` family is the firmware's and
+     * everything else is Android's. The device confirms a recognized press with
+     * `event` and releases the line for an app-side kind rather than hold a key
+     * with no action behind it, so when the app cannot run its half the press is
+     * silent on BOTH sides -- nothing on the wire and nothing on the phone.
+     *
+     * `AppViewModel.actionOutcomes` computed exactly this and NO screen rendered
+     * it, so the user's only evidence was a button that did nothing. The most
+     * recent press's outcome is what is shown: `runAppSideAction` replaces the
+     * list rather than appending, so the message describes the last press rather
+     * than accumulating one line per press for the rest of the session.
+     */
+    val actionProblems: List<String> = emptyList(),
 ) {
     /**
      * The config fault to show, or null when there is nothing to say.
@@ -92,6 +140,30 @@ data class LinkUiState(
                     "Check the Bindings screen to confirm your buttons are right."
             else -> null
         }
+}
+
+/**
+ * The maintenance window's length, in words.
+ *
+ * **It says how long the window lasts, NOT "of inactivity", and that distinction
+ * is the whole point.** Spec 8.2 and FR-38 both describe the close as "5 minutes
+ * of INACTIVITY", but the firmware closes on a FIXED deadline from entry: nothing
+ * calls `NoteActivity`, so no user action extends the window (spec open item
+ * N-35). Copy promising that "activity" keeps it open told the user a behaviour
+ * the device does not have — and this card is where they would notice, since a
+ * user typing a password is exactly the person N-35 says gets closed out. The
+ * wording is derived from what the firmware does, not from the spec's intent.
+ *
+ * **Rounded UP, never down.** Telling a user the window is shorter than it is
+ * makes them rush; telling them it is longer is how they get cut off mid-task. A
+ * sub-minute timeout (legal: the codec accepts any value in the range) is
+ * therefore "under a minute" rather than "0 minutes".
+ */
+internal fun describeTimeout(timeoutMs: Long): String {
+    if (timeoutMs <= 0) return "after a short delay"
+    if (timeoutMs < 60_000L) return "after under a minute"
+    val minutes = (timeoutMs + 59_999L) / 60_000L
+    return if (minutes == 1L) "after 1 minute" else "after $minutes minutes"
 }
 
 /**
@@ -155,6 +227,45 @@ fun LinkScreen(
             }
         }
 
+        val deviceLoss = state.deviceTxDropped + state.deviceRxOverflows
+        if (deviceLoss > 0) {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFF3E0)),
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("The adapter lost frames", style = MaterialTheme.typography.titleMedium)
+                    Text(
+                        buildString {
+                            append("The adapter's own link dropped ")
+                            append(deviceLoss)
+                            append(if (deviceLoss == 1) " frame" else " frames")
+                            append(":\n")
+                            if (state.deviceTxDropped > 0) {
+                                append("  \u2022 ")
+                                append(state.deviceTxDropped)
+                                append(" it could not send (USB buffer full)")
+                                append("\n")
+                            }
+                            if (state.deviceRxOverflows > 0) {
+                                append("  \u2022 ")
+                                append(state.deviceRxOverflows)
+                                append(" it could not receive (came in faster than it ")
+                                append("could parse)")
+                            }
+                        }.trimEnd(),
+                        style = MaterialTheme.typography.bodyMedium,
+                    )
+                    Text(
+                        "A frame the adapter could not receive was discarded BEFORE it " +
+                            "was parsed, so the command may have failed with no error " +
+                            "at all. Re-seat the USB cable and try the operation again.",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
+            }
+        }
+
         if (state.lostFrames > 0) {
             Card(
                 Modifier.fillMaxWidth(),
@@ -168,6 +279,33 @@ fun LinkScreen(
                             " missing on the link. A command may not have reached the " +
                             "device. Check the USB cable and try the operation again.",
                         style = MaterialTheme.typography.bodyMedium,
+                    )
+                }
+            }
+        }
+
+        /*
+         * An app-side action the device asked this phone to run and the phone
+         * refused. Its own card, and NOT folded into the device-warning list
+         * above: those come from the device over `log`, while this happened HERE,
+         * and the fix is on the phone (a permission, another app) rather than on
+         * the adapter. Merging them would send the user to check the wrong end.
+         */
+        if (state.actionProblems.isNotEmpty()) {
+            Card(
+                Modifier.fillMaxWidth(),
+                colors = CardDefaults.cardColors(containerColor = Color(0xFFFFEBEE)),
+            ) {
+                Column(Modifier.padding(16.dp)) {
+                    Text("A button's action did not run", style = MaterialTheme.typography.titleMedium)
+                    state.actionProblems.forEach {
+                        Text(it, style = MaterialTheme.typography.bodyMedium)
+                    }
+                    Text(
+                        "The adapter still sent the key press. This is the phone's half " +
+                            "of the action (spec 3.6) — the button itself is configured " +
+                            "correctly.",
+                        style = MaterialTheme.typography.bodySmall,
                     )
                 }
             }
@@ -208,12 +346,29 @@ fun LinkScreen(
                 Text("Maintenance mode", style = MaterialTheme.typography.titleMedium)
                 Text(
                     if (state.maintenanceOpen) {
-                        "The device's WiFi is on. Connect to its setup page to " +
-                            "configure WiFi or update the firmware. It returns to " +
-                            "normal by itself after 5 minutes of no activity."
+                        // **It must NOT claim the radio is up.** The device acks
+                        // `maintenance_enter` and enters the mode -- it records the
+                        // trigger, lights `LED_STAT` and runs the window's clock --
+                        // but nothing brings up NimBLE, `wifi_provisioning` or the
+                        // web server: `MaintenanceMode` is pure state and the
+                        // plan's `MaintenanceStartRadio()` does not exist (spec open
+                        // item N-15). So "the WiFi is on, connect to its setup page"
+                        // was the N-39 shape one layer out -- the N-35/N-39 repairs
+                        // corrected this same card's TIMEOUT wording on the rule that
+                        // it must describe what the device does, and left this
+                        // sentence asserting a radio that never comes up. A user
+                        // hunting for an access point that does not exist is the
+                        // concrete harm; saying the mode is open and the network is
+                        // not yet available is the truthful version.
+                        "The device is in maintenance mode. Its WiFi setup page is " +
+                            "not available yet -- this build does not start the " +
+                            "device's radio. The mode returns to normal by itself " +
+                            "${describeTimeout(state.maintenanceTimeoutMs)}."
                     } else {
-                        "Turn the device's WiFi on, so it can be configured or " +
-                            "updated over the network."
+                        "Put the device into maintenance mode. This build does not " +
+                            "start the device's radio yet, so it does not bring up a " +
+                            "WiFi setup page; the mode is the state the provisioning " +
+                            "and network-update paths will use once the radio is wired."
                     },
                     style = MaterialTheme.typography.bodyMedium,
                 )

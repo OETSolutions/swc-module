@@ -28,6 +28,7 @@
 #include "esp_system.h"
 #include "esp_timer.h"
 #include "nvs.h"
+#include "nvs_flash.h"
 
 static const char *TAG = "esp_hal";
 
@@ -42,7 +43,8 @@ struct EspHalState {
     bool                      cali_degraded;
     i2c_master_bus_handle_t   i2c_bus;
     i2c_master_dev_handle_t   dac;
-    bool                      nvs_open;
+    // Latched by any failed DAC write. See HalDacSetCode and IHAL::dac_faulted.
+    bool                      dac_failed = false;
 };
 
 static EspHalState g_state;
@@ -143,7 +145,7 @@ static void HalDacSetCode(void *ctx, DacChannel ch, uint16_t code)
 
     // Which MCP4728 output: A=KEY1, B=ADJ1, C=KEY2, D=ADJ2 (DESIGN.md 4.3).
     uint8_t dac_sel;
-    if (!DacFrame::SelectForChannel(ch, &dac_sel)) return;
+    if (!DacFrame::SelectForChannel(static_cast<uint8_t>(ch), &dac_sel)) return;
 
     // Multi-write, one channel: THREE bytes, with the command type, the channel
     // select and UDAC packed into byte 0 (DS22187E Figure 5-8). DacFrame.h owns
@@ -170,7 +172,20 @@ static void HalDacSetCode(void *ctx, DacChannel ch, uint16_t code)
     esp_err_t err = i2c_master_transmit(g_state.dac, frame, sizeof(frame), 100);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "dac write failed: %s", esp_err_to_name(err));
+        // LATCHED, and never cleared: spec 7.3's reboot-only rule covers exactly
+        // this (a hardware condition that does not fix itself). FR-37's health
+        // gate reads it through `dac_faulted` -- without it the gate had no
+        // signal that could say NO, so it was constant-true and would confirm a
+        // bricked image. The return type stays `void` (N-21); this is the
+        // accessor that makes a failed write observable without one.
+        g_state.dac_failed = true;
     }
+}
+
+static bool HalDacFaulted(void *ctx)
+{
+    (void)ctx;
+    return g_state.dac_failed;
 }
 
 static void HalDacPowerMode(void *ctx, DacChannel ch, DacPowerMode mode)
@@ -179,7 +194,7 @@ static void HalDacPowerMode(void *ctx, DacChannel ch, DacPowerMode mode)
     if (g_state.dac == NULL) return;
 
     uint8_t dac_sel;
-    if (!DacFrame::SelectForChannel(ch, &dac_sel)) return;
+    if (!DacFrame::SelectForChannel(static_cast<uint8_t>(ch), &dac_sel)) return;
 
     // Power-down replaces the top data bits, so the code field is 12 bits and
     // PD1:PD0 sits above them in byte 1 (DacFrame::EncodeSet). The MCP4728 has
@@ -198,6 +213,10 @@ static void HalDacPowerMode(void *ctx, DacChannel ch, DacPowerMode mode)
     esp_err_t err = i2c_master_transmit(g_state.dac, frame, sizeof(frame), 100);
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "dac power-mode write failed: %s", esp_err_to_name(err));
+        // Same latch as the code write: a gain-mode write that did not land
+        // leaves the output on the wrong gain, which is precisely "cannot do its
+        // job" for FR-37's gate.
+        g_state.dac_failed = true;
     }
 }
 
@@ -251,7 +270,6 @@ static uint64_t HalNowUs(void *ctx)
 static int HalNvsGet(void *ctx, const char *key, void *out, size_t len)
 {
     (void)ctx;
-    if (!g_state.nvs_open) return -1;
     nvs_handle_t h;
     if (nvs_open(SWC_NVS_NAMESPACE, NVS_READONLY, &h) != ESP_OK) return -1;
 
@@ -275,7 +293,15 @@ static int HalNvsSet(void *ctx, const char *key, const void *in, size_t len)
     esp_err_t err = nvs_set_blob(h, key, in, len);
     if (err == ESP_OK) err = nvs_commit(h);
     nvs_close(h);
-    return (err == ESP_OK) ? (int)len : -1;
+    // 0 on success, nonzero on failure -- the SAME contract MockHal::NvsSet
+    // keeps. It used to return `len` on success, and every consumer treats
+    // nonzero as a write failure (`ConfigStore::WriteSlot`'s `!= 0`), so on a
+    // real device EVERY NVS write read as failed: Save() always returned false,
+    // cfg_seq never advanced, and a config or a headless learn could never
+    // persist -- while passing on the host, where the mock returns 0. The
+    // on-device suite asserts `== 0` (test/test_hw/TestEspHal.c), so this was a
+    // contract the two HALs disagreed on with no host test able to see it.
+    return (err == ESP_OK) ? 0 : -1;
 }
 
 static void HalReboot(void *ctx)
@@ -343,8 +369,11 @@ static void InitCalibration(void)
     g_state.cali_degraded = !supported;
 
     if (!supported) {
-        // Reported, not silent (spec 3.2): a log at init and BOOT_DEGRADED from
-        // the orchestrator, the same class of condition as a config fallback.
+        // Reported, not silent (spec 3.2): a log at init here, and BOOT_DEGRADED
+        // from the orchestrator, the same class of condition as a config fallback.
+        // The orchestrator gets the flag via `SystemOrchestratorCreate`'s argument,
+        // read from `EspHalCalibrationIsDegraded` in `src/main.cpp` -- this file is
+        // the one the host build excludes, so the orchestrator cannot call into it.
         ESP_LOGW(TAG, "eFuse ADC calibration unavailable (%s); using the linear "
                       "approximation -- readings are degraded",
                  esp_err_to_name(err));
@@ -434,15 +463,46 @@ IHAL *EspHalInit(void)
     // than an orchestrator that believes it is serving presses.
     if (InitI2c() != ESP_OK) return NULL;
 
+    // NVS MUST BE MOUNTED before any nvs_open, and this call was MISSING: nothing
+    // in the firmware ever called `nvs_flash_init()`, so on a real device every
+    // nvs_open returned ESP_ERR_NVS_NOT_INITIALIZED. The namespace probe below,
+    // every HalNvsGet, and every HalNvsSet all failed silently -- so a config or a
+    // headless learn could never be saved or loaded on hardware, while the host
+    // suite passed throughout against MockHal (which has no mount step). This is
+    // the same device-only blind spot as the HalNvsSet/HalNvsGet return-contract
+    // bugs, one layer down.
+    //
+    // Not fatal, and the same reasoning as the namespace probe below: a device
+    // whose NVS cannot be mounted is FR-25's pass-through case, so it must still
+    // serve presses. The difference is that a mount failure with NO free pages or
+    // a version mismatch is recoverable by erasing, which is the standard IDF
+    // idiom -- and worth doing, because the alternative is a device that appears
+    // to save a config and forgets it at reboot.
+    esp_err_t nvs_err = nvs_flash_init();
+    if (nvs_err == ESP_ERR_NVS_NO_FREE_PAGES || nvs_err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
+        ESP_LOGW(TAG, "nvs needs a format (%s); erasing and retrying", esp_err_to_name(nvs_err));
+        nvs_flash_erase();
+        nvs_err = nvs_flash_init();
+    }
+    if (nvs_err != ESP_OK) {
+        ESP_LOGW(TAG, "nvs_flash_init failed: %s; running unconfigured (FR-25)",
+                 esp_err_to_name(nvs_err));
+    }
+
     // NVS is NOT fatal. A device with an unreadable namespace is exactly FR-25's
-    // pass-through case, so it must still serve. Opening here only proves the
-    // partition is mounted; failures fall through to the absent-key signal.
+    // pass-through case, so it must still serve. The open is NOT cached as a
+    // boot-time gate: nvs_open(READONLY) fails with ESP_ERR_NVS_NOT_FOUND on a
+    // factory-fresh board, where the namespace does not exist until the first
+    // Save creates it -- so a cached "unavailable" flag stayed false for the
+    // whole first power cycle and made every HAL nvs_get report "absent" even
+    // right after a successful save. Each get/set opens for itself (cheap, and
+    // it is what makes a same-session read-back see the write).
     nvs_handle_t h;
     if (nvs_open(SWC_NVS_NAMESPACE, NVS_READONLY, &h) == ESP_OK) {
-        g_state.nvs_open = true;
         nvs_close(h);
     } else {
-        ESP_LOGW(TAG, "nvs namespace '%s' unavailable; running unconfigured (FR-25)",
+        ESP_LOGI(TAG, "nvs namespace '%s' not present yet; it is created on first "
+                      "save (FR-25 pass-through until then)",
                  SWC_NVS_NAMESPACE);
     }
 
@@ -452,6 +512,7 @@ IHAL *EspHalInit(void)
     iface.dac_set_code   = HalDacSetCode;
     iface.dac_power_mode = HalDacPowerMode;
     iface.dac_ldac       = HalDacLdac;
+    iface.dac_faulted    = HalDacFaulted;
     iface.gpio_write     = HalGpioWrite;
     iface.gpio_read      = HalGpioRead;
     iface.buzzer_on      = HalBuzzerOn;

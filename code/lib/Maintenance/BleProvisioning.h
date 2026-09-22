@@ -60,12 +60,29 @@ class BleProvisioning {
 public:
     // Arms the session. Does NOT touch the radio -- `Start` is the point at
     // which the maintenance path may do so, and it happens on device only.
+    //
+    // **Both `ProvSecurity` fields decide something here, which is the point.**
+    // `sec1` selects the security mode and `allow_insecure` gates Sec0 through
+    // `ProvisioningAllowsSec0`. A Sec0 request without the flag is REFUSED rather
+    // than silently upgraded or silently downgraded, and a PoP is required only in
+    // Sec1 -- Sec0 has no Proof-of-Possession by construction.
+    //
+    // It used to store `allow_insecure` into a member nothing read, so a bench
+    // build that set the flag behaved exactly like a Sec1 build while *looking*
+    // like it honoured the choice, and `ProvisioningAllowsSec0` -- whose header
+    // calls it "a readable decision a test can assert" -- had no production caller
+    // at all. Returns false for a session that could not be armed.
     bool Start(const uint8_t mac[6], const ProvSecurity &sec);
 
     void Stop();
     bool Active() const { return active_; }
 
-    // The PoP the app should display for this session. Empty until Start().
+    // Whether this session runs WITHOUT security (spec 8.3 option 3). True only
+    // when the caller asked for Sec0 and `allow_insecure` permitted it.
+    bool Sec0() const { return sec0_; }
+
+    // The PoP the app should display for this session. Empty until Start(), and
+    // empty for a Sec0 session, which has none.
     const char *Pop() const { return pop_; }
     const char *AdvertisedName() const { return name_; }
 
@@ -73,8 +90,8 @@ public:
 
 private:
     bool     active_ = false;
+    bool     sec0_ = false;
     PopMode  mode_ = PopMode::kDerivedFromMac;
-    bool     allow_insecure_ = false;
     char     pop_[32] = {};
     char     name_[32] = {};
 };

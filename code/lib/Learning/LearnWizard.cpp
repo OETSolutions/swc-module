@@ -170,6 +170,16 @@ void LearnWizard::Tick(int channel, uint64_t now_ms, int idle_mv, int temp_tenth
 
 void LearnWizard::ServiceSelect(uint64_t now_ms) {
     const int mv = hal_->adc_read_mv(hal_->ctx, ADC_CH_AUX1);
+    // **A FAILED CONVERSION IS NOT A PRESS.** `IHAL::adc_read_mv` returns -1 on
+    // error (0 mV is a legal reading -- AUX1 shorts to ground when pressed, so 0
+    // is the FULLY PRESSED level here). Fed to the classifier, -1 becomes a ratio
+    // of ~0 permille against the profile's 3300 mV idle, which lands INSIDE the
+    // AUX window (centre 30 permille, half-width 485) and classifies as
+    // **kPressed** -- so one bad conversion counted a selection press the user
+    // never made, and a run of them would walk the slot menu with nobody
+    // touching the button. Hold instead: no press, no re-arm, no advancement.
+    // `SystemOrchestrator`'s own AUX1 read guards this sentinel (N-43).
+    if (mv < 0) return;
     // The same classifier the SWC channels use, so "what counts as a press" has
     // exactly one definition in the firmware.
     const ChannelLevel lvl = aux_.Update(mv, aux_profile_.learned_idle_mv, now_ms);
@@ -230,9 +240,8 @@ void LearnWizard::ServiceSelect(uint64_t now_ms) {
  * entry as a neighbour, and a re-measure lands inside the old window by
  * definition, so every attempt to correct a button reports
  * `too_close_to_existing` -- blaming the button for being too close to itself.
- * The exclusion is by id and by BOTH possible spellings of the slot
- * (0-based `bt0` and 1-based `bt<slot>`), so a profile produced by either
- * convention has its entry removed.
+ * The exclusion compares against the ONE id `FormatSlotId` generates for this
+ * slot (1-based, `swc<ch>_bt<slot>`); there is no second spelling to hedge over.
  */
 LadderProfile LearnWizard::NeighbourSetExcludingTheSlotBeingLearned() const {
     LadderProfile out = profile_;
@@ -257,6 +266,15 @@ LadderProfile LearnWizard::NeighbourSetExcludingTheSlotBeingLearned() const {
 
 void LearnWizard::ServicePrompt(int channel, uint64_t now_ms, int idle_mv, int temp_tenths_c) {
     const int level_mv = hal_->adc_read_mv(hal_->ctx, LevelChannelFor(channel));
+    // **A FAILED CONVERSION IS NOT A READING.** `IHAL::adc_read_mv` returns -1 on
+    // error (0 mV is legal), and `off_idle = level_mv - idle_mv` turns -1 into a
+    // large NEGATIVE excursion -- `(off_idle < -kPromptPressDetectMv)` is true --
+    // so a bad conversion was read as the user pressing, and `AddSample(-1, ...)`
+    // then latched `out_of_range_seen_`, which `Commit` reports as
+    // `out_of_range`. One ADC glitch anywhere in the prompt therefore blamed the
+    // user's wiring for a learn that never got a usable measurement. Skip the
+    // tick instead; the prompt holds its state and the safety cap still bounds it.
+    if (level_mv < 0) return;
     // The RAIL during learn (spec 3.4's `learned_at_rail_mv`). There is no rail
     // sense channel on this board (AdcChannel carries SWC1/SWC2/TEMP/AUX1-3/
     // KEY_SENSE1-2 and none of them is +3V3), so this is the board's nominal rail
@@ -332,11 +350,28 @@ void LearnWizard::ServicePrompt(int channel, uint64_t now_ms, int idle_mv, int t
         } else if (profile_.count < kLadderMaxButtons) {
             profile_.buttons[profile_.count] = out;
             ++profile_.count;
+        } else {
+            // At kLadderMaxButtons with no matching id there is no room to add.
+            // The measurement is a real one and the SESSION accepted it, but it
+            // cannot be stored -- so this is a REJECTION, not a commit.
+            //
+            // Reporting it as `kNone` was a silent-failure defect, and the two
+            // learn paths disagreed about it: `HandleLearnCommit` (the app path)
+            // refuses with `no_space` for the same condition. The caller persists
+            // on `kNone` (`ConsumeCommitted` -> `ApplyLearnedProfile` ->
+            // `store_->Save`), so LEARN_OK played while the ladder went back to NVS
+            // UNCHANGED and `LastLearnPersisted()` returned true -- the user hears
+            // success and the button is not there. Spec 7.4 step 6 makes "accept"
+            // mean "BEEP LEARN_OK, store LadderButton"; FR-29 requires a rejection
+            // to say WHY. Reachable with no contrivance: a ladder the app filled to
+            // 16 with app slugs, selected headlessly (the wizard generates its own
+            // `swc1_bt<n>`, so it matches no id and takes this append path), or a
+            // seventeenth AUX1 press.
+            last_result_ = LearnReject::kNoSpace;
         }
-        // At kLadderMaxButtons with no matching id there is no room to add: the
-        // learn is measured and reported (LEARN_OK) but not stored, rather than
-        // silently overwriting an existing button the user did not select.
-        //
+    }
+
+    if (last_result_ == LearnReject::kNone) {
         // The IDLE REFERENCE, and forgetting it is how the learned button ends up
         // dead. A LadderProfile is useless without it: spec 6.3 normalizes every
         // centre by the idle the button was measured at, and `LadderClassify`
@@ -349,7 +384,9 @@ void LearnWizard::ServicePrompt(int channel, uint64_t now_ms, int idle_mv, int t
         committed_ = true;   // the caller persists; see ConsumeCommitted()
         if (buzzer_ != nullptr) buzzer_->Play(BuzzerPattern::kLearnOk);
     } else {
-        // A REAL rejection: say WHY (FR-29) rather than a generic failure.
+        // A REAL rejection: say WHY (FR-29) rather than a generic failure. The
+        // full-ladder case above lands here too, which is what makes a learn that
+        // stored nothing sound like the refusal it is.
         if (buzzer_ != nullptr) buzzer_->Play(BuzzerPattern::kLearnReject);
     }
 

@@ -1,0 +1,210 @@
+# Firmware gates (spec 10.5).
+#
+# Three jobs, and each one guards a failure that has actually happened in this
+# project rather than a hypothetical:
+#
+#   host-tests        the native suite. Every defect found so far was
+#                     reproduced by one of these first. The count is
+#                     deliberately NOT written here: an earlier revision pinned
+#                     "263", which then drifted, and the replacement pinned a
+#                     second number while claiming not to. Treat the run's own
+#                     total as authoritative.
+#   contract-sync     regenerates the contract and FAILS if the checked-in files
+#                     differ. A stale generated header compiles fine on both
+#                     sides while meaning different things -- the defect class
+#                     this project has hit most often.
+#   build-and-size    builds for the real target and enforces the app slot.
+#                     R-1 from spec 12.2: a BLE+WiFi+OTA image that outgrows the
+#                     slot is discovered here on day one, not the week the boards
+#                     arrive.
+#
+# The toolchain is NOT a plain `pio run`. This project forces the pioarduino fork
+# (stock PlatformIO publishes no IDF 5.x), and the first build must fetch the
+# managed component from src/idf_component.yml.
+
+name: firmware
+
+on: [push, pull_request]
+
+jobs:
+  host-tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      # Pinned, because the native suite's cJSON comes from a git pin and a
+      # floating PlatformIO has moved LDF behaviour under this project before.
+      - run: pip install "platformio==6.1.18"
+      - name: Native unit tests
+        working-directory: code
+        run: pio test -e native
+
+      # The contract generators are pure Python and need no toolchain, so this
+      # job is the right place for them. Running the suite as well as the
+      # generators is deliberate: the suite is what asserts the generated header
+      # still matches the firmware's own enum and codec tables, which regenerating
+      # alone would not catch.
+      #
+      # `pytest .` rather than a named file: the tools directory is a package of
+      # gate helpers, and a helper added with its own test file must run without
+      # editing this line -- a named file silently skipped every later test.
+      - run: pip install pytest
+      - name: Contract tests
+        working-directory: code/tools
+        run: python3 -m pytest . -q
+      - name: Fail if the generated contract drifted
+        run: |
+          if ! git diff --exit-code -- code/contract code/android/app/src/main/java/com/oetsolutions/swc/contract; then
+            echo "::error::The generated contract is stale. Run code/tools/gen_contract*.py and commit."
+            exit 1
+          fi
+
+      # The maintenance page is compiled into flash, so the checked-in header IS
+      # the page the device serves. Nothing regenerated it in CI, and the hook
+      # that does (`extra_assets.py`) is an `extra_scripts` entry in `[env]`,
+      # which the native test env also inherits -- so a host run can silently
+      # "fix" the header and hide the drift from the very test meant to catch it.
+      # This step makes the drift visible on a clean checkout, where no build has
+      # run yet. Regenerate rather than trust: if the inputs are unchanged the
+      # file is byte-identical, so a diff here means a real divergence.
+      - name: Fail if the compiled-in maintenance page is stale
+        run: |
+          python3 code/tools/gen_assets.py
+          if ! git diff --exit-code -- code/lib/Maintenance/WebPageAssets.h; then
+            echo "::error::WebPageAssets.h is stale. Run code/tools/gen_assets.py and commit -- the device serves this header, not code/assets/index.html."
+            exit 1
+          fi
+
+      # The spec's worked example is its most concrete assertion about the wire,
+      # and it is what a reader copies into a config. It had drifted from the
+      # codecs in six ways at once, which nothing caught, so it is decoded here
+      # with the firmware's own decoder rather than trusted.
+      - name: The spec's worked example still decodes
+        working-directory: code
+        run: python3 tools/check_spec_example.py
+
+      # EspHal is the one lib/ file the host build excludes, so no native test
+      # compiles it and MockHal is the only implementation the suite exercises.
+      # The two HALs therefore agreed only by convention, and that convention was
+      # wrong in TWO places: HalNvsSet returned the byte count where every caller
+      # tests `!= 0`, and HalNvsGet read a 2048-byte chunk through a 16-byte
+      # buffer. Both are invisible on the host and make every config save/load
+      # fail on the device. This statically pins the shapes.
+      - name: The HAL nvs_* return contract is pinned
+        working-directory: code
+        run: python3 tools/check_hal_contracts.py
+
+      # The one check that can see a Kotlin/C codec divergence. Each side's own
+      # round-trip test compares that side to itself, so a field name that differs
+      # between them passes both and produces a config the device refuses, reported
+      # as "corrupt config" with nothing named.
+      #
+      # It reads the checked-in fixture the app produced. Run `pio test -e native`
+      # first: the probe needs the cJSON PlatformIO fetches into .pio/libdeps, which
+      # the step above has already done.
+      - name: The app's config decodes and re-encodes byte-identically
+        working-directory: code
+        run: bash tools/crosscheck_config.sh
+
+      # The app's `ConfigJson.problems()` is a hand-written mirror of the
+      # firmware's numeric limits, and it had drifted: the firmware grew a
+      # `send_duration_ms` ceiling that the app never got, so a save the app
+      # accepted was nacked at decode with the field unnamed. Every count, width
+      # and timing ceiling is read from both sides and asserted equal.
+      - name: The app's numeric limits still match the firmware's
+        working-directory: code
+        run: python3 tools/check_app_limits.py
+
+      # Every frame the firmware can emit must have an app-side handler. A frame
+      # that is declared and handled by nothing is a message the device sends
+      # into a void -- `link_gap` sat in exactly that state for a whole revision,
+      # so a dropped frame vanished with no explanation on either end. This is a
+      # different axis from the contract-sync step above: that checks the two
+      # GENERATED copies agree, this checks the app actually LOOKS at what it was
+      # generated. It is the N-22/N-24/N-45 shape stated as one rule.
+      - name: Every firmware-to-app frame has a handler
+        working-directory: code
+        run: python3 tools/check_frame_handlers.py
+
+  build-and-size-gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install "platformio==6.1.18"
+
+      # The IDF build needs the component manager, which PlatformIO does not
+      # install. Without it the build fails before compiling anything, with an
+      # error that names neither the package nor the manifest.
+      - name: Install the IDF component manager
+        run: python3 -m ensurepip --upgrade && pip install 'idf-component-manager~=2.2'
+
+      # The device Unity suite (test/test_hw) is NEVER run in CI -- it needs the
+      # board. Nothing built it either, and it did not link: each of its three
+      # files defined the global `setUp`/`tearDown` that Unity's runner calls,
+      # so the suite was a multiple-definition error that no one saw. Compiling
+      # it (no upload) is what keeps "the D column of the coverage matrix is
+      # runnable" true. A link failure here is the whole device test plan gone.
+      #
+      # **`pio test -e esp32s3` writes the SAME `.pio/build/esp32s3/firmware.bin`
+      # as the production build** (one env, one build dir), so it CLOBBERS the
+      # artifact the size gate measures. It therefore runs BEFORE the production
+      # build, not after, so the build below is the last thing to write the file.
+      # `check_size.py` also refuses a Unity image outright, so a future reorder
+      # cannot silently measure the test image -- but the ordering keeps the
+      # measured file the real one rather than relying on the refusal.
+      - name: The on-device test suite links
+        working-directory: code
+        env:
+          SWC_FW_VERSION: 0.0.0-ci
+          SWC_GIT_SHA: ${{ github.sha }}
+        run: pio test -e esp32s3 --without-uploading --without-testing
+
+      - name: Build for the real target
+        working-directory: code
+        env:
+          # The version is compiled in, so a CI build with unset vars would fail
+          # on -Werror. CI is not a release, and the artifact is only measured.
+          SWC_FW_VERSION: 0.0.0-ci
+          SWC_GIT_SHA: ${{ github.sha }}
+        run: pio run -e esp32s3
+
+      - name: Size gate (spec 10.5, R-1)
+        working-directory: code
+        run: python3 tools/check_size.py
+
+      # `sizeof(Config)` is 8,912 B, and several functions held one BY VALUE --
+      # which made frames of 9-18 KB on a 3,584-byte main task and a 4,096-byte
+      # TinyUSB task. That is a guaranteed stack overflow on every boot and every
+      # `config_get`, and NOTHING ELSE HERE CAN SEE IT: the native suite runs on
+      # 8 MB threads, so the frames never matter, and the failure needs a real
+      # task stack. It is the same device-only blind spot as the HAL NVS cluster,
+      # one layer up, so it gets the same treatment -- a gate rather than a
+      # review step. This recompiles the project with -fstack-usage and checks
+      # every frame AND every call chain from each task root against that task's
+      # stack.
+      - name: No stack frame or chain can overflow its task
+        working-directory: code
+        run: python3 tools/check_stack_usage.py
+
+      # UsbLink.cpp is device-only (it names TinyUSB), so the host suite calls
+      # OnLine and Tick from ONE thread and the cross-task race is invisible
+      # there. This pins the shape that keeps every protocol handler on the poll
+      # task: USB callbacks only stage bytes / publish the DTR transition.
+      - name: USB callbacks do not touch protocol state
+        working-directory: code
+        run: python3 tools/check_task_ownership.py
+
+      # A missing Kconfig key is neither a compile error nor a test failure --
+      # it is simply an unset symbol until the exact path that depends on it
+      # runs. FR-37's rollback shipped dead that way: the A/B partitions and the
+      # mark-valid call were both present, and without
+      # CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE the bootloader never reverts a
+      # crash-looping image. Checked before the build so it fails in seconds.
+      - name: Every requirement-bearing Kconfig key is present and correct
+        working-directory: code
+        run: python3 tools/check_sdkconfig_keys.py

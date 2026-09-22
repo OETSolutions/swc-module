@@ -13,8 +13,10 @@ constexpr int      kMinSamples  = 10;
 constexpr uint64_t kMinSpanMs   = 100;
 
 // Spec 3.2: the calibrated ADC ceiling. Above this no pin reading is possible,
-// so a sample exceeding it is a wiring or calibration fault, not a level.
-constexpr int kAdcCeilingMv = 2900;
+// so a sample exceeding it is a wiring or calibration fault, not a level. Read
+// from the shared constant (CalibrationCurve.h, via LadderDecode.h) rather than a
+// second local literal -- `LadderDecode.cpp` range-checks against the same fact.
+constexpr int kAdcCeilingMv = kAdcFullScaleMv12dB;
 
 // The learn's noise gate, as a permille of the idle reference -- NOT an absolute
 // millivolt figure. The spread a "clean" hold produces scales with the rail (the
@@ -25,8 +27,12 @@ constexpr int kAdcCeilingMv = 2900;
 // matching how `LadderRatioPermille` already normalizes.
 constexpr int kNoiseLimitPermille = 60;
 
-// How close to the idle reference still counts as "not pressed", in permille.
-constexpr int kIdleMarginPermille = 20;
+// The "not pressed" band is the CLASSIFIER's idle band (`kIdleMarginPermille`,
+// LadderDecode.h), not a local constant. It used to be a narrower local 20, so a
+// learn whose mean landed at ratio 970-979 passed every gate here while
+// `LadderClassify` returned `kIdle` for its own centre -- committing a DEAD button
+// with a LEARN_OK beep. The learn gate must be no weaker than the classifier's,
+// and sharing the one constant is what guarantees it.
 
 int RoundDiv(int64_t num, int den) {
     if (den <= 0) return 0;
@@ -40,9 +46,14 @@ const char *LearnRejectReason(LearnReject r) {
         case LearnReject::kNone:               return "ok";
         case LearnReject::kTooFewSamples:      return "too_few_samples";
         case LearnReject::kOutOfRange:         return "out_of_range";
+        case LearnReject::kNoIdleReference:    return "no_idle_reference";
         case LearnReject::kAtIdle:             return "at_idle";
         case LearnReject::kTooNoisy:           return "too_noisy";
         case LearnReject::kTooCloseToExisting: return "too_close_to_existing";
+        // The SAME wire string the app path uses for the same condition
+        // (`HandleLearnCommit`'s `no_space` nack), so a client reading the reason
+        // sees one vocabulary whether the learn was driven by the app or by AUX1.
+        case LearnReject::kNoSpace:            return "no_space";
     }
     return "unknown";
 }
@@ -59,6 +70,7 @@ void LearnSession::Start(const LadderProfile &existing) {
     first_ms_ = 0;
     last_ms_ = 0;
     have_sample_ = false;
+    have_idle_ = false;
     learned_idle_mv_ = 0;
     rail_mv_ = 0;
     temp_tenths_c_ = 0;
@@ -66,8 +78,8 @@ void LearnSession::Start(const LadderProfile &existing) {
 
 void LearnSession::AddSample(int level_mv, int idle_mv, MilliVolt rail_mv,
                              int16_t temp_tenths_c, uint64_t now_ms) {
-    // The first sample fixes the frame this session measures in, so the SEEDED
-    // neighbour set is converted into that frame exactly once.
+    // The first sample with a USABLE IDLE fixes the frame this session measures
+    // in, so the SEEDED neighbour set is converted into that frame exactly once.
     //
     // This is not cosmetic. `existing_` holds the channel's already-learned
     // buttons as absolute millivolts at the rail they were STORED against, while
@@ -78,8 +90,29 @@ void LearnSession::AddSample(int level_mv, int idle_mv, MilliVolt rail_mv,
     // tolerance's nearest-gap is measured to a centre that moved. The caller
     // rebases its own copy of the seeded buttons the same way (`LadderProfileRebase`)
     // so what is STORED and what was GATED agree.
-    if (!have_sample_ && idle_mv > 0) {
+    //
+    // **Gated on the IDLE being usable, not on the sample being the first one.**
+    // The condition is `idle_mv > 0` because the conversion needs a target frame;
+    // a sample that carries no idle cannot supply one. Keying it off `have_sample_`
+    // instead (the first sample, whatever it carried) skipped the rebase for a
+    // session whose opening reading had no idle and then stamped a LATER reading's
+    // idle as `learned_idle_mv` -- so the commit's denominator was the live frame
+    // while the seeded siblings stayed in the stored one, exactly the two-frames
+    // failure above, and reachable by an ADC read that failed on the first prompt
+    // tick.
+    //
+    // **`have_idle_` latches BOTH consumers of the reference**, so the rebase
+    // frame and the commit denominator are the SAME sample's idle. They were two
+    // policies before: this gate took the FIRST usable idle while the line below
+    // overwrote `learned_idle_mv_` on every sample -- last-writer-wins -- and a
+    // later reading of 0 (the `-1` sentinel's neighbour, an unreadable tick)
+    // reset the denominator to 0 and refused a learn that had seen a perfectly
+    // good reference. The two frames diverging is the same silent failure as
+    // above, so one latch fixes both directions at once.
+    if (!have_idle_ && idle_mv > 0) {
         LadderProfileRebase(existing_, existing_.learned_idle_mv, idle_mv);
+        learned_idle_mv_ = static_cast<MilliVolt>(idle_mv);
+        have_idle_ = true;
     }
     ++sample_count_;
     if (!have_sample_) {
@@ -88,12 +121,12 @@ void LearnSession::AddSample(int level_mv, int idle_mv, MilliVolt rail_mv,
     }
     last_ms_ = now_ms;
 
-    // The live idle and the rail are recorded from the SAMPLES, not from
+    // The rail and temperature are recorded from the SAMPLES, not from
     // `existing`: a fresh learn is passed an empty profile, so its
-    // `learned_idle_mv` is zero, while the live idle is a real ADC reading the
-    // caller hands us every time. (The plan's prose said "recorded at Start";
-    // that cannot be right, and its own test asserts the sampled value.)
-    learned_idle_mv_ = static_cast<MilliVolt>(idle_mv > 0 ? idle_mv : 0);
+    // `learned_idle_mv` is zero, while these are real readings the caller hands
+    // us every time. (The plan's prose said "recorded at Start"; that cannot be
+    // right, and its own test asserts the sampled value.) The IDLE reference is
+    // NOT re-recorded here -- it latched above, once, with the rebase.
     rail_mv_ = rail_mv;
     temp_tenths_c_ = temp_tenths_c;
 
@@ -126,6 +159,28 @@ LearnReject LearnSession::Commit(LadderButton *out) {
     if (out_of_range_seen_) return LearnReject::kOutOfRange;
     if (in_range_count_ == 0) return LearnReject::kOutOfRange;
 
+    // No usable idle reference: REFUSE, do not commit. Every gate below is a
+    // RATIO against the idle, and they substitute a nominal 2835 mV when the
+    // session recorded none -- which is right for the ratio itself (a reading can
+    // still be judged "pressed" and "steady" without the true rail) but wrong for
+    // the OUTCOME, because the caller stores `LearnedIdleMv()` as the profile's
+    // `learned_idle_mv`. Zero there is a profile `LadderProfileIsValid` refuses
+    // (`learned_idle_mv <= 0`), so the commit would be accepted, reported as
+    // LEARN_OK, applied in memory, and then persisted by a `Save` that does NOT
+    // validate -- and the next boot's `ConfigDecodeBlob` refuses the whole config,
+    // `Load` falls back to defaults, and the user loses every learned button and
+    // binding, reported only as a corrupt config. That is the exact chain the
+    // `LadderProfileIsValid(prospective)` gate below was added to close for a
+    // noisy WINDOW; this closes it for the REFERENCE, which that gate cannot see
+    // because it validates a profile whose `learned_idle_mv` is set from the
+    // session's (possibly zero) `learned_idle_mv_`.
+    //
+    // Reachable: `AddSample` records the idle it is GIVEN, so a call site that
+    // passes 0 (a channel whose live idle is unreadable, or a `ladder_sample`
+    // that reported 0 for a stale reading) is enough. A zero idle cannot build a
+    // profile the device can classify, so there is nothing to commit.
+    if (learned_idle_mv_ <= 0) return LearnReject::kNoIdleReference;
+
     const int mean_mv = RoundDiv(sum_mv_, in_range_count_);
     const int spread_mv = max_mv_ - min_mv_;
 
@@ -137,7 +192,13 @@ LearnReject LearnSession::Commit(LadderButton *out) {
     // this gate fire on every plausible reading instead of only on an unpressed
     // one. The convention is shared with the classifier, so it is worth stating
     // where it is easy to get backwards.)
-    const int idle = (learned_idle_mv_ > 0) ? learned_idle_mv_ : 2835;
+    //
+    // The reference is the session's OWN `learned_idle_mv_`, with no fallback: the
+    // gate above refuses a session whose reference is absent, so the nominal
+    // substitute that used to sit here was the one number that could let a
+    // reference-less session through to a commit that cannot be stored. One
+    // denominator, the one the caller will persist.
+    const int idle = learned_idle_mv_;
     const int ratio = LadderRatioPermille(mean_mv, idle);
     if (ratio >= 1000 - kIdleMarginPermille && ratio <= 1000 + kIdleMarginPermille) {
         return LearnReject::kAtIdle;
@@ -198,11 +259,12 @@ LearnReject LearnSession::Commit(LadderButton *out) {
             probe.mv_tolerance = static_cast<MilliVolt>(tolerance);
             prospective.buttons[prospective.count] = probe;
             ++prospective.count;
-            // The reference the validator and the classifier both use. A fresh
-            // headless learn passes an empty profile, so its own reference is
-            // zero while the live idle is a real reading.
-            prospective.learned_idle_mv =
-                (learned_idle_mv_ > 0) ? learned_idle_mv_ : 1;
+            // The reference the validator and the classifier both use -- the
+            // session's OWN, and NOT a substitute. It is guaranteed positive here
+            // by the gate at the top of `Commit`, so this validation checks the
+            // real stored reference rather than a stand-in that could pass while
+            // the value the caller stamps is zero.
+            prospective.learned_idle_mv = learned_idle_mv_;
             // The WHOLE validity predicate, not just the window relation. Three
             // routes were found to a commit the validator refuses: a window
             // overlapping its neighbour, a duplicate id (handled by the wizard,

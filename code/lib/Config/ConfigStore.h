@@ -13,6 +13,29 @@ enum class ConfigLoadResult {
 };
 
 /*
+ * Did `Load` put a REAL, user-authored config in the out-parameter?
+ *
+ * True for both `kLoaded` and `kRecoveredFromBackup`: a torn newest slot makes
+ * the OTHER slot authoritative, and that slot holds a genuine config the device
+ * is running (spec 6.8's whole point). `kFellBackToDefaults` is a synthesized
+ * default the user never wrote, and `kNoConfig` leaves the caller's argument
+ * untouched, so neither is "loaded".
+ *
+ * **This predicate exists because two call sites wrote `== kLoaded` instead.**
+ * A device that recovered from the backup slot therefore replied to
+ * `config_get` with the DEFAULTS while it was RUNNING the recovered config --
+ * the app would render an empty grid over a configured device and its next save
+ * would overwrite the recovered config with those defaults, losing the user's
+ * bindings and both learned ladders. And `learn_start` seeded its neighbour set
+ * from the same false negative, so a re-learn on a recovered device could not
+ * see the buttons already there. `Boot` got it right (it already accepts both),
+ * which is exactly the drift a shared predicate prevents.
+ */
+inline bool ConfigLoadResultIsUsable(ConfigLoadResult r) {
+    return r == ConfigLoadResult::kLoaded || r == ConfigLoadResult::kRecoveredFromBackup;
+}
+
+/*
  * Two alternating slots with a monotonic sequence, so the older copy is always
  * intact while the newer one is written. A torn write is detected by the blob
  * CRC (Task 8), not by a length guess.

@@ -39,6 +39,11 @@ void LinkBind(CommandRouter &router, UsbCdc &cdc, UsbCdc::RawWrite raw, void *ra
     router.SetSink(&RouterOutSinkThunk, &cdc);
     // ...and its synchronous flush, so a reply that must beat a reset can.
     router.SetTxFlush(&RouterTxFlushThunk, &cdc);
+    // The transport's loss counters, so `status` can report them: a refused frame
+    // fails entirely inside the transport (the sink returns void), so the router
+    // cannot learn about it any other way. This is the wiring point that makes
+    // `DroppedFrames`/`RxOverflows` reachable by a user.
+    router.SetLossCounters(&cdc);
     // The transport's INBOUND sink goes to the router. Two different thunks, two
     // different contexts: neither direction can be mistaken for the other.
     cdc.Init(raw, raw_ctx, &RouterSinkThunk, &router);

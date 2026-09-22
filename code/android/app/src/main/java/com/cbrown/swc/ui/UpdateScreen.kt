@@ -31,6 +31,18 @@ sealed interface UpdateStatus {
 data class UpdateUiState(
     val currentVersion: String = "—",
     val status: UpdateStatus = UpdateStatus.Unknown,
+    /**
+     * Always false in this build, and the screen's `enabled = !inProgress` gate
+     * follows from that.
+     *
+     * It used to be set true and then immediately false inside one `launch` body
+     * with no suspension between, so a `StateFlow` collector could only ever observe
+     * `false` — the "Checking…" label and the disabled button were unreachable, a
+     * gate that never fires. The underlying `checkForUpdates` is genuinely
+     * synchronous (it reports that this build has no manifest client rather than
+     * performing a fetch), so there is no in-progress state to represent. The writes
+     * are gone; when an async check lands (N-12) this becomes real again.
+     */
     val inProgress: Boolean = false,
 )
 

@@ -101,17 +101,31 @@ inline uint8_t PowerDownCode(DacPowerMode mode)
     }
 }
 
-// The channel-select field for a HAL channel. Returns false for a value that is
-// not a real output, so callers can drop the write rather than address a
+// The channel-select field for a HAL channel ORDINAL. Returns false for a value
+// that is not a real output, so callers can drop the write rather than address a
 // garbage channel.
-inline bool SelectForChannel(DacChannel ch, uint8_t *out)
+//
+// **The parameter is an integer, not a `DacChannel`, and that is a correctness
+// requirement rather than a style choice.** This function's contract includes
+// "rejects a value that is not a real output", and a `DacChannel` parameter makes
+// that half of the contract UNEXPRESSIBLE without undefined behaviour: forming a
+// `DacChannel` outside its enumerator range and then loading it (which the
+// `switch` does) is UB, and UBSan flags it -- `load of value 99, which is not a
+// valid value for type 'DacChannel'`. So the defensive case could only ever be
+// TESTED by executing UB, which is the same shape as an unchecked cast: the check
+// exists on paper and is unsound in fact.
+//
+// Taking the ordinal by value makes both the guard and its test well-defined.
+// Callers that have a real `DacChannel` name it explicitly with a static_cast at
+// the call site, so the valid path is still checked by the compiler.
+inline bool SelectForChannel(uint8_t ch_ordinal, uint8_t *out)
 {
-    switch (ch) {
-        case DAC_CH_KEY1: *out = kChannelA; return true;
-        case DAC_CH_ADJ1: *out = kChannelB; return true;
-        case DAC_CH_KEY2: *out = kChannelC; return true;
-        case DAC_CH_ADJ2: *out = kChannelD; return true;
-        default:          return false;
+    switch (ch_ordinal) {
+        case kChannelA: *out = kChannelA; return true;   // DAC_CH_KEY1
+        case kChannelB: *out = kChannelB; return true;   // DAC_CH_ADJ1
+        case kChannelC: *out = kChannelC; return true;   // DAC_CH_KEY2
+        case kChannelD: *out = kChannelD; return true;   // DAC_CH_ADJ2
+        default:        return false;
     }
 }
 

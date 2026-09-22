@@ -4,16 +4,16 @@
 
 namespace {
 // The calibrated ADC ceiling (spec 3.2): above this no pin reading is possible, so
-// a value beyond it is a wiring or calibration fault rather than a level.
-constexpr int kAdcCeilingMv = 2900;
-// The margin either side of the idle reference. Above idle+margin the reading
-// exceeds the reference, which is a short to a higher supply rather than a
-// button or an idle.
-constexpr int16_t kIdleMarginPermille = 30;
-// The idle reading has collapsed relative to the one learned. Expressed
-// against the LEARNED idle, not the ratio: ratio normalization deliberately
-// cancels rail movement out of the ratios, so a dead supply looks perfectly
-// normal to it. This is the check that catches that (FR-30).
+// a value beyond it is a wiring or calibration fault rather than a level. It is
+// the ONE shared constant (`kAdcFullScaleMv12dB`, CalibrationCurve.h) rather than
+// a local literal -- this file and `LearnSession.cpp` each used to carry their own
+// copy, which nothing compared.
+constexpr int kAdcCeilingMv = kAdcFullScaleMv12dB;
+// The idle reading has collapsed relative to the one learned. Expressed against
+// the LEARNED idle, not the ratio: ratio normalization deliberately cancels rail
+// movement out of the ratios, so a dead supply looks perfectly normal to it. This
+// is the check that catches that (FR-30). (`kIdleMarginPermille`, the idle band,
+// lives in the header because LearnSession shares it.)
 constexpr int16_t kRailHealthFloorPermille = 200;
 }  // namespace
 

@@ -2,6 +2,8 @@
 
 #include <string.h>
 
+#include <atomic>
+
 #include "esp_log.h"
 #include "tinyusb.h"
 #include "tusb_cdc_acm.h"
@@ -18,9 +20,31 @@ namespace {
 UsbCdc         g_cdc;
 CommandRouter *g_router = nullptr;
 bool           g_started = false;
-// Whether the HOST has opened the port (DTR). Tracked separately from `g_started`
-// because the driver being installed does not mean anything is reading.
-bool           g_host_open = false;
+// Whether the HOST has opened the port (DTR), as the poll task has APPLIED it.
+// Tracked separately from `g_started` because the driver being installed does not
+// mean anything is reading.
+//
+// Written and read by `ServiceLineState` on the poll task alone, so it needs no
+// atomicity of its own; it is the record of what side effects have run, which is
+// what makes `ServiceLineState` idempotent when the observed level has not moved.
+bool g_host_open = false;
+// The DTR LEVEL the callback observed most recently, which the poll task has not
+// yet acted on. The callback must not call into the router or the orchestrator
+// itself (see `UsbCdc::kRxCapacity`): it only records what it saw here, and
+// `UsbLinkService` performs the transition on the task that owns that state.
+//
+// **A LEVEL, not an edge, and that is a correctness requirement rather than a
+// convenience.** An edge published against the *applied* state loses a
+// transition: if the host opens and closes between two poll ticks, the close is
+// compared against `g_host_open == false` (the open has not been APPLIED yet), is
+// judged "not a change", and is dropped -- so the poll task then applies the open
+// and the device latches a session the host already ended: `hello` sent to
+// nobody, LED_STAT solid forever, and a config run left open.
+//
+// Publishing the level instead makes the service reconcile with reality: it
+// applies whatever the host's line is doing NOW, and applies both transitions
+// (one tick apart) when the host really did open and close.
+std::atomic<int> g_pending_line_state{-1};   // -1 no observation yet, 0 closed, 1 open
 
 // Gesture and log sinks deliberately stay here: they are wired to the
 // orchestrator, not to the transport, and only this TU names TinyUSB.
@@ -44,9 +68,12 @@ void LogSinkThunk(void *ctx, const char *level, const char *msg)
     if (r != nullptr) r->EmitLog(level, msg);
 }
 
-// TinyUSB hands us the bytes the host sent. They go straight into the transport's
-// assembler, which calls the sink once per COMPLETE frame -- so neither this
-// callback nor the router ever sees a partial line.
+// TinyUSB hands us the bytes the host sent. This callback runs on the TinyUSB
+// task, so it does the ONE thing that is safe from another task -- copy the bytes
+// into the transport's SPSC staging ring -- and returns. Parsing them here would
+// run the whole protocol against state that `SystemOrchestrator::Tick` is
+// concurrently mutating on the poll task; `DrainRx` moves that work to the poll
+// task, where the protocol's own state lives.
 void CdcRxCallback(int itf, cdcacm_event_t *event)
 {
     (void)event;
@@ -72,14 +99,38 @@ SystemOrchestrator *g_sys = nullptr;
 // discarded by the driver and the app sees a missing opening frame. TinyUSB's
 // own connection flag cannot serve here -- it only tracks the BUS (which is up
 // the moment the cable is in), not whether anything is listening.
+//
+// **The work is deferred, not done here.** `OnConnected` emits `hello` and starts
+// the config reply run, and `SetUsbConnected` repaints LED_STAT -- both reach
+// state the poll task is using. This callback runs on the TinyUSB task, so it
+// records the transition and `UsbLinkService` performs it.
 void CdcLineStateCallback(int itf, cdcacm_event_t *event)
 {
     if (itf != TINYUSB_CDC_ACM_0) return;
     if (event == nullptr) return;
 
     const bool open = event->line_state_changed_data.dtr;
-    if (open && !g_host_open) {
-        g_host_open = true;
+    // Publish the LEVEL unconditionally. Comparing against the applied state
+    // instead would DROP a close that arrived before its own open was serviced --
+    // see `g_pending_line_state`.
+    g_pending_line_state.store(open ? 1 : 0, std::memory_order_release);
+}
+
+// The deferred half of `CdcLineStateCallback`, on the poll task. Reconciles the
+// applied state with the level the callback last observed, at most once per call.
+void ServiceLineState()
+{
+    const int pending = g_pending_line_state.exchange(-1, std::memory_order_acq_rel);
+    if (pending < 0) return;
+
+    const bool open = (pending == 1);
+    // Idempotent: an observation that matches what has already been applied runs
+    // no side effects. This is also why the callback needs no edge detection of
+    // its own -- a steady DTR level re-published is a no-op here.
+    if (open == g_host_open) return;
+    g_host_open = open;
+
+    if (open) {
         g_cdc.NoteConnected();
         // `hello` first (spec 4.5), then the config reply run so the app can
         // render without having to ask for anything.
@@ -88,8 +139,7 @@ void CdcLineStateCallback(int itf, cdcacm_event_t *event)
         // Display only -- spec 6.6 keeps every button path independent of this.
         if (g_sys != nullptr) g_sys->SetUsbConnected(true);
         ESP_LOGI(TAG, "host opened the app port");
-    } else if (!open && g_host_open) {
-        g_host_open = false;
+    } else {
         g_cdc.NoteDisconnected();
         // Discards any half-received config run: an interrupted transfer must
         // never be applied (spec 4.2).
@@ -158,8 +208,23 @@ void UsbLinkStart(IHAL *hal, SystemOrchestrator *sys)
     // The task config is NOT optional and has no zero-valued default that passes:
     // tinyusb_driver_install rejects size 0 AND priority 0, so a zeroed struct
     // fails install with ESP_ERR_INVALID_ARG. 4096 is esp_tinyusb's own default
-    // stack; the priority is below the app loop so a USB burst cannot starve the
-    // poll loop that drives the KEY line.
+    // stack.
+    //
+    // **The priority is ABOVE the poll loop, not below it, and the design depends
+    // on that.** `app_main` runs at `ESP_TASK_MAIN_PRIO` = 1 (`esp_task.h`), and
+    // the idle task is 0, so 5 PREEMPTS `SystemOrchestrator::Tick` at any
+    // instruction -- both are pinned to core 0 (`CONFIG_ESP_MAIN_TASK_AFFINITY_CPU0`
+    // and `xCoreID = 0`). An earlier comment here claimed the opposite ("the
+    // priority is below the app loop so a USB burst cannot starve the poll loop"),
+    // which is unachievable rather than merely wrong: no priority below 1 exists
+    // above the idle task. What actually keeps a USB burst off the key path is the
+    // CALLBACK SPLIT, not the priority -- `CdcRxCallback` only copies bytes into the
+    // SPSC ring and `CdcLineStateCallback` only publishes a DTR level, so the
+    // preemption window is a memcpy and an atomic store, and all protocol and
+    // orchestrator work runs on the poll task in `UsbLinkService`. That invariant
+    // is what `tools/check_task_ownership.py` gates; a reader who believed this
+    // comment and lowered the priority to "fix" a real-time concern would instead
+    // let a large burst delay the USB task's own servicing.
     tusb_cfg.task.size = 4096;
     tusb_cfg.task.priority = 5;
     tusb_cfg.task.xCoreID = 0;
@@ -202,13 +267,30 @@ void UsbLinkStart(IHAL *hal, SystemOrchestrator *sys)
 void UsbLinkService()
 {
     if (!g_started) return;
+
+    // EVERYTHING below runs on the poll task (`app_main`), which is the point:
+    // the TinyUSB callbacks only stage bytes and record the DTR transition, and
+    // all protocol and orchestrator state is touched here, next to `Tick`.
+    //
+    // Order matters. The DTR transition first, so a session that just opened is
+    // marked connected before its first frame is parsed -- otherwise `hello` and
+    // the config reply run would be armed after the app's own opening frame
+    // arrived. Then the staged input, which is where the command handlers run.
+    ServiceLineState();
+
+    // Parse whatever the callback staged, delivering each complete frame to the
+    // router. Bounded by the staged bytes, not by a frame count, so a single call
+    // cannot spin on an empty ring.
+    g_cdc.DrainRx();
+
     // The router emits at most one deferred frame per call (a large config reply
     // is chunked), so calling both keeps a reply moving without a burst that the
     // transport's two-frame buffer would drop.
     if (g_router != nullptr) {
-        // Time-based frames first (spec 4.4's 2 s status). `Process()` is also
-        // called from host tests that never advance a clock, which is why the
-        // periodic status is driven here rather than from `Process()`.
+        // Time-based frames AFTER the inbound work (spec 4.4's 2 s status), so a
+        // command answered this tick is not delayed by a status frame. `Process()`
+        // is also called from host tests that never advance a clock, which is why
+        // the periodic status is driven here rather than from `Process()`.
         g_router->Tick();
         g_router->Process();
     }

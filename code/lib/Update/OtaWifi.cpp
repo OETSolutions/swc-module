@@ -60,6 +60,10 @@ const char *OtaWifiCaBundleAttach() {
     // A NAME, not a mode. The whole point of returning a string is that a test or
     // a log can record which verification path was used, so "we use the bundle"
     // is a checkable fact rather than a comment someone may have deleted.
+    //
+    // **It names the default bundle, which is NOT a pinned CA.** See the header
+    // and N-62 for what that does and does not buy; do not read this string as
+    // "the trust anchor is pinned".
     return "esp_crt_bundle";
 }
 
@@ -81,8 +85,10 @@ ReleaseCheckResult OtaWifiCheck(const char *manifest_url, const char *current_ve
     esp_http_client_config_t cfg = {};
     cfg.url = manifest_url;
     cfg.event_handler = ManifestHttpEvent;
-    // VERIFIED TLS. Not `setInsecure` -- see the header. Spec 9.5 records this as
-    // the reference project's known gap and says SWC must not repeat it.
+    // VERIFIED TLS, but see the header: this is IDF's DEFAULT bundle, not a pinned
+    // CA. Not `setInsecure` -- see spec 9.5, which records the reference project's
+    // disabled validation as a gap SWC must not repeat -- but the anchor is the
+    // ~200 stock Mozilla roots, and pinning one is open item N-62.
     cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.timeout_ms = 10000;
 
@@ -121,7 +127,9 @@ OtaResult OtaWifiInstall(const ReleaseInfo &info, size_t max_size,
     esp_http_client_config_t cfg = {};
     cfg.url = info.url;
     cfg.event_handler = ImageHttpEvent;
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;   // verified TLS
+    // Verified against the default bundle -- see the header and N-62. Still not
+    // `setInsecure`, and still not a pinned CA.
+    cfg.crt_bundle_attach = esp_crt_bundle_attach;
     cfg.timeout_ms = 15000;
     // The image is up to ~1.5 MB; the default buffer is fine because the event
     // handler consumes each chunk as it arrives rather than buffering the image.

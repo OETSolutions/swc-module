@@ -25,5 +25,21 @@ interface SwcTransport {
      */
     val incoming: Flow<ByteArray>
 
+    /**
+     * Re-run device enumeration and (re)open the port. Returns the problem to
+     * show the user, or null on success.
+     *
+     * **This exists so a retry can actually recover, and it is not the same as
+     * [write]ing another frame.** `UsbSerialTransport::open` was called exactly
+     * once, from `MainActivity.onCreate`, and nothing ran it again — there was no
+     * `ACTION_USB_DEVICE_ATTACHED` receiver — so an app opened before the adapter
+     * was plugged in stayed on "No device found" forever. "Try again" only called
+     * `connect()`, which sends a `ping`; `write` returns early when no connection
+     * is open, so the retry wrote nothing and could never succeed.
+     *
+     * A transport that needs no enumeration (a test double) returns null.
+     */
+    suspend fun reopen(): LinkProblem? = null
+
     fun close()
 }

@@ -91,6 +91,41 @@ TEST(SystemOrchestrator, SafeIdleIsEstablishedBeforeAnythingElse) {
     EXPECT_GT(hal.DacWriteCount(DAC_CH_KEY1), 0);
 }
 
+TEST(SystemOrchestrator, TheHealthGateCanSayNoWhenADacWriteFails) {
+    // **FR-37's gate, and the defect was that it could not be false.** `app_main`
+    // marked an OTA image valid on `SystemOrchestratorSafeIdle()`, which returns
+    // `safe_idle_established_` -- assigned `true` once, at the end of an
+    // `EstablishSafeIdle()` that returns void and cannot fail. The condition was a
+    // compile-time constant `true`, so an image whose I2C bus is dead had its
+    // pending rollback CANCELLED: bricked-but-"valid", the exact state spec §9.8
+    // says must never happen.
+    //
+    // `OutputVerified()` folds in the HAL's latched `dac_faulted`, so the gate can
+    // now answer NO. Both halves are asserted: the healthy device is verified, and
+    // a device whose write failed is NOT.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    EXPECT_TRUE(o.OutputVerified()) << "a healthy boot must be verified, or the gate "
+                                       "would refuse every good image";
+    EXPECT_FALSE(hal.DacFaulted());
+
+    // The falsifying case: a write that fails. Boot again so the failure lands
+    // during the safe-idle write, which is exactly when the gate reads it.
+    MockHal bad;
+    bad.FailNextDacWrite();
+    auto o2 = MakeOrch(bad);
+    bad.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o2.Boot();
+    EXPECT_TRUE(bad.DacFaulted()) << "the failed write must latch, and never clear";
+    EXPECT_TRUE(o2.SafeIdleEstablished())
+        << "the safe idle is still 'established' -- which is precisely why it "
+           "cannot be the gate on its own";
+    EXPECT_FALSE(o2.OutputVerified())
+        << "a device that cannot drive the DAC must not be confirmed healthy";
+}
+
 TEST(SystemOrchestrator, BootDrivesTheAdjustChannelIntoTheOneKiloOhmPulldown) {
     MockHal hal;
     auto o = MakeOrch(hal);
@@ -463,7 +498,8 @@ namespace {
 // Both channels are given a name and `enabled = true`, because
 // `ConfigDefault`'s values are what the real device boots with.
 SystemOrchestrator MakeUnconfiguredTwoChannel(MockHal &hal) {
-    Config c = ConfigDefault();
+    Config c{};
+    ConfigDefault(&c);
     c.channel_count = 2;
     hal.ClearNvs();
     return SystemOrchestrator(&hal.InterfaceRef(), c, GestureTimingsDefault());
@@ -1324,6 +1360,52 @@ TEST(SystemOrchestrator, ASustainedAUX1HoldEntersMaintenanceWithNoApp) {
     EXPECT_EQ(o.MaintenanceTriggeredBy(), MaintenanceTrigger::kAux1Hold);
 }
 
+TEST(SystemOrchestrator, TheMaintenanceTriggerIsRecordedAndNothingInProductionBranchesOnIt) {
+    // `MaintenanceTrigger` documents itself as existing because "the caller's
+    // shutdown path differs": a USB command should be acknowledged, an AUX1 hold
+    // gets a buzzer, and a no-config boot "must explain itself on the LED". None of
+    // that exists. Two of its five values (`kConfigFlag`, `kNoConfigAtBoot`) have
+    // NO emitter anywhere, and no production code branches on the trigger at all
+    // -- the only reader in the tree is the accessor `MaintenanceTriggeredBy()`,
+    // whose sole caller is a test. So a device in maintenance mode is
+    // INDISTINGUISHABLE, on the wire and to the user, from one whose window opened
+    // for any other reason.
+    //
+    // **That matters most for the AUX1 path, which is the no-app path.** A user who
+    // holds AUX1 for 3 s gets LED_STAT's double-flash -- and so does a user whose
+    // window opened from the app, or from a config flag. The LED is the only
+    // evidence a no-app user has, and it cannot say which. The buzzer the enum
+    // promises for an AUX1 hold is never played.
+    //
+    // This test records the state rather than fixing it: making the triggers
+    // distinct is a feature (a per-trigger acknowledgement plus a wire field),
+    // not a repair, and the recorded finding is N-61.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // The USB path records kUsbCommand...
+    o.EnterMaintenance(MaintenanceTrigger::kUsbCommand, hal.NowMs());
+    ASSERT_TRUE(o.MaintenanceActive());
+    EXPECT_EQ(o.MaintenanceTriggeredBy(), MaintenanceTrigger::kUsbCommand)
+        << "the trigger is recorded faithfully -- this is not the defect";
+    o.ExitMaintenance();
+
+    // ...and the AUX1 path records kAux1Hold. The two ARE distinguished in the
+    // stored value; what is missing is any consequence of the difference.
+    HoldAuxFor(o, hal, SystemOrchestrator::kMaintenanceHoldMs + 150);
+    ASSERT_TRUE(o.MaintenanceActive());
+    EXPECT_EQ(o.MaintenanceTriggeredBy(), MaintenanceTrigger::kAux1Hold);
+
+    // The observable consequence that IS missing: an AUX1 hold plays no
+    // acknowledgement. Nothing in this build plays a maintenance-entered pattern
+    // for either trigger, so the two are indistinguishable to the user.
+    EXPECT_FALSE(o.LearnActive()) << "escalation still leaves no learn behind it";
+}
+
 TEST(SystemOrchestrator, AProgrammingHoldEscalatesIntoMaintenanceRatherThanUndefinedState) {
     // Spec 8.2's nesting, which is the part that is easy to get wrong: by 3 s the
     // 1.5 s programming hold has ALREADY toggled the wizard, so the maintenance
@@ -1360,7 +1442,12 @@ TEST(SystemOrchestrator, TheProgrammingHoldAloneDoesNotOpenMaintenance) {
 
 TEST(SystemOrchestrator, MaintenanceTimesOutAndDoesNotStrandTheDevice) {
     // FR-38: a device stuck unable to serve input because someone opened a web
-    // page is unacceptable. The window is bounded at 5 minutes of inactivity.
+    // page is unacceptable. The window is bounded by the configured
+    // `maintenance_timeout_ms` -- default 5 minutes -- timed from `Enter`.
+    //
+    // NOT "5 minutes of inactivity": nothing calls `NoteActivity` in this build
+    // (N-35), so the clock is never bumped and this is a FIXED deadline. The
+    // poll below is from entry, which is what the firmware actually measures.
     MockHal hal;
     auto o = MakeOrch(hal);
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
@@ -1374,7 +1461,8 @@ TEST(SystemOrchestrator, MaintenanceTimesOutAndDoesNotStrandTheDevice) {
     PollFor(o, hal, 299000);
     EXPECT_TRUE(o.MaintenanceActive()) << "the window must not close early";
     PollFor(o, hal, 2000);
-    EXPECT_FALSE(o.MaintenanceActive()) << "5 minutes of inactivity must close the window";
+    EXPECT_FALSE(o.MaintenanceActive())
+        << "the configured window must close and serve a press again";
 }
 
 TEST(SystemOrchestrator, PressesStillWorkWhileMaintenanceIsOpen) {
@@ -1410,7 +1498,7 @@ TEST(SystemOrchestrator, NoteMaintenanceActivityKeepsAWorkingUserInTheWindow) {
         o.NoteMaintenanceActivity(hal.NowMs());
     }
     EXPECT_TRUE(o.MaintenanceActive())
-        << "repeated activity must keep the window open past the original 5 minutes";
+        << "repeated activity must keep the window open past the original deadline";
 }
 
 TEST(SystemOrchestrator, AFreshDeviceTaughtHeadlesslyStopsPassingThrough) {
@@ -1473,6 +1561,130 @@ int CountStatEdges(MockHal &hal, SystemOrchestrator &o, uint32_t total_ms) {
     }
     return on;
 }
+
+// The fraction of a 2 s window LED_STAT spends LOW, in ticks. This is the
+// discriminator the learn-handback tests need: `kSolid` holds the line high
+// continuously (0 low ticks), while `kBreathe` is a 1 Hz 500/500 square (~half).
+// A rising-edge COUNT cannot tell them apart -- a solid line produces exactly one
+// rise, which is the same order as a slow breathe's two.
+int CountStatLowTicks(MockHal &hal, SystemOrchestrator &o, uint32_t total_ms) {
+    int low = 0;
+    for (uint32_t t = 0; t < total_ms; t += 5) {
+        o.Tick(hal.NowMs());
+        if (!hal.GpioRead(GPIO_LED_STAT)) ++low;
+        hal.AdvanceMs(5);
+    }
+    return low;
+}
+
+TEST(SystemOrchestrator, LeavingTheLearnHandsLedStatBackToTheLinkStateNotASolidLie) {
+    // **Spec 7.3 gives LED_STAT one meaning per state, and the learn's own
+    // handback cannot supply it.** `Solid` is documented as "Running, output safe,
+    // **USB connected**, config valid", "Slow breathe (1 Hz)" as "Running
+    // normally, **no USB**". `LearnWizard::Exit` unconditionally sets `kSolid`
+    // (LearnWizard.cpp:121) -- it has no HAL view of the link, and `ConsumeExited`
+    // hands back only LED2 -- so the wizard alone would leave a no-host device
+    // solid, which spec 7.3 reads as "USB connected".
+    //
+    // What makes the handback RIGHT is that the wizard's exit is not the last
+    // word: `ServiceLearn` defers the maintenance-LED decision while the wizard is
+    // active and holds `maintenance_led_state_` at its INVERSE, so the first tick
+    // after the wizard leaves sees a mismatch and repaints through `RestatLeds`,
+    // which ranks fault > maintenance > link and reads `usb_connected_`
+    // (SystemOrchestrator.cpp:708-715). This test is the guard on that
+    // mechanism -- mutation-tested by collapsing the deferred transition, which
+    // makes it fail -- and on the link state being the one that lands.
+    //
+    // The exit is REACHABLE without a host by design: the second AUX1 hold is the
+    // documented way to leave the learn (spec 7.4 step 5).
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // Deliberately NO SetUsbConnected(true): no host is attached. Boot has
+    // already painted `kBreathe` through RestatLeds.
+    HoldAuxToToggle(o, hal);
+    ASSERT_TRUE(o.LearnActive());
+    HoldAuxToToggle(o, hal);
+    ASSERT_FALSE(o.LearnActive()) << "the learn is over";
+
+    // Let the exit prompt and the handback settle before measuring the steady
+    // state, so this cannot pass or fail on a transient.
+    PollFor(o, hal, 100);
+    EXPECT_GT(CountStatLowTicks(hal, o, 2000), 100)
+        << "with no USB host, LED_STAT must breathe (spec 7.3), not sit solid";
+}
+
+TEST(SystemOrchestrator, AnEscalatedHoldShowsMaintenanceEvenWithNoHostAttached) {
+    // **The 3 s AUX1 escalation used to leave LED_STAT solid on a no-host
+    // device.** The two hold tiers (1.5 s learn, 3 s maintenance) are one
+    // continuous user action, so the same tick can exit the wizard and open the
+    // window. The maintenance-LED deferral then has to repaint ONCE, from the
+    // wizard's `kSolid` handback to the window's double-flash -- and it did not.
+    //
+    // The deferral tracked "a repaint is owed" by writing `!want_maint_led` into
+    // the state flag. During the learn, maintenance is not yet open, so `want` is
+    // false and the sentinel stored TRUE; the 3 s tier then opened the window in
+    // the same tick, making `want` true too -- equal to the sentinel, so the edge
+    // never fired. The wizard's solid handback stuck for the entire window, on a
+    // device with no host, which spec 7.3 reads as "USB connected". The flag is
+    // now an explicit owed-restat boolean (SystemOrchestrator.cpp:708-724), so it
+    // cannot be desynced by the deferral's own sentinel.
+    //
+    // This is the escalation twin of `AMaintenanceWindowDoubleFlashesLedStat`,
+    // which covers the plain path; the bug lived only in the overlapping one.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // ONE continuous hold past both tiers: 1.5 s enters the learn, 3 s escalates.
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxPressedMv);
+    PollFor(o, hal, SystemOrchestrator::kMaintenanceHoldMs + 150);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    PollFor(o, hal, 60);
+    ASSERT_TRUE(o.MaintenanceActive()) << "the long hold must escalate to maintenance";
+    ASSERT_FALSE(o.LearnActive()) << "and leave the learn behind it";
+
+    PollFor(o, hal, 100);
+    // A 2 s window at 5 ms steps is 400 ticks. Solid holds it high throughout
+    // (0 low); a 1 Hz breathe is ~50% (~200); the maintenance double-flash is
+    // 100/100 + 100/600 per 900 ms period, i.e. ~78% low (~310). 250 sits between
+    // the breathe and the burst, so this asserts the double-flash itself rather
+    // than merely "not solid".
+    EXPECT_GT(CountStatLowTicks(hal, o, 2000), 250)
+        << "the window must double-flash even with no host attached; a solid "
+           "LED_STAT here means the wizard's handback was never repainted";
+}
+
+TEST(SystemOrchestrator, LeavingTheLearnStillShowsSolidWhenAHostIsAttached) {
+    // The other half, so the fix cannot be "always breathe": with a host attached
+    // the handback must still land on `kSolid`, which is the state spec 7.3 gives
+    // a connected device. This is the assertion that makes the pair a parity
+    // check rather than a one-sided one.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    o.SetUsbConnected(true);
+
+    HoldAuxToToggle(o, hal);
+    ASSERT_TRUE(o.LearnActive());
+    HoldAuxToToggle(o, hal);
+    ASSERT_FALSE(o.LearnActive());
+
+    PollFor(o, hal, 100);
+    EXPECT_EQ(CountStatLowTicks(hal, o, 2000), 0)
+        << "with a host attached, LED_STAT must stay solid";
+}
+
 }  // namespace
 
 TEST(SystemOrchestrator, AnOutOfRangeChannelBlinksTheFaultLamp) {
@@ -1510,6 +1722,56 @@ TEST(SystemOrchestrator, AFaultDoesNotClearItselfWhenTheLevelReturnsToIdle) {
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
     PollFor(o, hal, 2000);
     EXPECT_TRUE(o.Faulted()) << "the fault must latch until a reboot";
+}
+
+/*
+ * The sense envelope is NOT a fault. Two conditions share the safety release --
+ * FR-4's ladder out-of-range and spec 6.2 step 2's "no head unit" -- but only
+ * the first may latch, and folding them together made the SECOND do it too.
+ *
+ * Why this matters mechanically: spec 4.4 says the head unit "may sleep,
+ * suspend, or reboot at any moment", and spec 6.8's head-unit-gone row says
+ * "keep classifying". A reboot-only latch (spec 7.3) on that condition means the
+ * first time the head unit sleeps -- or the user parks and the radio powers
+ * down -- LED_STAT blinks forever, telling the driver the adapter is broken
+ * when it is not. Recovery would need a full reboot, which is the one thing the
+ * indication must not require for a normal event.
+ */
+TEST(SystemOrchestrator, AHeadUnitThatGoesAwayReleasesButDoesNotLatchAFault) {
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    ASSERT_FALSE(o.Faulted()) << "a present head unit is not a fault";
+
+    // The head unit powers down: its KEY line collapses, so 2 x 250 = 500 mV is
+    // far below the envelope's 1.8 V floor.
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 250);
+    PollFor(o, hal, 300);
+    EXPECT_FALSE(o.Faulted())
+        << "a head unit that went away is spec 6.8's 'keep classifying', not a "
+           "latched hardware fault -- the head unit may sleep and come back";
+}
+
+TEST(SystemOrchestrator, AHeadUnitThatComesBackKeepsWorking) {
+    // The other half, and the reason the latch is wrong rather than merely
+    // pessimistic: the release must be recoverable without a reboot. A press
+    // after the head unit returns drives a key exactly as before.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 250);   // gone
+    PollFor(o, hal, 300);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);   // back
+    PollFor(o, hal, 100);
+
+    EXPECT_NE(PressAndCaptureDrivenCode(o, hal, 1430), idle_code)
+        << "a head unit that returned must classify and drive, with no reboot";
 }
 
 TEST(SystemOrchestrator, TheLedIsBreathingBeforeAnyHostAttaches) {
@@ -1674,10 +1936,11 @@ TEST(SystemOrchestrator, LeavingMaintenanceStopsTheDoubleFlash) {
 }
 
 TEST(SystemOrchestrator, TheMaintenanceTimeoutClosesTheWindowAndItsIndication) {
-    // FR-38's 5-minute timeout is the one exit with no caller to notify, so the
-    // LED must be restated from the tick rather than from the entry/exit sites.
-    // A device whose radio window expired while still double-flashing would tell
-    // the user to look at a state it is no longer in.
+    // FR-38's timeout is the one exit with no caller to notify, so the LED must
+    // be restated from the tick rather than from the entry/exit sites. A device
+    // whose radio window expired while still double-flashing would tell the user
+    // to look at a state it is no longer in. (The window is a FIXED deadline
+    // from `Enter`, not inactivity -- N-35 -- so this advances straight past it.)
     MockHal hal;
     auto o = MakeOrch(hal);
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
@@ -1691,8 +1954,8 @@ TEST(SystemOrchestrator, TheMaintenanceTimeoutClosesTheWindowAndItsIndication) {
     hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
     ASSERT_TRUE(o.MaintenanceActive());
 
-    // Past the 5-minute window, in one jump: `ShouldTimeout` is a comparison on
-    // elapsed time, so the intermediate ticks carry no information.
+    // Past the configured window, in one jump: `ShouldTimeout` is a comparison
+    // on elapsed time, so the intermediate ticks carry no information.
     hal.AdvanceMs(300001);
     o.Tick(hal.NowMs());
     hal.AdvanceMs(10);
@@ -2011,7 +2274,7 @@ TEST(SystemOrchestrator, ALearnLED2IsTheComplementOfLedStatNotActivity) {
            "than a solid state LED with a dark activity LED";
 }
 
-TEST(SystemOrchestrator, PROBE_LEARN_LED2) {
+TEST(SystemOrchestrator, TheLearnWizardDrivesLed2AsPartOfItsPrompt) {
     MockHal hal;
     MockHal::Defaults d;
     d.config.channel_count = 1;
@@ -2022,15 +2285,62 @@ TEST(SystemOrchestrator, PROBE_LEARN_LED2) {
     hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
     o.Boot();
-    printf("PROBE pass_through=%d\n", (int)o.PassThroughActive());
     HoldAuxToToggle(o, hal);
-    printf("PROBE learn=%d\n", (int)o.LearnActive());
+    const bool learn_entered = o.LearnActive();
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    // The property the old printf probe existed to eyeball, now ASSERTED so it is
+    // a real test rather than a probe whose output the runner swallows: LED2 is
+    // dark for the first part of a learn prompt (the wizard alternates the two
+    // LEDs), so a dark LED2 here is correct and a SOLID one would mean the prompt
+    // never started.
     for (int i = 0; i < 30; ++i) {
-        o.Tick(hal.NowMs()); hal.AdvanceMs(5);
-        printf("  t=%3d LED2=%d writes=%d\n", i*5,
-               (int)hal.GpioRead(GPIO_LED2), hal.GpioWriteCount(GPIO_LED2));
+        o.Tick(hal.NowMs());
+        hal.AdvanceMs(5);
     }
+    EXPECT_TRUE(learn_entered) << "the AUX1 hold must enter the learn wizard";
+    EXPECT_GT(hal.GpioWriteCount(GPIO_LED2), 0)
+        << "the wizard must drive LED2 as part of its prompt, not leave it untouched";
+}
+
+/*
+ * A FAILED ladder conversion must not read as a press.
+ *
+ * `IHAL::adc_read_mv` returns -1 on error, and 0 mV is a LEGAL reading (a button
+ * at the ladder's common), which is why the sentinel exists rather than a zero.
+ * The pass-through press test is `(idle - level) > kPassThroughPressDeltaMv`, and
+ * `idle - (-1)` is `idle + 1`: a failed read therefore looks like the wheel
+ * pulled DOWN by the full reference, i.e. the largest possible press. Every other
+ * raw read in this file guards the sentinel (`>= 0`); this one did not, so an ADC
+ * glitch or a bus fault drove a phantom key at the mapped level -- the exact
+ * failure FR-12/FR-39 exist to prevent, and the one the ladder path's own
+ * `AdcReader` guards by dropping failed conversions.
+ *
+ * A failed read means "no measurement", so the safe response is to hold the
+ * current press state rather than invent either a press or a release.
+ */
+TEST(SystemOrchestrator, AFailedLadderConversionDoesNotDriveAPhantomKey) {
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    // The HAL's error code, at idle: nothing is pressed and nothing was measured.
+    // Sampled EVERY tick: a phantom pulse self-releases after send_duration_ms, so
+    // a check at the end of a long poll would see only the released line and miss
+    // the drive entirely.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, -1);
+    int drives = 0;
+    for (uint32_t t = 0; t < 400; t += 10) {
+        o.Tick(hal.NowMs());
+        hal.AdvanceMs(10);
+        if (hal.LastDacCode(DAC_CH_KEY1) != idle_code) ++drives;
+    }
+
+    EXPECT_EQ(drives, 0)
+        << "a failed ADC read is not a press; driving the line here is the "
+           "phantom-key hazard the -1 sentinel exists to prevent";
 }
 
 /*
@@ -2145,7 +2455,8 @@ TEST(SystemOrchestrator, TheProductionConfigEnablesItsChannels) {
     // learned buttons is described by `ladder.count == 0`, not by `enabled =
     // false`; leaving it false is what made every app-pushed binding unfindable
     // on a fresh device.
-    const Config c = ConfigDefault();
+    Config c{};
+    ConfigDefault(&c);
     ASSERT_GE(c.channel_count, 1);
     for (uint8_t i = 0; i < c.channel_count; ++i) {
         EXPECT_TRUE(c.channels[i].enabled)
@@ -2168,7 +2479,8 @@ TEST(SystemOrchestrator, ABindingResolvesOnADeviceRunningTheProductionConfig) {
     MockHal hal;
     hal.ClearNvs();   // a NEVER-configured device: Boot() takes the real path
 
-    Config c = ConfigDefault();
+    Config c{};
+    ConfigDefault(&c);
     // The binding below must name a button the config ALREADY CARRIES. A binding
     // to a button that is not yet on the ladder fails `ConfigValidate`
     // (`BindingNamesARealInput`), so `store.Save` persists a config the next
@@ -2321,7 +2633,8 @@ TEST(SystemOrchestrator, AFailedNvsWriteIsReportedAsNotPersisted) {
     // value was discarded.
     MockHal hal;
     hal.ClearNvs();
-    Config c = ConfigDefault();
+    Config c{};
+    ConfigDefault(&c);
     ConfigStore store(&hal.InterfaceRef());
     ASSERT_TRUE(store.Save(c));
 
@@ -2357,7 +2670,8 @@ TEST(SystemOrchestrator, ASuccessfulNvsWriteIsReportedAsPersisted) {
     // always being false.
     MockHal hal;
     hal.ClearNvs();
-    Config c = ConfigDefault();
+    Config c{};
+    ConfigDefault(&c);
     ConfigStore store(&hal.InterfaceRef());
     ASSERT_TRUE(store.Save(c));
 
@@ -2380,6 +2694,53 @@ TEST(SystemOrchestrator, ASuccessfulNvsWriteIsReportedAsPersisted) {
     EXPECT_TRUE(o.LastLearnPersisted()) << "a good write must report as durable";
 }
 
+TEST(SystemOrchestrator, AFailedLearnSaveDoesNotStandDownTheConfigFault) {
+    // The ordering `NoteConfigCommitted` must respect: `ApplyLearnedProfile`
+    // performs its OWN save, so clearing the config-fault latch (and reporting
+    // `ok`) BEFORE that save would, on a failed write, tell the app the user's
+    // config is safe while nothing reached NVS -- the very "reported success for a
+    // failed write" lie `persisted_` exists to prevent, one layer up.
+    MockHal hal;
+    hal.ClearNvs();
+    Config c{};
+    ConfigDefault(&c);
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(c));
+    // Make the stored config unreadable, so Boot latches the config fault.
+    hal.CorruptNvsValue("cfg_a_0", 24);
+    hal.CorruptNvsValue("cfg_b_0", 24);
+    {
+        Config t{};
+        ConfigStore s(&hal.InterfaceRef());
+        ASSERT_EQ(s.Load(&t), ConfigLoadResult::kFellBackToDefaults) << "fixture";
+    }
+
+    SystemOrchestrator o(&hal.InterfaceRef(), c, c.settings.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    ASSERT_EQ(o.ConfigStateWord(), std::string("defaults")) << "fixture: the load fell back";
+    ASSERT_TRUE(o.Faulted()) << "fixture: the config fault latched";
+
+    HoldAuxToToggle(o, hal);
+    ASSERT_TRUE(o.LearnActive());
+    PressAux(o, hal, 1);
+    hal.FailNextNvsWrite();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 400);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 300);
+
+    ASSERT_FALSE(o.LastLearnPersisted()) << "precondition: the save failed";
+    EXPECT_EQ(o.ConfigStateWord(), std::string("defaults"))
+        << "a learn that did NOT persist has not remedied the config, so the "
+           "device must not claim the config is ok";
+    EXPECT_TRUE(o.Faulted())
+        << "and the config-fault blink must stay latched over an unremedied config";
+}
+
 // --- re-learning: a learn ADDS, it does not replace the ladder ----------------
 //
 // The learn's output is ASSIGNED over the channel's ladder
@@ -2393,7 +2754,8 @@ TEST(SystemOrchestrator, ReLearningOneButtonKeepsTheChannelsOtherButtons) {
     // LEARN_OK feedback and nothing reporting a loss.
     MockHal hal;
     hal.ClearNvs();
-    Config c = ConfigDefault();
+    Config c{};
+    ConfigDefault(&c);
     ConfigStore store(&hal.InterfaceRef());
     ASSERT_TRUE(store.Save(c));
 
@@ -2451,7 +2813,8 @@ TEST(SystemOrchestrator, ReLearningTheSameSlotTwiceDoesNotDuplicateItsId) {
     // different voltages. The second learn must REPLACE the entry in place.
     MockHal hal;
     hal.ClearNvs();
-    Config c = ConfigDefault();
+    Config c{};
+    ConfigDefault(&c);
     ConfigStore store(&hal.InterfaceRef());
     ASSERT_TRUE(store.Save(c));
 
@@ -2505,7 +2868,8 @@ TEST(SystemOrchestrator, TheStoredTimingsAreWhatTheDeviceRunsWith) {
     ASSERT_TRUE(store.Save(d.config));
 
     // The DEVICE construction: default timings at construction, config from NVS.
-    const Config boot = ConfigDefault();
+    Config boot{};
+    ConfigDefault(&boot);
     SystemOrchestrator o(&hal.InterfaceRef(), boot, boot.settings.timings);
     std::vector<std::string> seen;
     o.SetGestureSink(
@@ -2541,7 +2905,378 @@ TEST(SystemOrchestrator, TheStoredTimingsAreWhatTheDeviceRunsWith) {
         << "a hold past the user's long_press_ms must still fire LONG";
 }
 
-// --- Channel.enabled gates CLASSIFICATION (spec 3.4) -------------------------
+// --- ApplyConfig: a committed config runs without a reboot (spec 4.2) ---------
+
+TEST(SystemOrchestrator, ACommittedConfigIsWhatTheRunningDeviceClassifiesAgainst) {
+    // Spec 4.2: "committed" is BOTH halves -- persisted AND running. The app
+    // adopts the config it pushed as the device's live state on the `ack` and
+    // offers no reboot affordance, so a device still classifying against the
+    // previous config shows the user a binding it will not honour until a power
+    // cycle that a car-installed device may never get.
+    //
+    // Measured before `ApplyConfig`: this test's press produced NO SINGLE, while
+    // the SAME config stored before `Boot` produced one.
+    MockHal hal;
+    MockHal::Defaults d;
+
+    // Boot on a config with NO bindings: every learned button is an unbound
+    // gesture, so a press resolves to nothing.
+    d.config.binding_count = 0;
+    Config boot = d.config;
+    SystemOrchestrator o(&hal.InterfaceRef(), boot, boot.settings.timings);
+    std::vector<std::string> seen;
+    o.SetGestureSink(
+        [](void *ctx, const SystemOrchestrator::GestureEventRecord &ev) {
+            auto *v = static_cast<std::vector<std::string> *>(ctx);
+            switch (ev.gesture) {
+                case Gesture::kSingle: v->push_back("SINGLE"); break;
+                case Gesture::kDouble: v->push_back("DOUBLE"); break;
+                case Gesture::kLong:   v->push_back("LONG");   break;
+                default: break;
+            }
+        },
+        &seen);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // A short tap on vol_up: unbound, so nothing is reported.
+    seen.clear();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 400);
+    EXPECT_TRUE(seen.empty())
+        << "the unbound baseline must report nothing, or this test proves nothing";
+
+    // Now push a config that BINDS vol_up's SINGLE -- exactly what `config_end`
+    // hands `ApplyConfig` after a successful Save.
+    Config pushed = d.config;
+    pushed.binding_count = 1;
+    pushed.bindings[0].id[0] = 'p';
+    pushed.bindings[0].id[1] = '1';
+    pushed.bindings[0].id[2] = '\0';
+    std::snprintf(pushed.bindings[0].button, sizeof(pushed.bindings[0].button), "vol_up");
+    pushed.bindings[0].gesture = Gesture::kSingle;
+    pushed.bindings[0].enabled = true;
+    pushed.bindings[0].action_count = 1;
+    pushed.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    pushed.bindings[0].actions[0].key_mv = 2400;
+    ASSERT_TRUE(ConfigValidate(pushed));
+    o.ApplyConfig(pushed);
+
+    // The SAME tap, against the config that just arrived, with no reboot.
+    seen.clear();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 400);
+    EXPECT_NE(std::find(seen.begin(), seen.end(), "SINGLE"), seen.end())
+        << "a config committed over the link must be the config the RUNNING device "
+           "classifies against (spec 4.2) -- requiring a reboot is not a permissible "
+           "reading, and the app offers no reboot affordance";
+}
+
+TEST(SystemOrchestrator, APushedLaddersNewWindowsAreUsedWithoutAReboot) {
+    // `SeedChannelState` rebuilds each channel's CLASSIFIER from the new ladder.
+    // A binding-resolve-only apply would still classify against the OLD windows,
+    // so a button the pushed config just defined would sit inside the old
+    // profile's `kUnknown` band and report nothing -- a saved binding that the
+    // app calls configured and the device ignores.
+    //
+    // Constructed so that the OLD profile CANNOT see the press and the NEW one
+    // must: the baseline ladder's lowest button is 1430 mV, and the push moves the
+    // ladder to a 3300 mV rail with one button at 900 mV. 900 mV is a real button
+    // under the new profile and an unrecognised level under the old one.
+    MockHal hal;
+    MockHal::Defaults d;
+    Config boot = d.config;
+    boot.binding_count = 0;               // nothing is bound in the baseline
+    SystemOrchestrator o(&hal.InterfaceRef(), boot, boot.settings.timings);
+    std::vector<std::string> seen;
+    o.SetGestureSink(
+        [](void *ctx, const SystemOrchestrator::GestureEventRecord &ev) {
+            auto *v = static_cast<std::vector<std::string> *>(ctx);
+            if (ev.gesture == Gesture::kSingle) v->push_back("SINGLE");
+        },
+        &seen);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // The baseline must call 900 mV unrecognised, or the test proves nothing.
+    seen.clear();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 900);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 400);
+    EXPECT_TRUE(seen.empty()) << "the baseline ladder must not recognize 900 mV";
+
+    // A new ladder whose one button sits where the OLD profile has nothing: the
+    // baseline's lowest button is 1430 mV (+-120), so 1000 mV is unrecognised
+    // there and must be recognised here.
+    Config pushed = d.config;
+    pushed.channels[0].ladder.count = 1;
+    pushed.channels[0].ladder.buttons[0] = {"mute", "Mute", 1000, 120, 3300, 235, 200, 98};
+    pushed.binding_count = 1;
+    std::snprintf(pushed.bindings[0].id, sizeof(pushed.bindings[0].id), "p1");
+    std::snprintf(pushed.bindings[0].button, sizeof(pushed.bindings[0].button), "mute");
+    pushed.bindings[0].gesture = Gesture::kSingle;
+    pushed.bindings[0].enabled = true;
+    pushed.bindings[0].action_count = 1;
+    pushed.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    pushed.bindings[0].actions[0].key_mv = 2400;
+    ASSERT_TRUE(ConfigValidate(pushed));
+
+    o.ApplyConfig(pushed);
+
+    seen.clear();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1000);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 400);
+    EXPECT_NE(std::find(seen.begin(), seen.end(), "SINGLE"), seen.end())
+        << "the pushed ladder's window must be live immediately: a stale classifier "
+           "still holds the previous windows and calls this level unrecognised";
+}
+
+TEST(SystemOrchestrator, APushedConfigRestartsTheGestureMachines) {
+    // A gesture machine left mid-count from the OLD config carries a press it was
+    // timing. Press twice in quick succession across an apply and, unless the
+    // machine is rebuilt, the second press completes a DOUBLE against a binding
+    // the pushed config never defined for it.
+    MockHal hal;
+    MockHal::Defaults d;
+    Config boot = d.config;
+    boot.binding_count = 0;
+    SystemOrchestrator o(&hal.InterfaceRef(), boot, boot.settings.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // ONE tap on vol_up, left OPEN (not released) so the machine is mid-press.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    o.ApplyConfig(MockHalDefaultsConfig());
+
+    // Release, then tap once more. Against a REBUILT machine that is ONE single
+    // press; against a stale one it would be the second half of the first.
+    int singles = 0;
+    std::vector<std::string> seen;
+    o.SetGestureSink(
+        [](void *ctx, const SystemOrchestrator::GestureEventRecord &ev) {
+            auto *v = static_cast<std::vector<std::string> *>(ctx);
+            if (ev.gesture == Gesture::kSingle) v->push_back("SINGLE");
+        },
+        &seen);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 400);
+    singles = static_cast<int>(seen.size());
+    EXPECT_EQ(singles, 0)
+        << "the press that was open across the apply must NOT be completed after it: "
+           "the gesture machine has to be rebuilt, or the push's first tap pairs with "
+           "the pre-apply one into a DOUBLE the user never made";
+}
+
+TEST(SystemOrchestrator, APushedConfigsTimingsTakeEffectWithoutAReboot) {
+    // The `settings.*` case of the same rule, and the one a `config_patch`
+    // exercises: a patched `long_press_ms` that only landed at the next boot
+    // would be stored, reported in `config_get`, and silently ignored at runtime.
+    MockHal hal;
+    MockHal::Defaults d;
+    Config boot = d.config;
+    SystemOrchestrator o(&hal.InterfaceRef(), boot, boot.settings.timings);
+    std::vector<std::string> seen;
+    o.SetGestureSink(
+        [](void *ctx, const SystemOrchestrator::GestureEventRecord &ev) {
+            auto *v = static_cast<std::vector<std::string> *>(ctx);
+            if (ev.gesture == Gesture::kLong) v->push_back("LONG");
+        },
+        &seen);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    Config pushed = d.config;
+    pushed.settings.timings.long_press_ms = 1500;
+    o.ApplyConfig(pushed);
+
+    // Hold past the DEFAULT 750 but short of 1500: no LONG unless the new timing
+    // was adopted.
+    seen.clear();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 900);
+    EXPECT_TRUE(seen.empty())
+        << "LONG fired before the pushed long_press_ms (1500): ApplyConfig did not "
+           "adopt the new timings";
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 400);
+
+    seen.clear();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 1700);
+    EXPECT_FALSE(seen.empty()) << "a hold past the pushed long_press_ms must fire LONG";
+}
+
+TEST(SystemOrchestrator, APushedConfigEndsPassThrough) {
+    // FR-25 / spec 6.9: pass-through exists because there are no learned windows
+    // to classify against. A committed config HAS them, so a device left in
+    // pass-through would mirror the raw wheel onto the head unit and ignore the
+    // binding the user just saved -- with entirely correct-looking feedback.
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    ASSERT_TRUE(o.PassThroughActive()) << "the fixture must start in pass-through";
+
+    MockHal::Defaults d;
+    o.ApplyConfig(d.config);
+    EXPECT_FALSE(o.PassThroughActive())
+        << "a committed config must end pass-through, or the binding it carries is "
+           "never consulted";
+
+    // And the reverse must NOT hold: an apply never TURNS ON pass-through.
+    o.ApplyConfig(Config{});
+    EXPECT_FALSE(o.PassThroughActive()) << "no apply may re-enable pass-through";
+}
+
+TEST(SystemOrchestrator, ApplyConfigKeepsTheMaintenanceWindowOpen) {
+    // A config can arrive while the provisioning page is open -- the web UI talks
+    // to the same link, and `config_patch` is how a browser-driven setup writes.
+    // Rebuilding `maintenance_` from the new config would set `active_` back to
+    // false, and the CALLER tears the radio down on an `Active()` transition: the
+    // user's setup page would vanish mid-provision.
+    MockHal hal;
+    MockHal::Defaults d;
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.Boot();
+    o.EnterMaintenance(MaintenanceTrigger::kUsbCommand, hal.NowMs());
+    ASSERT_TRUE(o.MaintenanceActive());
+
+    Config pushed = d.config;
+    pushed.settings.maintenance_timeout_ms = 60000;
+    o.ApplyConfig(pushed);
+    EXPECT_TRUE(o.MaintenanceActive())
+        << "applying a config must not close an open maintenance window";
+    EXPECT_EQ(o.MaintenanceTriggeredBy(), MaintenanceTrigger::kUsbCommand)
+        << "and it must not rewrite how the window was opened";
+}
+
+TEST(SystemOrchestrator, ApplyConfigKeepsAHardwareFaultLatched) {
+    // `hw_faulted_` is a statement about the BOARD (spec 7.3), not about the
+    // config: a wiring fault or a collapsed rail does not fix itself, and a config
+    // arriving says nothing about the ladder's wiring. So an apply keeps it
+    // blinking. (The CONFIG half of the fault is the opposite case and DOES clear
+    // -- see ApplyConfigClearsTheConfigFaultAndReportsOk.)
+    MockHal hal;
+    Config boot{};
+    ConfigDefault(&boot);
+    SystemOrchestrator o(&hal.InterfaceRef(), boot, boot.settings.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    ASSERT_EQ(o.ConfigStateWord(), std::string("none")) << "a fresh device has no config";
+    ASSERT_FALSE(o.Faulted());
+
+    // Drive a HARDWARE fault: the ladder reads above its idle reference, which is
+    // FR-4's out-of-range case (a short to 12 V). It must be the LADDER that is
+    // out of range, not the KEY sense: the sense envelope is spec 6.2 step 2's
+    // "no head unit" test and spec 6.8 gives that row "keep classifying", so it
+    // deliberately does NOT latch (a head unit that sleeps and returns is normal,
+    // spec 4.4). Latching here is FR-4's alone.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3000);
+    PollFor(o, hal, 200);
+    ASSERT_TRUE(o.Faulted()) << "precondition: the hardware fault must latch";
+
+    MockHal::Defaults d;
+    o.ApplyConfig(d.config);
+    EXPECT_TRUE(o.Faulted()) << "an apply must not clear a hardware fault";
+    // And the config's own word still moves, because a config WAS committed -- the
+    // two facts are independent and the lamp shows either.
+    EXPECT_EQ(o.ConfigStateWord(), std::string("ok"))
+        << "a committed config is the one now in force";
+}
+
+TEST(SystemOrchestrator, ApplyConfigClearsTheConfigFaultAndReportsOk) {
+    // The case the app's own warning creates: `config_state: defaults` makes the
+    // link screen tell the user "Your learned buttons and bindings are gone.
+    // Program it again from the Bindings screen." When the user DOES -- any commit
+    // -- the device must stop saying defaults, or the app re-asserts a fault the
+    // device is no longer in. `config_state` describes the config in force (spec
+    // 4.3), so a committed config makes it `ok`, and the config-fault LED stands
+    // down with it (spec 7.3's reboot-only latch is for HARDWARE faults).
+    MockHal hal;
+    MockHal::Defaults d;
+    ASSERT_TRUE(([&]{ ConfigStore s(&hal.InterfaceRef()); return s.Save(d.config); })());
+    hal.CorruptNvsValue("cfg_a_0", 24);
+    hal.CorruptNvsValue("cfg_b_0", 24);
+    {
+        Config t{};
+        ConfigStore s(&hal.InterfaceRef());
+        ASSERT_EQ(s.Load(&t), ConfigLoadResult::kFellBackToDefaults)
+            << "the fixture must actually be unreadable";
+    }
+
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    ASSERT_EQ(o.ConfigStateWord(), std::string("defaults")) << "fixture: the load fell back";
+    ASSERT_TRUE(o.Faulted()) << "fixture: the config fault latched a blink";
+
+    // The user programs it again. Any of the three commit paths reaches here;
+    // `ApplyConfig` is the shared tail they all call.
+    o.ApplyConfig(d.config);
+    EXPECT_EQ(o.ConfigStateWord(), std::string("ok"))
+        << "a remedied config must stop being reported as defaults";
+    EXPECT_FALSE(o.Faulted())
+        << "and the config-fault blink must stand down, or the device keeps "
+           "signalling 'not OK' over a config it is successfully running";
+}
+
+TEST(SystemOrchestrator, ApplyConfigRepaintsTheLevels) {
+    // Feedback levels are part of the config (spec 3.3), and both grammars are
+    // rebuilt from them in `ApplyConfig`. A pushed `led_level` that only took
+    // effect at the next boot would leave the user's own level setting doing
+    // nothing on the device in front of them.
+    //
+    // The observable is the LED_STAT cadence, which the level gates: the default
+    // level 2 breathes (a 500/500 square, so writes every 500 ms), and a pushed
+    // level of 0 must hold it dark with no further writes.
+    MockHal hal;
+    MockHal::Defaults d;
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.Boot();
+
+    // Precondition: at the default level the lamp is being driven. Without this
+    // the test would pass on a device that never writes at all.
+    const int before = hal.GpioWriteCount(GPIO_LED_STAT);
+    PollFor(o, hal, 1200);
+    const int toggles_at_level_2 = hal.GpioWriteCount(GPIO_LED_STAT) - before;
+    ASSERT_GT(toggles_at_level_2, 0) << "the default level must drive LED_STAT";
+
+    Config pushed = d.config;
+    pushed.settings.led_level = 0;   // LEDs off
+    o.ApplyConfig(pushed);
+
+    // The lamp must GO DARK and then stay there. Its state is what the level gates,
+    // so assert the LEVEL rather than a write count: a `RestatLeds` on a level-0
+    // grammar emits exactly one off write, and a count assertion would confuse that
+    // single write with a live pattern.
+    PollFor(o, hal, 600);
+    EXPECT_FALSE(hal.GpioRead(GPIO_LED_STAT))
+        << "a level of 0 must leave LED_STAT dark after an apply";
+
+    // ...and it must STOP toggling, which is what separates "dark" from "still
+    // running the old breathe with the output clamped low".
+    const int after_apply = hal.GpioWriteCount(GPIO_LED_STAT);
+    PollFor(o, hal, 1200);
+    EXPECT_EQ(hal.GpioWriteCount(GPIO_LED_STAT), after_apply)
+        << "a level of 0 must stop driving LED_STAT after an apply: the grammar "
+           "still carries the OLD level if ApplyConfig did not adopt the new one";
+}
+
 
 TEST(SystemOrchestrator, ADisabledChannelDoesNotClassifyItsLearnedLadder) {
     // Spec 3.4: `Channel.enabled = false` means "this channel has no learned
@@ -2600,6 +3335,29 @@ TEST(SystemOrchestrator, ADisabledChannelStillReleasesAKeyDrivenByTheBench) {
         << "the pulse must still self-release on a disabled channel";
 }
 
+TEST(SystemOrchestrator, ADisabledChannelDoesNotLatchAFaultWhenTheHeadUnitGoesAway) {
+    // A disabled channel cannot classify, so its ONLY out-of-range signal is the
+    // KEY-sense envelope -- and that is spec 6.2 step 2's "no head unit" test,
+    // whose spec 6.8 response is "keep classifying", not a latch. Folding it into
+    // FR-4's fault branch made this branch latch a reboot-only blink on a
+    // recurring normal condition (the head unit sleeping, spec 4.4).
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.channels[0].enabled = false;
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    ASSERT_FALSE(o.Faulted());
+
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 250);   // the head unit powers down
+    PollFor(o, hal, 300);
+    EXPECT_FALSE(o.Faulted())
+        << "a disabled channel must release on a lost head unit without latching";
+}
+
 TEST(SystemOrchestrator, ACorruptConfigFallsBackToDefaultsAndActuallyRunsThem) {
     /*
      * Spec 6.8: "Config corrupt / bad checksum -> DEFAULTS; loud buzzer pattern;
@@ -2628,7 +3386,8 @@ TEST(SystemOrchestrator, ACorruptConfigFallsBackToDefaultsAndActuallyRunsThem) {
     // no slot yields a usable config.
     {
         ConfigStore boot_store(&hal.InterfaceRef());
-        Config good = ConfigDefault();
+        Config good{};
+        ConfigDefault(&good);
         std::strncpy(good.device_id, "REALDEVICE", sizeof(good.device_id) - 1);
         ASSERT_TRUE(boot_store.Save(good));
     }
@@ -2637,7 +3396,8 @@ TEST(SystemOrchestrator, ACorruptConfigFallsBackToDefaultsAndActuallyRunsThem) {
     // A caller config with a DISTINCTIVE idle reference, deliberately not the
     // default. If Boot applies the defaults this becomes 2835; if it leaves the
     // caller's config in place it stays 1234.
-    Config ctor_cfg = ConfigDefault();
+    Config ctor_cfg{};
+    ConfigDefault(&ctor_cfg);
     std::strncpy(ctor_cfg.device_id, "CTOR-CONFIG", sizeof(ctor_cfg.device_id) - 1);
     ctor_cfg.channels[0].ladder.learned_idle_mv = 1234;
 
@@ -2652,4 +3412,377 @@ TEST(SystemOrchestrator, ACorruptConfigFallsBackToDefaultsAndActuallyRunsThem) {
         << "and the fallback must actually RUN, not just be reported: the caller's "
            "1234 would mean the device kept a config it just told the app it had "
            "discarded";
+}
+
+namespace {
+// Count ON-transitions of the buzzer line over `ms`, the way the feedback tests
+// do. Spec 7.2: BOOT_OK is ONE 60/60 pulse, BOOT_DEGRADED is THREE, so counting
+// separates a clean boot from a degraded one without depending on timing.
+int CountBootBeeps(SystemOrchestrator &o, MockHal &hal, uint32_t ms) {
+    int on = 0;
+    bool prev = false;
+    for (uint32_t t = 0; t < ms; t += 5) {
+        o.Tick(hal.NowMs());
+        hal.AdvanceMs(5);
+        const bool now = hal.BuzzerIsOn();
+        if (now && !prev) ++on;
+        prev = now;
+    }
+    return on;
+}
+}  // namespace
+
+TEST(SystemOrchestrator, ADegradedAdcCalibrationBootsAsDegradedNotSilent) {
+    // Spec 3.2: a blank eFuse falls back to the linear approximation AND must be
+    // reported. `main.cpp` and `EspHal` both claimed "the orchestrator also plays
+    // BOOT_DEGRADED for this class of condition", and it did NOT -- `IHAL` carries
+    // no calibration accessor, so the orchestrator could not know, and the boot
+    // pattern came only from the config load. A blank-eFuse device booted silently,
+    // which is the failure the fallback clause names; the boot buzzer is the one
+    // signal a user at the bench hears with no host attached.
+    MockHal hal;
+    hal.ClearNvs();
+    MockHal::Defaults d;
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.SetCalibrationDegraded(true);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // 3 pulses = BOOT_DEGRADED; 1 = BOOT_OK. A window long enough for the whole
+    // degraded pattern (60/60 x3 = 360 ms) plus margin.
+    EXPECT_EQ(CountBootBeeps(o, hal, 1200), 3)
+        << "a degraded calibration must announce BOOT_DEGRADED (spec 3.2/7.2), "
+           "not boot silently as if nothing were wrong";
+}
+
+TEST(SystemOrchestrator, AHealthyAdcCalibrationStillBootsClean) {
+    // The other direction, so the test above cannot pass by the boot pattern
+    // always being BOOT_DEGRADED.
+    MockHal hal;
+    hal.ClearNvs();
+    MockHal::Defaults d;
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    // Degraded defaults to false; asserted explicitly so the fixture is the flag.
+    o.SetCalibrationDegraded(false);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    EXPECT_EQ(CountBootBeeps(o, hal, 1200), 1)
+        << "a healthy eFuse boots BOOT_OK (one pulse), not degraded";
+}
+
+/*
+ * `identify` BORROWS LED_STAT for a double-flash and must hand it back (spec
+ * 7.3). Two failures used to follow from it never restoring:
+ *   1. the pattern flashed FOREVER after one `identify` (until reboot), so the
+ *      state LED stopped answering "is this thing OK?";
+ *   2. it bypassed `RestatLeds`, so an `identify` on a FAULTED device repainted
+ *      the latched fault blink as a double-flash -- spec 7.3's "a connect
+ *      mid-fault must not repaint the lamp green", same hazard, different path.
+ */
+TEST(SystemOrchestrator, IdentifyRestoresLedStatAfterItsBurst) {
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    // Establish a known base state and let any boot pattern settle.
+    o.SetUsbConnected(true);
+    PollFor(o, hal, 100);
+
+    o.Identify();
+    PollFor(o, hal, SystemOrchestrator::kIdentifyFlashMs + 200);
+    // After the burst the LED must be BACK on the link state (solid with a host
+    // attached), not still cycling the double-flash.
+    const int before = hal.GpioWriteCount(GPIO_LED_STAT);
+    PollFor(o, hal, 500);
+    EXPECT_EQ(hal.GpioWriteCount(GPIO_LED_STAT), before)
+        << "LED_STAT must stop toggling once the identify burst ends; a pattern "
+           "that keeps writing is one that was never restored";
+    EXPECT_TRUE(hal.GpioRead(GPIO_LED_STAT))
+        << "with a host attached the restored state is SOLID";
+}
+
+TEST(SystemOrchestrator, IdentifyDoesNotRepaintALatchedFault) {
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    // Drive a latched fault: the LADDER reads above its idle reference, which is
+    // FR-4's out-of-range case (a short to 12 V). The KEY-sense envelope is NOT
+    // usable as this fixture -- spec 6.8's head-unit-gone row says "keep
+    // classifying", so it deliberately does not latch.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3000);
+    PollFor(o, hal, 200);
+    ASSERT_TRUE(o.Faulted()) << "precondition: the fault must latch";
+
+    o.Identify();
+    PollFor(o, hal, SystemOrchestrator::kIdentifyFlashMs + 400);
+    // The fault outranks the identify burst, so once the burst ends the lamp is
+    // back to the fault BLINK -- and the distinguishing property is its RATE:
+    // kBlink is 100/100 (10 toggles/s), kDoubleFlash is a 900 ms burst (about 4).
+    // Counting toggles over one second separates the two; "it still toggles"
+    // would not, because a STUCK double-flash also toggles.
+    EXPECT_TRUE(o.Faulted()) << "identify must not clear the fault";
+    const int before = hal.GpioWriteCount(GPIO_LED_STAT);
+    PollFor(o, hal, 1000);
+    const int toggles = hal.GpioWriteCount(GPIO_LED_STAT) - before;
+    EXPECT_GE(toggles, 7)
+        << "the restored state must be the fault BLINK (~10 toggles/s), not the "
+           "identify double-flash (~4) left pinned over the fault";
+}
+
+TEST(SystemOrchestrator, APushedConfigDoesNotPaintOverAnActiveLearn) {
+    // The learn wizard owns BOTH LEDs as prompts until it hands back, and `Tick`
+    // already defers its maintenance restate for exactly that reason. `ApplyConfig`
+    // repainting unconditionally would stamp a level change over a prompt the user
+    // is reading -- reachable because a config push over the link and a headless
+    // AUX1 learn can overlap.
+    MockHal hal;
+    MockHal::Defaults d;
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    // Enter the wizard with the 1.5 s AUX1 PROGRAMMING hold (FR-31). Not the 3 s
+    // maintenance hold -- that one exits the wizard and opens a maintenance
+    // window, which is a different state entirely.
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, 0);
+    PollFor(o, hal, LearnWizard::kEnterHoldMs + 300);
+    ASSERT_TRUE(o.LearnActive()) << "the hold must have opened the wizard";
+    // RELEASE, or the hold keeps running and the 3 s tier escalates into
+    // maintenance, which exits the wizard -- the test would then be measuring the
+    // wrong state entirely.
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, 3300);
+    PollFor(o, hal, 50);
+    ASSERT_TRUE(o.LearnActive()) << "releasing AUX1 must not exit the wizard";
+
+    // Let the wizard's prompts settle, then apply a config that changes the LED
+    // level. The prompt must not be cancelled and must not be repainted over.
+    PollFor(o, hal, 200);
+    // The wizard's select prompt is `kAlternate` (a 250/250 square), so it TOGGLES
+    // steadily. That cadence is what a level-only change must preserve.
+    const int before = hal.GpioWriteCount(GPIO_LED_STAT);
+    PollFor(o, hal, 1000);
+    const int toggles_before = hal.GpioWriteCount(GPIO_LED_STAT) - before;
+    ASSERT_GT(toggles_before, 0) << "the wizard's prompt must be animating";
+
+    Config pushed = d.config;
+    pushed.settings.led_level = 3;
+    o.ApplyConfig(pushed);
+
+    // **The defect this catches:** `leds_ = LedGrammar(...)` constructs a fresh
+    // object with `stat_ == kOff`, SILENTLY cancelling the wizard's prompt -- and
+    // the wizard sets that prompt once on entry, so nothing restores it. Asserting
+    // "no repaint" is not enough; the pattern must still be RUNNING.
+    const int after = hal.GpioWriteCount(GPIO_LED_STAT);
+    PollFor(o, hal, 1000);
+    EXPECT_GT(hal.GpioWriteCount(GPIO_LED_STAT) - after, 0)
+        << "applying a config during a learn CANCELLED the wizard's LED prompt: the "
+           "grammar was rebuilt from scratch, and the wizard sets its pattern once on "
+           "entry so nothing brings it back";
+    EXPECT_TRUE(o.LearnActive()) << "and the learn itself must keep running";
+}
+
+TEST(SystemOrchestrator, RemovingAChannelReleasesItsDrivenKey) {
+    /*
+     * FR-39: the KEY line must NEVER be left driving a phantom press. Every
+     * release path -- the pulse timeout, the ladder fault, the lost head unit --
+     * lives inside `ServiceChannel`, which `Tick` runs only for
+     * `channels_[0..channel_count_-1]`. So a channel a config REMOVES is never
+     * visited again, and a line driven at the moment of the apply held its key
+     * until the next reboot: a real phantom press, from a config push, on a
+     * device whose LED2 would keep showing "driving" as evidence.
+     *
+     * Reachable from the app: `channels` is a list the user edits, and a
+     * two-channel install reduced to one is an ordinary thing to save.
+     */
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.channel_count = 2;
+    d.config.channels[1] = d.config.channels[0];
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE2, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code2 = hal.LastDacCode(DAC_CH_KEY2);
+
+    // Hold channel 2's line open well past the moment the config lands -- the
+    // same "hold it open so only the release can end it" shape the rail-sag test
+    // uses, because a normal SINGLE pulse self-releases and would hide the bug.
+    ASSERT_TRUE(o.TestDriveKeyMv(1, 2400, 5000, hal.NowMs()));
+    ASSERT_NE(hal.LastDacCode(DAC_CH_KEY2), idle_code2) << "precondition: driving";
+
+    Config pushed = d.config;
+    pushed.channel_count = 1;   // channel 1 is gone
+    o.ApplyConfig(pushed);
+
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY2), idle_code2)
+        << "a channel removed by a config push must release its key at once";
+    // Still released after the old pulse deadline passes, so the release cannot
+    // be the ordinary timeout arriving a moment later.
+    PollFor(o, hal, 6000);
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY2), idle_code2)
+        << "and it must stay released, with the removed channel never serviced";
+}
+
+// --- Spec 6.2's command band, end to end (N-32) -----------------------------
+//
+// The unit tests pin `GainPolicyClampCommand`; these pin that the ORCHESTRATOR
+// uses it, because the gap was never in the arithmetic -- it was that no drive
+// path consulted the head unit's own idle at all.
+
+TEST(SystemOrchestrator, ACommandAboveTheHeadUnitsOwnIdleIsBroughtIntoTheBand) {
+    // The defect this pins (N-32): spec 6.2 says command targets must stay below
+    // the line's resting level, because above it "the servo can only turn `Q4` off,
+    // which is the release behavior, not a command". The only bound was FR-18's
+    // envelope clamp, which permits any value from 1800 to 5200 mV -- so a `key_mv`
+    // between the head unit's measured idle (4980 mV here) and the ceiling was
+    // driven AT ITS OWN VALUE and reached the radio as nothing at all.
+    //
+    // The consequence is a press that silently does nothing while every observable
+    // says it worked: the config is green, the press is acked, and LED2 reports a
+    // key presented. Only the radio disagrees. Clamping brings the request into the
+    // band, so the binding still works as a button.
+    MockHal hal;
+    MockHal::Defaults d;
+    // vol_up SINGLE -> a key ABOVE the line's rest and inside the envelope.
+    d.config.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    d.config.bindings[0].actions[0].key_mv = 5100;   // 4980 < 5100 < 5200
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config)) << "5100 mV is a legal key_mv per ConfigValidate";
+
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);   // 4980 mV idle
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    ASSERT_EQ(o.IdleKeyMv(0), 4980)
+        << "the accessor must report the head unit's MEASURED idle, not the idle "
+           "code's own (much higher) voltage";
+
+    LogCapture logs;
+    o.SetLogSink(&LogCapture::Sink, &logs);
+
+    const int driven = PressAndCaptureDrivenCode(o, hal, 1430);
+    const int raw_code =
+        GainPolicyCodeForTarget(o.ChannelGainMode(0), 5100).dac_code;
+    const int band_ceiling_code =
+        GainPolicyCodeForTarget(o.ChannelGainMode(0), 4980 - kCommandHeadroomMv).dac_code;
+    ASSERT_NE(raw_code, band_ceiling_code)
+        << "fixture error: the raw and clamped codes must differ, or this test can "
+           "pass without the clamp";
+    EXPECT_EQ(driven, band_ceiling_code)
+        << "a command above the line's own rest must be brought down to "
+           "V_KEY_idle - 0.20 V; driving its raw value leaves the FET off and the "
+           "radio receives no key";
+    ASSERT_EQ(logs.lines.size(), 1u) << "the clamp must be warned about, not silent";
+    EXPECT_NE(logs.lines[0].find("5100"), std::string::npos)
+        << "the warning must name the value that was clamped";
+}
+
+TEST(SystemOrchestrator, AnEmptyCommandBandPlaysKeyUnknownRatherThanAcknowledging) {
+    // A head unit idling at 1900 mV leaves `1900 - 200 = 1700`, below the servo's
+    // 1800 mV floor: no level is BOTH reachable and below the line's rest. There is
+    // no command to make, so the press must NOT be acknowledged -- `KEY_ACCEPTED`
+    // on a press that drove nothing is the lie this whole fix is about.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    d.config.bindings[0].actions[0].key_mv = 2400;
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 950);   // x2 = 1900 mV: a very low line
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    ASSERT_EQ(o.IdleKeyMv(0), 1900);
+
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+    const int before = hal.BuzzerOnCount();
+    const int driven = PressAndCaptureDrivenCode(o, hal, 1430);
+    EXPECT_EQ(driven, idle_code) << "an empty band must drive nothing";
+    EXPECT_GT(hal.BuzzerOnCount(), before)
+        << "the empty band must be reported audibly (KEY_UNKNOWN), not silently";
+    EXPECT_FALSE(hal.BuzzerIsOn()) << "and must leave the buzzer off when the pattern ends";
+}
+
+TEST(SystemOrchestrator, PassThroughWithAnEmptyCommandBandDrivesNothing) {
+    // The SAME band applies to the pass-through path, because a ratio-mapped
+    // target is still a command target (spec 6.2). `kPassThroughPressDeltaMv`
+    // caps the wheel's ratio at ~897 permille, so a head unit idling just above
+    // the envelope floor (1900 mV here) leaves `1900 - 200 = 1700`, below the
+    // servo's 1800 mV floor: there is no level BOTH reachable and below the line's
+    // rest. Mapping the ratio anyway would drive a level that reaches the radio as
+    // nothing -- the dead press this whole fix is about -- so the pass-through
+    // must refuse and release.
+    MockHal hal;
+    auto o = MakeUnconfigured(hal);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);   // the wheel at idle
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 950);   // x2 = 1900 mV: a very low line
+    o.Boot();
+    ASSERT_TRUE(o.PassThroughActive()) << "precondition: this is the pass-through path";
+    ASSERT_EQ(o.IdleKeyMv(0), 1900);
+
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+    // A press well off idle (300 mV is the pass-through threshold; 1430 is 1405 off).
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "a pass-through press whose mapped target falls in an empty command band "
+           "must drive nothing, rather than a level the radio cannot read";
+}
+
+// --- FR-1's NTC clause: the channel that is never converted (open item N-67) ---
+
+TEST(SystemOrchestrator, TheNtcChannelIsNeverConvertedSoFR1sFirstClauseIsUnmet) {
+    // FR-1 requires the firmware to "sample both ladder channels AND THE NTC
+    // continuously". The ladder half is real: every poll tick converts each
+    // channel through `AdcReader`. The NTC half has no implementation at all --
+    // `ADC_CH_TEMP` is mapped to `ADC_CHANNEL_6` in EspHal's `AdcPinFor` and is
+    // read by NOTHING, and there is no NTC-to-temperature conversion anywhere in
+    // the tree. So `temp_c_at_learn` is stamped from a literal 0 on both learn
+    // paths, and a field a future compensation is meant to consume is a constant.
+    //
+    // This test drives a full poll loop -- boot, a press, a release, and an
+    // entire headless learn -- and asserts the NTC was converted ZERO times
+    // throughout. It is written to PASS today, so it is a PROBE, not a bug: it
+    // pins the gap so the day the sampling path is added, the counter goes
+    // non-zero and this test fails, which is the moment to delete it and record
+    // that FR-1 is met. Without it the gap is invisible: nothing else in the
+    // suite would notice the difference between "the NTC is read" and "it is not",
+    // because the field it would fill is never consulted.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_TEMP, 1500);   // a plausible NTC divider reading
+    o.Boot();
+
+    // A press and a release, so the full classification path runs.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 700);
+
+    // And a whole headless learn, which is the path that RECORDS a temperature.
+    HoldAuxToToggle(o, hal);
+    ASSERT_TRUE(o.LearnActive());
+    PressAux(o, hal, 1);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 400);
+
+    EXPECT_GT(hal.AdcReadCount(ADC_CH_SWC1), 0)
+        << "the ladder channel IS converted (FR-1's second half), so a zero here "
+           "would mean the test is not driving the loop at all";
+    EXPECT_EQ(hal.AdcReadCount(ADC_CH_TEMP), 0)
+        << "ADC_CH_TEMP was converted -- FR-1's NTC clause now has an "
+           "implementation. Update open item N-67, delete this probe, and assert "
+           "the recorded temperature instead of the read count";
 }

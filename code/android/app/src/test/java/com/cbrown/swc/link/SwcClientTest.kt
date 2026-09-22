@@ -130,6 +130,32 @@ class SwcClientTest {
     }
 
     @Test
+    fun `a version mismatch stops the app talking`() = runTest {
+        // Spec 4.5: on a mismatch the app must STOP TALKING, not carry on
+        // best-effort -- "silent partial compatibility is how a config gets
+        // corrupted". The state was set, but nothing gated outbound frames: after a
+        // mismatched `hello` a `connect()` still wrote `ping`, a `getConfig()`
+        // still wrote `config_get`, and a config push still wrote every chunk --
+        // all onto a peer whose vocabulary disagrees with ours.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        t.emit("{\"v\":99,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+        assertTrue(client.state.value is LinkState.VersionMismatch)
+
+        val before = t.written.size
+        client.connect()
+        client.getConfig(timeoutMs = 1)
+        advanceUntilIdle()
+        assertEquals(
+            "no frame may reach the wire once the versions disagree",
+            before, t.written.size,
+        )
+        job.cancel()
+    }
+
+    @Test
     fun `an oversized line is dropped and reported instead of growing unbounded`() = runTest {
         val t = FakeTransport()
         val client = SwcClient(t)
@@ -232,6 +258,30 @@ class SwcClientTest {
         t.emit(frames.last() + "\n")
         advanceUntilIdle()
         assertEquals("", client.config.value.deviceId)
+        assertTrue(client.state.value is LinkState.Failed)
+        job.cancel()
+    }
+
+    @Test
+    fun `a config_begin with an out-of-range total_len releases the getConfig waiter`() = runTest {
+        // A `total_len` past the protocol maximum makes the run unusable, so the
+        // client goes to Failed -- and MUST release the pending `getConfig`. It
+        // used to set `inbound = null` and fail the state without calling
+        // `finishConfigRun`, so the waiter hung its full 15 s timeout: a spinner
+        // with no exit for a run the device had already made impossible.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+
+        val call = launch { client.getConfig(timeoutMs = 15_000) }
+        runCurrent()
+        assertTrue("the request must go out", t.written.any { it.contains("\"type\":\"config_get\"") })
+
+        // A begin whose total_len is absurdly large, and no further frames.
+        t.emit("{\"v\":1,\"seq\":1,\"type\":\"config_begin\",\"total_len\":99999999,\"crc32\":1}\n")
+        runCurrent()
+
+        assertTrue("the bad begin must release the waiter, not leave it hanging", call.isCompleted)
         assertTrue(client.state.value is LinkState.Failed)
         job.cancel()
     }
@@ -352,6 +402,36 @@ class SwcClientTest {
         job.cancel()
     }
 
+    @Test
+    fun `getConfig does not wait out its timeout once the versions disagree`() = runTest {
+        // Spec 4.5's silence has ONE more caller than the reply-bearing requests.
+        // `sendLocked` already refuses to put `config_get` on the wire on a
+        // mismatch, but `getConfig` also registers a waiter that only a config RUN
+        // can end -- and with no frame out, no run can come. So it parked on its
+        // full 15 s timeout on a silence the app chose, which is what `connect()`
+        // hits on every launch against a mismatched device. The early return must
+        // resolve it with the unchanged local model instead.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        t.emit("{\"v\":99,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+        assertTrue(client.state.value is LinkState.VersionMismatch)
+
+        val before = t.written.size
+        val call = launch { client.getConfig(timeoutMs = 15_000) }
+        runCurrent()
+        assertTrue(
+            "getConfig must not park for its whole timeout under a version mismatch",
+            call.isCompleted,
+        )
+        assertEquals(
+            "and it must still send nothing",
+            before, t.written.size,
+        )
+        job.cancel()
+    }
+
     private fun crc32ForTest(data: ByteArray): Long {
         var crc = 0xFFFFFFFFL
         for (b in data) {
@@ -457,6 +537,45 @@ class SwcClientTest {
         advanceUntilIdle()
         assertTrue("the digest failure must survive its own frame",
             client.state.value is LinkState.Failed)
+        job.cancel()
+    }
+
+    @Test
+    fun `a config error is not erased when the link was ALREADY failed`() = runTest {
+        // The recovery rule is "a well-formed frame clears a failure raised by an
+        // EARLIER frame". The guard was `failedBeforeThisFrame && Failed`, read AFTER
+        // dispatch -- and that cannot tell a STALE failure from one this very frame
+        // just raised: both read as Failed with the flag set. So a frame that both
+        // started on a Failed state AND raised a new failure erased its own error.
+        //
+        // `config_begin` is the frame that does both: an out-of-range `total_len` is
+        // refused INSIDE the dispatch, on a frame that is itself well-formed. Reached
+        // after any earlier malformed line, the bound check's failure vanished and
+        // the link reported a healthy `Connected` while every config request was
+        // rejected -- the exact "detected but not reported" failure.
+        val t = FakeTransport()
+        val client = SwcClient(t)
+        val job = startClient(client)
+        t.emit("{\"v\":1,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+        assertEquals(LinkState.Connected, client.state.value)
+
+        // A stale failure: a malformed line.
+        t.emit("not json\n")
+        advanceUntilIdle()
+        assertTrue(client.state.value is LinkState.Failed)
+
+        // A well-formed `config_begin` whose declared length the wire cannot carry.
+        // `beginInboundConfig` raises a failure for it -- on the SAME frame.
+        t.emit("{\"v\":1,\"seq\":2,\"type\":\"config_begin\"," +
+            "\"total_len\":99999999,\"crc32\":0}\n")
+        advanceUntilIdle()
+
+        assertTrue(
+            "an out-of-range config_begin must report its own failure even when the " +
+                "link was already failed: was ${client.state.value}",
+            client.state.value is LinkState.Failed,
+        )
         job.cancel()
     }
 

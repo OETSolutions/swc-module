@@ -37,10 +37,25 @@
  * the number is expected to be tuned on hardware. */
 constexpr int kAdcOversampleCount = 32;
 
-/* How close two consecutive windows must agree before the value is called
- * settled. Not zero: a real ADC's noise floor is a few mV, so an exact-equality
- * test would leave `Settled()` permanently false on hardware -- a filter whose
- * callers never classify. */
+/* The tolerance on the SPREAD WITHIN ONE BURST -- how far the 32 conversions of
+ * a single `Update` may range before the burst is called a mixture. Not zero: a
+ * real ADC's noise floor is a few mV, so an exact-equality test would leave
+ * `Settled()` permanently false on hardware -- a filter whose callers never
+ * classify.
+ *
+ * It is NOT "how close two consecutive windows must agree", which is what an
+ * earlier revision of this comment said. The class holds no previous-window
+ * member (`window_` is the only buffer), nothing is carried between `Update`
+ * calls, and `AdcReader::Update` compares `hi - lo` across the samples it just
+ * collected. That per-burst meaning is the deliberate one -- a window taken while
+ * the input is still moving spans both levels, so its median is a value the input
+ * never held -- and it is what the `.cpp` and the spec's N-18 note describe. A
+ * reader who took the old wording at face value would expect a large jump BETWEEN
+ * two bursts to be reported unsettled; it is not, because each uniform burst is
+ * settled on its own. Nothing downstream depends on the inter-window reading (the
+ * lone consumer, `ServiceChannel`'s idle-reference re-adoption, independently
+ * bounds the ratio), so this is corrected here rather than implemented. Recorded
+ * as spec open item N-66. */
 constexpr int kAdcSettleToleranceMv = 4;
 
 class AdcReader {

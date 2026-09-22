@@ -34,11 +34,12 @@ idf_component_register(
     #   app_update       esp_ota_ops.h        -- OtaUsb's slot read + boot switch
     #   esp_http_client  esp_http_client.h    -- OtaWifi's manifest + image fetch
     #   esp_https_ota    esp_https_ota.h      -- the esp_https_ota path (spec 9.5)
-    #   mbedtls          esp_crt_bundle.h     -- OtaWifi's PINNED CA. Listing
+    #   mbedtls          esp_crt_bundle.h     -- OtaWifi's trust anchor. Listing
     #                    mbedtls here is what makes the verified-TLS path
     #                    compilable at all; without it the temptation is to drop
     #                    the bundle and reach for setInsecure, which spec 9.5
-    #                    forbids outright.
+    #                    forbids outright. NOTE this gives the DEFAULT bundle, not
+    #                    a pinned CA (open item N-62).
     #   esp_tinyusb      tinyusb.h, tusb_cdc_acm.h -- the CDC transport. This is a
     #                    MANAGED component, not an IDF one: IDF 5.5.5 has no
     #                    components/tinyusb, and src/idf_component.yml is what

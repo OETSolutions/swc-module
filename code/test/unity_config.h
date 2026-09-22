@@ -56,8 +56,19 @@ extern "C" {
 
 typedef void (*swc_test_fn)(void);
 
-/* The registry lives in the test suite's main file; these are its hooks. */
-void swc_register_test(swc_test_fn fn, const char *name);
+/*
+ * The registry lives in the test suite's main file; these are its hooks.
+ *
+ * `setup`/`teardown` are PER FILE, and that is not decoration -- it is the fix
+ * for a link failure. Unity's own runner (`UnityDefaultTestRun` in unity.c)
+ * calls the GLOBAL `setUp`/`tearDown`, and this suite is three translation
+ * units, each needing its own. Three definitions of one global symbol is a
+ * multiple-definition error, so the suite could never link: every "D" row of
+ * the spec's coverage matrix was unrunnable. The file's hooks are therefore
+ * captured here, at registration, and the runner calls them itself.
+ */
+void swc_register_test(swc_test_fn fn, const char *name,
+                       swc_test_fn setup, swc_test_fn teardown);
 
 #ifdef __cplusplus
 }
@@ -69,12 +80,23 @@ void swc_register_test(swc_test_fn fn, const char *name);
  * Expands to the test function plus a constructor that registers it. The
  * name is stringified for the report; the tag is accepted for readability and
  * for a future filter, and is unused today.
+ *
+ * CONTRACT: the macro references `swc_setup` and `swc_teardown`, so EVERY file
+ * that uses TEST must declare both, file-local:
+ *
+ *     static void swc_setup(void)    { ... }   // runs before each test here
+ *     static void swc_teardown(void) { ... }   // runs after each test here
+ *
+ * They must be `static` (internal linkage) so the three suites do not collide,
+ * and they must be named this way -- not `setUp`/`tearDown`, which Unity.h
+ * declares as non-static globals and a static redefinition of which is an
+ * error. A file with no per-test state still defines both as empty bodies.
  */
 #ifndef TEST
 #define TEST(name, tag)                                                       \
     static void test_##name(void);                                            \
     __attribute__((constructor)) static void register_##name(void) {          \
-        swc_register_test(test_##name, #name);                                \
+        swc_register_test(test_##name, #name, swc_setup, swc_teardown);       \
     }                                                                         \
     static void test_##name(void)
 #endif

@@ -71,8 +71,16 @@ void NdjsonWriter::Write(const char *type, uint32_t seq, const char *json_body_f
     // which is always short enough -- rather than emit a line the peer cannot
     // parse and cannot resynchronize from.
     if (n < 0 || static_cast<size_t>(n) > kNdjsonMaxFrame) {
+        // `kNdjsonProtocolVersion`, NOT a literal `1`: this is the fallback frame
+        // of last resort, so a protocol bump that missed it would send a peer an
+        // envelope stamped with the OLD version -- and a peer that dispatches on
+        // the envelope's `v` would refuse or mis-handle the one frame whose whole
+        // job is to keep the link recoverable. The header above records that the
+        // literal `"v":1` was replaced by the constant; this branch was the
+        // remaining copy.
         n = snprintf(line_, sizeof(line_),
-                     "{\"v\":1,\"seq\":%u,\"type\":\"error\",\"error\":\"frame_too_long\"}\n",
+                     "{\"v\":%u,\"seq\":%u,\"type\":\"error\",\"error\":\"frame_too_long\"}\n",
+                     static_cast<unsigned>(kNdjsonProtocolVersion),
                      static_cast<unsigned>(seq));
         if (n < 0) n = 0;
     }

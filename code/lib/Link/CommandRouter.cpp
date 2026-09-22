@@ -7,6 +7,7 @@
 
 #include "Config/ConfigDefaults.h"
 #include "Feedback/BuzzerGrammar.h"
+#include "Link/UsbCdc.h"
 #include "Util/Base64.h"
 #include "Util/FwVersion.h"
 #include "Util/Sha256.h"
@@ -141,16 +142,39 @@ void CommandRouter::ResetRun() {
     run_open_ = false;
 }
 
-void CommandRouter::OnDisconnected() {
+void CommandRouter::ForgetLearnSession() {
+    // `Start` zeroes every accumulator; the neighbour set is irrelevant because
+    // nothing will be committed from this session. See the header for why the
+    // samples -- not just `learn_open_` -- must go.
+    session_.Start(LadderProfile{});
+    learn_open_ = false;
+    learn_channel_ = -1;
+    learn_samples_ = 0;
+}
+
+void CommandRouter::ResetLinkState() {
     // An interrupted run is discarded wholesale: a partial config is never
     // applied (spec 4.2).
     ResetRun();
-    // The learn stream is link-scoped too: the app session that opened it is what
-    // ends it, and that session is over.
-    learn_open_ = false;
+    // The `config_get` REPLY run is link-scoped for the same reason: `Process`
+    // emits one chunk per call and gates on `reply_open_` alone, so a run left
+    // open past the end of its link streams the rest of a reply to nobody, filling
+    // the TX buffer until a real reply is refused. `OnDisconnected` always cleared
+    // this; the silence reap did not -- that drift is what made this one function.
     reply_open_ = false;
     reply_off_ = 0;
     reply_len_ = 0;
+    reply_sent_begin_ = false;
+    // The learn stream AND its samples: the app session that opened the stream is
+    // what ends it, and a commit must not run on a dead stream's measurements.
+    ForgetLearnSession();
+}
+
+void CommandRouter::OnDisconnected() {
+    // Every link-scoped run is discarded in one place (spec 4.2, spec 4.4): a
+    // partial config is never applied, a half-sent reply is not resumed, and a
+    // learn session does not survive the session that opened it.
+    ResetLinkState();
     // Reconnect is stateless (spec 4.4), so the peer's sequence baseline is
     // re-established by the next frame rather than remembered across a link drop.
     seen_any_ = false;
@@ -176,9 +200,15 @@ void CommandRouter::OnConnected() {
     status_clock_seeded_ = false;
     // hello first (spec 4.5's version negotiation), then the config run so the
     // app can render immediately without asking.
+    //
+    // `caps` lists what this build can ACTUALLY do, not what the product will
+    // eventually do. It advertised "ota" while the dispatch below nacks every
+    // `ota_*` frame as `not_implemented` (spec open item N-14): a client that
+    // trusts `caps[]` would offer an update flow that cannot succeed. `ota`
+    // returns here the moment the router is wired to `OtaUsb`, and no earlier.
     char body[192];
     snprintf(body, sizeof(body),
-             "\"fw_version\":\"%s\",\"hw_id\":\"SWC-S3\",\"protocol_v\":%u,\"caps\":[\"config\",\"ota\",\"learn\"]",
+             "\"fw_version\":\"%s\",\"hw_id\":\"SWC-S3\",\"protocol_v\":%u,\"caps\":[\"config\",\"learn\"]",
              FwVersionString(), static_cast<unsigned>(kNdjsonProtocolVersion));
     Emit("hello", body);
     BeginConfigReplyRun();
@@ -188,10 +218,24 @@ void CommandRouter::BeginConfigReplyRun() {
     // Encode the CURRENT config -- stored if there is one, else the shared
     // default. Encoding the stored blob instead would put the wire form and the
     // NVS form on two different code paths that could drift.
-    Config c = ConfigDefault();
+    //
+    // **The scratch is a member, not a local.** `sizeof(Config)` is 8,912 B, and
+    // this runs on the 4,096-byte TinyUSB task (it is reached from `OnConnected`
+    // on the RX callback). As a local it measured a 17,856-byte frame, and with
+    // its `Load` -> `ConfigDecodeJson` chain the peak was ~35.8 KB -- a stack
+    // overflow the moment a host connects. A member is also what makes it legal
+    // to keep the config across the chunked reply, which is emitted one frame per
+    // `Process()` and so cannot hold a local.
+    Config &c = reply_config_;
+    ConfigDefault(&c);
     if (store_ != nullptr) {
-        Config loaded{};
-        if (store_->Load(&loaded) == ConfigLoadResult::kLoaded) c = loaded;
+        // `kRecoveredFromBackup` IS a loaded config: it is what `Boot` is running
+        // (spec 6.8 makes the other slot authoritative after a torn write), so
+        // replying with defaults here would draw an empty app over a configured
+        // device -- and the app's next save would then overwrite the recovered
+        // config. Only a synthesized default (`kFellBackToDefaults`) or an absent
+        // config (`kNoConfig`) is not the user's.
+        if (!ConfigLoadResultIsUsable(store_->Load(&c))) ConfigDefault(&c);
     }
     reply_len_ = ConfigEncodeJson(c, reply_buf_, sizeof(reply_buf_));
     reply_off_ = 0;
@@ -206,8 +250,19 @@ void CommandRouter::BeginConfigReplyRun() {
 }
 
 void CommandRouter::Process() {
-    // A learn run streams whether or not a config reply is in flight. One sample
-    // per call, so the stream cannot starve the reply run or the key path.
+    // ONE frame per call, and the CONFIG REPLY WINS when both are pending: a reply
+    // answers a request the peer is blocked on, whereas the learn stream is
+    // continuous and can resume on the next call. So the learn sample is emitted
+    // only when no reply run is in flight -- `!reply_open_` below.
+    //
+    // An earlier comment here said the opposite ("a learn run streams whether or
+    // not a config reply is in flight"), which is not what the guard does. The code
+    // is the intended behaviour -- giving the stream priority instead would stall a
+    // `config_get` reply for as long as a learn stayed open, and the reply is
+    // finite (its own chunks drain in one-frame-per-call steps) so the pause it
+    // imposes on the stream is bounded. The comment was corrected rather than the
+    // guard, because a reader who "fixed" the guard to match it would strand the
+    // reply.
     if (learn_open_ && !reply_open_) {
         EmitLadderSample();
         // The streamed sample is RECORDED, not merely sent. Spec 4.3 and this
@@ -243,7 +298,15 @@ void CommandRouter::Process() {
     const size_t remaining = reply_len_ - reply_off_;
     if (remaining > 0) {
         const size_t n = remaining < kConfigWireChunkBytes ? remaining : kConfigWireChunkBytes;
-        char b64[1024];
+        // The base64 text and the frame body are FILE-LOCAL STATICS, not locals.
+        // Together they are 2,112 B of scratch, which made this function's frame
+        // 2,352 B -- and `Process` runs on the 3,584-byte main task, three frames
+        // below `Emit` (1,072 B) and `Nack` (544 B) on the same path. The chain
+        // measured 4,080 B against that 3,584-byte stack: a guaranteed overflow
+        // the first time a `config_get` reply was chunked out. BSS is where the
+        // rest of this class's scratch already lives (`reply_buf_`, `staging_`),
+        // and `Process` is the only writer of either buffer.
+        static char b64[1024];
         const size_t bl = Base64Encode(reinterpret_cast<const uint8_t *>(reply_buf_ + reply_off_),
                                        n, b64, sizeof(b64));
         if (bl == 0) {
@@ -251,7 +314,7 @@ void CommandRouter::Process() {
             reply_open_ = false;
             return;
         }
-        char body[sizeof(b64) + 64];
+        static char body[sizeof(b64) + 64];
         snprintf(body, sizeof(body), "\"offset\":%u,\"data_b64\":\"%s\"",
                  static_cast<unsigned>(reply_off_), b64);
         reply_off_ += n;
@@ -301,17 +364,31 @@ void CommandRouter::EmitStatusBody(bool with_for_seq, uint32_t for_seq) {
     } else {
         reply_field[0] = '\0';
     }
+    // The two link-loss counters. Emitted on EVERY status, including the
+    // periodic keepalive, because they are not a reply to anything -- they
+    // describe the link, and the periodic frame is the app's one guaranteed
+    // chance to notice a degrading cable without asking.
+    //
+    // A refused INBOUND frame is counted by the transport and then, until now,
+    // dropped on the floor: `RxOverflows` had a test and nothing else, so an app
+    // whose burst overflowed the staging ring saw a command silently vanish --
+    // the exact `link_gap` failure spec 4.3's frame exists to make visible, one
+    // layer down. `tx_dropped` is N-24's outbound twin.
+    const uint32_t tx_dropped = (cdc_ != nullptr) ? cdc_->DroppedFrames() : 0u;
+    const uint32_t rx_overflows = (cdc_ != nullptr) ? cdc_->RxOverflows() : 0u;
     char body[288];
     snprintf(body, sizeof(body),
              "%s\"vbus_present\":%s,\"gain_mode\":\"%s\",\"uptime_ms\":%llu,"
-             "\"config_state\":\"%s\",\"output_safe\":%s",
+             "\"config_state\":\"%s\",\"output_safe\":%s,"
+             "\"tx_dropped\":%u,\"rx_overflows\":%u",
              reply_field, vbus ? "true" : "false",
              (sys_ != nullptr) ? (sys_->ChannelGainMode(0) == GainMode::kAmplified ? "amplified"
                                                                                   : "tracking")
                                : "unknown",
              static_cast<unsigned long long>(hal_ ? hal_->now_ms(hal_->ctx) : 0ULL),
              cfg,
-             ((sys_ != nullptr) && sys_->SafeIdleEstablished()) ? "true" : "false");
+             ((sys_ != nullptr) && sys_->SafeIdleEstablished()) ? "true" : "false",
+             static_cast<unsigned>(tx_dropped), static_cast<unsigned>(rx_overflows));
     Emit("status", body);
 }
 
@@ -319,14 +396,13 @@ void CommandRouter::NoteSilenceIfStale(uint64_t now) {
     if (link_down_) return;              // already reaped; idempotent
     if (!rx_clock_seeded_) return;       // no peer has ever spoken
     if (now - last_rx_ms_ <= kLinkSilenceMs) return;
-    // Link down (spec 4.4). Both runs are LINK-SCOPED state and neither survives:
-    // a half-received config_set is discarded wholesale (spec 4.2 -- a partial
-    // config is never applied), and a learn stream belongs to the app session
-    // that opened it. Reaping HERE is what recovers an interrupted transfer,
-    // because the router's OnDisconnected is only called on a real transport
-    // event, which a link that merely went quiet does not produce.
-    ResetRun();
-    learn_open_ = false;
+    // Link down (spec 4.4). EVERY link-scoped run is discarded, through the same
+    // teardown `OnDisconnected` uses -- a half-received config_set (spec 4.2 -- a
+    // partial config is never applied), a half-sent config_get reply, and a learn
+    // stream with its samples. Reaping HERE is what recovers an interrupted
+    // transfer, because the router's `OnDisconnected` is only called on a real
+    // transport event, which a link that merely went quiet does not produce.
+    ResetLinkState();
     // Stop the periodic status until a frame re-arms the link: a status written
     // now would sit in a FIFO nobody is draining, exactly as with no peer at all.
     connected_ = false;
@@ -492,10 +568,31 @@ void CommandRouter::HandleConfigBegin(const cJSON *root, uint32_t for_seq) {
         return;
     }
     const double tl = total->valuedouble;
-    if (tl < 0.0 || tl > static_cast<double>(ConfigMaxSerializedSize())) {
-        // Up front, from the declared length: the staging buffer is fixed and a
-        // peer-supplied length must never size it.
+    // RANGE FIRST, and written so it also rejects a non-finite value. The order
+    // matters: the integrality test below applies `static_cast<size_t>`, and
+    // casting a value outside `size_t`'s range is UNDEFINED BEHAVIOUR (measured:
+    // `(size_t)inf` returned 8443871320 on this toolchain). A JSON number literal
+    // cannot be NaN, but it CAN overflow to +inf -- cJSON parses with `strtod` and
+    // does not check `ERANGE`, so `total_len: 1e999` arrives as `inf`. The
+    // original guard (`tl < 0.0 || tl > max`) happened to catch `inf` and return
+    // before the cast, so it was safe by ordering; putting the integrality check
+    // first would have handed `inf` to the cast. `!(tl >= 0.0 && tl <= max)` is
+    // the NaN-safe form: for NaN both comparisons are false, so the negation is
+    // true and it is refused rather than falling through to the cast. Up front,
+    // from the declared length: the staging buffer is fixed and a peer-supplied
+    // length must never size it.
+    if (!(tl >= 0.0 && tl <= static_cast<double>(ConfigMaxSerializedSize()))) {
         Nack(for_seq, "too_large", "total_len exceeds the staging buffer");
+        return;
+    }
+    // Now the value is finite and in `[0, max]`, so the cast is defined.
+    // `total_len` is a BYTE COUNT, and the same rule that makes `NumToU32` refuse
+    // a fraction applies at this size: a bare `static_cast<size_t>` truncates it,
+    // so `total_len: 500.9` was acked as 500 and the sender's own number was not
+    // the one the receiver used. Refused rather than rounded -- a byte count of
+    // 500.9 is a caller bug, not 500 (see `NumToU32`).
+    if (tl != static_cast<double>(static_cast<size_t>(tl))) {
+        Nack(for_seq, "bad_frame", "total_len must be a whole number of bytes");
         return;
     }
     ResetRun();
@@ -526,8 +623,21 @@ void CommandRouter::HandleConfigChunk(const cJSON *root, uint32_t for_seq) {
         return;
     }
     const double od = off->valuedouble;
-    if (od < 0.0 || od > static_cast<double>(ConfigMaxSerializedSize())) {
+    // RANGE FIRST, same reason as `total_len`: the integrality test below casts
+    // to `size_t`, and casting a value outside its range (including the `inf` a
+    // `1e999` literal overflows to) is UNDEFINED BEHAVIOUR. The NaN-safe negated
+    // form refuses a non-finite value instead of letting it reach the cast.
+    if (!(od >= 0.0 && od <= static_cast<double>(ConfigMaxSerializedSize()))) {
         Nack(for_seq, "bad_offset", "offset out of range");
+        return;
+    }
+    // Same rule as `total_len`: an offset is a byte index, and a fraction must be
+    // refused rather than truncated. Measured on the sibling handlers, a bare cast
+    // made `offset: 9.5` satisfy the contiguity test at 9 -- the frame said one
+    // thing and the device did another, which is exactly what `NumToU32`'s integer
+    // check exists to prevent.
+    if (od != static_cast<double>(static_cast<size_t>(od))) {
+        Nack(for_seq, "bad_frame", "offset must be a whole number of bytes");
         return;
     }
     // `offset` is what makes a gap or an overlap detectable. A receiver that
@@ -595,7 +705,8 @@ void CommandRouter::HandleConfigEnd(const cJSON *root, uint32_t for_seq) {
         return;
     }
 
-    Config c{};
+    Config &c = command_config_;
+    c = Config{};
     if (!ConfigDecodeJson(reinterpret_cast<const char *>(staging_), staging_len_, &c)) {
         Nack(for_seq, "decode", "staged bytes are not a valid config");
         ResetRun();
@@ -630,6 +741,14 @@ void CommandRouter::HandleConfigEnd(const cJSON *root, uint32_t for_seq) {
         return;
     }
 
+    // Spec 4.2: "committed" is BOTH halves -- persisted AND running. The app
+    // adopts what it pushed as the device's live state the moment this `ack`
+    // arrives and offers no reboot affordance, so a device still classifying
+    // against the previous config shows the user bindings it will not honour
+    // until a power cycle. Applied only AFTER a successful Save, so a rejected
+    // config changes nothing in either place.
+    if (sys_ != nullptr) sys_->ApplyConfig(c);
+
     ResetRun();
     char body[64];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
@@ -648,7 +767,8 @@ void CommandRouter::HandleConfigPatch(const cJSON *root, uint32_t for_seq) {
         return;
     }
 
-    Config c{};
+    Config &c = command_config_;
+    c = Config{};
     const ConfigLoadResult lr = store_->Load(&c);
     if (lr == ConfigLoadResult::kFellBackToDefaults) {
         // A patch is read-modify-write, so an unreadable config must NOT be
@@ -661,7 +781,7 @@ void CommandRouter::HandleConfigPatch(const cJSON *root, uint32_t for_seq) {
              "the stored config could not be read; refusing to overwrite it");
         return;
     }
-    if (lr == ConfigLoadResult::kNoConfig) c = ConfigDefault();
+    if (lr == ConfigLoadResult::kNoConfig) ConfigDefault(&c);
 
     // BOUNDED before the cast, exactly as the config codec's `ReadU32`/`ReadU8`
     // are. A raw `static_cast` is not a range check: measured before this fix,
@@ -690,6 +810,13 @@ void CommandRouter::HandleConfigPatch(const cJSON *root, uint32_t for_seq) {
         in_range = NumToU8(v, &c.settings.buzzer_level);
     } else if (strcmp(path->valuestring, "settings.led_level") == 0) {
         in_range = NumToU8(v, &c.settings.led_level);
+    } else if (strcmp(path->valuestring, "settings.maintenance_timeout_ms") == 0) {
+        // The scope above is "`settings.*` scalars only", and this is one -- it was
+        // the single numeric settings scalar the table omitted, so a client could
+        // patch every timing and both levels but not the maintenance window. Its
+        // RANGE (zero, or past `kMaintenanceTimeoutMaxMs`) is enforced by the
+        // `ConfigValidate` call at the end of this handler, exactly like the others.
+        in_range = NumToU32(v, &c.settings.maintenance_timeout_ms);
     } else {
         known_path = false;
     }
@@ -710,6 +837,10 @@ void CommandRouter::HandleConfigPatch(const cJSON *root, uint32_t for_seq) {
         Nack(for_seq, "invalid", "patch produced an invalid config");
         return;
     }
+    // Spec 4.2 again: a patched config is a committed one, so it takes effect now
+    // (a `settings.long_press_ms` patch that only landed on the next boot would be
+    // exactly the silent no-op the chunked run's apply path exists to end).
+    if (sys_ != nullptr) sys_->ApplyConfig(c);
     char body[64];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
     Emit("ack", body);
@@ -738,13 +869,17 @@ void CommandRouter::HandleTestKey(const cJSON *root, uint32_t for_seq) {
         Nack(for_seq, "bad_param", "channel out of range");
         return;
     }
-    // `key_mv` is bounded BEFORE the int cast for the same reason as everything
-    // else here: a bare `static_cast<int>` of an out-of-range double is undefined
-    // behavior, and `TestDriveKeyMv` can only range-check an int that was formed
-    // safely. The envelope check still lives there -- this only ensures the value
-    // it sees is the value that was sent.
+    // `key_mv` is bounded BEFORE any cast, which the previous revision only
+    // claimed: `static_cast<double>(static_cast<int>(mvd))` in the comparison
+    // itself cast the raw value FIRST, so an out-of-range one was UB before the
+    // bounds were consulted. That is reachable, not theoretical -- cJSON's
+    // `parse_number` runs `strtod` and ignores `ERANGE`, so `key_mv: 1e999`
+    // arrives as `+inf` and `static_cast<int>(inf)` is undefined (measured:
+    // garbage). The range test therefore uses the NaN-safe negated form and casts
+    // only once the value is known to be in `int`'s range.
     const double mvd = key_mv->valuedouble;
-    if (mvd != static_cast<double>(static_cast<int>(mvd)) || mvd < -32768.0 || mvd > 32767.0) {
+    if (!(mvd >= -32768.0 && mvd <= 32767.0) ||
+        mvd != static_cast<double>(static_cast<int>(mvd))) {
         Nack(for_seq, "bad_param", "key_mv is not an integer in range");
         return;
     }
@@ -823,10 +958,15 @@ void CommandRouter::HandleIdentify(const cJSON *root, uint32_t for_seq) {
     // Two patterns only, because the spec's `pattern` field is a user-facing
     // "which unit is this" request rather than a way to drive the LEDs
     // arbitrarily. An unknown pattern is refused rather than silently ignored.
+    //
+    // The two patterns do DIFFERENT things, and used to be the same call -- an
+    // "accepts a field and ignores it" defect: a client asking for `buzz` got the
+    // LED double-flash too. `flash` borrows LED_STAT for the burst; `buzz` sounds
+    // the buzzer only, for a user looking at the wheel rather than the box.
     if (strcmp(pattern->valuestring, "flash") == 0) {
-        sys_->Identify();
+        sys_->Identify(true, false);
     } else if (strcmp(pattern->valuestring, "buzz") == 0) {
-        sys_->Identify();
+        sys_->Identify(false, true);
     } else {
         Nack(for_seq, "unknown_pattern", pattern->valuestring);
         return;
@@ -1006,8 +1146,14 @@ void CommandRouter::HandleLearnStart(const cJSON *root, uint32_t for_seq) {
     // subtraction by generating the id; here the id arrives from the host.
     LadderProfile existing{};
     if (store_ != nullptr) {
-        Config cur{};
-        if (store_->Load(&cur) == ConfigLoadResult::kLoaded) {
+        Config &cur = command_config_;
+        cur = Config{};
+        // Both loaded results carry a real ladder -- a recovered config is the one
+        // the device is running, so its buttons are exactly the neighbours a
+        // re-learn must stay clear of. Reading only `kLoaded` left the set empty
+        // on a recovered device, so a re-measure could land on top of an existing
+        // button and the classifier could no longer tell the two apart.
+        if (ConfigLoadResultIsUsable(store_->Load(&cur))) {
             existing = cur.channels[channel].ladder;
         }
     }
@@ -1027,7 +1173,31 @@ void CommandRouter::HandleLearnStart(const cJSON *root, uint32_t for_seq) {
 }
 
 void CommandRouter::HandleLearnStop(const cJSON *root, uint32_t for_seq) {
-    (void)root;
+    const cJSON *ch = Num(root, "channel");
+    if (ch == nullptr) {
+        Nack(for_seq, "bad_param", "channel is required");
+        return;
+    }
+    uint8_t channel = 0;
+    if (!NumToChannel(ch->valuedouble, &channel)) {
+        Nack(for_seq, "bad_param", "channel out of range");
+        return;
+    }
+    // The stop NAMES the stream to close, and the channel guard belongs here for
+    // the same reason `learn_commit` carries one. Without it `(void)root` meant a
+    // `learn_stop{channel:1}` closed channel 0's open stream and acked -- the peer
+    // could not target a stream and silently stopped the wrong one, and the two
+    // sibling handlers disagreed about whether the channel field meant anything.
+    //
+    // The samples are KEPT (`learn_channel_` and `session_` are untouched): spec
+    // 4.3's flow is start -> stream -> STOP -> commit, and the commit reads the
+    // session's channel, so discarding the session here would break the flow it
+    // exists to serve. Only the STREAM ends.
+    if (learn_open_ && static_cast<uint8_t>(learn_channel_) != channel) {
+        Nack(for_seq, "channel_mismatch",
+             "learn_stop's channel differs from the open learn stream's");
+        return;
+    }
     // Closing the stream. The app is expected to follow with learn_commit if it
     // wants the button stored; stopping alone stores nothing.
     learn_open_ = false;
@@ -1048,19 +1218,61 @@ void CommandRouter::HandleLearnCommit(const cJSON *root, uint32_t for_seq) {
         Nack(for_seq, "bad_param", "channel, button_id and name are required");
         return;
     }
+    // Refuse an EMPTY string, not merely a missing one. `Str` returns the item for
+    // `""` (a valid JSON string with a non-null `valuestring`), so a present-but-
+    // empty id or name passed this guard, was copied into the stored button, and
+    // -- since neither `LearnSession::Commit` nor `ConfigStore::Save` validates it
+    // -- was persisted. The next boot's `ConfigDecodeJson` refuses the empty string
+    // (`ReadStr`), so `Load` returns `kFellBackToDefaults` and the user loses every
+    // binding, both channels and all settings, reported only as a corrupt config.
+    // The id/name are BOUNDED here (their own widths, minus the NUL) for the same
+    // reason: `snprintf` would otherwise silently truncate a too-long value.
+    //
+    // The widths are the LADDER's (`LadderDecode.h`), because that is where these
+    // two strings land -- `out` is a `LadderButton`, whose `id` and `name` are
+    // `kLadderIdLen`/`kLadderNameLen`. They are deliberately SEPARATE constants
+    // from the binding/channel widths (`kBindingIdLen`/`kChannelNameLen`) even
+    // where the numbers agree, so a re-tune of one is a compile-time question
+    // rather than a silent over- or under-bound here. (The copy below is into
+    // `out`, not into a `Binding`, so the ladder pair is the one that governs.)
+    if (btn->valuestring[0] == '\0' || name->valuestring[0] == '\0') {
+        Nack(for_seq, "bad_param", "button_id and name must be non-empty");
+        return;
+    }
+    if (strlen(btn->valuestring) >= kLadderIdLen ||
+        strlen(name->valuestring) >= kLadderNameLen) {
+        Nack(for_seq, "bad_param", "button_id or name is too long");
+        return;
+    }
     uint8_t channel = 0;
     if (!NumToChannel(ch->valuedouble, &channel)) {
         Nack(for_seq, "bad_param", "channel out of range");
+        return;
+    }
+    // **A commit needs a SESSION, not just a matching channel.** `learn_channel_`
+    // is `-1` when no session exists -- before any `learn_start`, and after a link
+    // drop (see `ForgetLearnSession`). Without this the comparison below reads the
+    // sentinel as a channel and reports `channel_mismatch` for a commit that has no
+    // stream at all, naming the wrong cause (FR-29's "the reason is specific and
+    // actionable"). Named `no_session` so the peer knows the real state.
+    if (learn_channel_ < 0) {
+        Nack(for_seq, "no_session", "no learn session is open; send learn_start first");
         return;
     }
     // The samples came from the STREAM's channel, so the write must land on that
     // same channel -- a commit naming a different one would store channel 0's
     // measured voltage on channel 1's ladder. Measured: learn_start(channel 0)
     // then learn_commit(channel 1) returned `ack` and wrote a 1430 mV button onto
-    // channel 1 (whose own input was idle at 2835 mV). The frame's `channel` still
-    // has to be present and valid (the spec spells it that way and the app sends
-    // it), but the stream is the authority for WHERE the measurement belongs.
-    if (learn_open_ && channel != static_cast<uint8_t>(learn_channel_)) {
+    // channel 1 (whose own input was idle at 2835 mV).
+    //
+    // **Keyed on the SESSION's channel, not on `learn_open_`.** `learn_stop` is
+    // the SPECIFIED flow (spec 4.3: start, stream, stop, then commit), and it
+    // clears `learn_open_` while leaving the measured samples in the session. So a
+    // guard that only fired while the stream was open was defeated by the ordinary
+    // flow: learn_start(0) -> stream -> learn_stop -> learn_commit(1) wrote
+    // channel 0's measurement onto channel 1. `learn_channel_` is the session's
+    // channel and survives a stop, which is what makes it the right key.
+    if (channel != static_cast<uint8_t>(learn_channel_)) {
         Nack(for_seq, "channel_mismatch",
              "learn_commit's channel differs from the open learn stream's");
         return;
@@ -1095,14 +1307,15 @@ void CommandRouter::HandleLearnCommit(const cJSON *root, uint32_t for_seq) {
     // setting -- with defaults. Measured: three bindings replaced by zero on a
     // device whose slots were corrupt, from one `learn_commit`, with an `ack`. An
     // unreadable config is a fault to report, not a blank sheet.
-    Config c{};
+    Config &c = command_config_;
+    c = Config{};
     const ConfigLoadResult lr = store_->Load(&c);
     if (lr == ConfigLoadResult::kFellBackToDefaults) {
         Nack(for_seq, "config_unreadable",
              "the stored config could not be read; refusing to overwrite it");
         return;
     }
-    if (lr == ConfigLoadResult::kNoConfig) c = ConfigDefault();
+    if (lr == ConfigLoadResult::kNoConfig) ConfigDefault(&c);
     LadderProfile &lp = c.channels[channel].ladder;
 
     // Rescale the stored ladder's millivolts onto the LIVE rail this learn
@@ -1146,6 +1359,19 @@ void CommandRouter::HandleLearnCommit(const cJSON *root, uint32_t for_seq) {
         Nack(for_seq, "save_failed", "could not persist the learned button");
         return;
     }
+    // Spec 4.2/7.3: the same rule as the other two write paths. The app's learn
+    // screen is gone after this `ack`, so a device that re-derived its classifier
+    // only at the next boot would leave the user with a button they just measured
+    // doing nothing.
+    if (sys_ != nullptr) sys_->ApplyConfig(c);
+
+    // CLOSE the stream. The commit ends the learn run (spec 4.3's flow is
+    // start -> stream -> commit, with `learn_stop` optional), so a device that
+    // left it open kept emitting `ladder_sample` and kept feeding `session_` with
+    // post-press idle readings -- a duplicate `learn_commit` would then re-run
+    // `Commit` over idle samples, and a client that committed and stopped talking
+    // left the device streaming into the link forever.
+    learn_open_ = false;
 
     char body[192];
     snprintf(body, sizeof(body),
@@ -1164,7 +1390,14 @@ void CommandRouter::HandleReboot(const cJSON *root, uint32_t for_seq) {
     // Ack BEFORE rebooting, or the ack is lost with the reset and the app cannot
     // tell a successful reboot from a dropped link.
     const char *t = (target != nullptr) ? target->valuestring : "app";
-    if (strcmp(t, "app") != 0 && strcmp(t, "bootloader") != 0) {
+    // **`bootloader` is REFUSED, not accepted-and-ignored** (spec 4.3, N-48). The
+    // frame once declared both targets, but a reboot into the bootloader has no
+    // implementation: the HAL's `reboot` is a bare `esp_restart()` and entering the
+    // ROM download loader is a power-on/BOOT-pin event (§3.2), not a software call.
+    // A target the device cannot honour is an accepted field whose value changes
+    // nothing, reported as success -- the peer then expects a bootloader and talks
+    // to the application port. Refusing by name is the honest answer.
+    if (strcmp(t, "app") != 0) {
         Nack(for_seq, "bad_target", t);
         return;
     }
@@ -1177,8 +1410,7 @@ void CommandRouter::HandleReboot(const cJSON *root, uint32_t for_seq) {
     // cannot tell a successful reboot from a dropped link, which is precisely
     // what the ack-before-reset ordering exists to avoid.
     if (tx_flush_ != nullptr) tx_flush_(tx_flush_ctx_);
-    // A reboot into the bootloader is a serial-flash helper: the device stops
-    // running the app and does nothing else. Both targets reset, so the reboot
-    // request itself is the same call; the distinction is what the app does next.
+    // The one honoured target. The HAL's reboot is `esp_restart()`; see the guard
+    // above for why there is no second one.
     hal_->reboot(hal_->ctx);
 }

@@ -383,6 +383,240 @@ assertions (4 MB flash, 2 cores) are therefore **unexecuted**; they are a
 build-time-checked expression of intent only. The flash-size claim above is
 about the *image configuration*, not a measurement off silicon.
 
+## The device-only NVS cluster (three defects, none visible on the host)
+
+Found in the audit passes after Tasks 1–14c. All three are in `EspHal` — the ONE
+`lib/` file the host build excludes — so the native suite never compiles them and
+`MockHal` is the only HAL the tests exercise. Each passed on the host and failed
+totally on a real device.
+
+1. **`nvs_flash_init()` was called NOWHERE.** NVS was never mounted, so every
+   `nvs_open` returned `ESP_ERR_NVS_NOT_INITIALIZED`. Config save, config load,
+   and headless-learn persistence each silently did nothing. Fix: mount in
+   `EspHalInit` (with an erase-and-retry on `NO_FREE_PAGES`/`NEW_VERSION_FOUND`).
+   `MockHal` has no mount step, so nothing on the host could see it. Guard:
+   `tools/check_hal_contracts.py` now scans `lib/` and `src/` for a project call
+   to `nvs_flash_init`.
+2. **`HalNvsSet` returned `len` on success.** Every consumer treats nonzero as a
+   write failure (`ConfigStore` tests `!= 0`), so on hardware EVERY save read as
+   failed: `Save` always returned false, `cfg_seq` never advanced, nothing
+   persisted. `MockHal::NvsSet` returned 0, so the host suite was green. Fix:
+   return 0 on success.
+3. **`HalNvsGet` was gated on a boot-time flag.** `nvs_open(READONLY)` returns
+   `ESP_ERR_NVS_NOT_FOUND` on a factory-fresh board (the namespace is created by
+   the first READWRITE open), so the cached flag stayed false for the whole first
+   power cycle and every read reported "absent" even right after a successful
+   save. Fix: open per call, no cached flag.
+
+The common shape is worth naming: **a HAL contract the two implementations agree
+on only by convention, with no host test able to compile the real one.** The
+static guard in `tools/check_hal_contracts.py` exists because a behavioral test
+cannot reach `EspHal` at all.
+
+## The device-only stack overflow (the same blind spot, one layer up)
+
+Found 2026-09-22, in the audit pass after the NVS cluster. `sizeof(Config)` is
+**8,912 bytes**, and several functions held one BY VALUE — as a local, or as the
+return value of the `ConfigDefault()` factory. The compiler's own `-fstack-usage`
+(`-Og`) measured:
+
+| function | frame | runs on |
+|---|---:|---|
+| `SystemOrchestrator::Boot` | 18,704 B | main task, 3,584 B |
+| `CommandRouter::HandleLearnCommit` | 18,096 B | TinyUSB task, 4,096 B |
+| `CommandRouter::HandleConfigPatch` | 17,920 B | TinyUSB task |
+| `CommandRouter::BeginConfigReplyRun` | 17,856 B | TinyUSB task |
+| `CommandRouter::HandleLearnStart` | 9,728 B | TinyUSB task |
+| `CommandRouter::HandleConfigEnd` | 9,088 B | TinyUSB task |
+| `ConfigStore::Load` | 8,960 B | both |
+
+The task stacks are `CONFIG_ESP_MAIN_TASK_STACK_SIZE = 3584` (the generated
+`sdkconfig.h`; the defaults file does not raise it) and `tusb_cfg.task.size =
+4096` (`UsbLink.cpp`). Summed along the real chains, `Boot -> ConfigStore::Load
+-> ConfigDecodeBlob -> ConfigDecodeJson` reached **~36 KB**, and
+`HandleConfigPatch`'s chain ~35.8 KB. That is a **guaranteed stack overflow on
+every device boot and on the first `config_get`** — an immediate panic, before a
+single key could be driven.
+
+Invisible to everything that runs today, for the same reason as the NVS cluster:
+the host suite's threads have megabytes, so a frame of any size is harmless
+there, and **the board has never been flashed** (§"What is NOT verified"). The
+host build also excludes nothing here — these are all host-compiled files — so
+this was never a compile-visibility problem; it is a *runtime-resource* problem
+that no native test can express.
+
+**Fix.** `ConfigDefault` takes an out-parameter (`void ConfigDefault(Config*)`)
+instead of returning by value, and every site that needs a whole config works in
+a `static` or a member rather than a local — the same place the class's other
+scratch already lives (`CommandRouter::staging_`, `reply_buf_`,
+`ConfigStore`'s `g_blob`). `ConfigDecodeJson` keeps its "never partially applied"
+guarantee by decoding into a file-local scratch and copying to `*out` only after
+both the fields and the validator pass. After the fix the largest frame in the
+project is 1,072 B and the deepest chain is ~1.5 KB.
+
+**A SECOND overflow, found by the same check.** `CommandRouter::Process` held two
+1 KB scratch buffers as locals (2,352 B frame), and `Process` runs three frames
+below `Emit` (1,072 B) and `Nack` (544 B) on the main task:
+`app_main -> UsbLinkService -> Process -> Nack -> Emit -> NdjsonWriter::Write`
+summed to **4,080 B against the 3,584-byte stack**. That path is hit the first
+time a `config_get` reply is chunked out. Same fix: those buffers are file-local
+statics.
+
+**Guard:** `tools/check_stack_usage.py` (wired into the build-and-size-gate CI
+job). It recompiles the project with `-fstack-usage` from the device build's own
+flags, reads the task stacks from where they are actually set, builds the call
+graph from the objects' `ASM_EXPAND` relocations, and takes the EXACT longest
+path per task root. The exactness matters: the first version used a DFS that
+skipped already-visited nodes, and a mutation test (a 2 KB frame added to
+`EstablishSafeIdle`, reachable only through `Boot`) went **unreported** — a false
+negative, the one direction a stack gate must not fail in. The DP version
+catches it.
+
+## The cross-task race the host suite structurally cannot see
+
+Found 2026-09-23, audit pass after the stack work (same device-only blind spot,
+a different axis: concurrency rather than resources).
+
+**The topology.** `UsbLinkStart` installs TinyUSB with `tusb_cfg.task.size =
+4096`, `priority = 5`, `xCoreID = 0`. The device's own loop is `app_main` — main
+task, `priority = 1` (`ESP_TASK_MAIN_PRIO = ESP_TASK_PRIO_MIN + 1`), `xCoreID =
+0`. TinyUSB's driver task runs `tud_task()` forever, and `tud_task` is what
+invokes `tud_cdc_rx_cb` → `CdcRxCallback`, and the line-state callback → 
+`CdcLineStateCallback`. **So both callbacks run on the TinyUSB task, and it
+preempts the poll loop at any instruction** — same core, higher priority.
+
+**What they touched.** `CdcRxCallback` fed the bytes straight into
+`UsbCdc::FeedBytes`, which *parsed* them and called the sink — i.e. the entire
+command protocol ran on the TinyUSB task: `config_end`, `config_patch`,
+`learn_commit` reassigning `config_` and rebuilding classifiers; `identify`,
+`enter`/`exit_maintenance`, `test_key` driving a channel. Meanwhile
+`SystemOrchestrator::Tick` — classification, the gesture machines, the output
+derivation — ran on `app_main`. The DTR callback was worse in kind, however
+small: it called `SetUsbConnected`, mutating the orchestrator, and `hello`/the
+config reply run on the router.
+
+**Nothing takes a lock.** Verified by grep across `lib/` and `src/`: no
+`xSemaphore*`, no `portENTER_CRITICAL`, no `std::mutex`, no `std::atomic`
+outside the transport's own ring. So every field the two tasks share was an
+unprotected read/write pair. The dangerous one is `config_` (8,912 B, copied
+field-by-field while `Tick` classifies against it) and the per-channel
+classifiers: a torn read there is a **wrong key voltage driven at the head
+unit**, which is the direction spec 6.2 calls the only dangerous one.
+
+**Why no test caught it.** Every host test calls `OnLine` and `Tick` from one
+thread, so mutual exclusion is free and the race simply does not exist there.
+`UsbLink.cpp` is device-only (it names TinyUSB) and excluded from the host
+build, and **the board has never been flashed** — so this is invisible to the
+suite the same way the NVS cluster and the stack overflow were.
+
+**Fix.** All link work moves to the poll task. The `UsbCdc` RX path becomes a
+lock-free SPSC byte ring (`kRxCapacity = 4096`, well above the 1,024-byte CDC
+FIFO, so a burst arriving between two 10 ms ticks fits): `FeedBytes` now only
+*copies* bytes and publishes `rx_head_` with a release store; the new
+`DrainRx` parses and delivers, and is called from `UsbLinkService` — the poll
+task — next to `Tick`. The DTR callback no longer calls into the router or the
+orchestrator at all; it publishes `g_pending_line_state`, and `ServiceLineState`
+applies it on the poll task.
+
+**Two more defects found while fixing the fix** (both in the new code, both
+fixed, both now covered):
+
+1. **The DTR transition was published as an EDGE against the APPLIED state.**
+   `if (open != g_host_open) publish(...)` loses a transition: if the host opens
+   and closes between two poll ticks, the close is compared against a
+   `g_host_open` that is still `false` (the open has not been applied yet), is
+   judged "no change", and is dropped — so the poll task then applies the *open*
+   and the device latches a session the host already ended (`hello` sent to
+   nobody, `LED_STAT` solid forever, a config run left open). Fixed by
+   publishing the DTR **level** unconditionally and letting `ServiceLineState`
+   reconcile; it is idempotent when the level has not moved. Guarded (clause 2b).
+2. **A disconnect could not discard bytes a producer was in flight on.** The
+   callback runs on the other task, so `NoteDisconnected` moving only the
+   consumer-owned tail leaves a window: a producer that read its head *before*
+   the reset and stores it *after* resurrects the ring, and a command from the
+   ended session (`config_patch`, `test_key`) is then parsed as the first frame
+   of the next one. Fixed with `rx_epoch_`: the consumer bumps it **before**
+   reading the head, the producer re-checks it **after** storing the head and
+   pulls that head back to the tail if it moved. The bump-before-read order is
+   load-bearing and the leaking interleaving for the opposite order is written
+   out in `NoteDisconnected`. Tested with an injectable seam that fires inside
+   `FeedBytes` between staging and publishing — the only way to reach that
+   interleaving; a test that disconnected *before* calling `FeedBytes` would be
+   rescued by the disconnect's own tail reset and would pass with the epoch check
+   deleted. (Deleting the check is caught; the bump-vs-reset ORDER is a reasoned
+   invariant the seam cannot separate, and the comment says so rather than
+   claiming a test.)
+
+**A third defect, on the config-apply path (`ApplyConfig`).** Its first cut set
+`buzzer_ = BuzzerGrammar(hal_, level)` / `leds_ = LedGrammar(hal_, level)` — the
+same shape `Boot` uses, which is correct THERE because nothing is in flight yet.
+On the apply path it is a bug: a freshly constructed grammar starts at
+`kNone`/`kOff`, so the assignment **silently cancels whatever pattern is
+showing**. The learn wizard owns both channels as its prompts while it runs, and
+it sets each pattern **once on entry**, not per tick — so a config push landing
+mid-learn (a `config_patch`, or an app push overlapping a headless AUX1 learn)
+would blank the prompt the user is reading, with nothing to restore it. Fixed by
+adding `BuzzerGrammar::SetLevel` / `LedGrammar::SetLevel`, which change the level
+and leave the live pattern alone (same reasoning as `MaintenanceMode::SetTimeout`
+in the same function). Both the pattern-cancellation and the repaint-over-the-
+prompt cases were mutation-tested: restoring the assignment form fails two tests,
+making `SetLevel` a no-op fails a third.
+
+**Guard:** `tools/check_task_ownership.py` (wired into build-and-size-gate). It
+pins the shapes that make the split safe and are easy to undo by
+"simplifying" a callback: `CdcRxCallback` must not parse or reach the sink;
+`CdcLineStateCallback` must not call `OnConnected`/`OnDisconnected`/
+`SetUsbConnected` and must not read the applied `g_host_open`; `UsbLinkService`
+must call `DrainRx` and `ServiceLineState`; and `UsbCdc::FeedBytes` must not call
+`DrainRx` or touch the sink. Each was mutation-tested and is reported.
+
+## The ratio mapping narrowed to uint16 BEFORE clamping (a wrap into range)
+
+Found 2026-09-23, same audit pass. `PresentLevel` maps a wheel level onto the head
+unit's range by ratio (spec 6.9): `head_unit_idle_mv * level_mv / wheel_idle_mv`.
+The arithmetic was in `long` — and then **narrowed to `MilliVolt` (uint16_t)
+before any clamp**:
+
+```cpp
+const MilliVolt target = static_cast<MilliVolt>(
+    (static_cast<long>(head_unit_idle_mv) * level_mv) / wheel_idle_mv);
+```
+
+With a small `wheel_idle_mv` the product exceeds 65535, and the cast reduces it
+**mod 65536**. The dangerous part is where it lands: about **half** of the wrapped
+values fall back inside `[1800, 5200]` — the valid output envelope — so the value
+is indistinguishable from a real target and the downstream clamp in
+`GainPolicyCodeForTarget` sees nothing wrong. **The device drives a key voltage
+nothing defined.**
+
+Measured over the ranges the validators permit (`mv_center` and
+`learned_idle_mv` each bounded only to a plausible ADC reading, independently;
+`head_unit_idle_mv` to the envelope): **620,054 (level, wheel_idle) pairs wrap into
+the envelope**, and `wheel_idle_mv <= 230 mV` is enough to reach them. A concrete
+reachable case: `mv_center` = 2896 (a button "learned" against an unreadable input
+reads near full scale), `learned_idle_mv` = 1, head-unit idle 4980 →
+`4980 * 2896 / 1 = 14,422,080` → wraps to **4160 mV**, a perfectly plausible 5 V
+target.
+
+Invisible to the suite for a plain reason: no existing test presents a ratio whose
+product exceeds 16 bits, so the cast never wrapped in a test — and the wrap is
+silent by construction (it produces a *valid* value, not a crash).
+
+**Fix.** The mapping moved to `GainPolicyMapWheelLevelToHeadUnit` in
+`GainPolicy` — beside the other output arithmetic and directly unit-testable, which
+is what the wrap needs — and it **saturates to `[0, kOutputCeilingMv]` before the
+narrowing cast**. Saturation is the correct direction: the ceiling is where an
+over-large ratio would have been clamped anyway, and spec 6.2's only dangerous
+error is over-ranging a 3 V head unit, which the ceiling prevents. `0` is returned
+for a non-positive `wheel_idle_mv` (no denominator, nothing to say).
+
+**Guard:** two tests in `test_native/test_output/GainPolicyTest.cpp` —
+`AnExtremeRatioSaturatesInsteadOfWrappingIntoAValidTarget` (asserts the premise,
+that the product exceeds the uint16 range, and then that the result is the ceiling
+rather than the wrapped value) and `TheRatioMappingStillMatchesTheOrdinaryCase`
+(pins the normal arithmetic and the zero-denominator cases). Removing the
+saturation fails both.
+
 ## size-after-tasks-1-14c: TinyUSB arrives, and the size jump is real
 
 `size-after-tasks-1-14c: text=278681, data=89012, bss=779541, dec=1147234 (0x118162) bytes — firmware.elf, pio run -e esp32s3 -t size, 2026-09-19`
@@ -466,3 +700,528 @@ they will recur:
    a separate install root with its own copies; the `dist/` tarball is the reliable
    source. Restoring the package **directory** from `tools/` gives a tree whose
    top-level `bin/` is real but whose layout otherwise differs.
+
+## The on-device test suite did not link (the whole "D" column was unrunnable)
+
+Found 2026-09-23, same audit pass. Every "D" cell of the spec's coverage matrix
+(§11) claims a device test on real silicon. Nothing in CI ever built
+`test/test_hw` — the workflow ran `pio run -e esp32s3` and `pio test -e native`
+and stopped, so the device suite was never compiled by anything. Compiling it
+for the first time:
+
+```
+ld: .pio/build/esp32s3/test/test/test_hw/TestEspHal.o: multiple definition of `setUp';
+    TestBleProvisioning.o: first defined here
+```
+
+The cause is Unity's own runner. `UnityDefaultTestRun` (unity.c:2201) calls the
+GLOBAL `setUp()` and `tearDown()` around every test, and `test_hw` is three
+translation units — `TestEspHal.c`, `TestBleProvisioning.cpp`, `TestUsbCdc.cpp`
+— each of which defined its own to bring up the hardware it needs. Three
+definitions of one symbol is a multiple-definition error, so the suite could not
+link and the spec's device test plan was, in fact, empty.
+
+**The fix is per-file hooks.** `unity_config.h`'s `TEST` macro now passes the
+file's `swc_setup`/`swc_teardown` (both `static`) into the registry at
+registration, and `app_main` calls them around each test. The global
+`setUp`/`tearDown` still exist in `test_main.c` as empty no-ops, because Unity's
+runner insists on them. The names must NOT be `setUp`/`tearDown`: unity.h
+declares those non-static, and a `static` redefinition of a non-static
+declaration is its own error.
+
+**A second defect in the same file, found by the warning the fix surfaced.**
+`esp_hal_clock_advances` asserted with `TEST_ASSERT_GREATER_OR_EQUAL_UINT64`,
+which is a STUB on this target: `UNITY_SUPPORT_64` turns itself on only when
+`UNITY_LONG_WIDTH` or `UNITY_POINTER_WIDTH` is 64, and both are 32 on xtensa, so
+the macro expands to `UNITY_TEST_FAIL("not supported")`. The test could never
+pass AND asserted nothing — the compiler said so, quietly, by reporting `t0`
+unused, since the operand was discarded. It now compares the low 32 bits with
+the UINT32 form. It was the only 64-bit Unity assert in the device tree.
+
+**The guard.** CI now compiles the device suite with
+`pio test -e esp32s3 --without-uploading --without-testing`. With the defect
+reintroduced it exits 1 (`ERRORED`); clean, it exits 0 (`SKIPPED`). Verifying
+that exit status mattered — a step that printed the error and exited 0 would
+have been the same false confidence in a new costume.
+
+## Five CommandRouter frame-handler defects (found by the 2026-09-23 audit pass)
+
+All five are in `lib/Link/CommandRouter.cpp`, each invisible to the native suite
+until a test drives the exact frame shape it needs.
+
+**An empty `button_id` persisted a config the next boot refuses.** `Str()` returns
+the item for `""` — a valid JSON string with a non-null `valuestring` — so a
+present-but-EMPTY id passed the "required" guard and was copied into the stored
+button. Neither `LearnSession::Commit` nor `ConfigStore::Save` validates it, so it
+persisted. `ConfigDecodeJson` refuses the empty string (`ReadStr`), so the next
+boot's `Load` returns `kFellBackToDefaults` and the user loses every binding, both
+channels and all settings, reported only as a corrupt config. The id/name are now
+checked for non-empty AND width. Every prior `learn_commit` test sent a real id,
+which is why none caught it.
+
+**`send_duration_ms` had no upper bound.** A `config_patch` of `1e10` — which
+`NumToU32` had already wrapped into range — reached
+`key_released_at_ms = now + send_duration_ms` and drove the KEY line for ~49.7
+days: the phantom press FR-15/FR-39 exist to prevent. `ConfigValidate` bounded only
+that it was NONZERO; the codec's magnitude check refuses values PAST u32, not the
+u32 maximum. It now has a RANGE ceiling (`kSendDurationMaxMs`, 10 s), the same rule
+`maintenance_timeout_ms` already followed, and the spec's §3.4 paragraph says so.
+`test_key`'s `hold_ms` was already bounded at 1 s for the identical reason.
+
+**`learn_stop` defeated the channel guard.** The guard keyed on `learn_open_`, but
+`learn_stop` is the SPECIFIED flow (spec 4.3: start → stream → stop → commit) and
+clears it. So `learn_start(0) → stream → learn_stop → learn_commit(1)` wrote
+channel 0's measurement onto channel 1's ladder — the exact wrong-channel write the
+guard was added to prevent. It now keys on `learn_channel_`, the SESSION's channel,
+which survives a stop.
+
+**`learn_commit` never closed the stream.** It left `learn_open_` true, so the
+device kept emitting `ladder_sample` and kept feeding `session_` post-press idle
+readings; a duplicate commit re-ran `Commit` over idle samples, and a client that
+committed and went quiet left the device streaming into the link forever.
+
+**`identify` collapsed its two patterns.** Both `"flash"` and `"buzz"` mapped to one
+`Identify()` that did both the LED double-flash and the buzz — the "accepts a field
+and ignores it" class. `Identify(bool flash, bool buzz)` separates them; only
+`flash` arms the LED_STAT borrow window. A buzz-only request no longer flashes.
+
+Each fix has a test that fails on the reverted code (mutation-tested), and the
+spec rows for `send_duration_ms` and `identify` were corrected to match.
+
+## AUX1–AUX3 are declared bindable and nothing services them (N-26)
+
+Found 2026-09-23, continuing audit. `BindingChannel` is `SWC1 | SWC2 | AUX1 |
+AUX2 | AUX3 | ANY` (spec §3.5/§3.1), `Config` carries an `aux[3]` table, §3.7's
+worked example binds `{"channel":"AUX1","button":"aux1","gesture":"SINGLE"}`, the
+codec and `ConfigValidate` accept such a binding, and the Android model exposes
+AUX1/2/3 as first-class channels. **No firmware path reads any of it**:
+
+- `SystemOrchestrator` services only `channels_[0..channel_count_-1]` — the two
+  SWC ladders. There is no per-AUX servicing loop.
+- `ADC_CH_AUX2`/`ADC_CH_AUX3` are named only by `EspHal`'s channel map, never read.
+- `config.aux[]` is read only inside the codec.
+- `BindingResolve` consults `aux[i].id` only to decide whether a binding names a
+  real input; it is never invoked for an `AUX*` channel because nothing produces a
+  gesture event from an AUX input.
+
+An app that binds a gesture to AUX1 gets an `ack` and a binding that never fires.
+The one AUX behaviour that IS wired is AUX1's learn role (the 1.5 s / 3 s holds),
+a separate mechanism. Recorded as N-26 with a cheap v1 decision (declare AUX1–3
+bindings accepted-and-inert, drop them from the app picker); the full fix is a
+spec decision plus a servicing loop plus a hardware measurement, so it is not a
+local patch.
+
+## The app set VersionMismatch and kept talking (§4.5)
+
+Spec §4.5: on a version mismatch the app "must show an explicit ... state rather
+than attempting to talk. Silent partial compatibility is how a config gets
+corrupted." `SwcClient` set the state — off the envelope `v` and off a
+`version_mismatch` nack — but nothing gated outbound frames: after a mismatched
+`hello`, `connect()` still wrote `ping` and `getConfig()` still wrote
+`config_get`, onto a peer whose vocabulary disagrees. Fixed at the single choke
+point every write passes through (`sendLocked`), with a short-circuit in
+`sendAndAwait` so a caller does not park on a full 15 s timeout over the
+deliberate silence. Test `a version mismatch stops the app talking`, mutation-
+tested. The app's other §4.4 gap — no 5 s idle-ping, no 10 s silence watchdog, and
+`LinkState.Disconnected` assigned nowhere so a dead transport leaves the UI showing
+`Connected` — is recorded as N-27 (an app-plan decision, not a local patch).
+
+## The app's numeric limits drifted from the firmware's (`send_duration_ms`)
+
+Found 2026-09-23, continuing audit — and it was a drift the PREVIOUS pass
+introduced. That pass added a key-hold ceiling, `kSendDurationMaxMs` (10 s), to
+`ConfigValidate` and `ConfigModel.h` and updated the spec, but did NOT add the
+mirror to the app. `ConfigJson.problems()` is documented in its own comment as
+"Mirrors `ConfigValidate`"; it is the gate `SwcClient.setConfig` runs before
+sending. So a config carrying `send_duration_ms = 60000` passed the app's local
+check, reached the device, and was nacked at decode — losing the whole save with
+the offending field UNNAMED. The `maintenance_timeout_ms` ceiling had been mirrored
+by hand (third-audit finding 1 recorded the parity gap and that nothing guarded
+it); this is the same shape, one field later.
+
+Fixed by adding `K_SEND_DURATION_MAX_MS` and the range check to the app, plus a
+mutation-tested assertion in `ConfigCodecTest` (`the app refuses the fields the
+firmware refuses`). **The class of defect is now guarded**: `tools/check_app_limits.py`
+reads every count, string width and timing ceiling from BOTH `ConfigModel.h` and
+the app's `Config.kt` and fails on any divergence — nine limits, wired into the
+firmware workflow. Mutation-tested: changing the firmware ceiling to 20000 fails
+the guard with the field named.
+
+## `getConfig` parked on its full timeout under a version mismatch
+
+Found 2026-09-23, continuing audit — the sibling the previous pass's §4.5 fix
+missed. `sendLocked` (the choke point) correctly refuses to put `config_get` on the
+wire once the versions disagree, and `sendAndAwait` short-circuits so a
+reply-bearing request does not wait for a reply that deliberate silence will never
+bring. But `getConfig` does not use `sendAndAwait`: it registers a waiter that only
+a config RUN can end, and with no frame out no run can come — so it parked the
+caller for its full 15 s timeout on a silence the app chose, which is exactly what
+`connect()` hits on every launch against a mismatched device. Fixed with an early
+return of the unchanged local model, matching `sendAndAwait`. Test `getConfig does
+not wait out its timeout once the versions disagree`, mutation-tested.
+
+## The contract's `ack` row named a field no ack emits — and the field lists had no guard
+
+Found 2026-09-23, continuing audit. `contract_schema.py` had no test comparing a
+frame's declared `fields` to what the router actually puts on the wire, and it had
+drifted the same way spec N-22's `status` row did:
+
+- `ack` declared `err`, which **no ack ever emits** — every ack is `ok:true` and
+  every failure is a `nack`, so `err` is a field the app would read and never
+  receive. It also **omitted `mv_center`/`mv_tolerance`**, which `learn_commit`'s
+  ack genuinely carries (`HandleLearnCommit`) — the derived window that IS the
+  answer the learn flow exists to return, so the omission hid the one ack field a
+  client needs.
+- `status` was already corrected to `vbus_present,gain_mode,uptime_ms,config_state,output_safe`
+  (N-22), but nothing pinned it.
+
+Fixed the schema and the spec §4.3 row, and added
+`test_frame_field_lists_match_the_router`, which reads the router's emit sites
+(each `Emit("X", body)` attributed to the `snprintf` that built `body`) and asserts
+**both** directions: no field emitted but undeclared, and no field declared without
+a producer (`for_seq` excepted — it is reply-only by spec). Mutation-tested three
+ways: restoring `ack`'s `err`, restoring `status`'s phantom `rail_mv`, and adding a
+producerless field each fail with the field named. The `fields` column is unused by
+the generators, so this whole change produces **no diff** in the generated
+`swc_contract.h`/`Contract.kt` — it is a vocabulary guard, exactly as the field
+lists were meant to be.
+
+`time_sync`'s `epoch_ms`/`tz_offset_min` and `ota_begin`'s `size` are declared with
+no reader, but both are documented deferrals rather than live defects (the firmware
+has no RTC — `time_sync` is acked and discarded on purpose — and every `ota_*` is
+nacked `not_implemented`, N-14), and the app sends neither. Left as-is; the new test
+exempts them by reading only the fw→app direction, which is where the N-22 class of
+phantom lived.
+
+## The spec claimed `hello` is sent "on request" — it is sent only on connect
+
+Found 2026-09-23, continuing audit. Spec §4.3's `hello` row read "Sent on connect
+**and on request**", but the firmware has exactly ONE `hello` producer:
+`CommandRouter::OnConnected()`, reached from the DTR callback when the host opens
+the port (`UsbLink`). No request frame yields a `hello` — `ping` answers with a
+`status` (§4.3's own reply row says so), and §4.5's negotiation reads the envelope
+`v` that every frame carries, never `hello.protocol_v`. This is the spec-overclaims
+shape: a reader implementing a client could wait for a `hello` in reply to a
+`ping` and hang, or assume a re-`hello` recovers a link that has gone stale (it
+does not). Corrected the row to "Sent on connect" with the single producer named.
+Doc-only; no code change.
+
+## Spec §3.1's entity map named a `created_at` field that does not exist
+
+Found 2026-09-23, continuing audit. §3.1's entity map listed the top-level
+`Config` fields as `schema_version, device_id, created_at, updated_at`, but the
+model (`ConfigModel.h`), the codec (`ConfigCodec.cpp`) and the decoder-verified
+§3.7 worked example carry exactly ONE stamp: `updated_at_ms`. There is no
+`created_at` anywhere in `lib/`, `android/`, or `contract/`. A reader taking §3.1
+as the field list would emit a `created_at` the codec ignores and omit
+`updated_at_ms`'s real name. Corrected the map to `schema_version, device_id,
+updated_at_ms`.
+
+Investigating it surfaced the real underlying gap, recorded as **N-28**:
+`updated_at_ms` is itself declared, round-tripped and validated, but no production
+path gives it a value — the firmware never assigns it (only a test sets a fixed
+`1700000000000`), and the app writes back whatever it decoded (or `0`). It has the
+N-22 shape: a field carried and decoded but never meaningful. Not repaired here
+because a producer is a decision (no RTC without `time_sync`, so a device stamp
+would be uptime/boot-count, not wall-clock), and nothing reads it, so the only
+cost today is bytes.
+
+## The ADC ceiling was spelled three times (one fact, three homes)
+
+Found 2026-09-23, continuing audit. The calibrated ADC ceiling at 12 dB -- "the
+largest pin reading possible", 2900 mV, spec §3.2's `MilliVolt` bound -- existed as
+THREE independent constants with nothing comparing them:
+
+- `kAdcFullScaleMv12dB = 2900` in `lib/Analog/CalibrationCurve.h` (the real one --
+  it is the `mv_high` endpoint of the calibration curve, fed to `AdcRawToMilliVolts`);
+- an anonymous-namespace `kAdcCeilingMv = 2900` in `lib/Analog/LadderDecode.cpp`
+  (`LadderProfileIsValid`, the rebase clamp);
+- an anonymous-namespace `kAdcCeilingMv = 2900` in `lib/Learning/LearnSession.cpp`
+  (the sample-range gate).
+
+This is the project's most-repeated defect class (two homes for one fact, one of
+them stale) -- the same shape as `kIdleMarginPermille` before it was exported, and
+`kNominalRailMv`, both of which carry a comment saying exactly why they live in a
+header. A re-tune of any one (say the 12 dB endpoint, if a board revision changed
+the divider) would have silently disagreed with the ADC's own scaling.
+
+Fixed: `LadderDecode.h` now includes `Analog/CalibrationCurve.h`, and both `.cpp`
+files read `kAdcCeilingMv = kAdcFullScaleMv12dB` from that one home rather than a
+literal. Mutation-tested by setting the shared constant to 2500: 56 native tests
+across `test_analog`, `test_learning` and `test_system` fail, proving both
+consumers genuinely read the shared name and no local literal survives. Restored;
+450/450 pass, device build succeeds.
+
+## The firmware runs only a binding's FIRST action; §3.5 and the app run the list
+
+Found 2026-09-23, continuing audit. Spec §3.5 makes a binding's `actions` an
+**ordered list executed in order, each independently failable**, and names the
+product's core case as one binding carrying both halves: "emit the factory key
+press **and** tell the app". The plan agrees — "the multi-action runner is Task
+13's job". The APP implements its half: `AppViewModel.runAppSideAction` iterates
+`binding.actions` and runs every app-owned one. The firmware does not:
+
+- `BindingResolve` returns only `actions[0]` (`out.action = b.actions[0]`);
+- `SystemOrchestrator` executes that one action and only in its `OUT_VOLTAGE`
+  branch — every other kind, and every action past the first, falls to the `else`
+  that just `ReleaseKey`s.
+
+**Confirmed by probe, not by reading.** A temporary `BindingResolver` test built a
+legal two-action binding (`[APP_INTENT, OUT_VOLTAGE]`, `kMaxActionsPerBinding` is
+2, so `ConfigValidate` accepts it) and asserted the resolver returns the
+`OUT_VOLTAGE`. It FAILED: the resolver returned `APP_INTENT`. So on a binding whose
+app-side action is FIRST, the firmware drives NO key at all (the `else` releases
+the line) while the app still fires its own half from the `event` — a press that
+silently does nothing on the wire. Probe removed after confirming; 450/450 pass.
+
+**Reachability is narrow:** the app's editor always builds single-action bindings
+(`actions = listOf(action)`) and `ConfigDefault` ships none, so this needs a
+hand-authored or `config_patch`-written config. Recorded as **N-29** with the v1
+alternative (refuse a multi-action binding in `ConfigValidate` until the runner
+exists, turning silent partial execution into a named rejection).
+
+## `config_patch` omitted the one settings scalar it claimed to cover
+
+Found 2026-09-23, continuing audit. `HandleConfigPatch`'s own comment scopes it to
+"`settings.*` scalars only", and it carried a path branch for every one EXCEPT
+`maintenance_timeout_ms` — the single numeric settings scalar missing from an
+otherwise-complete table. A client could patch all four timings and both feedback
+levels but not the maintenance window; the path was refused `unknown_path` as if it
+did not exist.
+
+Inert today (the app and the web page send no `config_patch`), but it is a real
+inconsistency between the handler's stated scope and the table, and the fix is the
+same shape as everything else there. Added the branch (`NumToU32`, so the same
+range rule as the others) and extended the spec §4.3 row to NAME the path
+vocabulary rather than saying "single field" generically — the vague wording is
+what let the omission hide.
+
+Two tests added and mutation-tested: `APatchCanSetEverySettingsScalarIncludingTheMaintenanceWindow`
+(asserts the whole declared set is patchable, so a future added scalar fails here
+rather than going silently unpatchable) and `APatchOfTheMaintenanceWindowIsRangeChecked`
+(zero and `> kMaintenanceTimeoutMaxMs` are refused, stored config untouched).
+Reverting the branch fails the first test. Native suite 450 → 452.
+
+## A recovered config was reported as DEFAULTS over the link
+
+Found 2026-09-23, continuing audit. `ConfigStore::Load` reports a config that came
+from the BACKUP slot (the newest slot was torn) as `kRecoveredFromBackup` — a
+distinct result precisely because that config is real and authoritative: spec 6.8
+makes the other slot THE config after a tear. `SystemOrchestrator::Boot` accepts
+both `kLoaded` and `kRecoveredFromBackup` and runs the recovered config.
+
+Two other call sites wrote the narrower test `== kLoaded`:
+
+- `CommandRouter::BeginConfigReplyRun` (the `config_get` / connect reply). On a
+  recovered device it answered with `ConfigDefault()` while the device was RUNNING
+  the recovered config. The app drew an empty grid over a configured device, and
+  its next save then wrote those defaults back — wiping the user's bindings, both
+  learned ladders and every setting, reported as a successful save.
+- `CommandRouter::HandleLearnStart`'s neighbour seed. Reading only `kLoaded` left
+  the neighbour set EMPTY, so a re-learn on a recovered device could not see the
+  buttons already there and could commit a second window on top of an existing one.
+
+**The fix is one home, not two patches.** `ConfigLoadResultIsUsable()` in
+`ConfigStore.h` now answers "did `Load` put a real, user-authored config in the
+out-parameter", and all three sites (Boot included, where the inline `||` was the
+same fact spelled a second time) call it. A predicate is the right shape here
+because the rule is about the RESULT's meaning, and every consumer of `Load` asks
+that same question.
+
+Two tests added and mutation-tested independently: `AConfigGetReportsARecoveredBackupRatherThanDefaults`
+(reassembles the chunked reply and asserts it carries the RECOVERED device id, not
+the default one) and `ALearnStartOnARecoveredDeviceSeedsTheRecoveredLadder` (a
+measurement inside a recovered button's window is refused `too_close_to_existing`,
+which is only true if the recovered ladder seeded the neighbour set). Reverting
+either call site fails exactly its own test and not the other. Native suite
+452 → 454.
+
+## The config-fault state and LED were latched at boot, and never cleared by a commit
+
+`status`'s `config_state` is spec'd (§4.3) as **the config's state** — one of
+`ok` / `none` / `recovered` / `defaults` — and `status` is emitted "Periodic **+
+on change**". The firmware set it once, in `Boot`, from the `ConfigLoadResult`,
+and `ApplyConfig` never touched it. So the field went on describing the BOOT LOAD
+after the device had committed — and was RUNNING — a different config.
+
+The reachable failure is the app's own wording. `LinkScreen.configWarning` for
+`defaults` tells the user *"Your learned buttons and bindings are gone. Program
+it again from the Bindings screen."* The user does exactly that — a `config_end`,
+`config_patch` or `learn_commit` — and the device keeps reporting `defaults`
+every 2 s forever. The app re-asserts a fault the device is no longer in: the
+report contradicting the reality, which is the exact class of lie §6.8 and the
+`config_state` field both exist to prevent. `none` had the same shape (a fresh
+device that has just been programmed is no longer a pass-through device), and
+`recovered` likewise (the newest slot was lost but the user has since re-saved).
+
+The LED had the matching half. `Boot` latches `LED_STAT` to `kBlink` on a
+`kFellBackToDefaults`, and nothing cleared it — so a remedied device blinked
+"not OK" forever. Spec §7.3's "`blink` clears only on a reboot" is stated for **"a
+wiring fault or a collapsed rail ... a hardware condition that does not fix
+itself"**; a corrupt config is not one. A commit writes a valid config, which is
+precisely the remedy.
+
+**The fix splits the one flag into the two facts it was conflating.** `faulted_`
+became `hw_faulted_` (a hardware condition, latched to reboot, raised by
+`ReportFault`) and `config_faulted_` (the spec 6.8 fallback, cleared by a commit);
+`Faulted()` ORs them, because the lamp is the single fault channel. `config_state_`
+(renamed from `boot_config_state_`, a name that invited the boot-only behaviour)
+is set by `Boot` and reset by the new `NoteConfigCommitted()`, the one home every
+commit path already funnels through — `ApplyConfig` (`config_end`, `config_patch`,
+the app's `learn_commit`) and `ApplyLearnedProfile` (the headless AUX1 learn).
+
+Spec updated first, in both places: §4.3 now states the field follows the config
+through a commit, and §7.3 states the config-fault exception to the reboot-only
+latch and why the two fault kinds share a lamp but have different lifetimes.
+
+Two tests, mutation-tested independently. `ApplyConfigClearsTheConfigFaultAndReportsOk`
+(boots a corrupt config, asserts `defaults` + a latched fault, commits, asserts
+`ok` + no fault) and `ApplyConfigKeepsAHardwareFaultLatched` (a collapsed rail
+stays latched across a commit, while `config_state` still moves to `ok` — the two
+facts are independent and the lamp shows either). Reverting the `NoteConfigCommitted()`
+call fails both; making it also clear `hw_faulted_` fails exactly the hardware test.
+Native suite 454 → 455.
+
+The learn wizard's `Exit` handback was checked as a possible third case — it
+stamps `LED_STAT` solid directly, bypassing `RestatLeds` — and is **correct**: the
+maintenance-deferral branch holds its state flag inverted while the wizard is
+active, so the first tick after it deactivates fires a `RestatLeds` that restores
+the fault blink. Verified by probe (10 toggles/s over the second after a learn on
+a faulted device), so no change was needed there.
+
+**A second half found while testing the fix.** `ApplyLearnedProfile` performs its
+OWN `Save` (the wizard holds no store), so the obvious placement of
+`NoteConfigCommitted()` — right after the `pass_through_ = false` — would report
+`ok` and stand the config-fault blink down BEFORE the write, and a FAILED write
+would leave the app told the config was safe while nothing reached NVS: the
+"reported success for a failed write" lie `persisted_` exists to prevent, one
+layer up. The call is therefore ordered AFTER the save and **gated on
+`persisted_`**. The other two commit paths (`config_end`, `config_patch`) already
+gate `ApplyConfig` on a successful `Save`, so they need no change; only the
+headless learn owns its save. Third test:
+`AFailedLearnSaveDoesNotStandDownTheConfigFault` (corrupt boot → `defaults` +
+latched, arm `FailNextNvsWrite`, learn, assert the word STAYS `defaults` and the
+fault STAYS latched) — removing the `persisted_` gate fails it. Native suite
+455 → 456.
+
+## The size gate measured the TEST image, not the production one (CI R-1 was blind)
+
+`pio run -e esp32s3` (production) and `pio test -e esp32s3` (the device Unity
+suite) are ONE PlatformIO env, so they share ONE build directory and write the
+SAME `.pio/build/esp32s3/firmware.bin`. Whichever ran last is what a reader sees.
+CI ran the production build, then the device-suite link, then `check_size.py` — so
+the gate read the **test** image.
+
+Measured on this machine: production `firmware.bin` = **386,064 bytes** (19.6 % of
+the 1,966,080-byte slot); the image left behind by `pio test -e esp32s3` =
+**287,424 bytes** (14.6 %). The gate was under-reporting the production image by
+**~99 KB** — ready to pass a production image ~99 KB over its slot, which is the
+exact R-1 failure (an image that cannot be OTA-updated) the gate exists to catch.
+A gate that reports a confident number for the wrong file is worse than no gate.
+
+The two images are distinguishable without running anything: the test image links
+Unity's runner (`UnityDefaultTestRun`, `UnityBegin`, `UnityConcludeTest`) and none
+of the app's own symbols, and the production image is the reverse. `check_size.py`
+now reads the artifact's sibling `.elf` and **refuses to report** (exit 2) when it
+is a Unity image, naming the shared-path cause and the fix. The CI step order is
+also corrected — the device-suite link runs BEFORE the production build, so the
+build is the last writer and the measured file is the real one — but the refusal
+is what makes the mistake impossible to make silently rather than merely unlikely;
+the ordering could be reordered again by a future edit.
+
+Mutation-checked: disabling the `is_unity_test_image` guard makes the gate report
+`14.6 % [OK]` for the test image (the original bug), and restoring it reports the
+true `19.6 % [OK]`. Four tests added in `tools/test_check_size.py`, and the CI
+`pytest` step broadened from `pytest test_gen_contract.py` to `pytest .` — a
+named file silently skipped every later test file, which is how a new gate test
+would have been added and never run. tools pytest 20 → 24.
+
+## A blank eFuse booted silently — the BOOT_DEGRADED the comments promised was never played
+
+Spec §3.2 requires that when `adc_cali_create_scheme_curve_fitting()` returns
+`ESP_ERR_NOT_SUPPORTED` (blank eFuses — some third-party module batches), the
+firmware "fall back to a documented linear approximation **and report that it
+did**, rather than silently mis-scaling every reading". The fallback exists. The
+**report** did not: `EspHal` logged it to the console and set `cali_degraded`, but
+nothing ever announced it, and both `src/main.cpp` and `EspHal.cpp` carried a
+comment claiming "the orchestrator also plays `BOOT_DEGRADED` for this class of
+condition".
+
+It did not. `IHAL` carries no calibration accessor, so the orchestrator had no way
+to know; its boot pattern came purely from the `ConfigLoadResult`, and
+`kBootDegraded` fired only for a recovered config (SystemOrchestrator.cpp:420). A
+blank-eFuse device therefore booted with the clean `BOOT_OK` beep — silent about
+the one thing the spec says must not be silent. The device console log that does
+name it is unreadable in production anyway (N-16: TinyUSB moves the shared USB PHY
+and the console goes dark), so the buzzer is the only signal a user at the bench
+actually hears.
+
+The plan's own step for this (`EspHal.c`) specified **two** mechanisms — "a `log`
+frame (§4.3) at init, and a `BOOT_DEGRADED` boot (§7.2)". Neither was reachable:
+the `log` frame cannot exist because the log sink is registered by `UsbLinkStart`,
+which runs *after* `SystemOrchestratorCreate`, so there is no link at boot; and the
+boot pattern was never wired.
+
+**Fix.** `SystemOrchestratorCreate(hal, calibration_degraded)` takes the flag —
+it is an ARGUMENT, not a call into `EspHalCalibrationIsDegraded()`, because
+`SystemOrchestrator.cpp` is HOST-compiled and `EspHal.cpp` is the one translation
+unit the host build excludes, so naming it here would fail the native link. The
+device caller (`src/main.cpp`) already holds the answer. `Boot` folds it into the
+pattern with an explicit precedence — a config fallback (`FAULT_CONFIG`) outranks a
+degraded calibration, which outranks a clean boot — because `Play` REPLACES, so
+playing-then-overwriting would lose the louder signal. Spec §3.2, the plan step,
+and open item N-17 corrected to match.
+
+Two tests, mutation-checked: `ADegradedAdcCalibrationBootsAsDegradedNotSilent`
+(3 pulses = `BOOT_DEGRADED`) and `AHealthyAdcCalibrationStillBootsClean` (1 pulse =
+`BOOT_OK`, so the first cannot pass by the pattern always being degraded). Dropping
+`|| calibration_degraded_` from `Boot` fails exactly the first. Native suite
+456 → 458. Device build and the device-suite link both succeed with the changed
+`Create` signature.
+
+## The app's DTR went to the data interface — so `hello` was never sent
+
+Found 2026-09-23, continuing audit. `UsbSerialTransport.open()` issues CDC
+`SET_CONTROL_LINE_STATE` itself (Android's `UsbDeviceConnection` has no `setDtr`),
+and it addressed the request to the **data** interface — `conn.setControlLineState(
+iface.id, ...)`, where `iface` is the `USB_CLASS_CDC_DATA` interface it had just
+claimed. That is the wrong interface, and the failure is total and silent.
+
+CDC 1.2 §6.3.12 puts `SET_CONTROL_LINE_STATE` on the **communication** interface,
+and the device side enforces it: TinyUSB's `cdcd_control_xfer_cb` walks its CDC
+instances and matches `request->wIndex` against `p_cdc->itf_num`
+(`managed_components/espressif__tinyusb/src/class/cdc/cdc_device.c:388`), and
+`itf_num` is set from the **communication** interface descriptor
+(`cdcd_open`, `cdc_device.c:307`). `TUD_CDC_DESCRIPTOR` emits the pair as
+`(comm_id, comm_id + 1)` (`usbd.h:262`), so the data interface number matches no
+instance: the loop falls out, `TU_VERIFY(itf < CFG_TUD_CDC)` fails, the class
+handler returns false, and the core stalls EP0 (`process_setup_received`'s
+"Returns false if unable to complete the request, causing caller to stall control
+endpoints").
+
+The chain from there is every part of the link:
+
+1. The request STALLs, so `tud_cdc_line_state_cb` never fires.
+2. `UsbLink`'s `CdcLineStateCallback` therefore never records an open, so
+   `ServiceLineState` never calls `CommandRouter::OnConnected()`.
+3. No `hello` is emitted — `OnConnected` is its only producer — and no config reply
+   run is started.
+4. The app sets `LinkState.Connected` only on `hello`, so the app sits at
+   `Disconnected` forever. `getConfig` still asks, but the app's own `config_get`
+   is answered by nothing.
+
+Nothing errors anywhere. Enumeration succeeds, the interface claims, the bulk
+endpoints read and write, and no frame ever arrives — which reads as a dead
+adapter. The class's own comment already warned about exactly this ("getting it
+wrong is silent"), which is why it is worth recording that it was wrong.
+
+**Fixed** by resolving the communication interface rather than assuming the data
+one: `selectControlLineInterface` (a top-level `internal` function so it is
+JVM-testable, since the failure it guards is invisible without a device) prefers the
+communication interface immediately preceding the claimed data interface and falls
+back to the first one. A device with no communication interface yields null and is
+reported `NotOurDevice` rather than sent a request that would stall.
+`ControlLineInterfaceTest` covers the single-instance pair, a reversed enumeration
+order, a two-instance composite device (where picking the *first* comm interface
+would address the wrong CDC), the no-comm case, and the non-adjacent fallback.
+Mutation-tested: returning `dataId` (the old behaviour) fails all five.

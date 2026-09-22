@@ -4,6 +4,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <string>
 #include <vector>
 
@@ -27,6 +28,11 @@ struct Fifo {
         return n;
     }
 };
+
+// `CONFIG_TINYUSB_CDC_RX_BUFSIZE` on the device, repeated here rather than
+// included: the host build has no sdkconfig, so this is the number the ring must
+// absorb several of. It is the value the device actually runs (sdkconfig.h).
+constexpr size_t kCdcFifoRx = 1024;
 
 struct Sink {
     std::vector<std::string> lines;
@@ -75,6 +81,7 @@ TEST(UsbCdc, BytesArrivingInFragmentsBecomeOneWholeFrameAtTheSink) {
     u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
     const std::string frame = "{\"v\":1,\"seq\":2,\"type\":\"status\"}\n";
     for (char c : frame) u.FeedBytes(reinterpret_cast<const uint8_t *>(&c), 1);
+    u.DrainRx();
     ASSERT_EQ(s.lines.size(), 1u) << "fragments must assemble into one frame";
     EXPECT_EQ(s.lines[0], "{\"v\":1,\"seq\":2,\"type\":\"status\"}");
     EXPECT_EQ(s.lines[0].find('\n'), std::string::npos) << "the sink must not see the newline";
@@ -88,6 +95,7 @@ TEST(UsbCdc, TwoCompleteFramesInOneReadArriveAsTwoFrames) {
     u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
     const std::string two = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}\n{\"v\":1,\"seq\":2,\"type\":\"ping\"}\n";
     u.FeedBytes(reinterpret_cast<const uint8_t *>(two.data()), two.size());
+    u.DrainRx();
     ASSERT_EQ(s.lines.size(), 2u);
     EXPECT_NE(s.lines[0].find("\"seq\":1"), std::string::npos);
     EXPECT_NE(s.lines[1].find("\"seq\":2"), std::string::npos);
@@ -102,10 +110,12 @@ TEST(UsbCdc, AnOversizedLineDoesNotBecomeAFrameAndTheNextOneStillDoes) {
     std::string bad(kNdjsonMaxFrame + 200, 'x');
     bad += "\n";
     u.FeedBytes(reinterpret_cast<const uint8_t *>(bad.data()), bad.size());
+    u.DrainRx();
     EXPECT_TRUE(s.lines.empty()) << "an overrun line is not a frame";
 
     const std::string good = "{\"v\":1,\"seq\":9,\"type\":\"ping\"}\n";
     u.FeedBytes(reinterpret_cast<const uint8_t *>(good.data()), good.size());
+    u.DrainRx();
     ASSERT_EQ(s.lines.size(), 1u) << "the link must resynchronize after an overrun";
     EXPECT_NE(s.lines[0].find("\"seq\":9"), std::string::npos);
 }
@@ -182,13 +192,168 @@ TEST(UsbCdc, DisconnectResetsTheAssemblerSoAHalfFrameCannotLeakIntoTheNextSessio
     u.NoteConnected();
     const std::string half = "{\"v\":1,\"seq\":1,";
     u.FeedBytes(reinterpret_cast<const uint8_t *>(half.data()), half.size());
+    u.DrainRx();
     EXPECT_TRUE(s.lines.empty());
 
     u.NoteDisconnected();
     EXPECT_FALSE(u.IsConnected());
     const std::string whole = "{\"v\":1,\"seq\":2,\"type\":\"ping\"}\n";
     u.FeedBytes(reinterpret_cast<const uint8_t *>(whole.data()), whole.size());
+    u.DrainRx();
     ASSERT_EQ(s.lines.size(), 1u);
     EXPECT_EQ(s.lines[0], "{\"v\":1,\"seq\":2,\"type\":\"ping\"}")
         << "the pre-disconnect fragment must not be prepended";
+    EXPECT_EQ(s.lines[0], "{\"v\":1,\"seq\":2,\"type\":\"ping\"}")
+        << "the pre-disconnect fragment must not be prepended";
+}
+
+// --- The RX staging ring (the cross-task split) ------------------------------
+
+TEST(UsbCdc, StagedBytesAreNotParsedUntilTheConsumerDrains) {
+    // The whole point of the split: `FeedBytes` runs on the TinyUSB task and must
+    // touch NO protocol state -- no parsing, no sink. If it parsed, the callback
+    // would run every command handler against state the poll task is concurrently
+    // mutating. `DrainRx` is the only place a frame reaches the sink, and it runs
+    // on the poll task.
+    Fifo f; Sink s; UsbCdc u;
+    u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
+    const std::string frame = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}\n";
+    u.FeedBytes(reinterpret_cast<const uint8_t *>(frame.data()), frame.size());
+    EXPECT_TRUE(s.lines.empty())
+        << "FeedBytes must only STAGE: parsing there runs the protocol on the USB "
+           "task while Tick mutates the same orchestrator state on the poll task";
+    EXPECT_EQ(u.PendingRx(), frame.size());
+
+    EXPECT_EQ(u.DrainRx(), 1u);
+    ASSERT_EQ(s.lines.size(), 1u);
+    EXPECT_EQ(s.lines[0], "{\"v\":1,\"seq\":1,\"type\":\"ping\"}");
+    EXPECT_EQ(u.PendingRx(), 0u) << "the drain must consume what it delivered";
+}
+
+TEST(UsbCdc, AFragmentStaysStagedUntilItsNewlineArrives) {
+    // A partial line must survive across drains: the consumer may run between two
+    // fragments, and it must not lose or duplicate the bytes it has seen.
+    Fifo f; Sink s; UsbCdc u;
+    u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
+    const std::string part1 = "{\"v\":1,\"seq\":";
+    const std::string part2 = "3,\"type\":\"ping\"}\n";
+    u.FeedBytes(reinterpret_cast<const uint8_t *>(part1.data()), part1.size());
+    EXPECT_EQ(u.DrainRx(), 0u) << "no newline yet, so no frame";
+    EXPECT_TRUE(s.lines.empty());
+
+    u.FeedBytes(reinterpret_cast<const uint8_t *>(part2.data()), part2.size());
+    EXPECT_EQ(u.DrainRx(), 1u);
+    ASSERT_EQ(s.lines.size(), 1u);
+    EXPECT_EQ(s.lines[0], "{\"v\":1,\"seq\":3,\"type\":\"ping\"}");
+}
+
+TEST(UsbCdc, TheRingHoldsABurstLargerThanOnePollTicksWorth) {
+    // The ring must absorb more than a single FIFO read: the callback drains the
+    // whole CDC FIFO per invocation (CONFIG_TINYUSB_CDC_RX_BUFSIZE is 1024) and
+    // the poll loop only runs every 10 ms, so several invocations can land between
+    // two drains. This proves the capacity claim rather than trusting it.
+    Fifo f; Sink s; UsbCdc u;
+    u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
+    std::string burst;
+    int frames = 0;
+    // Well over the 1024-byte CDC FIFO, in several separate FeedBytes calls.
+    while (burst.size() < 3 * kCdcFifoRx) {
+        burst += "{\"v\":1,\"seq\":1,\"type\":\"ping\"}\n";
+        ++frames;
+    }
+    for (size_t off = 0; off < burst.size(); off += 1024) {
+        const size_t n = std::min<size_t>(1024, burst.size() - off);
+        u.FeedBytes(reinterpret_cast<const uint8_t *>(burst.data() + off), n);
+    }
+    EXPECT_EQ(u.RxOverflows(), 0u) << "a 3 KB burst between two drains must not overflow";
+    EXPECT_EQ(u.DrainRx(), static_cast<size_t>(frames));
+    EXPECT_EQ(s.lines.size(), static_cast<size_t>(frames));
+}
+
+TEST(UsbCdc, AnOverfullRingDropsAndCountsRatherThanBlockingOrCorrupting) {
+    // The producer must never spin or block: it is a USB callback, and stalling
+    // it stalls the USB stack. Overflow therefore DROPS, and says so.
+    Fifo f; Sink s; UsbCdc u;
+    u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
+    // One byte more than the ring can hold: the last byte cannot be staged.
+    const std::string too_much(UsbCdc::kRxCapacity, 'x');
+    u.FeedBytes(reinterpret_cast<const uint8_t *>(too_much.data()), too_much.size());
+    EXPECT_EQ(u.RxOverflows(), 1u) << "the refused byte must be counted, not silently lost";
+    EXPECT_EQ(u.PendingRx(), UsbCdc::kRxCapacity - 1)
+        << "the ring holds capacity-1 bytes, so the producer can tell a full ring from "
+           "an empty one without a separate count";
+
+    // And it RECOVERS: draining frees space, and the reader resynchronizes at the
+    // next newline. The overrun line was unterminated, so the reader is still
+    // discarding -- the newline that ends it is consumed, and the frame AFTER it
+    // is the one that lands. (Exactly the `kTooLong` contract the overrun test
+    // above exercises at the transport level.)
+    u.DrainRx();
+    const std::string terminator = "\n";
+    u.FeedBytes(reinterpret_cast<const uint8_t *>(terminator.data()), terminator.size());
+    EXPECT_EQ(u.DrainRx(), 0u) << "the newline ends the discarded line, not a frame";
+    EXPECT_TRUE(s.lines.empty());
+
+    const std::string ok = "{\"v\":1,\"seq\":4,\"type\":\"ping\"}\n";
+    u.FeedBytes(reinterpret_cast<const uint8_t *>(ok.data()), ok.size());
+    EXPECT_EQ(u.DrainRx(), 1u) << "the ring must be usable again after a drain";
+    ASSERT_EQ(s.lines.size(), 1u);
+    EXPECT_EQ(s.lines[0], "{\"v\":1,\"seq\":4,\"type\":\"ping\"}");
+}
+
+TEST(UsbCdc, DisconnectDropsStagedBytesSoTheyCannotLeakIntoTheNextSession) {
+    // Same rule as the reader reset, applied to the ring: a command the app sent in
+    // the session that just ended must not be parsed as if the new session sent it.
+    Fifo f; Sink s; UsbCdc u;
+    u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
+    u.NoteConnected();
+    const std::string cmd = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}\n";
+    u.FeedBytes(reinterpret_cast<const uint8_t *>(cmd.data()), cmd.size());
+    ASSERT_EQ(u.PendingRx(), cmd.size());
+
+    u.NoteDisconnected();
+    EXPECT_EQ(u.PendingRx(), 0u) << "the staged bytes belong to the ended session";
+    EXPECT_EQ(u.DrainRx(), 0u) << "and must not be delivered on the next drain";
+    EXPECT_TRUE(s.lines.empty());
+}
+
+namespace {
+// Disconnects the transport at the exact instant a producer call is between
+// staging its bytes and publishing their head. That interleaving is the whole
+// reason `rx_epoch_` exists, and nothing else can reach it.
+struct DisconnectAtPublish {
+    UsbCdc *u = nullptr;
+    static void Fire(void *ctx) {
+        static_cast<DisconnectAtPublish *>(ctx)->u->NoteDisconnected();
+    }
+};
+}  // namespace
+
+TEST(UsbCdc, ABytesInFlightAcrossADisconnectAreDiscardedNotDelivered) {
+    // The window a tail reset alone cannot cover: a producer that read its head
+    // BEFORE the disconnect and stores it AFTER has effectively resurrected the
+    // ring. Those bytes were sent in the session that ended, and delivering them
+    // means replaying a stale command (`config_patch`, `test_key`) into a fresh
+    // session -- exactly what the reader reset exists to prevent.
+    //
+    // The hook is what makes this a REAL test of the epoch: it fires inside
+    // `FeedBytes` at the hostile instant. A test that disconnected before calling
+    // `FeedBytes` would be rescued by the disconnect's own tail reset and would
+    // still pass with the epoch check deleted.
+    Fifo f; Sink s; UsbCdc u;
+    u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
+    u.NoteConnected();
+    DisconnectAtPublish hook{&u};
+    u.SetRxInterleaveHookForTest(&DisconnectAtPublish::Fire, &hook);
+
+    const std::string stale = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}\n";
+    u.FeedBytes(reinterpret_cast<const uint8_t *>(stale.data()), stale.size());
+    u.SetRxInterleaveHookForTest(nullptr, nullptr);
+
+    EXPECT_EQ(u.PendingRx(), 0u)
+        << "a disconnect landing during the producer call must leave the ring EMPTY: "
+           "otherwise the late head store resurrects the ended session's bytes";
+    EXPECT_EQ(u.DrainRx(), 0u);
+    EXPECT_TRUE(s.lines.empty())
+        << "a command from the ended session must never reach the sink";
 }

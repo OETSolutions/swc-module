@@ -26,6 +26,15 @@ bool ReadSize(const cJSON *obj, const char *key, size_t *out) {
     const cJSON *v = Member(obj, key);
     if (!cJSON_IsNumber(v) || v->valuedouble <= 0.0) return false;
     if (v->valuedouble > 4294967295.0) return false;
+    // A byte count carrying a fraction is REFUSED, not truncated -- the same rule
+    // `ConfigCodec`'s ReadU32/ReadU64 and `CommandRouter`'s NumToU32/NumToU8
+    // enforce, for the same reason: a bare cast accepts a value the sender did not
+    // write and the receiver then acts on. Here the consequence is not an accepted
+    // wrong image (OtaEnd still requires an exact byte count AND the digest) but a
+    // permanent unexplained failure: `size_bytes: 1543210.9` declared a size no real
+    // image has, so every download of a correct image ended in `kSizeMismatch`,
+    // which names neither the manifest nor the field.
+    if (v->valuedouble != static_cast<double>(static_cast<size_t>(v->valuedouble))) return false;
     *out = static_cast<size_t>(v->valuedouble);
     return true;
 }

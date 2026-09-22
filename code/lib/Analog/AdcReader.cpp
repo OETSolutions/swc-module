@@ -26,10 +26,13 @@ MilliVolt MedianOf(const int *v, int n) {
             tmp[m] = t;
         }
     }
-    // Even count: the LOWER of the two middle values, not their mean. A mean
-    // would be a fractional value no conversion produced, and it would make the
-    // reported level depend on arithmetic rather than on a real sample -- which
-    // matters because this value is compared against learned windows.
+    // Even count: the UPPER of the two middle values -- sorted indices n/2-1 and
+    // n/2 are the middles, and `tmp[n/2]` is the higher of them. (An earlier
+    // comment said "lower", the opposite half; the behaviour was always this.) It
+    // is NOT their mean: a mean is a fractional value no conversion produced, and
+    // it would make the reported level depend on arithmetic rather than on a real
+    // sample -- which matters because this value is compared against learned
+    // windows.
     return static_cast<MilliVolt>(tmp[n / 2]);
 }
 

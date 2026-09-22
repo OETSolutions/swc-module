@@ -22,6 +22,8 @@
  */
 #include "Link/SwcContract.h"
 
+class UsbCdc;
+
 /*
  * Frame -> handler. One `OnLine` per complete frame (the transport owns framing
  * and the trailing newline), replies written through the sink.
@@ -121,6 +123,24 @@ public:
     uint32_t LastSeenSeqSent() const { return seq_sent_; }
     uint32_t LastSeenSeqReceived() const { return expected_seq_ - 1; }
 
+    /*
+     * The two link-loss counters, reported in the `status` body.
+     *
+     * Both were countable and READ BY NOBODY: `UsbCdc::DroppedFrames()` (an
+     * outbound frame the TX buffer refused) had a test as its only reader, while
+     * its own doc-comment says a silent drop "is the failure this class exists to
+     * prevent, so it must be observable"; `RxOverflows()` (staged input the ring
+     * refused) had a test and not even that claim. What was missing is
+     * reachability TO A USER, not the counting -- and the only channel the router
+     * has to a user is a frame it emits. That is why these are pushed in at the
+     * wiring point rather than pulled at each `Send`, which cannot report anything
+     * (the sink returns void, so a refused frame fails entirely inside the
+     * transport and nothing returns to the caller that asked for it).
+     *
+     * Both default to zero, so a router used in isolation reads zero.
+     */
+    void SetLossCounters(const UsbCdc *cdc) { cdc_ = cdc; }
+
 private:
     // One place that writes a frame, so `seq_sent_` cannot be forgotten on one
     // path and the sink contract (no trailing newline) is enforced once.
@@ -164,6 +184,30 @@ private:
 
     void ResetRun();
 
+    // EVERY piece of state that belongs to the LINK rather than to the device,
+    // discarded in one place. Two callers end a link -- `OnDisconnected` (a real
+    // transport event) and `NoteSilenceIfStale` (the peer went quiet for 10 s) --
+    // and spec 4.4 makes the same promise for both: a link drop leaves no
+    // half-finished work behind. Kept as one function because the two callers had
+    // DRIFTED: the silence reap closed the `config_set` run and the learn STREAM
+    // but left the `config_get` REPLY run open, so `Process` -- which gates only on
+    // `reply_open_`, never on `connected_` -- kept emitting `config_chunk` into a
+    // FIFO nobody was draining until the 2 KB TX buffer filled, and a genuine
+    // reply was then refused. The learn SESSION was left behind by BOTH paths, so
+    // a `learn_commit` after a reconnect committed samples the previous session
+    // recorded (see `ForgetLearnSession`).
+    void ResetLinkState();
+
+    // A learn stream and the samples it accumulated, discarded together. The
+    // session must be emptied, not merely left with `learn_open_` cleared: the
+    // commit path is keyed on the SESSION's channel (see `HandleLearnCommit`), and
+    // a session that survives the link lets a peer with no open stream commit the
+    // PREVIOUS session's measurement -- `session_.Commit` would accept it and stamp
+    // `learned_idle_mv` from a rail measured before the disconnect (spec 4.4 makes
+    // reconnect stateless). `Start` with an empty neighbour set is what zeroes the
+    // session, so calling it here is the discard.
+    void ForgetLearnSession();
+
     // FR-5's live sample, one per Process() while a run is open.
     void EmitLadderSample();
 
@@ -195,6 +239,27 @@ private:
     // The reply is generated lazily, one frame per Process(), so a 22 KB config
     // does not need a 22 KB TX buffer nor a blocking burst.
     char     reply_buf_[ConfigMaxSerializedSize()];
+    // The config a `config_get` reply is encoded FROM. A member rather than a
+    // local in `BeginConfigReplyRun`: `sizeof(Config)` is 8,912 B and that
+    // function runs on the 4 KB TinyUSB task, where a local Config (its own
+    // 17,856-byte frame, ~35.8 KB with its Load chain) overflows the stack. It
+    // also has to outlive the call, since the reply goes out one chunk per
+    // `Process()` -- but `reply_buf_` is what the chunks are read from, so this
+    // only needs to hold the source for the encode.
+    Config   reply_config_{};
+    // The scratch every INBOUND handler that needs a whole config works in
+    // (`config_end`, `config_patch`, `learn_start`'s seed, `learn_commit`). One
+    // member for all four because they cannot run concurrently: each is entered
+    // from `OnLine`, which is called from the TinyUSB RX callback, so at most one
+    // is live at a time -- and none of them is reentrant.
+    //
+    // A local in any of them is a stack overflow: `sizeof(Config)` is 8,912 B
+    // against a 4,096-byte task stack, and each of those handlers also calls
+    // `ConfigStore::Load`, whose own decode reaches `ConfigDecodeJson`. Measured
+    // frames were 9,088 B (`config_end`) to 17,920 B (`config_patch`), ~35 KB
+    // peaking through the Load chain. Invisible on the host, where the suite's
+    // stacks are megabytes, and never exercised because the board is unflashed.
+    Config   command_config_{};
     size_t   reply_len_ = 0;
     size_t   reply_off_ = 0;
     uint32_t reply_seq_ = 0;
@@ -249,6 +314,21 @@ private:
     // session accumulates what the stream reports.
     LearnSession session_;
     bool         learn_open_ = false;
-    int          learn_channel_ = 0;
+    // -1 MEANS "no session", and it is the value the member starts at. The
+    // sentinel must be the initializer, not merely a value `ForgetLearnSession`
+    // assigns: `HandleLearnCommit` refuses `no_session` on `learn_channel_ < 0`
+    // BEFORE comparing it to the frame's channel, so a default of `0` let a
+    // `learn_commit{channel:0}` on a freshly constructed router clear BOTH the
+    // no-session guard and the channel-match guard, reach `session_.Commit` on an
+    // empty session, and answer `learn_rejected: too_few_samples` -- naming a
+    // sample count as the cause when the truth is that no stream was ever opened
+    // (the un-actionable reason FR-29 forbids). `learn_open_` alone is not the
+    // guard: spec 4.3's flow is start -> stream -> STOP -> commit, and a stop
+    // leaves the samples and this channel behind on purpose.
+    int          learn_channel_ = -1;
     uint32_t     learn_samples_ = 0;
+
+    // The transport whose loss counters `status` reports. Null unless wired;
+    // see `SetLossCounters`. Held as a pointer only to READ the two counters.
+    const UsbCdc *cdc_ = nullptr;
 };

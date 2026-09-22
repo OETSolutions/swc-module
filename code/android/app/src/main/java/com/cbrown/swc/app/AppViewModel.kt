@@ -25,6 +25,7 @@ import com.oetsolutions.swc.ui.UpdateUiState
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -53,6 +54,15 @@ import kotlinx.serialization.json.jsonPrimitive
 class AppViewModel(
     private val client: SwcClient,
     private val scope: CoroutineScope = CoroutineScope(SupervisorJob() + Dispatchers.Default),
+    /**
+     * Whether [scope] is OURS to cancel in [close].
+     *
+     * True for the default (a scope this class created), false for an injected one
+     * (every test passes its own on the test scheduler, and cancelling a scope the
+     * caller owns would be a surprising side effect). This is what makes [close]
+     * able to stop the collectors without reaching into someone else's job.
+     */
+    private val ownsScope: Boolean = true,
     /**
      * Persisting a config. Injected because the real write needs the device, and
      * the screen's job is to show the RESULT — a nack, a timeout, a refusal — not
@@ -87,6 +97,20 @@ class AppViewModel(
      * This is the surface for spec 3.6's Android BAL limitation: an app launched
      * from the background may be refused by the system (hence `targetSdk` 34), and
      * "the button did nothing" is the outcome `ActionOutcome` exists to prevent.
+     *
+     * **Mirrored into [LinkUiState.actionProblems], which is what the screen
+     * renders.** This flow existed and nothing collected it: no screen and not
+     * `MainActivity` referenced it, so an app-side action that could not run was
+     * computed, classified, worded, and then dropped on the floor -- the exact
+     * "the button did nothing" outcome the whole `ActionOutcome` type exists to
+     * prevent, silently reintroduced at the last step. `AppViewModel`'s own
+     * doc-comment claimed the four screens consume it. It is the same shape as
+     * N-24 (`UsbCdc::dropped_`, counted and never reported) and N-22 (`rail_mv`,
+     * read with no producer): a diagnostic that terminates inside the class that
+     * produced it reports nothing.
+     *
+     * The flow stays the single home for the OUTCOME; the link state carries a
+     * copy for rendering, written by the collector in `init`.
      */
     val actionOutcomes: StateFlow<List<String>> = _actionOutcomes.asStateFlow()
 
@@ -113,6 +137,11 @@ class AppViewModel(
         scope.launch { client.state.collect { _link.value = linkStateFor(it) } }
         scope.launch { client.frames.collect { onFrame(it) } }
         scope.launch { client.config.collect { onConfig(it) } }
+        // The app-side failure surface, mirrored into the link state the Link
+        // screen renders. Without this the flow was produced and read by nothing.
+        scope.launch { actionOutcomes.collect { outcomes ->
+            _link.value = _link.value.copy(actionProblems = outcomes)
+        } }
     }
 
     /** Ask the device to identify itself, and read its config back. */
@@ -142,7 +171,33 @@ class AppViewModel(
         _link.value = _link.value.copy(problem = problem)
     }
 
-    fun retry() = connect()
+    /**
+     * Try again: RE-ENUMERATE the USB bus, then connect.
+     *
+     * **It used to be `connect()` alone, which could not recover anything.** The
+     * transport was opened once, in `MainActivity.onCreate`, and nothing ever
+     * enumerated again — there is no `ACTION_USB_DEVICE_ATTACHED` receiver. So an
+     * app opened BEFORE the adapter was plugged in showed "No device found"
+     * permanently, and "Try again" only sent a `ping` through a transport with no
+     * connection (`write` returns early when `connection == null`), i.e. it wrote
+     * nothing and re-reported the same problem forever.
+     *
+     * Opening here rather than in `onCreate` is also what makes the retry do real
+     * work: the user plugging the adapter in and tapping the button now enumerates
+     * the device that appeared.
+     */
+    fun retry() {
+        scope.launch {
+            try {
+                reportOpenProblem(client.reopen())
+            } catch (e: Exception) {
+                _link.value = _link.value.copy(problem = LinkProblem.NoDevice)
+                return@launch
+            }
+            connect()
+        }
+    }
+
 
     /**
      * Ask the device to open its maintenance window (spec 8.2), which is what
@@ -239,6 +294,15 @@ class AppViewModel(
                 val gesture = frame.fields["gesture"]?.jsonPrimitive?.content
                 val channel = frame.fields["channel"]?.jsonPrimitive?.intOrNull
                 if (gesture != null && level != null) {
+                    // The app-side outcome describes THIS press, so it is cleared
+                    // here -- at the one place a press arrives -- rather than
+                    // inside `runAppSideAction`, which the unrecognized-press
+                    // branch below never reaches. Clearing only there would leave
+                    // a failed action's warning on the Link screen through every
+                    // subsequent press the device could not attribute to a
+                    // button, and the user has no way to tell when it stopped
+                    // being true.
+                    _actionOutcomes.value = emptyList()
                     // The WHOLE view follows the pressing channel: its bands, its
                     // rail and its name together. The screen is a single-channel
                     // diagnostic, and an event carries ONE channel's reading, so a
@@ -297,10 +361,21 @@ class AppViewModel(
             Frames.LADDER_SAMPLE -> {
                 val level = frame.fields["level_mv"]?.jsonPrimitive?.intOrNull
                 val channel = frame.fields["channel"]?.jsonPrimitive?.intOrNull
-                if (level != null && level > 0) {
+                if (level != null) {
+                    // A 0 is the device saying "NO READING", not a millivolt value.
+                    // `EmitLadderSample` emits 0 when there is no orchestrator to
+                    // sample (`sys_ == nullptr`) and `FilteredLevelMv` returns 0 for
+                    // an unreadable or stale conversion, and its comment states the
+                    // contract: "0 mV is unambiguous: it is below the ladder's floor,
+                    // so the app renders it as 'no reading' rather than as a real
+                    // level." This branch did the opposite -- `level > 0` dropped the
+                    // frame, so the LAST real reading stayed on screen and the user
+                    // watching during a learn saw a number the device had already
+                    // abandoned. Blanking the reading is what the producer intends and
+                    // what the screen renders as "Reading: —".
                     val shown = ladderFor(client.config.value, channel)
                     _ladder.value = _ladder.value.copy(
-                        liveMv = level,
+                        liveMv = if (level > 0) level else null,
                         idleMv = shown.idleMv,
                         channelName = shown.channelName,
                         buttons = shown.buttons,
@@ -332,6 +407,22 @@ class AppViewModel(
             Frames.STATUS -> {
                 val cs = frame.fields["config_state"]?.jsonPrimitive?.content
                 if (cs != null) _link.value = _link.value.copy(configState = cs)
+                // The DEVICE-side loss counters, spec 4.3's `status`. `lostFrames`
+                // above counts `link_gap`, which the device reports when the APP's
+                // frame went missing; these two are the other direction -- frames
+                // the device's OWN transport refused, inbound (staging-ring
+                // overflow) and outbound (TX buffer full). Both were counted and
+                // read by no one: the counter had a unit test and nothing else, so
+                // a refused command still vanished with no explanation on either
+                // end. Reported here rather than in its own `link_gap`-style frame
+                // because `status` already arrives every 2 s, which is the app's
+                // one guaranteed look at the link without asking for it.
+                frame.fields["tx_dropped"]?.jsonPrimitive?.int?.let {
+                    _link.value = _link.value.copy(deviceTxDropped = it)
+                }
+                frame.fields["rx_overflows"]?.jsonPrimitive?.int?.let {
+                    _link.value = _link.value.copy(deviceRxOverflows = it)
+                }
             }
 
             // Spec 4.3's `link_gap`: the DEVICE lost one of the app's outgoing
@@ -400,6 +491,10 @@ class AppViewModel(
      * else is affected.
      */
     private fun runAppSideAction(channelIndex: Int?, buttonId: String, gestureName: String) {
+        // The outcome describes THIS press. A press with nothing app-side to run
+        // clears it, rather than leaving the previous press's failure on the Link
+        // screen indefinitely -- see the clear at the `EVENT` branch, which is
+        // the one place a press arrives.
         val gesture = Gesture.fromWireName(gestureName) ?: return
         // The channel filter mirrors `BindingResolve` (firmware) exactly: a binding
         // fires for the channel the press came from, or for `ANY`. Filtering on the
@@ -501,6 +596,13 @@ class AppViewModel(
             cells = buildCells(config),
             problems = ConfigJson.problems(config).map { it.toString() },
         )
+        // The maintenance card names the window's length, and the window is a
+        // SETTING (`maintenance_timeout_ms`), not a constant — so the card must
+        // read the device's own value rather than a "5 minutes" literal. A device
+        // configured for 20 minutes otherwise tells the user 5.
+        _link.value = _link.value.copy(
+            maintenanceTimeoutMs = config.settings.maintenanceTimeoutMs,
+        )
     }
 
     /**
@@ -585,6 +687,31 @@ class AppViewModel(
     private fun editKey(channel: BindingChannel, button: String, gesture: String): String =
         "${channel.wireName}/$button/$gesture"
 
+    /**
+     * The binding `id` for a triple the user just authored: spec 3.5's own `bN`.
+     *
+     * **An ordinal slug, deliberately NOT derived from the button id.** `Binding.id`
+     * is `char[kBindingIdLen]` (16) in `ConfigModel.h` and `ConfigJson.problems()`
+     * refuses anything at or over that width. Building it as
+     * `"${button}-${gesture}"` from a headless-learned button id -- `swc1_bt10`,
+     * which is the only production learn vocabulary (the app has no learning
+     * screen) -- came to exactly 16 characters, so the app refused its OWN edit
+     * ("id must be under 16 chars") and Save was disabled: the user could not bind
+     * those buttons at all.
+     *
+     * Truncating the button to fit is worse than an ordinal, because it LIES: slot
+     * 10's `swc1_bt10` truncated to the last 8 characters is `swc1_bt1`, an id that
+     * reads as slot 1 -- and no length-preserving scheme survives a button id that
+     * is itself 15 characters.
+     *
+     * Nothing READS a binding id: the firmware resolves on
+     * `channel`/`button`/`gesture` (`BindingResolve` never looks at `id`), and the
+     * app's grid keys on the same triple. So a collision with a device-supplied id
+     * in the kept list is inert, which is what makes an ordinal a safe label rather
+     * than a key.
+     */
+    private fun bindingIdFor(ordinal: Int): String = "b$ordinal"
+
     /** Record an edit locally. It is not sent until [save]. */
     fun editBinding(cell: BindingCell, action: Action?) {
         pendingEdits[editKey(cell.channel, cell.buttonId, cell.gesture)] = action
@@ -604,7 +731,12 @@ class AppViewModel(
             val merged = withEdits(current)
             val problems = ConfigJson.problems(merged)
             if (problems.isNotEmpty()) {
-                _bindings.value = _bindings.value.copy(problems = problems.map { it.toString() })
+                // A VALIDATION refusal, so it gates Save -- the user can fix it by
+                // editing a cell.
+                _bindings.value = _bindings.value.copy(
+                    problems = problems.map { it.toString() },
+                    saveError = null,
+                )
                 return@launch
             }
             val ok = try {
@@ -614,10 +746,21 @@ class AppViewModel(
             }
             if (ok) {
                 pendingEdits.clear()
-                _bindings.value = _bindings.value.copy(problems = emptyList())
+                _bindings.value = _bindings.value.copy(problems = emptyList(), saveError = null)
             } else {
+                // A RUNTIME failure. It goes to `saveError`, NOT to `problems`.
+                //
+                // It used to be written into `problems` -- the same field the
+                // screen gates Save on -- so a device nack or a link timeout
+                // disabled the button. The pending edit was still rendered in its
+                // cell, so the change looked live while the device held the old
+                // bindings, and there was no way to retry: the config was fine and
+                // the failure was transient, but the only recovery was to edit an
+                // unrelated cell. A save failure must be visible AND retryable.
                 _bindings.value = _bindings.value.copy(
-                    problems = listOf("The device did not accept the configuration."),
+                    problems = emptyList(),
+                    saveError = "The device did not accept the configuration. " +
+                        "Nothing was changed on the device; try again.",
                 )
             }
         }
@@ -635,6 +778,7 @@ class AppViewModel(
         val kept = config.bindings.filter { b ->
             !pendingEdits.containsKey(editKey(b.channel, b.button, b.gesture.wireName))
         }
+        var emitted = 0
         val added = pendingEdits.mapNotNull { (key, action) ->
             val parts = key.split("/")
             if (parts.size != 3) return@mapNotNull null
@@ -668,13 +812,17 @@ class AppViewModel(
             // here: `buildCells` keys only ladder buttons.)
             if (!buttonOnThatLadder(config, channel, button)) return@mapNotNull null
             com.oetsolutions.swc.model.Binding(
-                id = "${button}-${gestureName}",
+                // An ordinal label, never derived from the button id -- see
+                // [bindingIdFor] for the headless-learned id that made the old
+                // derivation a self-refusal. The counter is `kept` plus the edits
+                // emitted so far, so the ids stay distinct within one save.
+                id = bindingIdFor(kept.size + emitted),
                 channel = channel,
                 button = button,
                 gesture = gesture,
                 enabled = true,
                 actions = listOf(action),
-            )
+            ).also { ++emitted }
         }
         // The CHANNELS are carried through untouched. This function edits
         // bindings, and a binding names its own channel, so the two are
@@ -736,10 +884,8 @@ class AppViewModel(
      */
     fun checkForUpdates() {
         scope.launch {
-            _update.value = _update.value.copy(inProgress = true)
             val version = _link.value.firmwareVersion
             _update.value = _update.value.copy(
-                inProgress = false,
                 currentVersion = version ?: "—",
                 status = when {
                     version == null -> UpdateStatus.Failed("No device is connected.")
@@ -753,7 +899,24 @@ class AppViewModel(
         }
     }
 
-    fun close() = client.close()
+    /**
+     * Tear down: close the transport AND stop this view model's coroutines.
+     *
+     * **Cancelling the scope is the half that was missing, and its absence leaked.**
+     * `MainActivity.onDestroy` calls this and drops its reference, but the five
+     * collectors and `client.run()` — all launched on `scope` — kept collecting
+     * flows that never complete, holding the old view model, client and transport
+     * alive for the process's lifetime. That is a leak on any activity recreation
+     * the launch mode and `configChanges` do not absorb.
+     *
+     * `client.run()` "never returns" by design, so nothing inside it will stop on
+     * its own; cancelling the scope is the only thing that ends it.
+     */
+    fun close() {
+        client.close()
+        if (ownsScope) scope.cancel()
+    }
+
 
     private companion object {
         /** How many device log lines the link screen keeps. */

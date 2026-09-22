@@ -75,6 +75,10 @@ struct Fixture {
         // A frame the HOST writes, terminator included, goes into the transport.
         const std::string wire = cmd + "\n";
         cdc.FeedBytes(reinterpret_cast<const uint8_t *>(wire.data()), wire.size());
+        // `FeedBytes` only STAGES the bytes (the device callback runs on another
+        // task); `DrainRx` is what parses them and delivers the frame, and it runs
+        // on this calling thread -- the same order `UsbLinkService` uses.
+        cdc.DrainRx();
         // The reply is queued by the poll loop, not by the inbound call: the
         // router emits at most one deferred frame per Process() (a chunked config
         // reply is a run), so drain it the way `UsbLinkService` does.
@@ -189,6 +193,9 @@ TEST(LinkWiring, TheRebootAckReachesTheTransportBeforeTheReset) {
     const std::string rb = "{\"v\":1,\"seq\":7,\"type\":\"reboot\",\"boot_target\":\"app\"}";
     const std::string wire = rb + "\n";
     f.cdc.FeedBytes(reinterpret_cast<const uint8_t *>(wire.data()), wire.size());
+    // Stage then parse, exactly as the device does (the callback stages on the
+    // TinyUSB task; `UsbLinkService` drains on the poll task).
+    f.cdc.DrainRx();
     ASSERT_EQ(f.hal.RebootCount(), 1);
     EXPECT_NE(f.sink.got.find("\"type\":\"ack\""), std::string::npos)
         << "the reboot ack must be flushed before reboot(), not queued into the reset";

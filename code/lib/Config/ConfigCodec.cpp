@@ -39,6 +39,22 @@ static_assert(sizeof(BlobHeader) == kBlobHeaderBytes,
 // `ConfigStore::Save` writes whatever it is handed). It is called below via
 // LadderWindowsAreDistinguishable; the local copy that used to sit here was the
 // second home, and it had already drifted from learn's tolerance floor.
+// The decode scratch. `ConfigDecodeJson` decodes into this and copies to the
+// caller's `out` only once every field AND the validator have passed, which is
+// what keeps spec 3.8's "never partially applied" true.
+//
+// **Why a static rather than a local.** `sizeof(Config)` is 8,912 B, so a local
+// made this function's frame 8,944 B -- and its callers frame 9-18 KB, on a
+// 3,584-byte main task and a 4,096-byte TinyUSB task. That is a stack overflow on
+// every boot and every `config_get`, invisible to the host suite (the crash needs
+// a real task stack) and to the board, which has never been flashed.
+//
+// One scratch is safe because the decode is not reentrant: it is reached from the
+// USB task (`config_end`, `config_get`) and from `Boot` on the main task, never
+// from both at once, and never nested within itself. Same reasoning as
+// ConfigStore's `g_blob`, which is the precedent for a file-local config buffer.
+Config g_decode_scratch{};
+
 bool BindingNamesARealInput(const Config &c, const Binding &b) {
     if (strcmp(b.button, "NONE") == 0) return true;   // gestures on the prog button
     for (uint8_t ch = 0; ch < c.channel_count; ++ch) {
@@ -94,6 +110,13 @@ bool ConfigValidate(const Config &c) {
     // the gesture could be both a LONG and a DOUBLE.
     if (c.settings.timings.long_press_ms <= c.settings.timings.double_press_off_ms) return false;
     if (c.settings.timings.send_duration_ms == 0) return false;
+    // Bounded at BOTH ends, like `maintenance_timeout_ms` below and for the same
+    // reason: this is how long the KEY line is DRIVEN, so a `uint32` maximum
+    // (~49.7 days) pins a phantom press the user cannot release -- the hazard
+    // FR-39 exists to prevent. A magnitude check alone refuses only a value past
+    // the width (which a raw cast would have wrapped anyway); the in-range maximum
+    // is what a patch of `1e10`-wrapped-to-u32-max sailed past.
+    if (c.settings.timings.send_duration_ms > kSendDurationMaxMs) return false;
     if (c.settings.buzzer_level > 3 || c.settings.led_level > 3) return false;
     // The maintenance window is BOUNDED, like every other timing above. A zero
     // makes the close test (`now - last_activity >= timeout`) true on the tick
@@ -745,7 +768,8 @@ bool ConfigDecodeJson(const char *json, size_t len, Config *out) {
     cJSON *root = cJSON_ParseWithLength(json, len);
     if (root == nullptr) return false;
 
-    Config c{};
+    Config &c = g_decode_scratch;
+    c = Config{};
     bool ok = cJSON_IsObject(root) != 0;
     ok = ok && ReadU32(root, "schema_version", &c.schema_version);
     // A schema the firmware does not implement is refused HERE, as its own

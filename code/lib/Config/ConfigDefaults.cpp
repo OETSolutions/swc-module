@@ -4,8 +4,10 @@
 
 #include "Output/GainPolicy.h"   // kDacMaxCode: full scale is the SAFE idle (spec 6.7)
 
-Config ConfigDefault() {
-    Config c{};
+void ConfigDefault(Config *out) {
+    if (out == nullptr) return;
+    Config &c = *out;
+    c = Config{};
     c.schema_version = kConfigSchemaVersion;
     // A NON-EMPTY device id. `ReadStr` refuses an empty string, so a config with
     // `device_id: ""` encodes fine and then cannot be decoded by the very codec
@@ -43,5 +45,4 @@ Config ConfigDefault() {
     }
     c.aux_count = 0;
     c.binding_count = 0;   // no bindings: pass-through, nothing acts on a gesture
-    return c;
 }

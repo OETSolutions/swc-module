@@ -62,18 +62,30 @@ int Aux1PressedMaxMv() {
 /*
  * `temp_c_at_learn`, in tenths of a degree C, when the NTC has not been read.
  *
- * Spec 6.4 says v1's temperature compensation is a linear correction with a
- * coefficient defaulting to zero, so that it "does not change behavior until the
- * user or a bring-up measurement supplies a non-zero coefficient".
+ * **An earlier revision of this comment attributed a claim to spec 6.4 that spec
+ * 6.4 does not make, and quoted a sentence that appears nowhere in it.** It read
+ * "Spec 6.4 says v1's temperature compensation is a linear correction with a
+ * coefficient defaulting to zero, so that it 'does not change behavior until the
+ * user or a bring-up measurement supplies a non-zero coefficient'." The spec says
+ * the OPPOSITE, and says it explicitly: "No correction is implemented in v1, and
+ * this is stated plainly rather than claimed as a zero-valued one. There is no
+ * coefficient field, no correction function, and no test of one." So there is no
+ * default-zero coefficient to describe -- there is no coefficient at all -- and
+ * the quoted sentence is not in the document. A reader who trusted the opening
+ * line would believe a correction exists behind a zero default, which is exactly
+ * the reading spec 6.4 was rewritten to prevent. See open item N-67.
  *
  * **What actually exists is the two halves the coefficient would need and not the
  * correction itself:** `temp_c_at_learn` is recorded per button, and
  * `temp_comp_enabled` is carried through the config. There is no coefficient field,
- * no correction function, and no test of one. An earlier version of this comment
- * (and of the spec paragraph it was written from) claimed "the correction path is
- * present and being testable", which overstated it -- and mattered, because that
- * sentence is the thing that would satisfy FR-17 on review. Recording the input to
- * a correction is not implementing it. See open item N-9.
+ * no correction function, and no test of one. Recording the input to a correction
+ * is not implementing it. See open item N-9.
+ *
+ * **The sentinel is 0 in every case today, because the NTC is never converted.**
+ * `ADC_CH_TEMP` is mapped in EspHal and read by nothing; no NTC conversion exists
+ * anywhere in the tree; and both call sites pass a literal 0 (`RecordLearnSample`
+ * and the headless `Tick`). So `temp_c_at_learn` cannot hold a measurement, which
+ * is FR-1's "sample ... the NTC continuously" unmet -- see open item N-67.
  *
  * The sentinel is deliberate regardless: 23.5 would be a plausible-looking number
  * that nothing measured, and a plausible number in a field a future engineer uses
@@ -92,9 +104,9 @@ SystemOrchestrator::SystemOrchestrator(IHAL *hal, const Config &config,
       // use, so "what counts as an AUX1 press" matches "what counts as a wheel
       // press" -- one debounce definition in the firmware.
       wizard_(hal, &buzzer_, &leds_, Aux1ProfileDefault(), timings),
-      // Spec 8.2's 5-minute inactivity window. A config may carry a different
-      // one; this default exists so a bare device still has a BOUNDED window
-      // rather than an unbounded one.
+      // Spec 8.2's default maintenance window (5 minutes). A config may carry a
+      // different one; this default exists so a bare device still has a BOUNDED
+      // window rather than an unbounded one.
       maintenance_(hal, 300000) {}
 
 /*
@@ -152,7 +164,6 @@ void SystemOrchestrator::EstablishSafeIdle() {
     // of writing it is one I2C transaction at boot.
     const uint8_t n = (config_.channel_count <= kMaxChannels) ? config_.channel_count
                                                               : kMaxChannels;
-    int first_idle_key_mv = 0;
 
     for (uint8_t i = 0; i < n; ++i) {
         const DacChannel adj_ch = (i == 0) ? DAC_CH_ADJ1 : DAC_CH_ADJ2;
@@ -210,102 +221,23 @@ void SystemOrchestrator::EstablishSafeIdle() {
 
         idle_code_[i] = idle_code;
         DriveKeyCode(i, idle_code);
-        if (i == 0) first_idle_key_mv = GainPolicyKeyMvForCode(mode, idle_code);
     }
 
-    idle_key_mv_ = first_idle_key_mv;
     // Set BEFORE the state machines are constructed, so anything that observes
     // SafeIdleEstablished() knows the output is already safe (FR-13).
     safe_idle_established_ = true;
 }
 
-void SystemOrchestrator::Boot() {
-    // 1. Load the config. `kNoConfig` is not a failure -- FR-25 makes an
-    //    unconfigured device a transparent pass-through, so the device works
-    //    before it is ever configured.
-    ConfigStore store(hal_);
-    Config loaded{};
-    const ConfigLoadResult result = store.Load(&loaded);
-
-    if (result == ConfigLoadResult::kLoaded || result == ConfigLoadResult::kRecoveredFromBackup) {
-        config_ = loaded;
-        buzzer_ = BuzzerGrammar(hal_, config_.settings.buzzer_level);
-        leds_ = LedGrammar(hal_, config_.settings.led_level);
-    } else if (result == ConfigLoadResult::kFellBackToDefaults) {
-        // Spec 6.8: a corrupt config falls back to DEFAULTS. That has to actually
-        // ASSIGN them, and the earlier revision did not -- it reported
-        // `config_state: "defaults"`, latched the fault LED, and left `config_`
-        // as the constructor's argument. The constructor is PUBLIC, so a caller
-        // that passed a non-default config kept running it while the status frame
-        // and the LED both claimed defaults: the report and the reality disagreed,
-        // which is the exact class of lie spec 6.8 exists to prevent. The device
-        // path hides it because it constructs with `ConfigDefault()`, and no test
-        // caught it because the store and the constructor carried the SAME config,
-        // so "reported defaults" and "running defaults" were indistinguishable.
-        //
-        // Safe to do here: the output's SAFE state (FR-13) is a DAC code derived
-        // from the gain mode and the envelope, not from `config_`, and
-        // `EstablishSafeIdle` runs below against the defaults -- which are the
-        // same shape it would have used anyway. `timings_` is assigned from
-        // `config_.settings.timings` further down, so the fallback propagates to
-        // the classifiers too.
-        config_ = ConfigDefault();
-        buzzer_ = BuzzerGrammar(hal_, config_.settings.buzzer_level);
-        leds_ = LedGrammar(hal_, config_.settings.led_level);
-    }
-    // kNoConfig leaves config_ as supplied (the caller's defaults) -- the
-    // pass-through case. Nothing here starts a link, so "no config" cannot
-    // become "no steering wheel".
-    //
-    // FR-25 / spec 6.9: mark it and auto-detect the reference the wheel will be
-    // measured against. With no config there is no LEARNED idle, so the live
-    // reading is the only one available -- and a live reading is exactly what
-    // spec 6.3's ratio normalization needs.
-    pass_through_ = (result == ConfigLoadResult::kNoConfig);
-
-    // The RUNTIME timings come from the loaded config, and re-deriving them here
-    // is load-bearing. The device path (`SystemOrchestratorCreate`) constructs
-    // with `ConfigDefault()`'s timings, and every channel's classifier and gesture
-    // machine is built from `timings_` in step 3 below -- so without this a user's
-    // `long_press_ms` / `double_press_off_ms` / `debounce_ms` / `send_duration_ms`
-    // were stored, reported in `config_get`, and SILENTLY IGNORED at runtime.
-    // Measured before the fix: a config with `long_press_ms = 1500` still fired
-    // LONG at the default 750 ms.
-    //
-    // `settings.timings` is the authority, not the constructor's argument. A
-    // caller that passes different timings (every host test, to drive the loop
-    // faster) is overridden by a stored config -- which is correct, because the
-    // stored config is what the device will run with, and a test that wants
-    // specific timings should store them.
-    timings_ = config_.settings.timings;
-    // Same reasoning for the maintenance window: the constructor hardcodes spec
-    // 8.2's 5-minute default, but a config may carry its own, and `Boot` is the
-    // only place that has the loaded config.
-    maintenance_ = MaintenanceMode(hal_, config_.settings.maintenance_timeout_ms);
-
-    // Record what the load actually did, so `status`'s `config_state` carries the
-    // CONFIG's state rather than the output's (see ConfigStateWord).
-    switch (result) {
-        case ConfigLoadResult::kLoaded:             boot_config_state_ = BootConfigState::kOk; break;
-        case ConfigLoadResult::kNoConfig:           boot_config_state_ = BootConfigState::kNone; break;
-        case ConfigLoadResult::kRecoveredFromBackup: boot_config_state_ = BootConfigState::kRecovered; break;
-        case ConfigLoadResult::kFellBackToDefaults: boot_config_state_ = BootConfigState::kDefaults; break;
-    }
-
-    // 2. Establish safe idle. This is BEFORE anything else that could accept a
-    //    command (FR-13), and before the per-channel state exists.
-    EstablishSafeIdle();
-
-    // 3. Now the per-channel state.
-    channel_count_ = (config_.channel_count <= kMaxChannels) ? config_.channel_count
-                                                             : kMaxChannels;
-    // FR-25's pass-through reference is captured PER CHANNEL, here and not before
-    // the loop, because the two SWC inputs are independent wheels (FR-9) with
-    // their own idles. A single device-wide reference taken from channel 0 made
-    // the SECOND channel's idle look like a press on the first whenever the two
-    // differed by more than kPassThroughPressDeltaMv -- a key driven every tick
-    // with nothing held, which is the phantom-key hazard FR-15/FR-39 exist to
-    // prevent. A disconnected second input (reading ~0) did it unconditionally.
+/*
+ * Per-channel state, derived from `config_` and the LIVE ADC readings.
+ *
+ * Called from `Boot` and from `ApplyConfig`, so a config that arrives over the
+ * link is classified by exactly the same construction as one stored before boot
+ * (spec 4.2). Returns whether any channel found a pass-through reference, which
+ * only `Boot` consults -- after boot, `pass_through_` has already been decided
+ * and `ApplyConfig` never revives a disabled pass-through.
+ */
+bool SystemOrchestrator::SeedChannelState() {
     bool any_reference = false;
     for (uint8_t i = 0; i < channel_count_; ++i) {
         ChannelState &cs = channels_[i];
@@ -321,6 +253,17 @@ void SystemOrchestrator::Boot() {
         // (spec 6.6 rule 3) and the button is not known until classification.
         cs.key_driven = false;
         cs.key_released_at_ms = 0;
+        // FR-25's edge detector. A stale `true` left from the previous config
+        // suppresses the FIRST rising edge after the swap, so a button the user is
+        // holding through a learn commit would not be seen until they let go and
+        // pressed again -- a "the button I just taught does nothing" report that
+        // looks exactly like a classification bug.
+        cs.pass_through_pressed = false;
+        // FR-12's one-report-per-press latch is per-channel and must not survive
+        // a config swap: the new profile may name a button the OLD profile called
+        // unknown, and a latch still set from the old one would swallow the first
+        // report of a press the user just taught the device to recognize.
+        cs.unknown_reported = false;
         // The trim loop is present but DISABLED in v1: spec 6.5 says open-loop
         // command with the loop off until its gain is measured on hardware, and
         // running a software loop against the hardware integrator is how you
@@ -359,6 +302,113 @@ void SystemOrchestrator::Boot() {
             if (cs.pass_through_idle_mv > 0) any_reference = true;
         }
     }
+    return any_reference;
+}
+
+void SystemOrchestrator::Boot() {
+    // 1. Load the config. `kNoConfig` is not a failure -- FR-25 makes an
+    //    unconfigured device a transparent pass-through, so the device works
+    //    before it is ever configured.
+    //
+    // **The loaded config is a file-local static, not a local, and that is a
+    // safety requirement rather than an optimization.** `sizeof(Config)` is
+    // 8,912 B; as a local it made this function's frame 18,704 B (it also held a
+    // by-value `ConfigDefault()`), and `Boot` runs on the 3,584-byte main task
+    // via `SystemOrchestratorCreate`. The real worst case is worse than the frame
+    // suggests: the chain is Boot -> ConfigStore::Load -> ConfigDecodeBlob ->
+    // ConfigDecodeJson, which summed to ~36 KB of frame for a 3.5 KB stack. That
+    // is a guaranteed boot crash on hardware, and it is invisible on the host --
+    // the host suite runs these on an 8 MB thread stack, and the board has never
+    // been flashed.
+    //
+    // One static is safe: `Boot` runs exactly once, from `SystemOrchestratorCreate`,
+    // before the link exists, so nothing else can be decoding concurrently.
+    static Config loaded;
+    loaded = Config{};
+    ConfigStore store(hal_);
+    const ConfigLoadResult result = store.Load(&loaded);
+
+    if (ConfigLoadResultIsUsable(result)) {
+        config_ = loaded;
+        buzzer_ = BuzzerGrammar(hal_, config_.settings.buzzer_level);
+        leds_ = LedGrammar(hal_, config_.settings.led_level);
+    } else if (result == ConfigLoadResult::kFellBackToDefaults) {
+        // Spec 6.8: a corrupt config falls back to DEFAULTS. That has to actually
+        // ASSIGN them, and the earlier revision did not -- it reported
+        // `config_state: "defaults"`, latched the fault LED, and left `config_`
+        // as the constructor's argument. The constructor is PUBLIC, so a caller
+        // that passed a non-default config kept running it while the status frame
+        // and the LED both claimed defaults: the report and the reality disagreed,
+        // which is the exact class of lie spec 6.8 exists to prevent. The device
+        // path hides it because it constructs with `ConfigDefault()`, and no test
+        // caught it because the store and the constructor carried the SAME config,
+        // so "reported defaults" and "running defaults" were indistinguishable.
+        //
+        // Safe to do here: the output's SAFE state (FR-13) is a DAC code derived
+        // from the gain mode and the envelope, not from `config_`, and
+        // `EstablishSafeIdle` runs below against the defaults -- which are the
+        // same shape it would have used anyway. `timings_` is assigned from
+        // `config_.settings.timings` further down, so the fallback propagates to
+        // the classifiers too.
+        ConfigDefault(&config_);
+        buzzer_ = BuzzerGrammar(hal_, config_.settings.buzzer_level);
+        leds_ = LedGrammar(hal_, config_.settings.led_level);
+    }
+    // kNoConfig leaves config_ as supplied (the caller's defaults) -- the
+    // pass-through case. Nothing here starts a link, so "no config" cannot
+    // become "no steering wheel".
+    //
+    // FR-25 / spec 6.9: mark it and auto-detect the reference the wheel will be
+    // measured against. With no config there is no LEARNED idle, so the live
+    // reading is the only one available -- and a live reading is exactly what
+    // spec 6.3's ratio normalization needs.
+    pass_through_ = (result == ConfigLoadResult::kNoConfig);
+
+    // The RUNTIME timings come from the loaded config, and re-deriving them here
+    // is load-bearing. The device path (`SystemOrchestratorCreate`) constructs
+    // with `ConfigDefault()`'s timings, and every channel's classifier and gesture
+    // machine is built from `timings_` in step 3 below -- so without this a user's
+    // `long_press_ms` / `double_press_off_ms` / `debounce_ms` / `send_duration_ms`
+    // were stored, reported in `config_get`, and SILENTLY IGNORED at runtime.
+    // Measured before the fix: a config with `long_press_ms = 1500` still fired
+    // LONG at the default 750 ms.
+    //
+    // `settings.timings` is the authority, not the constructor's argument. A
+    // caller that passes different timings (every host test, to drive the loop
+    // faster) is overridden by a stored config -- which is correct, because the
+    // stored config is what the device will run with, and a test that wants
+    // specific timings should store them.
+    timings_ = config_.settings.timings;
+    // Same reasoning for the maintenance window: the constructor hardcodes spec
+    // 8.2's 5-minute default, but a config may carry its own, and `Boot` is the
+    // only place that has the loaded config.
+    maintenance_ = MaintenanceMode(hal_, config_.settings.maintenance_timeout_ms);
+
+    // Record what the load actually did, so `status`'s `config_state` carries the
+    // CONFIG's state rather than the output's (see ConfigStateWord).
+    switch (result) {
+        case ConfigLoadResult::kLoaded:             config_state_ = BootConfigState::kOk; break;
+        case ConfigLoadResult::kNoConfig:           config_state_ = BootConfigState::kNone; break;
+        case ConfigLoadResult::kRecoveredFromBackup: config_state_ = BootConfigState::kRecovered; break;
+        case ConfigLoadResult::kFellBackToDefaults: config_state_ = BootConfigState::kDefaults; break;
+    }
+
+    // 2. Establish safe idle. This is BEFORE anything else that could accept a
+    //    command (FR-13), and before the per-channel state exists.
+    EstablishSafeIdle();
+
+    // 3. Now the per-channel state.
+    channel_count_ = (config_.channel_count <= kMaxChannels) ? config_.channel_count
+                                                             : kMaxChannels;
+    // FR-25's pass-through reference is captured PER CHANNEL inside
+    // `SeedChannelState`, because the two SWC inputs are independent wheels
+    // (FR-9) with their own idles. A single device-wide reference taken from
+    // channel 0 made the SECOND channel's idle look like a press on the first
+    // whenever the two differed by more than kPassThroughPressDeltaMv -- a key
+    // driven every tick with nothing held, which is the phantom-key hazard
+    // FR-15/FR-39 exist to prevent. A disconnected second input (reading ~0) did
+    // it unconditionally.
+    const bool any_reference = SeedChannelState();
 
     // No usable reference on ANY channel: the ladders are unpowered or unreadable.
     // Pass-through is then impossible, and guessing a denominator would map every
@@ -368,14 +418,30 @@ void SystemOrchestrator::Boot() {
     //
     // No logging here on purpose: this file is HOST-compiled (the native suite
     // runs it), so it cannot call esp_log. The state is observable through
-    // PassThroughActive(), which is what a test and the link status both read.
+    // PassThroughActive(). (That accessor's only reader today is a test: the
+    // `status` frame does not carry a pass-through field, so nothing on the LINK
+    // reports it.) The mode is keyed on `kNoConfig`, i.e. the wire word `none`
+    // -- spec 4.3: "`none` is FR-25's supported pass-through device, deliberately
+    // NOT `defaults`". `defaults` is `kFellBackToDefaults`, the opposite
+    // condition: a config that EXISTS and could not be read. An earlier version
+    // of this comment named `defaults` as the pass-through condition and claimed
+    // the app inferred the mode from it, which is backwards in the condition and
+    // false about the app (nothing in it reads `config_state` for pass-through).
     if (pass_through_ && !any_reference) pass_through_ = false;
 
     // 4. Feedback for the load result. A recovered backup is degraded (the user
     //    should know their newest config was lost); a fallback is an error.
+    //
+    // A degraded ADC CALIBRATION folds in here as SPEC 3.2 requires: a blank
+    // eFuse is the same class of condition as a recovered config -- the device
+    // runs, but with knowledge it did not have -- so it, too, is announced as
+    // `BOOT_DEGRADED` rather than only logged. `Play` REPLACES, so the more
+    // severe pattern must be chosen, not played-then-overwritten: a config
+    // fallback (`kFaultConfig`) outranks a calibration fallback, which outranks a
+    // clean boot. The ordering below states that precedence once.
     if (result == ConfigLoadResult::kFellBackToDefaults) {
         buzzer_.Play(BuzzerPattern::kFaultConfig);
-    } else if (result == ConfigLoadResult::kRecoveredFromBackup) {
+    } else if (result == ConfigLoadResult::kRecoveredFromBackup || calibration_degraded_) {
         buzzer_.Play(BuzzerPattern::kBootDegraded);
     } else {
         buzzer_.Play(BuzzerPattern::kBootOk);
@@ -386,7 +452,11 @@ void SystemOrchestrator::Boot() {
     // is the only lasting record that the running config is not the user's.
     const bool config_faulted = (result == ConfigLoadResult::kFellBackToDefaults);
     if (config_faulted) {
-        faulted_ = true;
+        // The CONFIG latch, not `ReportFault`'s hardware one: spec 7.3's
+        // reboot-only rule is stated for "a hardware condition that does not fix
+        // itself", and a corrupt config is not one -- a commit that persists a
+        // valid config remediates it, and `ApplyConfig` clears this.
+        config_faulted_ = true;
         leds_.SetStat(LedStatPattern::kBlink);
     } else {
         RestatLeds();
@@ -396,6 +466,122 @@ void SystemOrchestrator::Boot() {
     //    starts them, which is what makes FR-42 structural rather than a promise.
 }
 
+/*
+ * Adopt a config that arrived over the link (spec 4.2: committed means
+ * PERSISTED **and** running).
+ *
+ * **Why this is not a reboot.** The app adopts the config it pushed as the
+ * device's live state the moment the `ack` arrives, and offers no reboot
+ * affordance. So a device still classifying against the previous config makes
+ * the app and the device disagree about the bindings the user is looking at: the
+ * user saves a binding, sees the app call the device configured, and the button
+ * does nothing until a power cycle that a car-installed device may never get.
+ * The headless learn path already applied its commit immediately
+ * (`ApplyLearnedProfile`, whose comment calls the stale alternative "the worst
+ * version of the bug"); this is the whole-config case of the same rule.
+ *
+ * **A REJECTED config never reaches here.** Every caller applies only after
+ * `ConfigStore::Save` returned true, so a refusal leaves BOTH halves untouched:
+ * the stored config is the old one and the running config is the old one.
+ *
+ * **The config's own state IS re-derived, because this function changes it.** The
+ * `status` frame's `config_state` describes the config the device is RUNNING, so a
+ * commit that puts the user's validated config in force returns it to `ok` and
+ * clears the config-fault LED -- see `ConfigStateWord`. It used to be frozen at the
+ * boot value, which made the app tell a user who had just re-programmed the device
+ * that it had "lost its configuration ... program it again": the field naming a
+ * fault the device was no longer in, the exact lie spec 6.8 exists to prevent.
+ * `hw_faulted_` is the opposite case and is deliberately NOT touched here: a wiring
+ * fault or a collapsed rail is a hardware condition that does not fix itself (spec
+ * 7.3), and a config arriving is not evidence about the ladder's wiring. Likewise
+ * `pass_through_` is not re-decided here -- see below.
+ */
+void SystemOrchestrator::ApplyConfig(const Config &c) {
+    // FR-25 / spec 6.9: a config has been committed, so there ARE learned windows
+    // to classify against and pass-through must end -- the same rule
+    // `ApplyLearnedProfile` follows, and for the same reason. A device left in
+    // pass-through would mirror the raw wheel onto the head unit and ignore every
+    // binding the user just saved, with entirely correct-looking feedback.
+    //
+    // The reverse is deliberately NOT done: a committed config never TURNS ON
+    // pass-through. Pass-through is for a device with no configuration at all,
+    // and reaching this function means one exists.
+    pass_through_ = false;
+
+    // Spec 4.2 + 4.3: this commit puts the user's validated config in force, so
+    // `config_state` describes THAT config and the config-fault LED stands down.
+    // See the function comment for why `hw_faulted_` is untouched.
+    NoteConfigCommitted();
+
+    config_ = c;
+
+    // `channel_count_` is derived from the config and indexes every per-channel
+    // array below, so it is set BEFORE anything reads it. A config carrying more
+    // channels than the device has is clamped, exactly as in `Boot`.
+    const uint8_t new_count = (config_.channel_count <= kMaxChannels)
+                                  ? config_.channel_count
+                                  : kMaxChannels;
+
+    // FR-39: a channel this config REMOVES must not leave its KEY line driven.
+    // `Tick` services only `channels_[0..channel_count_-1]`, and the pulse
+    // timeout, the rail-fault release and the head-unit-gone release all live
+    // inside that per-channel service -- so a channel that stops being serviced
+    // is never visited again. A `test_key` pulse or a resolved action still in
+    // flight when the config lands would hold a phantom key until the next
+    // reboot, which is exactly the hazard §6.7/FR-39 exist to prevent. Released
+    // against the OLD idle code and gain mode, which are the settings the line
+    // was actually driven under -- `EstablishSafeIdle` below only re-derives the
+    // channels the NEW config keeps, so a removed channel's pair is still the
+    // correct release level for it.
+    for (uint8_t i = new_count; i < channel_count_ && i < kMaxChannels; ++i) {
+        ReleaseKey(i);
+    }
+    channel_count_ = new_count;
+
+    // Same re-derivation as `Boot` step 1, and load-bearing for the same reason:
+    // every classifier and gesture machine below is built from `timings_`, and
+    // both feedback grammars carry the config's levels. Without this the user's
+    // `long_press_ms` would be stored, reported in `config_get`, and silently
+    // ignored at runtime -- measured once before the fix as a config with
+    // `long_press_ms = 1500` still firing LONG at the default 750 ms.
+    timings_ = config_.settings.timings;
+    // `SetTimeout`, NOT a fresh `MaintenanceMode`: a config can arrive while the
+    // provisioning window is OPEN (the web UI talks to the same link), and
+    // assigning a newly constructed object would set `active_` back to false and
+    // tear the radio down under a user who is mid-provision. See SetTimeout.
+    maintenance_.SetTimeout(config_.settings.maintenance_timeout_ms);
+    // `SetLevel`, NOT a fresh grammar, and for the same reason one level up: both
+    // grammars carry a pattern IN FLIGHT, and a newly constructed one starts at
+    // `kNone`/`kOff`, so assignment would SILENTLY CANCEL what is showing. The learn
+    // wizard owns both as its prompts (it sets them once on entry, not per tick),
+    // and a config push can land mid-learn -- the user's prompt would stop with no
+    // explanation. `Boot` may assign because nothing is in flight there yet.
+    buzzer_.SetLevel(config_.settings.buzzer_level);
+    leds_.SetLevel(config_.settings.led_level);
+
+    // The OUTPUT before the per-channel state, because `SeedChannelState` reads
+    // the ADC with the KEY line already released: a key still driven from the old
+    // config would be pulling its own ladder and could be mistaken for a press.
+    EstablishSafeIdle();
+    SeedChannelState();
+
+    // Repaint, so a config that changed a feedback level is visible on the LEDs
+    // rather than only in the next `status` frame. A HARDWARE fault is deliberately
+    // not cleared (see the function comment): `RestatLeds` ranks it first, so the
+    // lamp correctly stays blinking after the apply. The CONFIG fault is the other
+    // way round -- `NoteConfigCommitted` above cleared it, so this repaint is what
+    // actually returns the lamp to its normal state.
+    //
+    // **Deferred while the learn wizard is active**, exactly as `Tick` defers its
+    // own restate: the wizard owns BOTH LEDs as its prompts until it hands back
+    // (`Exit` sets LED_STAT solid itself), so repainting here would stamp a level
+    // change over a prompt the user is reading. This is reachable -- the learning
+    // screen is gone from the product, but a config push over the link and a
+    // headless AUX1 learn can overlap, and a `config_patch` of `settings.led_level`
+    // is the shortest way to hit it.
+    if (!wizard_.Active()) RestatLeds();
+}
+
 void SystemOrchestrator::Tick(uint64_t now_ms) {
     for (uint8_t i = 0; i < channel_count_; ++i) {
         ServiceChannel(i, now_ms);
@@ -403,6 +589,7 @@ void SystemOrchestrator::Tick(uint64_t now_ms) {
     // FR-31: after the channels, so a learn commit is applied before the next
     // tick classifies against the new profile.
     ServiceLearn(now_ms);
+    RestoreLedsAfterIdentify(now_ms);
     UpdateLed2ForDrivingState();
     buzzer_.Update(now_ms);
     leds_.Update(now_ms);
@@ -498,9 +685,24 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
         maint_fired_latch_ = false;
     }
 
-    // FR-38: the window closes on its own after 5 minutes of inactivity, so a
+    // FR-38: the window closes on its own after the configured timeout, so a
     // device left unable to serve input because someone opened a web page cannot
     // happen. Update() is what performs the close.
+    //
+    // **The window is a FIXED deadline from entry, NOT an inactivity timeout, and
+    // that is a spec-versus-code gap rather than the intended behaviour.** Spec 8.2
+    // and FR-38 both say "5 minutes of INACTIVITY", and `MaintenanceMode` has the
+    // machinery for it (`NoteActivity` bumps `last_activity_`, and `ShouldTimeout`
+    // measures from it), but nothing produces an activity event: the only wrapper,
+    // `NoteMaintenanceActivity`, has no caller. It cannot acquire one in this build
+    // -- activity is HTTP requests and PoP entry, and the web server and radio it
+    // would come from do not exist yet (N-15). So a user actively working in a
+    // provisioning page is closed out on the fixed deadline, which is the stricter
+    // direction: a device that closes EARLY serves a press again sooner, whereas an
+    // unbounded window is the "unable to serve input" state FR-38 exists to prevent.
+    // The activity input lands with the radio; the earlier comment here claimed the
+    // close was already on inactivity, which was false and is why this stayed
+    // invisible (open item N-35).
     maintenance_.Update(now_ms);
 
     // Restate the LEDs when the maintenance window opens or closes, whatever
@@ -514,15 +716,24 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
     // arrives during an open window repaints through `ReportFault`'s own
     // `RestatLeds` call, from the channel loop that runs before this.
     //
-    // DEFERRED while the learn wizard is active: entering maintenance by a 3 s
-    // AUX1 hold exits a running learn first, and the wizard's own `Exit` sets
-    // LED_STAT solid as its handback. Restating in the same tick would overwrite
-    // that with the double-flash. The wizard is the LED owner until it hands back.
+    // DEFERRED while the learn wizard is active: the wizard owns LED_STAT until
+    // it hands back, so repainting mid-learn would fight its prompts.
+    //
+    // The deferred repaint is tracked as an explicit "owed" flag rather than by
+    // writing a sentinel into `maintenance_led_state_`. The sentinel version
+    // wrote `!want_maint_led` -- which is only guaranteed to mismatch the FUTURE
+    // state when that state is false. The 3 s AUX1 tier opens maintenance in the
+    // SAME tick it exits the wizard, so the post-defer want is TRUE while the
+    // sentinel had already stored true: the comparison saw no edge, never
+    // repainted, and the wizard's `kSolid` handback stuck -- a no-host device
+    // showing "USB connected" for the whole maintenance window, where spec 8.2
+    // requires the double-flash. The flag now means exactly what the header says
+    // it means (the last restated state) and cannot be desynced by the deferral.
     const bool want_maint_led = maintenance_.Active();
     if (wizard_.Active()) {
-        // Hold the state flag back so the deferred transition still fires later.
-        maintenance_led_state_ = !want_maint_led;
-    } else if (want_maint_led != maintenance_led_state_) {
+        leds_owed_restat_ = true;
+    } else if (leds_owed_restat_ || want_maint_led != maintenance_led_state_) {
+        leds_owed_restat_ = false;
         maintenance_led_state_ = want_maint_led;
         RestatLeds();
     }
@@ -596,6 +807,17 @@ void SystemOrchestrator::ApplyLearnedProfile(int channel, const LadderProfile &p
     // no NVS learns correctly and cannot persist -- and it is reported the same way
     // as a failed write, because the user-visible fact is identical: not durable.
     persisted_ = (store_ != nullptr) && store_->Save(config_);
+
+    // A learned profile that PERSISTED is a committed config (spec 7.4 / 4.2): the
+    // user has just programmed the device, so `config_state` describes the config
+    // now in force and a config-fault latch stands down -- the same rule as
+    // `ApplyConfig`. **Gated on `persisted_`, and ordered after the save**, because
+    // the reverse would report `ok` and stand the fault down over a config that
+    // never reached NVS: the device would come back corrupt -- or defaulted -- at
+    // the next boot, having told the app, in the meantime, that the user's config
+    // was safe. That is the "reported success for a failed write" lie
+    // `persisted_`'s own fix above exists to prevent, one layer up.
+    if (persisted_) NoteConfigCommitted();
 }
 
 void SystemOrchestrator::ReportGesture(uint8_t index, const GestureEvent &ev, int level_mv) {
@@ -655,7 +877,7 @@ bool SystemOrchestrator::TestDriveKeyMv(uint8_t channel_index, int key_mv, uint3
  * which is the one reading the LED exists to prevent.
  */
 void SystemOrchestrator::RestatLeds() {
-    if (faulted_) {
+    if (Faulted()) {
         leds_.SetStat(LedStatPattern::kBlink);
         return;
     }
@@ -722,11 +944,44 @@ void SystemOrchestrator::UpdateLed2ForDrivingState() {
     }
 }
 
-void SystemOrchestrator::Identify() {
+void SystemOrchestrator::Identify(bool flash, bool buzz) {
     // Both channels, because "which unit is this" is a question about the box,
     // not about one steering-wheel input.
-    leds_.SetStat(LedStatPattern::kDoubleFlash);
-    buzzer_.Play(BuzzerPattern::kKeyAccepted);
+    //
+    // `flash` and `buzz` are separate because the caller (spec 4.3's `identify`)
+    // offers them as separate patterns: a user looking at the wheel wants the
+    // buzzer, one looking at the box wants the flash. Collapsing them -- which the
+    // router used to do -- is an "accepts a field and ignores it" defect, since a
+    // `buzz` request also drove the LEDs.
+    //
+    // The double-flash BORROWS LED_STAT and must hand it back (spec 7.3). Every
+    // other borrower restores: the learn wizard's `Exit` sets the link state, a
+    // maintenance close repaints via `RestatLeds`, and a USB transition does too.
+    // This one used to simply set the pattern, so the LED double-flashed FOREVER
+    // after an `identify` (until the next reboot), and it bypassed `RestatLeds`
+    // entirely -- so an `identify` on a FAULTED device repainted the latched fault
+    // blink to a double-flash, the exact "must not repaint the lamp green" hazard
+    // spec 7.3 forbids. The restore is driven from Tick so the fault precedence
+    // lives in ONE place (`RestatLeds`) rather than being re-derived here.
+    if (flash) {
+        leds_.SetStat(LedStatPattern::kDoubleFlash);
+        // Only the flash BORROWS LED_STAT, so only it needs the restore window --
+        // a buzz-only identify must not leave a phantom latch that repaints the
+        // LEDs 1.5 s later.
+        identify_active_ = true;
+        identify_until_ms_ = hal_->now_ms(hal_->ctx) + kIdentifyFlashMs;
+    }
+    if (buzz) buzzer_.Play(BuzzerPattern::kKeyAccepted);
+}
+
+void SystemOrchestrator::RestoreLedsAfterIdentify(uint64_t now_ms) {
+    if (!identify_active_) return;
+    if (now_ms < identify_until_ms_) return;
+    identify_active_ = false;
+    // The wizard owns both LEDs while it runs, so let it keep them; otherwise
+    // repaint through `RestatLeds`, which already ranks fault > maintenance >
+    // link and is the single answer to "what should LED_STAT show now".
+    if (!wizard_.Active()) RestatLeds();
 }
 
 void SystemOrchestrator::ReleaseKey(uint8_t index) {
@@ -768,9 +1023,40 @@ bool SystemOrchestrator::PresentLevel(uint8_t index, int level_mv, int wheel_idl
     // The mapping is by RATIO, not by voltage (spec 6.9): the wheel's ladder and
     // the head unit's need not have the same resistances, so copying the incoming
     // millivolts across would land on the wrong key.
-    const MilliVolt target = static_cast<MilliVolt>(
-        (static_cast<long>(head_unit_idle_mv) * level_mv) / wheel_idle_mv);
-    cs.servo.Target(gain_mode_[index], target);
+    //
+    // **Clamp BEFORE the narrowing cast, because the cast can wrap into range.**
+    // The ratio is `head_unit_idle * level / wheel_idle`; with a small
+    // `wheel_idle` (a ladder whose LEARNED idle is near zero -- a miswired or
+    // unpowered wheel, which `ConfigValidate` permits because it only bounds
+    // `learned_idle_mv` to a plausible ADC reading) the product exceeds 65535 and
+    // `static_cast<uint16_t>` reduces it modulo 65536. A wrapped value commonly
+    // lands back INSIDE [1800, 5200], so it is indistinguishable from a real
+    // target and the downstream clamp in `GainPolicyCodeForTarget` sees nothing
+    // wrong -- the device drives a key voltage nothing defined. Measured over the
+    // reachable ranges: ~620k (level, wheel_idle) pairs wrap into the envelope;
+    // `wheel_idle <= 230 mV` is enough to reach it.
+    //
+    // The bound is the OUTPUT ceiling, the same value `GainPolicyCodeForTarget`
+    // clamps to, so an over-large ratio saturates exactly where it already would
+    // have. Saturation is the safe direction here (spec 6.2's only dangerous error
+    // is over-ranging a 3 V head unit, which the ceiling clamp is what prevents).
+    const MilliVolt target =
+        GainPolicyMapWheelLevelToHeadUnit(head_unit_idle_mv, level_mv, wheel_idle_mv);
+
+    // Spec 6.2's command band applies here too: a RATIO-mapped target is still a
+    // command target, and this is the other place one is produced. The band is
+    // what bounds it below the line's own rest, and the mapping above can land
+    // past that ceiling -- `kPassThroughPressDeltaMv` caps the wheel's ratio at
+    // ~897 permille (300 mV off a rail that cannot exceed the 2900 mV ADC
+    // ceiling), so against a head unit idling under ~1934 mV the mapped value
+    // sits above the rest AND the band's own ceiling is below the servo's floor.
+    // That band is EMPTY, and a press there has no command to make: refuse rather
+    // than drive a level that reaches the radio as nothing -- the caller releases,
+    // which is the same direction the missing-denominator case above takes.
+    const int banded = GainPolicyClampCommand(target, head_unit_idle_mv, nullptr);
+    if (banded == 0) return false;
+
+    cs.servo.Target(gain_mode_[index], banded);
     cs.servo.Update(sense_mv);
     DriveKeyCode(index, cs.servo.Code());
     cs.key_driven = true;
@@ -807,12 +1093,19 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
         const int sense_mv =
             hal_->adc_read_mv(hal_->ctx, (index == 0) ? ADC_CH_KEY_SENSE1 : ADC_CH_KEY_SENSE2);
         const int key_idle_now_mv = sense_mv * kSenseDividerRatio;
-        const bool rail_fault = (key_idle_now_mv < kKeyEnvelopeLowMv) ||
-                                (key_idle_now_mv > kKeyEnvelopeHighMv);
-        if (rail_fault) {
+        const bool head_unit_gone = (key_idle_now_mv < kKeyEnvelopeLowMv) ||
+                                    (key_idle_now_mv > kKeyEnvelopeHighMv);
+        // Release, but do NOT latch. This envelope is spec 6.2 step 2's "no head
+        // unit" test, and spec 6.8's head-unit-gone row requires "keep
+        // classifying" -- because spec 4.4 says the head unit "may sleep,
+        // suspend, or reboot at any moment". Latching a reboot-only fault
+        // (ReportFault) on a recurring normal condition leaves LED_STAT blinking
+        // forever the first time the head unit sleeps, reporting a fault the
+        // device is not in. The latch belongs to the LADDER's own out-of-range
+        // (FR-4), which this branch cannot see because the channel is disabled.
+        if (head_unit_gone) {
             ReleaseKey(index);
             cs.gestures.Reset();
-            ReportFault();
             return;
         }
         if (cs.key_driven && now_ms >= cs.key_released_at_ms) ReleaseKey(index);
@@ -856,13 +1149,17 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     const ChannelLevel level = cs.classifier.Update(level_mv, cs.idle_reference_mv, now_ms);
 
     // The head unit's own idle, live. Outside the envelope the head unit has
-    // gone (spec 6.8, VBUS off / rail collapse) and the KEY line must be
-    // released rather than held -- FR-39's phantom-key hazard.
+    // gone (spec 6.2 step 2's "no head unit", spec 6.8's head-unit-gone row) and
+    // the KEY line must be released rather than held -- FR-39's phantom-key
+    // hazard. This is NOT a latch: the head unit may sleep and come back (spec
+    // 4.4), so the response is "release and keep classifying". Named for what it
+    // measures rather than "rail_fault", which invited exactly the mistake of
+    // folding it in with FR-4's ladder fault.
     const int sense_mv = hal_->adc_read_mv(hal_->ctx,
                                            (index == 0) ? ADC_CH_KEY_SENSE1 : ADC_CH_KEY_SENSE2);
     const int key_idle_now_mv = sense_mv * kSenseDividerRatio;
-    const bool rail_fault = (key_idle_now_mv < kKeyEnvelopeLowMv) ||
-                            (key_idle_now_mv > kKeyEnvelopeHighMv);
+    const bool head_unit_gone = (key_idle_now_mv < kKeyEnvelopeLowMv) ||
+                                (key_idle_now_mv > kKeyEnvelopeHighMv);
 
     // FR-25 / spec 6.9: with no config there are no learned windows to classify
     // against, so the press is detected by the ratio moving off idle and mapped
@@ -886,8 +1183,29 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             // captured this same way at Boot, so comparing like with like needs no
             // filter (and `cs.reader` must warm up for the configured path's
             // debounce).
-            const int level_now_mv =
+            //
+            // **A FAILED CONVERSION IS NOT A READING, and the sentinel is -1, not
+            // 0** (`IHAL::adc_read_mv`: 0 mV is a legal level at the ladder's
+            // common). Unchecked, `idle - (-1)` is `idle + 1` -- the largest
+            // possible press by this test's own arithmetic -- so one bad
+            // conversion, or a bus fault held across ticks, drove a phantom key at
+            // the mapped level while nothing was pressed. That is the hazard
+            // FR-12/FR-39 exist to prevent, and it is why `AdcReader` drops failed
+            // conversions rather than averaging them in as zero. The three sense
+            // reads in this file guard it; `LearnWizard` did not guard two of its
+            // own (fixed with the same reasoning, N-43).
+            //
+            // HOLD the previous press state rather than resolving either way: a
+            // failure says "no measurement", so treating it as a release would cut
+            // a real press short, and treating it as a press invents one. Assuming
+            // the state is unchanged makes both edges false below, so no key is
+            // driven or released HERE, and the tail of this function still runs its
+            // safety releases (a pulse timeout, a rail fault) -- they are not
+            // classification.
+            const int raw_level_mv =
                 hal_->adc_read_mv(hal_->ctx, (index == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
+            const bool have_reading = raw_level_mv >= 0;
+            const int level_now_mv = raw_level_mv;
 
             // Self-heal a reference captured while a button was held. It is read
             // once at Boot; if the user was holding a button at power-on then it is
@@ -901,8 +1219,10 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             // PER CHANNEL: this heals only THIS channel's reference. Healing a
             // shared one from whichever channel happened to read higher is what
             // made a two-channel device drive a phantom key on the lower-idle
-            // channel.
-            if (level_now_mv > cs.pass_through_idle_mv) {
+            // channel. Gated on `have_reading`: a failed read is not a level ABOVE
+            // the reference, and letting -1 through here would move the reference
+            // DOWN -- the one direction the heal is designed never to take.
+            if (have_reading && level_now_mv > cs.pass_through_idle_mv) {
                 cs.pass_through_idle_mv = level_now_mv;
                 cs.pass_through_pressed = false;
             }
@@ -915,7 +1235,15 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             // noisy median -- the reference was captured the same way, so like is
             // compared with like. `level_mv`/`cs.reader` stay for the configured
             // path, whose debounce genuinely needs the filter.
-            const bool pressed = (idle - level_now_mv) > kPassThroughPressDeltaMv;
+            //
+            // A failed read holds the previous press state instead: `pressed` is
+            // left as it was, so neither edge can fire and this branch neither
+            // drives nor releases a key. Without `have_reading` here, `idle - (-1)`
+            // is `idle + 1` -- the largest possible press by this very comparison
+            // -- and a single bad conversion drove a phantom key.
+            const bool pressed =
+                have_reading ? ((idle - level_now_mv) > kPassThroughPressDeltaMv)
+                             : cs.pass_through_pressed;
             // RISING EDGE only. The pulse self-releases on `send_duration_ms`
             // below, so without this latch the very next tick would see the button
             // still held, `key_driven` false, and re-arm -- the line would pulse
@@ -950,7 +1278,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
         //
         // NOTE: this block deliberately no longer RETURNS. The early return that
         // used to sit here skipped both the pulse-timeout release below and the
-        // rail-fault release, so a held pass-through press drove the line for as
+        // head-unit-gone release, so a held pass-through press drove the line for as
         // long as the button was held (spec 6.6 rule 2 requires a bounded pulse)
         // and a head unit that went away mid-press was never released (FR-39's
         // phantom key). Release is not configuration-dependent.
@@ -1001,6 +1329,11 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
 
         if (fired) {
             const ResolvedAction resolved = BindingResolve(config_, index, ev);
+            // The tail's default acknowledgement is KEY_ACCEPTED for every action
+            // that produced a key. The one case that must not be acknowledged is an
+            // OUT_VOLTAGE whose command band is EMPTY: nothing was driven, so the
+            // press is reported as unknown instead and this suppresses the default.
+            bool play_default_ack = true;
             // Spec 4.3: the app is told AFTER the device has acted on its own
             // local binding, never before. `event` is fire-and-forget precisely
             // so that a button press is not held hostage to the app being
@@ -1015,6 +1348,34 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                     // bounded pulse, held for the recognition time, then released:
                     // the head unit sees a single key event, not a held line.
                     //
+                    // Spec 6.2's command band comes FIRST, and it is the bound
+                    // that was missing entirely. "Command targets must stay inside
+                    // `[min_ladder, V_KEY_idle - 0.20 V]` so the sink FET is never
+                    // asked to drive above the line's own resting level -- above
+                    // that point the servo can only turn `Q4` off, which is the
+                    // release behavior, not a command." The envelope clamp below is
+                    // not that bound: it permits any target from 1800 to 5200 mV,
+                    // so a `key_mv` sitting between the head unit's own idle and
+                    // the envelope ceiling was accepted by `ConfigValidate`, sent
+                    // back as an ack and persisted -- and then drove the radio to
+                    // nothing at all, because the output only sinks. A press that
+                    // silently does nothing is the failure the user cannot tell
+                    // from a broken adapter.
+                    //
+                    // A clamp to 0 is the empty band (a head unit idling so low
+                    // that no reachable command is below its rest). There is no
+                    // level to drive, so RELEASE and say so, exactly as the
+                    // unrecognised-level path does.
+                    bool band_clamped = false;
+                    const int target_key_mv =
+                        GainPolicyClampCommand(a.key_mv, IdleKeyMv(index), &band_clamped);
+                    // ABSENT (0) only when the command band is EMPTY -- a head unit
+                    // idling so low that no reachable level is below its rest. There
+                    // is no command to make, so the press is reported as unknown
+                    // rather than silently released, which is the same direction
+                    // FR-12 takes for a level matching no window.
+                    const bool no_commandable_level = (target_key_mv == 0);
+
                     // FR-18: a key_mv outside the gain mode's envelope is
                     // VALIDATED and CLAMPED, with a warning -- never driven out of
                     // range. The clamp itself lives in GainPolicyCodeForTarget
@@ -1028,21 +1389,34 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                     // than a second copy of the envelope bounds, so the envelope
                     // has one definition and this cannot drift from the clamp it
                     // reports on.
-                    const GainDecision decision =
-                        GainPolicyCodeForTarget(gain_mode_[index], a.key_mv);
-                    if (decision.clamped) {
-                        char msg[128];
-                        snprintf(msg, sizeof(msg),
-                                 "key_mv %d clamped to DAC code %u in gain mode %d",
-                                 a.key_mv, static_cast<unsigned>(decision.dac_code),
-                                 static_cast<int>(gain_mode_[index]));
-                        if (log_sink_ != nullptr) log_sink_(log_sink_ctx_, "WARN", msg);
+                    if (no_commandable_level) {
+                        ReleaseKey(index);
+                    } else {
+                        const GainDecision decision =
+                            GainPolicyCodeForTarget(gain_mode_[index], target_key_mv);
+                        if (band_clamped || decision.clamped) {
+                            char msg[128];
+                            snprintf(msg, sizeof(msg),
+                                     "key_mv %d clamped to DAC code %u in gain mode %d",
+                                     a.key_mv, static_cast<unsigned>(decision.dac_code),
+                                     static_cast<int>(gain_mode_[index]));
+                            if (log_sink_ != nullptr) log_sink_(log_sink_ctx_, "WARN", msg);
+                        }
+                        cs.servo.Target(gain_mode_[index], target_key_mv);
+                        cs.servo.Update(sense_mv);
+                        DriveKeyCode(index, cs.servo.Code());
+                        cs.key_driven = true;
+                        cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
                     }
-                    cs.servo.Target(gain_mode_[index], a.key_mv);
-                    cs.servo.Update(sense_mv);
-                    DriveKeyCode(index, cs.servo.Code());
-                    cs.key_driven = true;
-                    cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
+                    // The feedback for the empty-band outcome is played HERE rather
+                    // than falling through to the tail, whose default is
+                    // KEY_ACCEPTED -- a press that drove no key must not be
+                    // acknowledged as if it had. The tail is suppressed for this case
+                    // through `play_default_ack`.
+                    if (no_commandable_level) {
+                        play_default_ack = false;
+                        buzzer_.Play(BuzzerPattern::kKeyUnknown);
+                    }
                 } else {
                     // Not a level (an OUT_RELEASE, a NONE, or an app-side action
                     // this firmware does not execute). Release rather than hold:
@@ -1074,8 +1448,10 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                 const BuzzerPattern bound =
                     (a.kind == ActionKind::kBuzzer) ? BuzzerPatternFromName(a.target)
                                                     : BuzzerPattern::kKeyAccepted;
-                buzzer_.Play(bound == BuzzerPattern::kNone ? BuzzerPattern::kKeyAccepted
-                                                           : bound);
+                if (play_default_ack) {
+                    buzzer_.Play(bound == BuzzerPattern::kNone ? BuzzerPattern::kKeyAccepted
+                                                               : bound);
+                }
             } else {
                 // The button was RECOGNISED but its gesture is not bound, so there
                 // is no action to run. The device then behaves as a STOCK WHEEL:
@@ -1121,15 +1497,30 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     // This sits outside the branch because the pass-through path used to return
     // before reaching it, leaving the line driven against a head unit that had
     // gone away.
-    if (level == ChannelLevel::kFault || rail_fault) {
+    //
+    // The two conditions release, but only ONE of them latches. `level == kFault`
+    // is FR-4's ladder out-of-range (a short to 12 V, an open input): a wiring
+    // condition that does not fix itself, so it reports and latches `blink`
+    // (spec 7.3's reboot-only rule). `head_unit_gone` is the KEY-sense envelope,
+    // which is spec 6.2 step 2's "no head unit" test and spec 6.8's head-unit-gone
+    // row -- and that row's response is "keep classifying", because spec 4.4 says
+    // the head unit "may sleep, suspend, or reboot at any moment" and spec 6.2
+    // makes gain re-evaluation happen "on `/VBUS_VALID` transitions". Latching a
+    // reboot-only fault on a recurring NORMAL condition leaves LED_STAT blinking
+    // forever the first time the head unit sleeps or the user unplugs the car
+    // radio, reporting a fault the device is not in.
+    const bool ladder_fault = (level == ChannelLevel::kFault);
+    if (ladder_fault || head_unit_gone) {
         ReleaseKey(index);
         cs.gestures.Reset();
-        // FR-4: an out-of-range channel -- a collapsed rail, an open input, a
-        // short to 12 V -- must be REPORTED, not merely survived. Releasing the
-        // line is the safety half; this is the half the user can act on. The
-        // indication latches (see ReportFault): a wiring fault does not clear
-        // itself, and an indication that faded would be a lie.
-        ReportFault();
+        if (ladder_fault) {
+            // FR-4: an out-of-range channel -- an open input, a short to 12 V --
+            // must be REPORTED, not merely survived. Releasing the line is the
+            // safety half; this is the half the user can act on. The indication
+            // latches (see ReportFault): a wiring fault does not clear itself, and
+            // an indication that faded would be a lie.
+            ReportFault();
+        }
         return;
     }
 
@@ -1148,18 +1539,35 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
 // them directly; these wrappers are the device path, where the config comes from
 // NVS and nobody has one to hand at construction time.
 
-extern "C" SystemOrchestrator *SystemOrchestratorCreate(IHAL *hal) {
+extern "C" SystemOrchestrator *SystemOrchestratorCreate(IHAL *hal, bool calibration_degraded) {
     if (hal == nullptr) return nullptr;
 
     // A default config is what FR-25 wants anyway: if NVS holds nothing, this IS
     // the pass-through fallback, and Boot() overwrites it when a config loads.
     // Built by the shared `ConfigDefault()` so the router's config_get reply and
     // this boot config cannot drift apart (Config/ConfigDefaults.h).
-    const Config boot_config = ConfigDefault();
+    //
+    // **A file-local static, not a local.** `sizeof(Config)` is 8,912 B, and this
+    // function runs on the 3,584-byte main task; by value it made a frame of
+    // 8,944 B before `Boot` (18 KB) was even entered. It is written once, at
+    // start-up, and only read here, so there is nothing to race with.
+    static Config boot_config;
+    ConfigDefault(&boot_config);
+    const Config &bc = boot_config;
 
     SystemOrchestrator *sys =
-        new (std::nothrow) SystemOrchestrator(hal, boot_config, boot_config.settings.timings);
+        new (std::nothrow) SystemOrchestrator(hal, bc, bc.settings.timings);
     if (sys == nullptr) return nullptr;
+
+    // Spec 3.2: a blank eFuse means every reading is on the linear approximation,
+    // and that must be REPORTED, not silent. It arrives as an ARGUMENT rather than
+    // a call to `EspHalCalibrationIsDegraded()` here, because this file is
+    // HOST-compiled and `EspHal.cpp` is the one translation unit the host build
+    // excludes -- naming it here would fail the native link. The device caller
+    // (`src/main.cpp`) already has the answer from the HAL. A host build's MockHal
+    // is never degraded, so the native suite sees the clean-boot path unless a
+    // test sets the flag explicitly.
+    sys->SetCalibrationDegraded(calibration_degraded);
 
     // Safe idle FIRST (FR-13), before the caller can start any link. A device
     // that cannot reach its safe state must be loud rather than quietly running:
@@ -1175,5 +1583,9 @@ extern "C" void SystemOrchestratorTick(SystemOrchestrator *sys, uint64_t now_ms)
 
 extern "C" bool SystemOrchestratorSafeIdle(const SystemOrchestrator *sys) {
     return sys != nullptr && sys->SafeIdleEstablished();
+}
+
+extern "C" bool SystemOrchestratorOutputVerified(const SystemOrchestrator *sys) {
+    return sys != nullptr && sys->OutputVerified();
 }
 

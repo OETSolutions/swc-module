@@ -23,9 +23,11 @@ enum class LearnReject {
     kNone = 0,            // committed
     kTooFewSamples,       // not enough samples, or too short a span
     kOutOfRange,          // a sample above the calibrated ADC ceiling
+    kNoIdleReference,     // the live idle reference was absent (0)
     kAtIdle,              // the button was never pressed
     kTooNoisy,            // the level wandered further than classification can tolerate
     kTooCloseToExisting,  // indistinguishable from a button already learned
+    kNoSpace,             // the ladder is full; nothing could be stored
 };
 
 // The wire string for a rejection. FR-29 requires the reason to be specific:
@@ -62,6 +64,18 @@ public:
 
     // Runs the gates and, on success, fills the six fields learn owns. `out`'s
     // id/name are left EXACTLY as the caller set them.
+    //
+    // **A session that never saw a usable idle reference CANNOT commit.** The
+    // callers store `LearnedIdleMv()` as the profile's `learned_idle_mv`, and
+    // `LadderProfileIsValid` refuses a zero reference -- so a commit without one
+    // would be accepted here, reported as success, and then persist a config the
+    // next boot's `ConfigValidate` rejects, losing the user's whole config to
+    // `kFellBackToDefaults` (the same "validator runs on the way IN, never OUT"
+    // hole as the noisy-tolerance defect). The gates below deliberately substitute
+    // a nominal idle for their RATIO math, so they could all pass with the stored
+    // reference still 0; the check that catches it is here, at the point of
+    // decision, and it is the last thing the caller needs before it stamps the
+    // profile.
     LearnReject Commit(LadderButton *out);
 
     int SampleCount() const { return sample_count_; }
@@ -87,6 +101,17 @@ private:
     uint64_t first_ms_ = 0;
     uint64_t last_ms_ = 0;
     bool     have_sample_ = false;
+    // Whether the session's idle REFERENCE has been established -- by the first
+    // sample that carries a usable idle, and then for good. Its OWN flag, NOT
+    // `have_sample_`, and ONE flag for BOTH consumers of the reference: the
+    // rebase below converts the seeded neighbours into this frame, and
+    // `learned_idle_mv_` is the denominator `Commit` stamps. Keying either off
+    // the ordinal skipped the rebase for a session whose first reading had no
+    // idle, and letting the denominator take the LAST sample's idle (or a later
+    // zero reset it) put the stored siblings in one frame and the committed
+    // ratio in another -- the silent wrong-button failure the rebase exists to
+    // prevent (see AddSample).
+    bool     have_idle_ = false;
 
     MilliVolt learned_idle_mv_ = 0;
     MilliVolt rail_mv_ = 0;

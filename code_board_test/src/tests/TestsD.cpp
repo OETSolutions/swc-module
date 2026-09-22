@@ -310,12 +310,15 @@ Outcome Test32_TempVerify()
     float c_hot = c0;
     float r_hot = r0;
     uint32_t mv_hot = mv0;
-    for (int i = 0; i < 20; ++i) {
+    // 8 samples over ~500 ms, not 20 over 2.4 s. The point is to catch the warmest
+    // reading while the operator is still touching the part; the NTC responds in
+    // well under 100 ms, so a longer window adds nothing.
+    for (int i = 0; i < 8; ++i) {
         uint32_t mv = 0;
         Adc::ReadAvgMv(Adc::kTemp, 64, &mv);
         const float c = Temp::CelsiusFromMv((float)mv, 3300.0f);
         if (!isnan(c) && c > c_hot) { c_hot = c; r_hot = Temp::ResistanceFromMv((float)mv, 3300.0f); mv_hot = mv; }
-        delay(120);
+        delay(65);
     }
 
     Log::Printf("");

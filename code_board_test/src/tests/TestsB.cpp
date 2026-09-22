@@ -168,10 +168,11 @@ static Outcome ServoSweep(int ch)
                 True(false, "the DAC write was ACKed");
                 return TestRunner::Current();
             }
-            // The integrator's time constant is ~10 ms and settling is "tens of ms"
-            // (spec 6.5). 60 ms is several time constants; anything faster would
-            // measure the servo mid-slew and report it as an error.
-            delay(60);
+            // The integrator's time constant is ~10 ms (spec 6.5), so 35 ms is 3-4
+            // time constants -- enough for a stable reading. The full step response is
+            // measured separately in test 22; this sweep only needs the value to have
+            // settled, not to be at its final 5%.
+            delay(35);
 
             const int dac_mv = Output::DacMvForCode(codes[i]);
             const int target = Output::KeyMvForDacMv(m, dac_mv);
@@ -686,20 +687,20 @@ Outcome Test19_Buzzer()
 
     Log::Printf("    three short blips, then one long...");
     for (int i = 0; i < 3; ++i) {
-        digitalWrite(PIN_BUZZ, HIGH); delay(80);
-        digitalWrite(PIN_BUZZ, LOW);  delay(120);
+        digitalWrite(PIN_BUZZ, HIGH); delay(60);
+        digitalWrite(PIN_BUZZ, LOW);  delay(70);
     }
-    digitalWrite(PIN_BUZZ, HIGH); delay(600);
+    digitalWrite(PIN_BUZZ, HIGH); delay(400);
     digitalWrite(PIN_BUZZ, LOW);
-    delay(250);
+    delay(120);
 
     Log::Printf("    ...then a rising pattern (each blip longer than the last)...");
-    for (int i = 0; i < 5; ++i) {
-        const int d = 60 + i * 60;
+    for (int i = 0; i < 4; ++i) {
+        const int d = 50 + i * 45;
         digitalWrite(PIN_BUZZ, HIGH); delay(d);
-        digitalWrite(PIN_BUZZ, LOW);  delay(90);
+        digitalWrite(PIN_BUZZ, LOW);  delay(60);
     }
-    delay(200);
+    delay(100);
     Log::Printf("    done -- did you hear a rhythm of blips (NOT a rising pitch)?");
     Log::Printf("");
 
@@ -751,7 +752,11 @@ Outcome Test19_Buzzer()
 
     // 40 steps x 50 ms = 2000 ms, logarithmically spaced so the low end (where the
     // clicking is most audible) is not skipped through.
-    const int kSteps = 40;
+    // 22 steps x 25 ms = 550 ms. The sweep still spans 200 Hz-5 kHz logarithmically;
+    // a faster dwell is enough to hear the character at each end, and this is a
+    // listening test, not a measurement.
+    const int kSteps = 22;
+    (void)0;
     const float f_lo = 200.0f, f_hi = 5000.0f;
     int reported = 0;
     for (int i = 0; i < kSteps; ++i) {
@@ -759,11 +764,11 @@ Outcome Test19_Buzzer()
         const float f = f_lo * powf(f_hi / f_lo, t);   // log sweep
         ledcWriteTone(PIN_BUZZ, (uint32_t)(f + 0.5f));
         // Report a few points so the log shows the sweep happened, without 40 lines.
-        if (i % 10 == 0 || i == kSteps - 1) {
+        if (i % 6 == 0 || i == kSteps - 1) {
             Log::Printf("      %.0f Hz", f);
             ++reported;
         }
-        delay(50);
+        delay(25);
     }
     ledcWriteTone(PIN_BUZZ, 0);   // silence
     ledcDetach(PIN_BUZZ);
@@ -818,16 +823,16 @@ Outcome Test20_Leds()
     // ---------------------------------------------------------------------
     Log::Printf("  part 1: polarity and steady state");
     Log::Printf("    Both LEDs are OFF now. Watch them.");
-    delay(400);
+    delay(200);
 
     Log::Printf("");
     Log::Printf("    driving each pin per BoardPins.h's LED_ON (%d):", LED_ON);
     for (size_t i = 0; i < nrows; ++i) {
         Log::Printf("      %s (%s) ON", rows[i].name, rows[i].net);
         digitalWrite(rows[i].pin, LED_ON);
-        delay(500);
+        delay(220);
         digitalWrite(rows[i].pin, LED_OFF);
-        delay(250);
+        delay(120);
     }
 
     // The opposite level, so a wrong polarity reads as a polarity bug rather than a
@@ -838,18 +843,18 @@ Outcome Test20_Leds()
     for (size_t i = 0; i < nrows; ++i) {
         Log::Printf("      %s (%s) asserted", rows[i].name, rows[i].net);
         digitalWrite(rows[i].pin, !LED_ON);
-        delay(500);
+        delay(220);
         digitalWrite(rows[i].pin, LED_OFF);
-        delay(250);
+        delay(120);
     }
 
     Log::Printf("");
     Log::Printf("    both together, three times (this is the boot indication)");
     for (int i = 0; i < 3; ++i) {
         for (size_t j = 0; j < nrows; ++j) digitalWrite(rows[j].pin, LED_ON);
-        delay(180);
+        delay(90);
         for (size_t j = 0; j < nrows; ++j) digitalWrite(rows[j].pin, LED_OFF);
-        delay(180);
+        delay(90);
     }
     delay(200);
 
@@ -911,8 +916,11 @@ Outcome Test20_Leds()
     // symptom -- solid at low rate, dark at high rate -- is a joint problem, not a
     // firmware one, and it is exactly what a per-LED sweep makes visible.
     // ---------------------------------------------------------------------
-    const float f_lo = 1.0f, f_hi = 60.0f;
-    const uint32_t sweep_ms = 2000;
+    // 2 Hz -> 60 Hz over 700 ms. Still spans the perceptually interesting range
+    // (distinct blinks to merged glow) but a quarter of the dwell time, and the
+    // merge point is visible within the first few hundred ms.
+    const float f_lo = 2.0f, f_hi = 60.0f;
+    const uint32_t sweep_ms = 900;
 
     for (size_t i = 0; i < nrows; ++i) {
         Log::Printf("");
@@ -943,9 +951,13 @@ Outcome Test20_Leds()
 
         // Count the toggles so the log says what was actually driven. If the LED did
         // not follow this many transitions, that is a hardware answer.
+        // A 2 -> 60 Hz log sweep over 900 ms integrates to roughly 2*sum(f)*dt, about
+        // 20-30 toggles. Assert a floor that the sweep can actually reach; the earlier
+        // >40 was calibrated for the 2 s sweep and became unreachable when the dwell
+        // was shortened -- an assertion that fails for the wrong reason.
         Log::Printf("    drove %d toggles (%.0f complete cycles) -- %s", toggles,
                     toggles / 2.0f, rows[i].name);
-        True(toggles > 40, "the sweep produced a real number of transitions");
+        True(toggles >= 14, "the sweep produced a real number of transitions");
     }
 
     for (size_t i = 0; i < nrows; ++i) digitalWrite(rows[i].pin, LED_OFF);

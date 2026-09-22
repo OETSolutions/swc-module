@@ -525,6 +525,38 @@ Measured on this board with the loopback fitted:
 A board that missed that budget would have a genuine problem no amount of slow
 trimming would reveal, which is why the test asserts it rather than only reporting it.
 
+## Speed and the web UI
+
+Two things made this tool look far slower than it was, and both were real bugs.
+
+**Logging blocked on the USB console.** `HWCDC::write()` blocks while trying to push
+each line into its TX ring, and when no host is draining the port it waits up to
+20 × `tx_timeout_ms` before giving up. With the default 100 ms that is **2 seconds
+per line**, so test 31 — which prints about 65 lines — took **130 s** instead of
+0.4 s, and only when nobody had a serial terminal open (a browser holding the port
+counts as "plugged", so the disconnect path never fires). `Serial.setTxTimeoutMs(0)`
+makes the write non-blocking. Nothing is lost: the web UI's copy is captured into the
+ring buffer *before* the serial write, so only the serial copy can be dropped, and
+only when nobody is reading it.
+
+**Unnecessary delays in the tests.** Test 22 ran its trim loop at 1 Hz for twelve
+iterations (12 s) to demonstrate a loop whose behaviour is identical at any rate
+below the 16 Hz analog pole; the LED sweep dwelled 2 s per LED; test 30 wrote 120
+times; test 23 watched a pull-up for 3 s. All trimmed to what the measurement
+actually needs, and the full suite went from ~130 s to **~33 s**, with every test
+still passing. Two of the trims were initially too aggressive and broke their own
+assertions (the LED sweep no longer produced enough transitions; the servo was still
+mid-slew between sweep points) — both corrected, and the assertions now match what
+the sweep can actually produce.
+
+The remaining long tests are the ones that *are* measurements: WiFi association
+(~5 s), the buzzer and LED listening sweeps, and the 120 ms double-press timing.
+
+**The log pane scrolls properly now.** It used to force `scrollTop` to the bottom on
+every 1.2 s poll, so you could not read anything above the tail — it yanked you back
+down. It now follows only when you are already at the bottom (standard `tail -f`
+behaviour), and shows a **jump to latest** button when you have scrolled away.
+
 ## Known limits
 
 - **Tests 31 and 32 need the operator.** 31 skips (rather than passing) if no

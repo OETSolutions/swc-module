@@ -159,7 +159,9 @@ static void handleRoot()
     }
     h += "</table>";
 
-    h += "<h2>Log</h2><pre id=l>waiting for the first output...</pre>";
+    h += "<h2>Log <button id=jump style='display:none;font-size:11px;padding:2px 8px' "
+         "onclick='jumpBottom()'>&#9660; jump to latest</button></h2>"
+         "<pre id=l>waiting for the first output...</pre>";
 
     // ---- the logic -----------------------------------------------------
     //
@@ -184,9 +186,29 @@ static void handleRoot()
     h += "if(prompt&&prompt.length){el('actw').textContent=prompt;a.className='on';}";
     h += "else{a.className='';}";
     h += "}";
+    // THE LOG FOLLOWS ONLY IF YOU ARE ALREADY AT THE BOTTOM.
+    //
+    // The first version forced scrollTop to scrollHeight on every 1.2 s poll, so
+    // scrolling up was impossible -- the poll yanked you back down before you could
+    // read anything. Now the pane is only auto-scrolled when it was already at (or
+    // within ~24 px of) the bottom, which is the standard "tail -f" behaviour: it
+    // follows the output while you watch it, and leaves you alone the moment you
+    // scroll up to read something.
+    //
+    // A "jump to latest" affordance is offered instead of forcing it: when you are
+    // scrolled away from the bottom, the bar shows it and clicking returns you.
+    h += "function atBottom(e){return e.scrollHeight-e.scrollTop-e.clientHeight<24}";
     h += "function refreshLog(){fetch('/log?raw=1',{cache:'no-store'})"
-         ".then(r=>r.text()).then(t=>{el('l').textContent=t;})"
-         ".then(()=>{el('l').scrollTop=el('l').scrollHeight;}).catch(()=>{})}";
+         ".then(r=>r.text()).then(t=>{"
+         "var e=el('l');"
+         "var follow=atBottom(e);"          // decide BEFORE replacing the text
+         "if(e.textContent!==t){e.textContent=t;}"
+         "if(follow)e.scrollTop=e.scrollHeight;"
+         "var away=!atBottom(e);"
+         "el('jump').style.display=away?'inline-block':'none';"
+         "}).catch(()=>{})}";
+    h += "function jumpBottom(){var e=el('l');e.scrollTop=e.scrollHeight;"
+         "el('jump').style.display='none';}";
     h += "function poll(){";
     h += "fetch('/state',{cache:'no-store'}).then(r=>r.json()).then(s=>{";
     h += "setBar(s.busy,s.running,s.results,s.prompt);";

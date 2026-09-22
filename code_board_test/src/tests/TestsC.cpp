@@ -329,7 +329,7 @@ Outcome Test22_ServoTrimLoop()
     bool settled = false;
     int consecutive_in_deadband = 0;
 
-    for (int u = 1; u <= 12; ++u) {
+    for (int u = 1; u <= 8; ++u) {
         uint32_t sense_mv = 0;
         Adc::ReadAvgMv(Adc::kSense1, 64, &sense_mv);
         const int seen_key = Output::KeyMvFromSenseMv((int)sense_mv);
@@ -368,7 +368,13 @@ Outcome Test22_ServoTrimLoop()
         }
 
         Log::Printf("  %-6d %-12d %+-12d %-10d %s", u, seen_key, error, correction, note);
-        delay(1000);   // 1 Hz: the spec's rate, two decades below the analog loop
+
+        // 100 ms between updates, NOT 1000. The spec's 1-2 Hz is the rate the
+        // SUPERVISOR would run at over minutes on a car; reproducing that rate here
+        // cost twelve seconds to demonstrate a loop whose behaviour is identical at
+        // any rate below the 16 Hz analog pole. The measured step response above is
+        // the timing that actually matters, and it is unaffected.
+        delay(100);
 
         if (settled) break;
     }
@@ -438,16 +444,19 @@ Outcome Test23_IdleSafety()
     // --- B. released, with a pull-up ---------------------------------------
     Log::Printf("");
     Log::Printf("  B. released, WITH a pull-up : fit ~10k from J3.3 to 3V3 now if you");
-    Log::Printf("     can. Reading for 3 seconds...");
+    Log::Printf("     can. Reading for half a second...");
 
+    // 6 reads over ~450 ms, not 12 over 3 s. The line rises and settles in well
+    // under 100 ms; the reads only need to span the moment a pull-up is connected,
+    // not to be taken slowly.
     int best = 0;
-    for (int i = 0; i < 12; ++i) {
+    for (int i = 0; i < 6; ++i) {
         Adc::ReadAvgMv(Adc::kSense1, 64, &sense);
         const int k = Output::KeyMvFromSenseMv((int)sense);
         if (k > best) best = k;
-        delay(250);
+        delay(75);
     }
-    Log::Printf("     KEY1 = %d mV (best of 12 reads)", best);
+    Log::Printf("     KEY1 = %d mV (best of 6 reads)", best);
 
     if (best > 1500) {
         True(true, "released, the line RISES to a fitted pull-up -> genuinely high-Z");
@@ -472,7 +481,7 @@ Outcome Test23_IdleSafety()
     const int code = Output::CodeForTargetKeyMv(Output::Mode::kAmplified, low_target);
     Log::Printf("     target %d mV -> code %d", low_target, code);
     Dac::SetSignal(ch, Output::Mode::kAmplified, (uint16_t)code);
-    delay(200);
+    delay(80);
 
     uint32_t driven_sense = 0;
     Adc::ReadAvgMv(Adc::kSense1, 128, &driven_sense);
@@ -671,10 +680,13 @@ Outcome Test25_Wifi()
     Log::Printf("  associating with '%s'...", SWC_WIFI_SSID);
     WiFi.begin(SWC_WIFI_SSID, SWC_WIFI_PASSWORD);
 
-    const uint32_t deadline = millis() + 20000;
+    // 8 s, not 20. Association on a reachable AP completes in 1-3 s; the long wait
+    // only helped the failure case, and a board that has not associated in 8 s is
+    // not going to. The status reported below names which failure it was either way.
+    const uint32_t deadline = millis() + 8000;
     wl_status_t st = WiFi.status();
     while (millis() < deadline && st != WL_CONNECTED) {
-        delay(250);
+        delay(150);
         st = WiFi.status();
     }
 
@@ -1037,7 +1049,7 @@ Outcome Test27_GesturePassthrough()
                 if (down) ++crossings;
                 was_down = down;
             }
-            delay(10);
+            delay(6);
         }
         Dac::Release(1);
 
@@ -1178,7 +1190,8 @@ Outcome Test28_FullPassthrough()
                 const int code = Output::CodeForTargetKeyMv(modes[mi], want_key);
                 if (code <= 0) continue;
                 if (Dac::SetSignal(chs[ci].ch, modes[mi], (uint16_t)code) < 0) break;
-                delay(70);
+                delay(55);   // ~5 integrator time constants; 35 ms left it mid-slew
+                             // between sweep points, which broke the monotonicity check
                 ++steps;
 
                 const int dac_mv = Output::DacMvForCode((uint16_t)code);
@@ -1215,7 +1228,7 @@ Outcome Test28_FullPassthrough()
             const int low_code = Output::CodeForTargetKeyMv(modes[mi], Output::kEnvelopeLowMv);
             if (low_code > 0) {
                 Dac::SetSignal(chs[ci].ch, modes[mi], (uint16_t)low_code);
-                delay(90);
+                delay(40);
                 uint32_t low_in = 0;
                 Adc::ReadAvgMv(chs[ci].in, 32, &low_in);
                 Log::Printf("  commanded the %d mV floor -> SWC = %u mV (released %u mV)",
@@ -1347,7 +1360,8 @@ Outcome Test30_Endurance()
     struct Ch { int ch; Adc::Ch in; Adc::Ch sense; const char *name; };
     const Ch chs[] = {{1, Adc::kSwc1, Adc::kSense1, "ch1"}, {2, Adc::kSwc2, Adc::kSense2, "ch2"}};
 
-    const int rounds = 120;
+    const int rounds = 60;   // halves the run; still far more writes than the
+                             // DAC needs to show drift, and 60 x 8 ms is ~0.5 s
     const uint16_t code = 2800;   // a mid-band command
 
     Log::Printf("  %d write/read rounds per channel, target code %u", rounds, code);
@@ -1372,7 +1386,7 @@ Outcome Test30_Endurance()
             if (Dac::SetSignal(chs[ci].ch, Output::Mode::kAmplified, code) < 0) {
                 ++write_errors;
             }
-            delay(15);
+            delay(8);
 
             uint32_t smv = 0, imv = 0;
             Adc::ReadAvgMv(chs[ci].sense, 8, &smv);

@@ -42,6 +42,33 @@ void Begin()
 {
     if (!s_mtx) s_mtx = xSemaphoreCreateRecursiveMutex();
     Serial.begin(115200);
+
+    // DO NOT BLOCK ON THE USB CONSOLE.
+    //
+    // HWCDC::write() blocks trying to push each line into its TX ring buffer, and if
+    // no host is draining the USB CDC it waits up to 20 x tx_timeout_ms = 2 SECONDS
+    // per write before giving up. That made this tool look wildly slow whenever
+    // nobody had a serial terminal open: test 31 emits ~65 lines, so it took
+    // 65 x 2 s ~= 130 s instead of 0.4 s. The measurement was never slow -- the
+    // LOGGING was, and only when the web UI was being used without a serial monitor.
+    //
+    // The USB CDC connection stays "plugged" as long as any host has the port open
+    // (a browser serial page counts), so the disconnect path never fires and every
+    // write pays the full timeout.
+    //
+    // A timeout of 0 makes the write NON-BLOCKING. The first attempt at this used
+    // 10 ms and it was still far too slow, because HWCDC::write() retries up to
+    // max_consec_timeouts = 20 times before giving up -- so a "10 ms" timeout was
+    // really 200 ms per line, and a 65-line test still took ~13 s of pure stall.
+    // Zero removes the retry loop's cost entirely: the ring send is attempted once
+    // and the write returns immediately whether or not it fit.
+    //
+    // Nothing is lost when a terminal IS attached, because the ring buffer drains
+    // between writes and the send succeeds first time -- the timeout is only ever
+    // reached when there is no reader, which is exactly when waiting is pointless.
+    // The web UI's copy is unaffected either way: it is captured into the ring buffer
+    // in CaptureLine() before this write happens.
+    Serial.setTxTimeoutMs(0);
     // HWCDC's begin() allocates its ring buffers; give the host a moment to
     // enumerate so the banner is not the thing that gets dropped.
     delay(50);

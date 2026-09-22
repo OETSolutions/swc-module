@@ -2659,6 +2659,132 @@ TEST(SystemOrchestrator, ABuzzBindingPlaysItsPatternAndStillDrivesTheKey) {
     (void)idle_code;
 }
 
+TEST(SystemOrchestrator, ABindingWithTwoActionsRunsBothInOrder) {
+    // Spec 3.5's product case, and the multi-action defect N-29: ONE binding whose
+    // SINGLE is "emit the factory key press AND tell the app". The firmware used to
+    // run only `actions[0]`, and its execute branch only looked at `kOutVoltage` --
+    // so a binding stored `[OUT_VOLTAGE, BUZZ]` drove the key but never played the
+    // BUZZ, and `[BUZZ, OUT_VOLTAGE]` (app action first) drove NO key at all.
+    MockHal hal;
+    MockHal::Defaults d;
+    // Both halves of the ordered list. The BUZZ is the firmware-owned action
+    // AFTER the level, which is exactly the shape the old code dropped.
+    d.config.bindings[0].action_count = 2;
+    d.config.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    d.config.bindings[0].actions[0].key_mv = 2400;
+    d.config.bindings[0].actions[1].kind = ActionKind::kBuzzer;
+    std::strncpy(d.config.bindings[0].actions[1].target, "ProgramEnter",
+                 sizeof(d.config.bindings[0].actions[1].target) - 1);
+
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(ConfigValidate(d.config)) << "the two-action binding must be one the device accepts";
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+    const int bound_code = GainPolicyCodeForTarget(o.ChannelGainMode(0), 2400).dac_code;
+    ASSERT_NE(bound_code, idle_code) << "fixture error: the bound level must differ from idle";
+
+    const int before = hal.BuzzerOnCount();
+    const int driven = PressAndCaptureDrivenCode(o, hal, 1430);
+    EXPECT_EQ(driven, bound_code)
+        << "the SECOND action must not suppress the FIRST -- the key still drives";
+    EXPECT_GT(hal.BuzzerOnCount(), before)
+        << "and the BUZZ (action 2) must reach the buzzer, not be dropped as before";
+}
+
+TEST(SystemOrchestrator, AnAppActionFirstStillDrivesTheKeyAfterIt) {
+    // The worse half of N-29: a binding stored `[APP_INTENT, OUT_VOLTAGE]`. The old
+    // code tested only `actions[0]`, found a non-`OUT_VOLTAGE` kind, and fell to
+    // its `else` that RELEASED -- so the press drove NO key, silently doing nothing
+    // on the very wire the user was watching, while the app still fired its half.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.bindings[0].action_count = 2;
+    d.config.bindings[0].actions[0].kind = ActionKind::kAppIntent;
+    std::strncpy(d.config.bindings[0].actions[0].target, "com.oetsolutions.swc.ACTION_NAVIGATE",
+                 sizeof(d.config.bindings[0].actions[0].target) - 1);
+    std::strncpy(d.config.bindings[0].actions[0].payload, "geo:40.7608,-111.8910?q=Home",
+                 sizeof(d.config.bindings[0].actions[0].payload) - 1);
+    d.config.bindings[0].actions[1].kind = ActionKind::kOutVoltage;
+    d.config.bindings[0].actions[1].key_mv = 2400;
+
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(ConfigValidate(d.config));
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    const int bound_code = GainPolicyCodeForTarget(o.ChannelGainMode(0), 2400).dac_code;
+    const int driven = PressAndCaptureDrivenCode(o, hal, 1430);
+    EXPECT_EQ(driven, bound_code)
+        << "the app-owned first action must be SKIPPED, not treated as a release: "
+           "the hardware key press is the firmware's half and must still happen";
+}
+
+TEST(SystemOrchestrator, AnAppActionAfterTheLevelDoesNotReleaseTheKey) {
+    // The mirror shape, and the one that pins SKIP-not-RELEASE: `[OUT_VOLTAGE,
+    // APP_INTENT]`. Treating the app-owned kind as "release" would drive the bound
+    // level and then immediately drop the line -- a pulse of ~0 ms the radio never
+    // registers, while the app's half fired and the user saw a bound button do
+    // nothing. Spec 3.5: "a failed app-side action must never prevent the hardware
+    // key press".
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.bindings[0].action_count = 2;
+    d.config.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    d.config.bindings[0].actions[0].key_mv = 2400;
+    d.config.bindings[0].actions[1].kind = ActionKind::kAppIntent;
+    std::strncpy(d.config.bindings[0].actions[1].target, "com.oetsolutions.swc.ACTION_NAVIGATE",
+                 sizeof(d.config.bindings[0].actions[1].target) - 1);
+    std::strncpy(d.config.bindings[0].actions[1].payload, "geo:40.7608,-111.8910?q=Home",
+                 sizeof(d.config.bindings[0].actions[1].payload) - 1);
+
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(ConfigValidate(d.config));
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+    const int bound_code = GainPolicyCodeForTarget(o.ChannelGainMode(0), 2400).dac_code;
+    ASSERT_NE(bound_code, idle_code) << "fixture error: the bound level must differ from idle";
+
+    // Drive by hand and read the line INSIDE the pulse window, so a same-tick
+    // release is caught -- `PressAndCaptureDrivenCode` stops at the first
+    // non-idle code and would see the drive even if the line dropped right after.
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
+    PollFor(o, hal, 100);                 // press + debounce
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    int driven = idle_code;
+    for (uint32_t t = 0; t < 60; t += 10) {   // well inside the 200 ms hold
+        o.Tick(hal.NowMs());
+        hal.AdvanceMs(10);
+        const int code = hal.LastDacCode(DAC_CH_KEY1);
+        if (code != idle_code) { driven = code; break; }
+    }
+    ASSERT_EQ(driven, bound_code) << "the level action must drive";
+    // And the line must STILL be driven a moment later: the app action after it
+    // must not have released it.
+    for (uint32_t t = 0; t < 60; t += 10) {
+        o.Tick(hal.NowMs());
+        hal.AdvanceMs(10);
+    }
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), bound_code)
+        << "an app-owned action AFTER the level must be skipped, not release the "
+           "line the level just drove";
+}
+
 TEST(SystemOrchestrator, AFailedNvsWriteIsReportedAsNotPersisted) {
     // `persisted_` answers "is this learn DURABLE", not "is a store attached".
     // An earlier revision set it from the pointer alone

@@ -3,6 +3,7 @@
 #include <stdint.h>
 
 #include "Analog/AdcReader.h"
+#include "Bindings/BindingResolver.h"
 #include "Config/ConfigModel.h"
 #include "Feedback/BuzzerGrammar.h"
 #include "Feedback/LedGrammar.h"
@@ -576,6 +577,34 @@ private:
     // DAC code would let the next update pull the line back toward the released
     // key's voltage.
     void ReleaseKey(uint8_t index);
+    /*
+     * Drive a channel's KEY line to a BOUND level (spec 3.6's `OUT_VOLTAGE`).
+     *
+     * Returns false when the spec 6.2 command band is EMPTY for this channel --
+     * a head unit idling so low that no reachable level is below its rest. There
+     * is no command to make then, and the caller must report the press as
+     * un-acknowledged rather than silently releasing it.
+     *
+     * The band clamp and the envelope clamp are separate and both apply: the
+     * first keeps the sink FET from being asked to drive above the line's own
+     * rest (above which the servo can only turn `Q4` OFF -- the release
+     * behaviour, not a command), the second is FR-18's gain-mode envelope.
+     */
+    bool DriveBoundLevelMv(uint8_t index, int key_mv, int sense_mv, uint64_t now_ms);
+    /*
+     * Execute a resolved binding's WHOLE ordered action list (spec 3.5).
+     *
+     * Spec 3.5: the actions run "in order, each independently failable" -- "if
+     * action 1 fails, action 2 still runs", and "a failed app-side action must
+     * never prevent the hardware key press". So this walks every action and
+     * executes the kinds the FIRMWARE owns (the `OUT_` family and `BUZZ`, spec
+     * 3.6's "Executed by" column) while SKIPPING the kinds the phone owns -- the
+     * app receives the same `event` frame and iterates the same list. Skipping
+     * rather than releasing is what makes a binding stored `[APP_INTENT,
+     * OUT_VOLTAGE]` drive its key, which the single-`actions[0]` version did not.
+     */
+    void RunBindingActions(uint8_t index, const ResolvedBinding &resolved,
+                           int sense_mv, uint64_t now_ms);
     /*
      * Write a channel's signal DAC code, and in TRACKING mode mirror the SAME
      * code onto its V_ADJ channel.

@@ -4,12 +4,11 @@
 
 #include "Bindings/ActionLibrary.h"
 
-ResolvedAction BindingResolve(const Config &cfg, uint8_t channel_index,
-                              const GestureEvent &ev) {
-    ResolvedAction out{};
+ResolvedBinding BindingResolve(const Config &cfg, uint8_t channel_index,
+                               const GestureEvent &ev) {
+    ResolvedBinding out{};
     out.found = false;
-    out.action = Action{};
-    out.action.kind = ActionKind::kNone;   // inert by default, never uninitialised
+    out.action_count = 0;
     if (channel_index >= cfg.channel_count) return out;
     // NOT gated on `cfg.channels[channel_index].enabled`. Spec 3.4: `enabled`
     // gates whether the channel's ladder is CLASSIFIED, not whether its bindings
@@ -55,14 +54,18 @@ ResolvedAction BindingResolve(const Config &cfg, uint8_t channel_index,
         // from the one that was stored.
         if (b.action_count > kMaxActionsPerBinding) return out;
         // An empty list is legal and MEANS "swallow the gesture" (spec 3.5), so
-        // it is found-and-inert, not not-found.
+        // it is found-and-inert, not not-found: `found` true with a zero count.
         if (b.action_count == 0) { out.found = true; return out; }
-        // v1 executes the FIRST action; the list is ordered and best-effort
-        // (spec 3.5), and the multi-action runner is Task 13's job. An action
-        // that cannot be executed is refused, not skipped -- silently dropping
-        // it would fire a different binding than the one stored.
-        if (!ActionIsExecutable(b.actions[0])) return out;
-        out.action = b.actions[0];
+        // The whole ordered list, executed best-effort by the caller (spec 3.5).
+        // EVERY action is checked, not just the first: an action that cannot be
+        // executed is refused whole, because silently dropping it would fire a
+        // different binding than the one stored -- and now that the caller runs
+        // the list, the un-checked tail is reachable rather than dead.
+        for (uint8_t a = 0; a < b.action_count; ++a) {
+            if (!ActionIsExecutable(b.actions[a])) return out;
+            out.actions[a] = b.actions[a];
+        }
+        out.action_count = b.action_count;
         out.found = true;
         return out;
     }

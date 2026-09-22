@@ -68,28 +68,28 @@ GestureEvent Ev(Gesture g, uint8_t b) { return GestureEvent{g, b, 0}; }
 }  // namespace
 
 TEST(BindingResolver, ResolvesAButtonsSinglePressToItsAction) {
-    const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kSingle, 0));
+    const ResolvedBinding r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kSingle, 0));
     ASSERT_TRUE(r.found);
-    EXPECT_EQ(r.action.kind, ActionKind::kOutVoltage);
-    EXPECT_EQ(r.action.key_mv, 2400);
+    EXPECT_EQ(r.actions[0].kind, ActionKind::kOutVoltage);
+    EXPECT_EQ(r.actions[0].key_mv, 2400);
 }
 
 TEST(BindingResolver, CarriesTheDataPayloadThroughUntouched) {
     // b4, spec 3.7's APP_INTENT. A binding's payload is stored in the ACTION, and
     // this asserts it arrives byte for byte rather than being re-derived.
-    const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kLong, 2));
+    const ResolvedBinding r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kLong, 2));
     ASSERT_TRUE(r.found);
-    EXPECT_EQ(r.action.kind, ActionKind::kAppIntent);
-    EXPECT_STREQ(r.action.target, "com.oetsolutions.swc.ACTION_NAVIGATE");
-    EXPECT_STREQ(r.action.payload, "geo:40.7608,-111.8910?q=Home");
+    EXPECT_EQ(r.actions[0].kind, ActionKind::kAppIntent);
+    EXPECT_STREQ(r.actions[0].target, "com.oetsolutions.swc.ACTION_NAVIGATE");
+    EXPECT_STREQ(r.actions[0].payload, "geo:40.7608,-111.8910?q=Home");
 }
 
 TEST(BindingResolver, ABindingOnAnotherChannelIsNotResolved) {
     // b2 binds vol_up SINGLE on SWC2. Resolving a SWC1 event must not find it --
     // this is the check the earlier per-channel revision could not express.
-    const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kSingle, 0));
+    const ResolvedBinding r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kSingle, 0));
     ASSERT_TRUE(r.found);
-    EXPECT_NE(r.action.kind, ActionKind::kOutRelease) << "that binding is SWC2's";
+    EXPECT_NE(r.actions[0].kind, ActionKind::kOutRelease) << "that binding is SWC2's";
 }
 
 TEST(BindingResolver, AnyChannelIsHonouredFromEitherChannel) {
@@ -103,7 +103,7 @@ TEST(BindingResolver, AnyChannelIsHonouredFromEitherChannel) {
 }
 
 TEST(BindingResolver, UnboundGestureIsNotFoundRatherThanDefaultingToSomething) {
-    const ResolvedAction r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kLong, 0));
+    const ResolvedBinding r = BindingResolve(MakeConfig(), 0, Ev(Gesture::kLong, 0));
     EXPECT_FALSE(r.found) << "an unbound gesture must do nothing, not act by accident";
 }
 
@@ -118,9 +118,43 @@ TEST(BindingResolver, AnEmptyActionListSwallowsTheGestureWithoutActing) {
     // recognised and does nothing, so no lower-priority binding may take it.
     Config c = MakeConfig();
     c.bindings[0].action_count = 0;
-    const ResolvedAction r = BindingResolve(c, 0, Ev(Gesture::kSingle, 0));
+    const ResolvedBinding r = BindingResolve(c, 0, Ev(Gesture::kSingle, 0));
     EXPECT_TRUE(r.found);
-    EXPECT_EQ(r.action.kind, ActionKind::kNone) << "recognised, and deliberately inert";
+    EXPECT_EQ(r.action_count, 0) << "recognised, with nothing to run -- deliberately inert";
+}
+
+TEST(BindingResolver, CarriesTheWholeOrderedActionList) {
+    // Spec 3.5's product case: ONE binding whose SINGLE is "emit the factory key
+    // press AND tell the app". Both halves must reach the caller IN ORDER; the
+    // single-`actions[0]` revision dropped the second, and the caller's
+    // first-action-only branch dropped BOTH when the app action came first.
+    Config c = MakeConfig();
+    c.bindings[0].action_count = 2;
+    c.bindings[0].actions[0].kind = ActionKind::kAppIntent;
+    std::strncpy(c.bindings[0].actions[0].target, "com.oetsolutions.swc.ACTION_NAVIGATE",
+                 sizeof(c.bindings[0].actions[0].target) - 1);
+    c.bindings[0].actions[1].kind = ActionKind::kOutVoltage;
+    c.bindings[0].actions[1].key_mv = 2400;
+    const ResolvedBinding r = BindingResolve(c, 0, Ev(Gesture::kSingle, 0));
+    ASSERT_TRUE(r.found);
+    ASSERT_EQ(r.action_count, 2);
+    EXPECT_EQ(r.actions[0].kind, ActionKind::kAppIntent)
+        << "position is preserved -- the caller executes in order";
+    EXPECT_EQ(r.actions[1].kind, ActionKind::kOutVoltage);
+    EXPECT_EQ(r.actions[1].key_mv, 2400);
+}
+
+TEST(BindingResolver, AnUnExecutableActionAnywhereInTheListIsRefused) {
+    // A malformed action is refused for the WHOLE binding, not silently dropped
+    // from the tail: now that the caller runs every action, an unchecked second
+    // action is reachable rather than dead.
+    Config c = MakeConfig();
+    c.bindings[0].action_count = 2;
+    c.bindings[0].actions[0].kind = ActionKind::kOutVoltage;
+    c.bindings[0].actions[0].key_mv = 2400;
+    c.bindings[0].actions[1].kind = ActionKind::kOutVoltage;
+    c.bindings[0].actions[1].key_mv = 0;   // no level
+    EXPECT_FALSE(BindingResolve(c, 0, Ev(Gesture::kSingle, 0)).found);
 }
 
 TEST(BindingResolver, ADisabledBindingIsSkippedNotSwallowed) {

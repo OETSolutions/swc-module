@@ -182,7 +182,7 @@ detail is in the auto-memory index (`MEMORY.md`) under the N-numbers.
 | **DAC fault path** | FR-13's read-back, §6.8's retry/backoff/latch, and a `FAULT_DAC` emitter are absent (`kFaultDac` has no caller). |
 | **NTC temperature** | FR-1's "sample the NTC continuously" is unimplemented — the ADC temp channel is read by nothing, no B3380 conversion, so `temp_c_at_learn` is always 0 (N-67). |
 | **AUX bindings are inert** | AUX1–3 are declared bindable inputs (spec §3.5, model, validator, app) but **no firmware path services a binding on them** (AUX1 is only the learn/maintenance trigger). An AUX binding is acked and never fires. |
-| **Multi-action bindings** | Firmware executes only `actions[0]` — `BindingResolve` returns just the first (spec allows 2). |
+| **Multi-action bindings** | ✅ **DONE 2026-09-24 (N-29).** `BindingResolve` now returns the whole ordered `ResolvedBinding` list and `SystemOrchestrator::RunBindingActions` executes every firmware-owned action (`OUT_*`, `BUZZ`) while SKIPPING app-owned kinds rather than releasing. Pinned by 3 orchestrator + 2 resolver tests. |
 | **`learn_channel_` is a constant 0** | Only channel 0 is learnable by any shipping means (the app has no learn screen), so SWC2 is not learnable on a two-channel install (N-23). |
 | **`status` rail/temp/heap** | `rail_mv`, `temp_c`, `heap_free` have no producer (N-22); `gain_mode` reports channel 0 only (N-60). |
 

@@ -1081,6 +1081,128 @@ void SystemOrchestrator::DriveKeyCode(uint8_t index, uint16_t code) {
     }
 }
 
+// Spec 3.6's `OUT_VOLTAGE`: drive a channel to a level the action NAMES. There is
+// no head-unit model here and no resistance to convert -- the app is what converts
+// a head unit's resistance to this voltage, and the action carries the voltage.
+//
+// Spec 6.2's command band comes FIRST, and it is the bound that was missing
+// entirely. "Command targets must stay inside `[min_ladder, V_KEY_idle - 0.20 V]`
+// so the sink FET is never asked to drive above the line's own resting level --
+// above that point the servo can only turn `Q4` off, which is the release
+// behavior, not a command." The envelope clamp is NOT that bound: it permits any
+// target from 1800 to 5200 mV, so a `key_mv` sitting between the head unit's own
+// idle and the envelope ceiling was accepted by `ConfigValidate`, sent back as an
+// ack and persisted -- and then drove the radio to nothing at all, because the
+// output only sinks. A press that silently does nothing is the failure the user
+// cannot tell from a broken adapter.
+//
+// Returns false on the empty band: a head unit idling so low that no reachable
+// level is below its rest. There is no command to make then, and the caller
+// reports the press as un-acknowledged rather than quietly releasing it, which is
+// the same direction FR-12 takes for a level matching no window.
+bool SystemOrchestrator::DriveBoundLevelMv(uint8_t index, int key_mv, int sense_mv,
+                                           uint64_t now_ms) {
+    ChannelState &cs = channels_[index];
+    bool band_clamped = false;
+    const int target_key_mv =
+        GainPolicyClampCommand(key_mv, IdleKeyMv(index), &band_clamped);
+    if (target_key_mv == 0) return false;
+
+    // FR-18: a key_mv outside the gain mode's envelope is VALIDATED and CLAMPED,
+    // with a warning -- never driven out of range. The clamp itself lives in
+    // GainPolicyCodeForTarget (both the floor and the ceiling, then a second clamp
+    // to the DAC's range); what was missing was the warning. The action is clamped
+    // rather than refused because the alternative is a press that silently does
+    // nothing, and a clamped level still reaches the radio as a key.
+    //
+    // The comparison is against `GainDecision::clamped` rather than a second copy
+    // of the envelope bounds, so the envelope has one definition and this cannot
+    // drift from the clamp it reports on.
+    const GainDecision decision =
+        GainPolicyCodeForTarget(gain_mode_[index], target_key_mv);
+    if (band_clamped || decision.clamped) {
+        char msg[128];
+        snprintf(msg, sizeof(msg), "key_mv %d clamped to DAC code %u in gain mode %d",
+                 key_mv, static_cast<unsigned>(decision.dac_code),
+                 static_cast<int>(gain_mode_[index]));
+        if (log_sink_ != nullptr) log_sink_(log_sink_ctx_, "WARN", msg);
+    }
+    // One bounded pulse, held for the recognition time, then released: the head
+    // unit sees a single key event, not a held line.
+    cs.servo.Target(gain_mode_[index], target_key_mv);
+    cs.servo.Update(sense_mv);
+    DriveKeyCode(index, cs.servo.Code());
+    cs.key_driven = true;
+    cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
+    return true;
+}
+
+void SystemOrchestrator::RunBindingActions(uint8_t index,
+                                           const ResolvedBinding &resolved,
+                                           int sense_mv, uint64_t now_ms) {
+    // The tail's default acknowledgement is KEY_ACCEPTED for every action that
+    // produced a key. The one case that must not be acknowledged is an OUT_VOLTAGE
+    // whose command band is EMPTY: nothing was driven, so the press is reported as
+    // unknown instead and this suppresses the default.
+    bool play_default_ack = true;
+    // Spec 3.6 puts `BUZZ` in the FIRMWARE's column; the action carries the named
+    // pattern. Zero means none was bound.
+    BuzzerPattern bound = BuzzerPattern::kNone;
+
+    for (uint8_t i = 0; i < resolved.action_count; ++i) {
+        const Action &a = resolved.actions[i];
+        switch (a.kind) {
+            case ActionKind::kOutVoltage:
+                if (!DriveBoundLevelMv(index, a.key_mv, sense_mv, now_ms)) {
+                    // The empty command band: nothing was driven, so the press must
+                    // not be acknowledged as if it had. Report it and suppress the
+                    // tail's default -- the same direction the unrecognised-level
+                    // path takes.
+                    play_default_ack = false;
+                    buzzer_.Play(BuzzerPattern::kKeyUnknown);
+                }
+                break;
+            case ActionKind::kOutRelease:
+            case ActionKind::kNone:
+                // An explicit release, or the explicit no-op. Releasing rather than
+                // holding is right: a stale key with no action behind it is the
+                // phantom-key hazard, and a NONE action cannot leave one driven.
+                ReleaseKey(index);
+                break;
+            case ActionKind::kBuzzer:
+                // An unknown pattern name parses to kNone, which `Play` treats as
+                // "stop" -- that would leave the press silent rather than
+                // acknowledged, so an unnameable pattern falls back to
+                // KEY_ACCEPTED: a value this build cannot honour is inert, not a
+                // different pattern AND not a missing acknowledgement.
+                bound = BuzzerPatternFromName(a.target);
+                break;
+            default:
+                // An app-owned kind (spec 3.6's "Executed by" column: Android). The
+                // phone receives the same `event` frame and runs its half from the
+                // same list; the firmware's half is the hardware key press, which
+                // spec 3.5 says a failed app-side action must NEVER prevent. So skip
+                // it -- do NOT release. Releasing was the defect: a binding stored
+                // `[APP_INTENT, OUT_VOLTAGE]` (app action first) drove NO key at
+                // all, and the user saw the press silently do nothing on the wire
+                // they were watching.
+                break;
+        }
+    }
+
+    // A BUZZ REPLACES KEY_ACCEPTED rather than joining it, and that is forced by
+    // the hardware: there is one buzzer and `Play` replaces rather than queues
+    // (spec 7.2), so playing both in one tick would mean whatever went second is
+    // the only thing heard. Since the user explicitly bound a pattern for this
+    // gesture, that pattern is what they asked for; KEY_ACCEPTED is the DEFAULT
+    // acknowledgement, and an explicit BUZZ overrides a default. (Playing BUZZ
+    // second was measured: it is exactly as silent, because KEY_ACCEPTED would be
+    // the one replaced.)
+    if (play_default_ack) {
+        buzzer_.Play(bound == BuzzerPattern::kNone ? BuzzerPattern::kKeyAccepted : bound);
+    }
+}
+
 bool SystemOrchestrator::PresentLevel(uint8_t index, int level_mv, int wheel_idle_mv,
                                       int sense_mv, uint64_t now_ms) {
     ChannelState &cs = channels_[index];
@@ -1404,12 +1526,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
         }
 
         if (fired) {
-            const ResolvedAction resolved = BindingResolve(config_, index, ev);
-            // The tail's default acknowledgement is KEY_ACCEPTED for every action
-            // that produced a key. The one case that must not be acknowledged is an
-            // OUT_VOLTAGE whose command band is EMPTY: nothing was driven, so the
-            // press is reported as unknown instead and this suppresses the default.
-            bool play_default_ack = true;
+            const ResolvedBinding resolved = BindingResolve(config_, index, ev);
             // Spec 4.3: the app is told AFTER the device has acted on its own
             // local binding, never before. `event` is fire-and-forget precisely
             // so that a button press is not held hostage to the app being
@@ -1417,117 +1534,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             // of the key path.
             ReportGesture(index, ev, level_mv);
             if (resolved.found) {
-                const Action &a = resolved.action;
-                if (a.kind == ActionKind::kOutVoltage && a.key_mv != 0) {
-                    // The action names the voltage directly (spec 3.6) -- there is
-                    // no head-unit model here and no resistance to convert. One
-                    // bounded pulse, held for the recognition time, then released:
-                    // the head unit sees a single key event, not a held line.
-                    //
-                    // Spec 6.2's command band comes FIRST, and it is the bound
-                    // that was missing entirely. "Command targets must stay inside
-                    // `[min_ladder, V_KEY_idle - 0.20 V]` so the sink FET is never
-                    // asked to drive above the line's own resting level -- above
-                    // that point the servo can only turn `Q4` off, which is the
-                    // release behavior, not a command." The envelope clamp below is
-                    // not that bound: it permits any target from 1800 to 5200 mV,
-                    // so a `key_mv` sitting between the head unit's own idle and
-                    // the envelope ceiling was accepted by `ConfigValidate`, sent
-                    // back as an ack and persisted -- and then drove the radio to
-                    // nothing at all, because the output only sinks. A press that
-                    // silently does nothing is the failure the user cannot tell
-                    // from a broken adapter.
-                    //
-                    // A clamp to 0 is the empty band (a head unit idling so low
-                    // that no reachable command is below its rest). There is no
-                    // level to drive, so RELEASE and say so, exactly as the
-                    // unrecognised-level path does.
-                    bool band_clamped = false;
-                    const int target_key_mv =
-                        GainPolicyClampCommand(a.key_mv, IdleKeyMv(index), &band_clamped);
-                    // ABSENT (0) only when the command band is EMPTY -- a head unit
-                    // idling so low that no reachable level is below its rest. There
-                    // is no command to make, so the press is reported as unknown
-                    // rather than silently released, which is the same direction
-                    // FR-12 takes for a level matching no window.
-                    const bool no_commandable_level = (target_key_mv == 0);
-
-                    // FR-18: a key_mv outside the gain mode's envelope is
-                    // VALIDATED and CLAMPED, with a warning -- never driven out of
-                    // range. The clamp itself lives in GainPolicyCodeForTarget
-                    // (both the floor and the ceiling, then a second clamp to the
-                    // DAC's range); what was missing was the warning. The action is
-                    // clamped rather than refused because the alternative is a
-                    // press that silently does nothing, and a clamped level still
-                    // reaches the radio as a key.
-                    //
-                    // The comparison is against `GainDecision::clamped` rather
-                    // than a second copy of the envelope bounds, so the envelope
-                    // has one definition and this cannot drift from the clamp it
-                    // reports on.
-                    if (no_commandable_level) {
-                        ReleaseKey(index);
-                    } else {
-                        const GainDecision decision =
-                            GainPolicyCodeForTarget(gain_mode_[index], target_key_mv);
-                        if (band_clamped || decision.clamped) {
-                            char msg[128];
-                            snprintf(msg, sizeof(msg),
-                                     "key_mv %d clamped to DAC code %u in gain mode %d",
-                                     a.key_mv, static_cast<unsigned>(decision.dac_code),
-                                     static_cast<int>(gain_mode_[index]));
-                            if (log_sink_ != nullptr) log_sink_(log_sink_ctx_, "WARN", msg);
-                        }
-                        cs.servo.Target(gain_mode_[index], target_key_mv);
-                        cs.servo.Update(sense_mv);
-                        DriveKeyCode(index, cs.servo.Code());
-                        cs.key_driven = true;
-                        cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
-                    }
-                    // The feedback for the empty-band outcome is played HERE rather
-                    // than falling through to the tail, whose default is
-                    // KEY_ACCEPTED -- a press that drove no key must not be
-                    // acknowledged as if it had. The tail is suppressed for this case
-                    // through `play_default_ack`.
-                    if (no_commandable_level) {
-                        play_default_ack = false;
-                        buzzer_.Play(BuzzerPattern::kKeyUnknown);
-                    }
-                } else {
-                    // Not a level (an OUT_RELEASE, a NONE, or an app-side action
-                    // this firmware does not execute). Release rather than hold:
-                    // a stale key with no action behind it is the phantom-key
-                    // hazard.
-                    ReleaseKey(index);
-                }
-                // Spec 3.6 puts `BUZZ` in the FIRMWARE's column -- "local audible
-                // confirmation" -- and until now nothing executed it: the app
-                // explicitly skips it as "the firmware's half", and the firmware
-                // only ever looked at `kOutVoltage`, so a user could bind it and
-                // get nothing while the key was accepted anyway.
-                //
-                // It REPLACES KEY_ACCEPTED rather than joining it, and that is
-                // forced by the hardware: there is one buzzer and `Play` replaces
-                // rather than queues (spec 7.2), so playing both in one tick would
-                // mean whatever went second is the only thing heard. Since the user
-                // explicitly bound a pattern for this gesture, that pattern is what
-                // they asked for; KEY_ACCEPTED is the DEFAULT acknowledgement, and
-                // an explicit BUZZ overrides a default. (Playing BUZZ second was
-                // measured: it is exactly as silent, because KEY_ACCEPTED would be
-                // the one replaced.)
-                //
-                // An unknown pattern name parses to kNone, which `Play` treats as
-                // "stop". That would leave the press silent rather than
-                // acknowledged, so an unnameable pattern falls back to
-                // KEY_ACCEPTED: a value this build cannot honour is inert, not a
-                // different pattern AND not a missing acknowledgement.
-                const BuzzerPattern bound =
-                    (a.kind == ActionKind::kBuzzer) ? BuzzerPatternFromName(a.target)
-                                                    : BuzzerPattern::kKeyAccepted;
-                if (play_default_ack) {
-                    buzzer_.Play(bound == BuzzerPattern::kNone ? BuzzerPattern::kKeyAccepted
-                                                               : bound);
-                }
+                RunBindingActions(index, resolved, sense_mv, now_ms);
             } else {
                 // The button was RECOGNISED but its gesture is not bound, so there
                 // is no action to run. The device then behaves as a STOCK WHEEL:

@@ -617,8 +617,8 @@ Outcome Test25_Wifi()
 
     if (!SWC_WIFI_CONFIGURED) {
         True(false, "WiFi credentials are present");
-        Note("No SSID was found. tools/gen_secrets.py looks for ../swc_module_pcb/"
-                    "code/.env, then ./.env, then the WIFI_SSID/WIFI_PASSWORD "
+        Note("No SSID was found. tools/gen_secrets.py looks for ../code/.env, "
+                    "then ./.env, then the WIFI_SSID/WIFI_PASSWORD "
                     "environment variables. Fix that and rebuild. The radio itself is "
                     "still tested below.");
     }

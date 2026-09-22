@@ -6,7 +6,7 @@ function at a time, prints what it measured, and says whether that is what the
 design predicts.
 
 This is **not the product firmware**. The product lives in
-`../swc_module_pcb/code` (ESP-IDF, TinyUSB CDC link to an Android head unit).
+`../code` (ESP-IDF, TinyUSB CDC link to an Android head unit).
 Nothing here ships.
 
 | | |
@@ -51,7 +51,7 @@ pio device monitor -b 115200
 The board prints a boot banner, brings up the ADC and the DAC, blinks both LEDs
 twice, and then presents a menu. Type a **test number** and press ENTER.
 
-WiFi credentials are read from `../swc_module_pcb/code/.env` at build time by
+WiFi credentials are read from `../code/.env` at build time by
 `tools/gen_secrets.py` and written to a **git-ignored** `include/Secrets.h`.
 Nothing in this repository contains a credential. If the `.env` is missing the
 build still succeeds and test 25 reports "not configured".
@@ -295,11 +295,11 @@ Each was read from a primary source and is cited at its definition.
 
 | Source | What it is | Used for |
 | --- | --- | --- |
-| `../swc_module_pcb/production/netlist.ipc` | IPC-D-356 netlist exported from the live PCB | **every pin assignment**, including that `R15`/`R16` return to net `3V3` and not 12 V |
-| `../swc_module_pcb/DESIGN.md` | engineering description | topology, divider ratios, the servo relation |
+| `../production/netlist.ipc` | IPC-D-356 netlist exported from the live PCB | **every pin assignment**, including that `R15`/`R16` return to net `3V3` and not 12 V |
+| `../DESIGN.md` | engineering description | topology, divider ratios, the servo relation |
 | spec §2.1–2.5 | the firmware spec's verified hardware contract | pin map, DAC frame, envelope, guard band |
-| `../swc_module_pcb/code/lib/HAL/*` | the product's own HAL | the NVS contract, the DAC frame history |
-| `../swc_module_pcb/code/lib/HAL/DacFrame.h` | the product's frame encoder | the **3-byte** Multi-Write layout |
+| `../code/lib/HAL/*` | the product's own HAL | the NVS contract, the DAC frame history |
+| `../code/lib/HAL/DacFrame.h` | the product's frame encoder | the **3-byte** Multi-Write layout |
 | `DS22187E` (MCP4728) | the DAC datasheet | PD1:PD0, channel-select, read-back layout |
 | installed Arduino-ESP32 3.3.11 / IDF 5.5.5 | the actual toolchain | API signatures, enum names |
 

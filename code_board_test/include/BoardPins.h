@@ -2,7 +2,7 @@
 
 // Every GPIO the board connects, and every analog constant the tests need.
 //
-// PROVENANCE: each pin below was read out of `swc_module_pcb/production/netlist.ipc`
+// PROVENANCE: each pin below was read out of `production/netlist.ipc`
 // (IPC-D-356, the netlist KiCad generated from the live PCB) as the `U3` pad -> net
 // assignment, and cross-checked against the firmware spec's section 2.2 pin map and
 // `code/lib/HAL/PinMap.h`. Where any of those three ever disagree, the netlist wins.

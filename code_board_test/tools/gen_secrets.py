@@ -10,9 +10,13 @@ So the .env is read by this pre-build step and the generated header is
 git-ignored. Nothing in the repository tree contains a credential.
 
 Lookup order (first hit wins):
-  1. ./.env                       -- local override, git-ignored
-  2. ../swc_module_pcb/code/.env  -- the existing project's file
-  3. environment variables          -- CI / one-off use
+  1. ./.env                 -- local override, git-ignored
+  2. ../code/.env           -- the product's file, one level up in this repo
+  3. environment variables  -- CI / one-off use
+
+Path 2 changed when this tree moved from a sibling checkout
+(../swc_module_pcb/code/) into swc_module_pcb/code_board_test/. See the note in
+platformio.ini.
 
 If nothing is found the header is still written, with empty strings, so the build
 succeeds and the WiFi tests report "no credentials" rather than failing to
@@ -30,7 +34,9 @@ PROJ = env["PROJECT_DIR"]  # noqa: F821
 
 ENV_CANDIDATES = [
     os.path.join(PROJ, ".env"),
-    os.path.join(os.path.dirname(PROJ), "swc_module_pcb", "code", ".env"),
+    # The product's .env, one level up: this project lives at
+    # <repo>/code_board_test, the product at <repo>/code.
+    os.path.join(os.path.dirname(PROJ), "code", ".env"),
 ]
 
 WANTED = ["WIFI_SSID", "WIFI_PASSWORD"]

@@ -8,7 +8,7 @@
 include/Secrets.h
 
 # A local .env override, if you make one. The project reads the existing one in
-# ../swc_module_pcb/code/.env by default.
+# ../code/.env by default (the product, one level up in this repo).
 .env
 
 # Editor / OS

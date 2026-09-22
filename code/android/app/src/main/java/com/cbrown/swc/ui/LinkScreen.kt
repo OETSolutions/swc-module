@@ -208,6 +208,11 @@ fun LinkScreen(
                         is LinkState.Connected -> "Connected"
                         is LinkState.VersionMismatch -> "Version mismatch"
                         is LinkState.Failed -> "Failed"
+                        // Not "Connected" and not "Failed": the app has heard
+                        // nothing for 10 s (spec §4.4, N-27). Saying "Connected"
+                        // over a dead cable is the exact lie this state exists to
+                        // stop showing.
+                        LinkState.SilenceExpired -> "Not responding"
                         LinkState.Disconnected -> "Not connected"
                     },
                     style = MaterialTheme.typography.headlineSmall,
@@ -463,4 +468,11 @@ internal fun describe(problem: LinkProblem): Pair<String, String> = when (proble
             "Check the USB-C cable is connected to the adapter and that the adapter " +
             "has power. The adapter keeps working without the app, so a missing link " +
             "does not mean the adapter is broken."
+
+    LinkProblem.SilenceExpired ->
+        "The adapter stopped responding" to
+            "It answered normally and then went quiet for 10 seconds. Check the " +
+            "USB-C cable is still connected and that the adapter still has power — " +
+            "a button press still works even while the app cannot see it. Reopen " +
+            "this app or tap \"Try again\" once it is back."
 }

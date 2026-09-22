@@ -3,6 +3,8 @@ package com.oetsolutions.swc.ui
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onNodeWithText
+import com.oetsolutions.swc.link.LinkProblem
+import com.oetsolutions.swc.link.LinkState
 import org.junit.Assert.assertEquals
 import org.junit.Rule
 import org.junit.Test
@@ -148,5 +150,42 @@ class LinkScreenTimeoutTest {
         }
         composeRule.onNodeWithText("Board temp: no reading").assertIsDisplayed()
         composeRule.onNodeWithText("Board temp: 0.0 C").assertDoesNotExist()
+    }
+
+    @Test
+    fun `a silent link is shown as not responding, not as connected`() {
+        // Spec §4.4's liveness, the app's own half (open item N-27). The whole
+        // point of the state is that "Connected" was the last thing the app had
+        // been told while the cable was already out, so the headline must change.
+        composeRule.setContent {
+            LinkScreen(
+                state = LinkUiState(link = LinkState.SilenceExpired),
+                onRetry = {},
+                onEnterMaintenance = {},
+                onExitMaintenance = {},
+            )
+        }
+        composeRule.onNodeWithText("Not responding").assertIsDisplayed()
+        composeRule.onNodeWithText("Connected").assertDoesNotExist()
+    }
+
+    @Test
+    fun `a silent link gets physical guidance, not a retry`() {
+        // Its own message. Folded onto "The link failed" the user is told to retry
+        // a conversation that did not fail; the actual cause is almost always the
+        // cable, so the copy says so and reminds them the adapter still works.
+        composeRule.setContent {
+            LinkScreen(
+                state = LinkUiState(
+                    link = LinkState.SilenceExpired,
+                    problem = LinkProblem.SilenceExpired,
+                ),
+                onRetry = {},
+                onEnterMaintenance = {},
+                onExitMaintenance = {},
+            )
+        }
+        composeRule.onNodeWithText("The adapter stopped responding").assertIsDisplayed()
+        composeRule.onNodeWithText("10 seconds", substring = true).assertIsDisplayed()
     }
 }

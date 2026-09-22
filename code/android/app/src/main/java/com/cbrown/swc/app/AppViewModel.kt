@@ -145,6 +145,13 @@ class AppViewModel(
         scope.launch { actionOutcomes.collect { outcomes ->
             _link.value = _link.value.copy(actionProblems = outcomes)
         } }
+        // The keepalive loop is NOT started here. It is a periodic timer, and a
+        // driver launched on this scope would be a never-completing `delay` loop in
+        // `init` -- which makes every `advanceUntilIdle()` in the JVM suite spin
+        // forever, since a virtual clock never runs out of future tasks. The
+        // mechanism ([SwcClient.SilenceTick]) is unit-tested directly, the driver
+        // ([SwcClient.DriveLiveness]) is tested with a virtual clock, and the
+        // lifecycle that owns the periodic loop is `MainActivity.onCreate`.
     }
 
     /** Ask the device to identify itself, and read its config back. */
@@ -260,6 +267,10 @@ class AppViewModel(
             // cable that was working, and gave them no way to tell a flaky transfer
             // from a genuinely absent device.
             is LinkState.Failed -> LinkProblem.LinkFailed(state.reason)
+            // The app's own liveness finding (spec §4.4, N-27). Its own problem
+            // rather than `LinkFailed`: the conversation did not fail, it stopped,
+            // and the fix is a cable or a power cycle rather than a retry.
+            LinkState.SilenceExpired -> LinkProblem.SilenceExpired
             is LinkState.Connected -> null
             LinkState.Disconnected -> _link.value.problem
         }

@@ -5,6 +5,7 @@ import com.oetsolutions.swc.contract.PROTOCOL_VERSION
 import com.oetsolutions.swc.model.Config
 import com.oetsolutions.swc.model.ConfigJson
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -29,6 +30,22 @@ sealed interface LinkState {
     data object Connected : LinkState
     data class VersionMismatch(val firmware: Int, val app: Int) : LinkState
     data class Failed(val reason: String) : LinkState
+
+    /**
+     * The app's OWN half of spec §4.4's liveness: nothing has arrived for
+     * `kLinkSilenceMs` while the link otherwise looked healthy (open item N-27).
+     *
+     * **Distinct from [Failed], and the distinction is what the user acts on.** The
+     * firmware draws the same line the other way round: a protocol failure on a live
+     * link (`Failed`, here) is not a link that went quiet (this). The concrete case
+     * is unplugging the adapter: `UsbSerialTransport`'s read loop ends on a
+     * `bulkTransfer` error and emits nothing, so before this state existed the last
+     * thing the app had been told was `Connected` — the frame the client had just
+     * processed — and the UI showed a healthy link over a dead cable until the user
+     * pressed something. Nothing about that is the device's fault and nothing on the
+     * wire describes it, so the app has to notice by the absence of frames.
+     */
+    data object SilenceExpired : LinkState
 }
 
 sealed interface AckResult {
@@ -46,7 +63,19 @@ sealed interface AckResult {
  * started its own coroutine scope would be a client that leaks one when the app
  * is backgrounded, and its tests would have to reason about two schedulers.
  */
-class SwcClient(private val transport: SwcTransport) {
+class SwcClient(
+    private val transport: SwcTransport,
+    /**
+     * Milliseconds since the epoch, for spec §4.4's keepalive clock.
+     *
+     * A FUNCTION, injected, because the whole keepalive is time-driven and the JVM
+     * suite must be able to move the clock without sleeping in real time: every
+     * existing test drives a virtual `TestScheduler`, and a client that read
+     * `System.currentTimeMillis()` directly would make the silence watchdog
+     * untestable without wall-clock sleeps.
+     */
+    private val nowMs: () -> Long = System::currentTimeMillis,
+) {
 
     private val _frames = MutableSharedFlow<Frame>(extraBufferCapacity = 256)
     val frames: Flow<Frame> = _frames.asSharedFlow()
@@ -111,6 +140,70 @@ class SwcClient(private val transport: SwcTransport) {
     private fun finishConfigRun() {
         for (w in configRunWaiters) w.complete(Unit)
         configRunWaiters.clear()
+    }
+
+    // --- liveness (spec §4.4, open item N-27) ------------------------------
+    //
+    // The app's half of the keepalive. The firmware sends `status` every 2 s on a
+    // connected link, so a live link is never silent — which is exactly what makes
+    // silence a signal. `SilenceTick` is the whole mechanism and is called by the
+    // view model's periodic loop.
+    //
+    // `lastInboundMs` and `lastPingMs` are LONG.MIN_VALUE, not 0, and that is
+    // deliberate: `nowMs` counts from the epoch, so a `0` initialiser makes
+    // `now - last` a huge positive number on the first tick and the very first
+    // `SilenceTick` of a fresh client immediately declares the link down. The
+    // sentinel means "no frame has ever arrived" / "no ping has ever been sent",
+    // and both read as "nothing to measure yet" rather than "infinitely stale".
+    private var lastInboundMs: Long = Long.MIN_VALUE
+    private var lastPingMs: Long = Long.MIN_VALUE
+
+    /**
+     * Advance the liveness clock, sending a `ping` or reporting a dead link as
+     * spec §4.4 requires. Returns true if the link was found dead on this call, so
+     * the caller knows to stop the periodic drive.
+     *
+     * **Order matters.** Silence is judged first: a link that has been quiet for
+     * longer than `kLinkSilenceMs` is down whatever else is true, and pinging into
+     * it would put a frame into a transport that has already gone (the read loop
+     * ended, `write` returns early) — the same "silence that will never be
+     * answered" `getConfig` avoids. Only a link that is not yet expired is worth a
+     * liveness probe.
+     *
+     * The silence test uses `>=` on the firmware's own `kLinkSilenceMs`: the app
+     * and the device must not disagree about when the link is down, so the two
+     * constants are the same value and the same inclusive comparison.
+     */
+    suspend fun SilenceTick(): Boolean {
+        // A version mismatch is a peer we have agreed not to talk to: an expired
+        // silence must not overwrite that state, and a ping must not go out.
+        if (_state.value is LinkState.VersionMismatch) return false
+        // Already down: report it and do nothing else. Idempotent, so the state is
+        // not rewritten (a `StateFlow` would conflate it, but the contract is
+        // cleaner when the function simply has no second effect) and no ping goes
+        // into a transport that has gone. A frame revives the link; `handle()`
+        // clears the state and this short-circuit stops applying.
+        if (_state.value === LinkState.SilenceExpired) return true
+        val now = nowMs()
+        // No peer has ever spoken: there is no silence to measure, and pinging a
+        // device that never connected is `connect()`'s job, not the watchdog's.
+        if (lastInboundMs == Long.MIN_VALUE) return false
+        if (now - lastInboundMs >= kLinkSilenceMs) {
+            lastInboundMs = now
+            _state.value = LinkState.SilenceExpired
+            return true
+        }
+        // Spec §4.4: "app sends ping if it has seen nothing for 5 s". Stamped on
+        // the ATTEMPT rather than on a reply, because a reply would never come on a
+        // dead link and a 5 s timer that only advanced on replies would emit a ping
+        // on every tick forever.
+        if (now - lastInboundMs >= kPingIdleMs &&
+            (lastPingMs == Long.MIN_VALUE || now - lastPingMs >= kPingIdleMs)
+        ) {
+            lastPingMs = now
+            send(Frames.PING)
+        }
+        return false
     }
 
     private fun beginInboundConfig(frame: Frame) {
@@ -242,6 +335,13 @@ class SwcClient(private val transport: SwcTransport) {
         val fseq = obj["seq"]?.jsonPrimitive?.intOrNull ?: 0
         val frame = Frame(type, fseq, version, obj)
 
+        // A frame the peer sent is the proof of liveness (spec §4.4), stamped HERE
+        // rather than after the version check: a mismatched peer is still a peer
+        // that is talking, and `SilenceTick` above must not declare a link down one
+        // tick after a `hello` arrived. A malformed line (the parse above threw)
+        // never reaches this line, so garbage on the wire does not count.
+        lastInboundMs = nowMs()
+
         // Spec 4.5: a protocol version this app does not implement must become an
         // explicit mismatch state, not a best-effort parse. A mismatch means the
         // two sides disagree about the frame vocabulary, so continuing invites a
@@ -298,7 +398,14 @@ class SwcClient(private val transport: SwcTransport) {
         // VersionMismatch is deliberately NOT cleared: the disagreement is a
         // property of the peer, not a transient, and spec 4.5 requires the app to
         // stop talking rather than carry on best-effort.
-        if (stateBefore is LinkState.Failed && _state.value === stateBefore) {
+        //
+        // `SilenceExpired` IS cleared, by the same rule: an expired silence is
+        // exactly the transient this promises to resynchronize, and a frame after
+        // it is the proof the link is back (spec §4.4's liveness). Left set, a
+        // device that went quiet and then answered would be shown as dead forever.
+        if ((stateBefore is LinkState.Failed || stateBefore === LinkState.SilenceExpired) &&
+            _state.value === stateBefore
+        ) {
             _state.value = LinkState.Connected
         }
 
@@ -575,6 +682,26 @@ class SwcClient(private val transport: SwcTransport) {
         return request(Frames.OTA_END, timeoutMs)
     }
 
+    /**
+     * Drive [SilenceTick] on spec §4.4's cadence until the link is found dead.
+     * **This is the loop the app runs for the life of a connection.**
+     *
+     * It lives here rather than in `AppViewModel.init` for a testing reason that is
+     * also a design one: a periodic `while (true) { delay(...) }` started in a view
+     * model's constructor is invisible to every test that drives a virtual clock,
+     * because `advanceUntilIdle()` never runs out of future tasks and hangs. As a
+     * plain suspend function it is driven by whoever owns the lifecycle — the
+     * activity, in production, and a `runTest` with a virtual clock in the suite —
+     * so the cadence itself is verifiable rather than asserted.
+     *
+     * Returns normally when the link expires (there is nothing left to drive), and
+     * only ever returns from cancellation otherwise, so a caller can treat
+     * "returned" as "the link is down".
+     */
+    suspend fun DriveLiveness() {
+        while (!SilenceTick()) delay(kLivenessTickMs)
+    }
+
     /** Send a frame of [type] and wait for the reply carrying its `for_seq`. */
     private suspend fun request(
         type: String,
@@ -610,6 +737,27 @@ class SwcClient(private val transport: SwcTransport) {
 
     private companion object {
         const val NEWLINE: Byte = '\n'.code.toByte()
+
+        /**
+         * Spec §4.4's keepalive timings, and they are **the same numbers the
+         * firmware uses** — deliberately, so the two ends cannot disagree about
+         * when a link is dead.
+         *
+         * 5,000 ms: "app sends `ping` if it has seen nothing for 5 s".
+         * 10,000 ms: "after 10 s of silence the firmware considers the link down",
+         * which the app mirrors as its own liveness bound (`CommandRouter`'s
+         * `kLinkSilenceMs` is the same 10,000).
+         */
+        const val kPingIdleMs = 5_000L
+        const val kLinkSilenceMs = 10_000L
+
+        /**
+         * How often [DriveLiveness] checks. A third of the ping threshold, so the
+         * 5 s idle is noticed within a bounded delay rather than a whole tick late
+         * (a cadence exactly equal to 5,000 ms would make the first ping land at
+         * 5,000, 10,000 or never, depending on the phase of the loop's start).
+         */
+        const val kLivenessTickMs = 1_667L
 
         /**
          * 512, matching the firmware's `kConfigWireChunkBytes` (spec 4.2): 512

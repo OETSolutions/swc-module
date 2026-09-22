@@ -62,8 +62,9 @@ class MainActivity : ComponentActivity() {
         // view model takes an `SwcClient`, which takes an `SwcTransport`, so the
         // whole state machine runs on the JVM against a fake.
         val transport = UsbSerialTransport(applicationContext)
+        val client = SwcClient(transport)
         val model = AppViewModel(
-            SwcClient(transport),
+            client,
             // Spec 3.6: the app executes the non-OUT_ kinds. Passing the runner is
             // what makes an app-side binding (launch an app, send an intent)
             // actually fire when the wheel reports a press.
@@ -76,6 +77,12 @@ class MainActivity : ComponentActivity() {
             model.reportOpenProblem(transport.open())
             model.connect()
         }
+        // Spec §4.4's keepalive + the app's liveness detection (open item N-27).
+        // Driven from the ACTIVITY's lifecycle scope, so it stops with the screen
+        // and the "app open and idle" case — the one this exists for — keeps it
+        // running. `DriveLiveness` returns when the link expires; the `connect()`
+        // above and the screen's retry are what re-arm it.
+        lifecycleScope.launch { client.DriveLiveness() }
         setContent {
             MaterialTheme {
                 Surface(Modifier.fillMaxSize()) { AppRoot(model) }

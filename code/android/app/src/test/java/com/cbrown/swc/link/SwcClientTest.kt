@@ -12,6 +12,7 @@ import kotlinx.coroutines.test.advanceUntilIdle
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -744,5 +745,209 @@ class SwcClientTest {
         val types = t.written.map { Regex("\"type\":\"(\\w+)\"").find(it)!!.groupValues[1] }
         assertEquals(listOf("ota_begin", "ota_chunk"), types)
         job.cancel()
+    }
+
+    // --- spec §4.4 keepalive and liveness (open item N-27) ------------------
+
+    /**
+     * A clock the test moves by hand, in the SAME units the client's own
+     * injection point uses.
+     *
+     * The client reads wall-clock milliseconds, so the fake advances real
+     * milliseconds too: the mechanism is time-based and a fake that used a
+     * different unit would test a translation nothing performs. Hand-advanced so
+     * the test controls exactly when "5 s" and "10 s" pass, rather than racing a
+     * real timer.
+     */
+    private class Clock {
+        var ms: Long = 1_000_000L
+        fun advance(delta: Long) { ms += delta }
+    }
+
+    @Test
+    fun `the ping is emitted once the idle threshold passes`() = runTest {
+        val t = FakeTransport()
+        val clock = Clock()
+        val client = SwcClient(t, nowMs = { clock.ms })
+        val job = startClient(client)
+        t.emit("{\"v\":1,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+
+        // Just under the threshold: still silent, no ping.
+        clock.advance(4_999)
+        assertTrue("just under 5 s must not ping", client.SilenceTick() == false)
+        assertEquals(0, t.written.size)
+
+        // Over it: exactly one ping.
+        clock.advance(2)
+        assertTrue("over 5 s must ping", client.SilenceTick() == false)
+        assertEquals(1, t.written.size)
+        assertEquals("ping", Regex("\"type\":\"(\\w+)\"").find(t.written[0])!!.groupValues[1])
+
+        // And NOT again on the very next tick -- the 5 s timer is stamped on the
+        // attempt, so an unanswered ping does not become a flood.
+        assertTrue(client.SilenceTick() == false)
+        assertEquals("one ping per 5 s idle window", 1, t.written.size)
+        job.cancel()
+    }
+
+    @Test
+    fun `ten seconds of silence reports the link down rather than a healthy link`() = runTest {
+        val t = FakeTransport()
+        val clock = Clock()
+        val client = SwcClient(t, nowMs = { clock.ms })
+        val job = startClient(client)
+        t.emit("{\"v\":1,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+        assertEquals(LinkState.Connected, client.state.value)
+
+        clock.advance(10_000)
+        assertTrue("10 s of silence must be reported as down", client.SilenceTick())
+        assertEquals(LinkState.SilenceExpired, client.state.value)
+        job.cancel()
+    }
+
+    @Test
+    fun `an expired link is not re-reported and no ping goes into it`() = runTest {
+        // The watchdog's own liveness matters: a ping into a dead link is a write
+        // nothing drains, and a state rewritten every tick is work with no effect.
+        // `SilenceTick` therefore STAYS true once down (idempotent) without doing
+        // anything further, and a frame is the only thing that revives the link.
+        val t = FakeTransport()
+        val clock = Clock()
+        val client = SwcClient(t, nowMs = { clock.ms })
+        val job = startClient(client)
+        t.emit("{\"v\":1,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+        clock.advance(10_000)
+        assertTrue(client.SilenceTick())
+        val stateAfter = client.state.value
+        val pingsAfterExpiry = t.written.size
+
+        clock.advance(10_000)
+        assertTrue("an already-dead link keeps reporting down", client.SilenceTick())
+        assertEquals("the state is not rewritten", stateAfter, client.state.value)
+        assertEquals("no ping goes into a dead link", pingsAfterExpiry, t.written.size)
+        job.cancel()
+    }
+
+    @Test
+    fun `a frame after the silence expires revives the link`() = runTest {
+        // Spec §4.4's recovery, and it must not need a reconnect: a device that was
+        // unplugged and replugged without the app restarting answers again.
+        val t = FakeTransport()
+        val clock = Clock()
+        val client = SwcClient(t, nowMs = { clock.ms })
+        val job = startClient(client)
+        t.emit("{\"v\":1,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+        clock.advance(10_000)
+        assertTrue(client.SilenceTick())
+        assertEquals(LinkState.SilenceExpired, client.state.value)
+
+        // A new frame: the peer is talking, so the link is healthy again.
+        clock.advance(100)
+        t.emit("{\"v\":1,\"seq\":2,\"type\":\"status\"}\n")
+        advanceUntilIdle()
+        assertEquals(LinkState.Connected, client.state.value)
+
+        // And the silence clock was re-armed from that frame, not from the expiry:
+        // the next 10 s is measured from the revival, so a link is not declared
+        // dead again the moment it comes back.
+        clock.advance(5_000)
+        assertTrue("the clock restarted at the revival", client.SilenceTick() == false)
+        job.cancel()
+    }
+
+    @Test
+    fun `a client that has never heard a frame does not report the link down`() = runTest {
+        // The bug the Long.MIN_VALUE sentinels exist to prevent: with a zero
+        // initialiser, `now - last` is a huge positive number on the first tick and
+        // a freshly constructed client declares the link down before any device has
+        // been asked a question. That would paint "Not responding" over the startup
+        // screen of an app whose cable is perfectly fine.
+        val t = FakeTransport()
+        val clock = Clock()
+        val client = SwcClient(t, nowMs = { clock.ms })
+        val job = startClient(client)
+        // No frame at all. Move well past both thresholds.
+        clock.advance(60_000)
+        assertTrue("no peer has ever spoken: nothing to measure",
+            client.SilenceTick() == false)
+        assertEquals(LinkState.Disconnected, client.state.value)
+        assertEquals("no ping to a device that never connected", 0, t.written.size)
+        job.cancel()
+    }
+
+    @Test
+    fun `a version mismatch is not overwritten by an expired silence`() = runTest {
+        // Spec §4.5's mismatch is a property of the peer and must survive the
+        // liveness watchdog; the watchdog must also not start pinging a peer the
+        // app has agreed to stop talking to.
+        val t = FakeTransport()
+        val clock = Clock()
+        val client = SwcClient(t, nowMs = { clock.ms })
+        val job = startClient(client)
+        t.emit("{\"v\":99,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+        assertTrue(client.state.value is LinkState.VersionMismatch)
+        clock.advance(30_000)
+        assertTrue("the watchdog defers to a version mismatch",
+            client.SilenceTick() == false)
+        assertTrue("the mismatch must not become SilenceExpired",
+            client.state.value is LinkState.VersionMismatch)
+        assertEquals("no traffic on a mismatched link", 0, t.written.size)
+        job.cancel()
+    }
+
+    @Test
+    fun `a malformed line is not a liveness signal`() = runTest {
+        // Only a DECODED frame counts as the peer talking (spec §4.4). Garbage on
+        // the wire -- the torn write the framing contract tolerates -- must not keep
+        // a dead link looking alive, or the watchdog can never fire.
+        val t = FakeTransport()
+        val clock = Clock()
+        val client = SwcClient(t, nowMs = { clock.ms })
+        val job = startClient(client)
+        t.emit("{\"v\":1,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+        clock.advance(6_000)
+        t.emit("not a frame\n")
+        advanceUntilIdle()
+        clock.advance(5_000)
+        assertTrue("garbage does not revive the clock; the link is down",
+            client.SilenceTick())
+        job.cancel()
+    }
+
+    @Test
+    fun `DriveLiveness drives the loop and returns when the link expires`() = runTest {
+        // The loop the activity runs. Driven on the test's VIRTUAL clock, so the
+        // cadence is verified rather than asserted -- which is only possible because
+        // the loop is a suspend function instead of a timer started in a
+        // constructor. `nowMs` reads the scheduler's own clock here, so advancing
+        // the scheduler advances the client's clock too and there is no second
+        // timeline to keep in step.
+        val t = FakeTransport()
+        val client = SwcClient(t, nowMs = { testScheduler.currentTime })
+        val reader = startClient(client)
+        t.emit("{\"v\":1,\"seq\":1,\"type\":\"hello\"}\n")
+        advanceUntilIdle()
+
+        var returned = false
+        val driver = launch { client.DriveLiveness(); returned = true }
+
+        advanceTimeBy(4_000); runCurrent()
+        assertTrue("no ping before the 5 s idle", t.written.isEmpty())
+        assertFalse("the driver is still running", returned)
+
+        advanceTimeBy(1_500); runCurrent()
+        assertTrue("the driver pinged after 5 s idle", t.written.isNotEmpty())
+        assertFalse(returned)
+
+        advanceTimeBy(6_000); runCurrent()
+        assertTrue("the driver returns once the link expires", returned)
+        assertEquals(LinkState.SilenceExpired, client.state.value)
+        driver.cancel(); reader.cancel()
     }
 }

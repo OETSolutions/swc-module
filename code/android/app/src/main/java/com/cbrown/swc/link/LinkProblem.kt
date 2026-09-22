@@ -43,4 +43,16 @@ sealed interface LinkProblem {
      * re-ran the same failing read with nothing naming what actually broke.
      */
     data class LinkFailed(val reason: String) : LinkProblem
+
+    /**
+     * Nothing has arrived for spec §4.4's 10 s while the link looked healthy --
+     * the app's OWN finding, from the silence watchdog (open item N-27).
+     *
+     * Its own case, not folded into [NoDevice] or [LinkFailed], because it is a
+     * different kind of fact: the device never said anything was wrong, it simply
+     * stopped. The common cause is the cable coming out (the transport's read loop
+     * ends on a `bulkTransfer` error and emits nothing) or the device losing power,
+     * so the guidance is physical rather than a retry.
+     */
+    data object SilenceExpired : LinkProblem
 }

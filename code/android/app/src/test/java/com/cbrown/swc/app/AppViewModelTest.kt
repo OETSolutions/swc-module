@@ -363,6 +363,42 @@ class AppViewModelTest {
     }
 
     @Test
+    fun `an expired link silence becomes a problem the screen can render`() = runTest {
+        // Spec §4.4's liveness, the app's own half (open item N-27). The state
+        // `SwcClient` raises on 10 s of silence must reach the screen as its OWN
+        // problem type: folded onto `LinkFailed` the user is told "retry", and onto
+        // `NoDevice` they are told the cable was never there -- neither is what
+        // happened, which is an adapter that answered and then stopped.
+        //
+        // This is the mapping half: a real client, driven past its own threshold.
+        // The clock half -- that 10 s of silence IS raised, once -- is pinned in
+        // `SwcClientTest` against a controlled clock.
+        val t = FakeTransport()
+        val clock = java.util.concurrent.atomic.AtomicLong(1_000_000L)
+        val client = SwcClient(t, nowMs = { clock.get() })
+        val vm = AppViewModel(client, scope = vmScope())
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+        assertEquals(LinkState.Connected, vm.link.value.link)
+
+        clock.addAndGet(10_000)
+        // The periodic loop belongs to the activity's lifecycle and this test owns
+        // no activity, so the tick is driven directly. `started(vm)` has already let
+        // the client's `state` collector subscribe, so the mapping runs.
+        assertTrue(client.SilenceTick())
+        advanceUntilIdle()
+
+        assertEquals(LinkState.SilenceExpired, vm.link.value.link)
+        assertEquals(
+            "the screen must show its own message for a silent link, not a retry " +
+                "or a missing cable: was ${vm.link.value.problem}",
+            com.oetsolutions.swc.link.LinkProblem.SilenceExpired,
+            vm.link.value.problem,
+        )
+    }
+
+    @Test
     fun `a failed config run reaches the screen with its reason, not as no-device`() = runTest {
         // `SwcClient` raises `LinkState.Failed` with a NAMED reason for a torn run,
         // a digest mismatch or an over-long line. The view model used to collapse

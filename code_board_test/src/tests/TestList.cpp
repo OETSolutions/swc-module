@@ -166,7 +166,11 @@ const TestRunner::Test kTests[] = {
       "Integrator stability, DAC repeatability, NTC drift over a sustained run" },
 
     { 31, "AUX1-AUX3 driven low and released",
-      "test wires: J5.4<->IO16 (TP5), J5.3<->IO21 (TP6), J5.2<->IO43 (TP7)",
+      // AS WIRED ON THIS BOARD, measured by the 'p' menu probe (not assumed). The
+      // order does not matter -- the test discovers it -- but the note should tell
+      // the truth about the rig in front of you.
+      "test wires: J5.4 (AUX1) <-> IO43/TP7, J5.3 (AUX2) <-> IO21/TP6, "
+      "J5.2 (AUX3) <-> IO16/TP5  (any order works)",
       Setup31_AuxManual, Test31_AuxManual,
       "R23-R25 1k series, R17-R19 10k pull-ups, D8-D10 clamps -- collapse and recovery" },
 

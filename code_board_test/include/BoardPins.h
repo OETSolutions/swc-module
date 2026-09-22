@@ -58,11 +58,17 @@
 // and produced six prompts per run. With a wire from each AUX input to one of these
 // spare test points, the board drives its own stimulus and the test runs unattended.
 //
-// The operator's wiring:
+// The wiring AS FITTED ON THE BENCH (measured, not assumed):
 //
-//     J5.4 (AUX1)  <->  IO16 (TP5)
+//     J5.4 (AUX1)  <->  IO43 (TP7)
 //     J5.3 (AUX2)  <->  IO21 (TP6)
-//     J5.2 (AUX3)  <->  IO43 (TP7)
+//     J5.2 (AUX3)  <->  IO16 (TP5)
+//
+// THE ORDER DOES NOT MATTER. Test 31 discovers which spare pin reaches which AUX
+// input before it measures anything, so any input may be wired to any test point --
+// the constants below are the SET of points, not a pairing. An earlier version
+// hard-coded the pairing and reported "no response" for two perfectly healthy lines
+// when the wires went the other way.
 //
 // DRIVING LOW simulates the button/short (the input is pulled to GND through the
 // wire). FLOATING (INPUT, no pull) simulates it being open, which is the released

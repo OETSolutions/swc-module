@@ -14,6 +14,7 @@
 #include "Log.h"
 #include "SetupPrompts.h"
 #include "TestTask.h"
+#include "driver/gpio.h"
 #include "Temp.h"
 #include "TestRunner.h"
 
@@ -54,104 +55,181 @@ Outcome Test31_AuxManual()
         {Adc::kAux3, PIN_AUX_STIM3, "AUX3", 25},
     };
     const size_t n = sizeof(rows) / sizeof(rows[0]);
+    const uint8_t stim[3] = {PIN_AUX_STIM1, PIN_AUX_STIM2, PIN_AUX_STIM3};
+    const char *stimname[3] = {"IO16/TP5", "IO21/TP6", "IO43/TP7"};
 
     Log::Printf("  AUX1-AUX3 are the user-facing programming inputs (spec 7.5), wired like");
     Log::Printf("  the SWC channels but with 1k series (R23-R25) and a 10k pull-up (R17-R19).");
     Log::Printf("  AUX1 is the one the production firmware uses.");
     Log::Printf("");
-    Log::Printf("  This test DRIVES ITS OWN STIMULUS through the three test wires:");
-    Log::Printf("    J5.4 (AUX1) <-> IO%d (TP5)   J5.3 (AUX2) <-> IO%d (TP6)   J5.2 (AUX3) <-> IO%d (TP7)",
-                PIN_AUX_STIM1, PIN_AUX_STIM2, PIN_AUX_STIM3);
-    Log::Printf("  Driving the spare pin LOW pulls the input to GND (the short); floating");
-    Log::Printf("  it leaves the board's own 10k pull-up to set the level (open/released).");
-    Log::Printf("  No operator prompts: the whole thing runs unattended.");
+    Log::Printf("  This test DRIVES ITS OWN STIMULUS through the three test wires: pulling a");
+    Log::Printf("  spare pin LOW pulls its AUX input to GND (button pressed), and floating it");
+    Log::Printf("  lets the board's own 10k pull-up set the level (released).");
+    Log::Printf("");
+    Log::Printf("  NOTE: the wire order does NOT matter -- the mapping is discovered below");
+    Log::Printf("  before anything is measured, so any AUX input may go to any test point.");
     Log::Printf("");
 
     // ---------------------------------------------------------------------
-    // Is the rig present? Park every stimulus pin as an INPUT (floating). If the wire
-    // is fitted, the AUX input sits on its own 10k pull-up and reads HIGH -- exactly
-    // what it reads with nothing attached, so that alone proves nothing. The check
-    // that DOES prove it is in the next step: driving the pin low must pull the input
-    // down. So this first pass just reports the resting levels.
+    // STEP 1: DISCOVER the wiring. Which spare pin feeds which AUX input is a fact
+    // the ADC can measure, and it is NOT safe to assume it.
     //
-    // A pin that is NOT wired is driven in the air, which harms nothing.
+    // The first version of this test hard-coded stim1->AUX1, stim2->AUX2,
+    // stim3->AUX3 -- and on the real rig two wires were crossed, so it reported "no
+    // response" for two perfectly healthy lines. The hardware was right and the
+    // code's assumption was wrong. Discovering the mapping costs one extra pass and
+    // removes the whole failure mode: the wires may go in any order.
     // ---------------------------------------------------------------------
-    for (size_t i = 0; i < n; ++i) {
-        pinMode(rows[i].stim, INPUT);          // float: simulates open
+    // Clear any internal pull left on the stimulus pins by an EARLIER test.
+    //
+    // This is what made the full-suite run disagree with the standalone run: test 3
+    // leaves its spare pins as INPUT_PULLUP, and an internal ~45k pull-up BEATS the
+    // stimulus pin's pull-down, so the discovery pass saw no movement and reported
+    // "no wire" for an input that is wired and works. `pinMode(INPUT)` does not clear
+    // an internal pull on the ESP32 -- gpio_set_pull_mode does.
+    for (size_t k = 0; k < n; ++k) {
+        // gpio_reset_pin DETACHES any peripheral function from the pad. Without it,
+        // a pin with a default peripheral role -- and IO43 is TXD0, UART0's
+        // transmitter -- can be held by that peripheral and ignore pinMode entirely.
+        // That is exactly what happened: IO43 drove its AUX input in one run and did
+        // nothing in another, because whether UART0 still owned the pad varied.
+        gpio_reset_pin((gpio_num_t)stim[k]);
+        gpio_set_pull_mode((gpio_num_t)stim[k], GPIO_FLOATING);
+        pinMode(stim[k], INPUT);
     }
-    delay(30);
+    delay(40);
 
-    struct Meas { uint32_t open_mv, short_mv; };
-    Meas m[3] = {};
+    uint32_t base[3] = {0, 0, 0};
+    for (size_t k = 0; k < n; ++k) Adc::ReadAvgMv(rows[k].ch, 64, &base[k]);
 
-    Log::Printf("  %-6s %-14s %-12s %-12s %s", "input", "resting/open", "driven low",
-                "swing", "verdict");
+    int driven_by[3] = {-1, -1, -1};      // per AUX input: which stim pin pulls it
 
-    int wired = 0;
-    for (size_t i = 0; i < n; ++i) {
-        // (a) OPEN: the stimulus pin floats, so the input is set by R17/R18/R19.
-        pinMode(rows[i].stim, INPUT);
-        delay(30);
-        Adc::ReadAvgMv(rows[i].ch, 64, &m[i].open_mv);
-
-        // (b) SHORTED: drive the stimulus pin low. Through the wire this pulls the AUX
-        // input toward GND, through R2x which limits the current.
-        pinMode(rows[i].stim, OUTPUT);
-        digitalWrite(rows[i].stim, LOW);
-        delay(30);
-        Adc::ReadAvgMv(rows[i].ch, 64, &m[i].short_mv);
-
-        // Back to open, and confirm it RECOVERS. This is the part that catches a board
-        // fault rather than a wiring one: if the input stays low once released, the
-        // node is held down on the board.
-        pinMode(rows[i].stim, INPUT);
-        delay(30);
-        uint32_t back = 0;
-        Adc::ReadAvgMv(rows[i].ch, 64, &back);
-
-        const long swing = (long)m[i].open_mv - (long)m[i].short_mv;
-        const bool present = (m[i].open_mv > 1500) && (swing > 800);
-        if (present) ++wired;
-
-        Log::Printf("  %-6s %-14u %-12u %-12ld %s", rows[i].name, m[i].open_mv,
-                    m[i].short_mv, swing,
-                    present ? "wired: collapses and recovers"
-                            : "no swing -- rig not fitted for this input?");
-
-        if (present) {
-            True(true, "the input collapses under its driven-low stimulus");
-            True(back > 1500, "the input recovers when the stimulus is released");
-            if (back <= 1500) {
-                Note("%s stayed at %u mV after the stimulus was released. The node is "
-                     "held down on the board -- a solder bridge or a shorted clamp "
-                     "diode (D%d), not a wiring problem.", rows[i].name, back,
-                     (int)(8 + i));
-            }
-            Log::Printf("      %s: open %u mV -> shorted %u mV -> open %u mV",
-                        rows[i].name, m[i].open_mv, m[i].short_mv, back);
+    // Show the resting levels before anything is driven. If an input is already LOW
+    // here it cannot be attributed to any drive, which is a distinct failure from a
+    // missing wire -- and the first version of this could not tell them apart.
+    Log::Printf("  resting levels before any drive: AUX1 %u, AUX2 %u, AUX3 %u mV",
+                base[0], base[1], base[2]);
+    for (size_t j = 0; j < n; ++j) {
+        if (base[j] <= 1500) {
+            Note("%s rests at %u mV, not high. It cannot be attributed to any drive, so "
+                 "this input cannot be verified until it is released. Something is "
+                 "holding it down: an output left low by an earlier test, a wire to a "
+                 "GND point, or a board fault. The matrix below shows what each drive "
+                 "does anyway.", rows[j].name, base[j]);
         }
     }
 
-    // Leave every stimulus pin floating, so an idle board drives nothing.
-    for (size_t i = 0; i < n; ++i) pinMode(rows[i].stim, INPUT);
+    for (size_t k = 0; k < n; ++k) {
+        gpio_reset_pin((gpio_num_t)stim[k]);
+        gpio_set_pull_mode((gpio_num_t)stim[k], GPIO_FLOATING);
+        pinMode(stim[k], OUTPUT);
+        digitalWrite(stim[k], LOW);
+        delay(30);
+        Log::Printf("  driving %s low:", stimname[k]);
+        for (size_t j = 0; j < n; ++j) {
+            uint32_t mv = 0;
+            Adc::ReadAvgMv(rows[j].ch, 32, &mv);
+            Log::Printf("      %s = %u mV", rows[j].name, mv);
+            // Only credit a pin that was HIGH and is now pulled well down. If a line
+            // was already low, it cannot be attributed to this drive.
+            if (base[j] > 1500 && mv < 1200 && driven_by[j] < 0) driven_by[j] = (int)k;
+        }
+        gpio_set_pull_mode((gpio_num_t)stim[k], GPIO_FLOATING);
+        pinMode(stim[k], INPUT);
+        delay(10);
+    }
 
+    Log::Printf("  Wiring as MEASURED (not assumed):");
+    int wired = 0;
+    for (size_t j = 0; j < n; ++j) {
+        if (driven_by[j] < 0) {
+            Log::Printf("    %s  <- no spare pin pulls it (no wire on this input)", rows[j].name);
+        } else {
+            Log::Printf("    %s  <- %s", rows[j].name, stimname[driven_by[j]]);
+            ++wired;
+        }
+    }
     Log::Printf("");
     if (wired == 0) {
-        // Nothing is wired, so the test has no stimulus and must NOT report PASS.
-        Note("None of the three test wires produced a swing, so no AUX input was "
-             "actually exercised. That is a SKIP: fit J5.4<->IO%d, J5.3<->IO%d and "
-             "J5.2<->IO%d and re-run. (An input with no wire attached simply reads its "
-             "pull-up level, which is why 'resting' alone proves nothing.)",
+        Note("None of the three test wires pulls any AUX input, so nothing was "
+             "exercised. That is a SKIP: fit wires from the AUX inputs to the spare "
+             "test points (IO%d/TP5, IO%d/TP6, IO%d/TP7 -- any order) and re-run. An "
+             "unwired input simply reads its own pull-up, which is why a resting "
+             "reading alone proves nothing.",
              PIN_AUX_STIM1, PIN_AUX_STIM2, PIN_AUX_STIM3);
         TestRunner::MutableCurrent().result = TestRunner::Result::kSkip;
         return TestRunner::Current();
     }
 
+    // ---------------------------------------------------------------------
+    // STEP 2: exercise each input through the mapping just discovered.
+    // ---------------------------------------------------------------------
+    Log::Printf("  %-6s %-11s %-12s %-12s %-10s %s", "input", "via", "open mV",
+                "driven low", "recovered", "verdict");
+
+    for (size_t j = 0; j < n; ++j) {
+        if (driven_by[j] < 0) {
+            Log::Printf("  %-6s %-11s %s", rows[j].name, "-",
+                        "NOT EXERCISED (no wire)");
+            continue;
+        }
+        const uint8_t sp = stim[driven_by[j]];
+
+        // (a) OPEN: float the stimulus pin; the board's 10k sets the level.
+        gpio_reset_pin((gpio_num_t)sp);
+        gpio_set_pull_mode((gpio_num_t)sp, GPIO_FLOATING);
+        pinMode(sp, INPUT);
+        delay(30);
+        uint32_t open_mv = 0;
+        Adc::ReadAvgMv(rows[j].ch, 64, &open_mv);
+
+        // (b) DRIVEN LOW: through the wire this pulls the input to GND.
+        pinMode(sp, OUTPUT);
+        digitalWrite(sp, LOW);
+        delay(30);
+        uint32_t short_mv = 0;
+        Adc::ReadAvgMv(rows[j].ch, 64, &short_mv);
+
+        // (c) RELEASED again: the node must come back up. This is the part that
+        // catches a BOARD fault rather than a wiring one -- a node held down on the
+        // board stays low however the stimulus is driven.
+        pinMode(sp, INPUT);
+        delay(30);
+        uint32_t back_mv = 0;
+        Adc::ReadAvgMv(rows[j].ch, 64, &back_mv);
+
+        const long swing = (long)open_mv - (long)short_mv;
+        const bool ok = (swing > 800) && (back_mv > 1500);
+
+        Log::Printf("  %-6s %-11s %-12u %-12u %-10u %s", rows[j].name,
+                    stimname[driven_by[j]], open_mv, short_mv, back_mv,
+                    ok ? "collapses and recovers" : "FAILED");
+
+        True(swing > 800, "the input collapses under its driven-low stimulus");
+        True(back_mv > 1500, "the input recovers when the stimulus is released");
+        if (back_mv <= 1500) {
+            Note("%s stayed at %u mV after the stimulus was released. The node is held "
+                 "down on the board -- a solder bridge or a shorted clamp diode (D%d). "
+                 "That is a board fault, not a wiring one.", rows[j].name, back_mv,
+                 (int)(8 + j));
+        }
+        if (swing <= 800 && back_mv > 1500) {
+            Note("%s moved only %ld mV under the drive (open %u, driven %u). The pin is "
+                 "live, so suspect R%d (1k series) far off value rather than a missing "
+                 "wire.", rows[j].name, swing, open_mv, short_mv, (int)(23 + j));
+        }
+    }
+
+    for (size_t k = 0; k < n; ++k) pinMode(stim[k], INPUT);
+
+    Log::Printf("");
     if (wired < (int)n) {
-        Log::Printf("  %d of %d inputs were exercised -- the others had no stimulus.", wired, (int)n);
-        Note("%d of %d AUX inputs responded. Fit the missing test wire(s) "
-                    "and re-run for full coverage.", (int)n - wired, (int)n);
-        TestRunner::MutableCurrent().result = TestRunner::Result::kWarn;
+        Log::Printf("  %d of %d inputs exercised; the rest have no wire.", wired, (int)n);
+        Note("%d of %d AUX inputs responded. Fit the missing wire(s) -- any order, the "
+             "map is discovered automatically -- and re-run for full coverage.",
+             (int)n - wired, (int)n);
+        if (TestRunner::MutableCurrent().result == TestRunner::Result::kNotRun)
+            TestRunner::MutableCurrent().result = TestRunner::Result::kWarn;
     } else {
         True(true, "all three AUX inputs collapse under a driven low and recover");
     }
@@ -159,6 +237,9 @@ Outcome Test31_AuxManual()
     Note("AUX1 is the input the production firmware uses for programming and "
          "maintenance entry (spec 7.5, 8.2): a fault on AUX1 specifically makes the "
          "device unmaintainable in the field even when AUX2 and AUX3 are fine.");
+    Note("The wire order does not matter: this test discovers which spare pin reaches "
+         "which AUX input before it measures anything, so wires may be fitted to any "
+         "of the three test points.");
     return TestRunner::Current();
 }
 

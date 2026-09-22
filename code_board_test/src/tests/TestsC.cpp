@@ -187,6 +187,129 @@ Outcome Test22_ServoTrimLoop()
 
     const int target_key_mv = 3000;
     const Output::Mode mode = Output::Mode::kAmplified;
+
+    // ---------------------------------------------------------------------
+    // RESPONSE TIME -- the measurement this test was missing.
+    //
+    // The loop above runs at 1 Hz because the spec says the supervisor must sit two
+    // decades BELOW the 16 Hz analog loop. But that is the TRIM rate, not the
+    // response rate, and conflating them hid the number that actually matters: how
+    // long the output takes to reach a commanded level.
+    //
+    // The worst case in service is a QUICK DOUBLE PRESS. The spec's windows are a
+    // 500 ms double-press window, a 750 ms long-press threshold and a 200 ms key-send
+    // duration (spec 6.6) -- so the output must reach a commanded level well inside
+    // 200 ms for the head unit to register the press at all. A servo that takes
+    // several hundred milliseconds to settle cannot express a double press: the two
+    // presses merge into one, and the feature silently does not work.
+    //
+    // So this measures the step response directly and asserts it against the 200 ms
+    // budget. The hardware integrator's time constant is ~10 ms (R46 100k x C24
+    // 100nF) and settling is quoted as "tens of ms" in spec 6.5, so a healthy board
+    // should come in far inside the budget -- and a board that does not has a real
+    // problem that no amount of slow trimming would reveal.
+    // ---------------------------------------------------------------------
+    Log::Printf("");
+    Log::Printf("  RESPONSE TIME (the worst case is a quick double press)");
+    Log::Printf("  budget: the head unit must see the level within 200 ms (key-send, spec 6.6)");
+    Log::Printf("");
+
+    {
+        const int ch = 1;
+        // Step between two levels inside the command band. Use the ceiling so the
+        // target is genuinely reachable on an open line.
+        const int ceil_mv = KeyLine::CommandCeilingMv(ch);
+        if (ceil_mv <= Output::kEnvelopeLowMv) {
+            Log::Printf("    (no command band on this line -- see test 23)");
+        } else {
+            const int lo_t = Output::kEnvelopeLowMv;
+            const int hi_t = ceil_mv;
+            Log::Printf("    stepping the KEY line %d mV -> %d mV", lo_t, hi_t);
+
+            const int code_lo = Output::CodeForTargetKeyMv(mode, lo_t);
+            const int code_hi = Output::CodeForTargetKeyMv(mode, hi_t);
+
+            // Settle at the low level first.
+            Dac::SetSignal(ch, mode, (uint16_t)code_lo);
+            delay(200);
+
+            // Now step up and time how long until the sense reading is within 5% of
+            // the new target. Sampled as fast as the ADC allows, which is the same
+            // instrument the firmware's own supervision would use.
+            const uint32_t t0 = millis();
+            Dac::SetSignal(ch, mode, (uint16_t)code_hi);
+            const int span = hi_t - lo_t;
+            const int tol = span / 20;               // 5% of the step
+            uint32_t settled_ms = 0;
+            int last = lo_t;
+            for (int i = 0; i < 400; ++i) {          // up to ~2 s of polling
+                int seen = 0;
+                if (!KeyLine::SenseMv(ch, &seen)) break;
+                last = seen;
+                if (seen >= hi_t - tol) { settled_ms = millis() - t0; break; }
+                delay(2);
+            }
+
+            Log::Printf("    settled to within 5%% in %u ms (reached %d mV of %d)",
+                        settled_ms, last, hi_t);
+
+            const uint32_t budget = 200;
+            if (settled_ms == 0) {
+                Log::Printf("    did not reach the target within the polling window");
+                True(false, "the output reaches a commanded level");
+                Note("The KEY line never came within 5%% of %d mV. With J3 open, a "
+                     "target above the line's float level is unreachable by design -- "
+                     "check the command band printed above before reading this as a "
+                     "fault.", hi_t);
+            } else if (settled_ms <= budget) {
+                True(true, "the output settles inside the 200 ms key-send budget");
+                Log::Printf("    -> %u ms is %.0f%% of the budget: a quick double press",
+                            settled_ms, 100.0 * settled_ms / budget);
+                Log::Printf("       can be expressed, because both presses land inside");
+                Log::Printf("       their own 200 ms window.");
+            } else {
+                True(false, "the output settles inside the 200 ms key-send budget");
+                Note("Settling took %u ms, over the 200 ms a head unit allows for a "
+                     "single key. A double press would merge into one and the feature "
+                     "would not work. The integrator's time constant is R46 x C24 = "
+                     "~10 ms, so a figure this large points at something loading the "
+                     "output: a long harness, a heavy head-unit pull-up, or C24 far "
+                     "off value.", settled_ms);
+            }
+
+            // A double press, driven for real: two steps 120 ms apart, which is the
+            // worst case. The output must follow BOTH, not just the average.
+            Log::Printf("");
+            Log::Printf("    now a real double press: two commands 120 ms apart");
+            Dac::SetSignal(ch, mode, (uint16_t)code_lo);
+            delay(150);
+            int seen_a = 0;
+            Dac::SetSignal(ch, mode, (uint16_t)code_hi);
+            delay(60);                               // mid-way through the first press
+            KeyLine::SenseMv(ch, &seen_a);
+            delay(60);                               // second press begins
+            int seen_b = 0;
+            Dac::SetSignal(ch, mode, (uint16_t)code_lo);
+            delay(60);
+            KeyLine::SenseMv(ch, &seen_b);
+
+            Log::Printf("      after press 1 (+60 ms): %d mV", seen_a);
+            Log::Printf("      after press 2 (+120 ms): %d mV", seen_b);
+            // The output must have MOVED for the first press before the second began,
+            // or the two are indistinguishable to the head unit.
+            const bool first_registered = (seen_a > lo_t + span / 10);
+            True(first_registered,
+                 "the first press of a double is resolved before the second begins");
+            if (!first_registered) {
+                Note("The line had only reached %d mV (+60 ms after the first press) "
+                     "when the second began. Below ~10%% of the step the head unit may "
+                     "not see a distinct key, so a quick double press would read as one "
+                     "press.", seen_a);
+            }
+        }
+        Dac::Release(ch);
+    }
+
     const int code0 = Output::CodeForTargetKeyMv(mode, target_key_mv);
     if (code0 <= 0) {
         True(false, "the target produced a valid DAC code");

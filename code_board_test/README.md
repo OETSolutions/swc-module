@@ -214,7 +214,7 @@ that is the diagnosis, not a board fault.
 | 19 | Buzzer | listen | gate toggles; rhythm **+ a 200 Hz–5 kHz sweep**; sound = operator |
 | 20 | LEDs | watch | both polarities; **1–60 Hz pulse sweep**; which lit = operator |
 | 21 | Gain auto-selection | loopback + pull-up | envelope, guard band, **safe 1.82 default** |
-| 22 | Servo trim loop | loopback | bounds are the spec's; loop **disabled** by default |
+| 22 | Servo trim loop **and response time** | loopback | bounds are the spec's; loop **disabled**; **settles inside the 200 ms key-send budget**, and a 120 ms double press resolves as two keys |
 | 23 | **Idle is high-Z** | loopback + pull-up | release needs no mode; sink-only proven both ways |
 | 24 | USB link configuration | — | console is on the recoverable peripheral |
 | 25 | WiFi radio + credentials | AP in range | **radio / scan / association** reported separately |
@@ -357,26 +357,35 @@ suite**; three files in one directory would collide on `_main`, `setUp` and
 ## Test 31's rig: three wires, then it runs unattended
 
 ```
-   J5.4 (AUX1)  <-->  IO16 / TP5
+   J5.4 (AUX1)  <-->  IO43 / TP7
    J5.3 (AUX2)  <-->  IO21 / TP6
-   J5.2 (AUX3)  <-->  IO43 / TP7
+   J5.2 (AUX3)  <-->  IO16 / TP5
 ```
 
-With those fitted, test 31 **drives its own stimulus**: pulling the spare pin LOW
-pulls the AUX input to GND through the wire (the "button pressed" state), and
-floating it lets the board's own 10 kΩ pull-up set the level (released). No operator
-prompts, ~340 ms instead of ~180 s.
+**The order does not matter.** Test 31 *discovers* which spare pin reaches which AUX
+input before it measures anything, so any input may go to any test point. That is not
+a convenience — the first version hard-coded the pairing, the real rig had two wires
+crossed, and it reported "no response" for two perfectly healthy lines. The `p` menu
+probe prints the measured response matrix if you ever want to see it.
 
-Without the wires it reports **SKIP** rather than failing, and with only some fitted
-it reports **WARN** naming which ones responded — an input with no wire simply reads
-its own pull-up level, which is why "resting" alone never proves anything.
+With the wires fitted, test 31 **drives its own stimulus**: pulling the spare pin LOW
+pulls the AUX input to GND (the "button pressed" state), and floating it lets the
+board's own 10 kΩ pull-up set the level (released). No operator prompts, **~400 ms
+instead of ~180 s**.
 
-**IO43 is safe to drive here.** It is traditionally UART0 TX, but this build sets
-`ARDUINO_USB_MODE=1`, so the console is the USB peripheral and UART0 is free. (An
-earlier note in test 3 claimed driving it would corrupt the console; that was written
-for a build using the UART console and was stale — corrected.) Test 3 now also
-excepts the three stimulus pins from its pull-down check, because the AUX inputs' own
-10 kΩ pull-ups legitimately win against an internal pull-down.
+Without the wires it reports **SKIP** rather than failing; with only some fitted,
+**WARN** naming which responded.
+
+**IO43 is safe to drive here.** It is UART0 TX, but this build sets
+`ARDUINO_USB_MODE=1`, so the console is the USB peripheral and UART0 is free. Two
+things had to be got right for it to work as a stimulus: `gpio_reset_pin()` to detach
+the UART peripheral from the pad, and `gpio_set_pull_mode()` (not `pinMode`) to clear
+an internal pull that an earlier test had left on it.
+
+**Measured on this board:** IO21→AUX2 and IO16→AUX3 both work. **IO43/TP7 drives
+correctly** (its pin reads back HIGH=1/LOW=0) **but pulls no AUX input**, so the wire
+from IO43 to AUX1 is not making contact — the board and the firmware are both fine,
+and test 31 reports WARN naming AUX1 as unexercised.
 
 ## Findings from the first bring-up (2026-09-21)
 
@@ -498,6 +507,23 @@ pins are also **read back** first, and they toggle identically (56 toggles, 28 c
 each) — so that difference is downstream of the MCU, and the likely cause is a
 marginal solder joint, which passes DC (solid light) and fails as the rate rises.
 Driving one at a time is what makes it visible per-LED.
+
+## Response time: the number that decides whether a double press works
+
+Test 22 measures the servo's **step response**, because the trim loop's 1 Hz rate is
+the *supervisor's* rate and says nothing about how fast the output moves. The worst
+case in service is a quick double press: the spec allows a **200 ms** key-send
+window, so the output must reach a commanded level well inside that or the two
+presses merge into one and the feature silently does not work.
+
+Measured on this board with the loopback fitted:
+
+- **settles to within 5% in 75–83 ms** — about 40% of the 200 ms budget
+- a real **120 ms double press** resolves as two distinct keys (press 1 at 3008 mV,
+  press 2 at 1750 mV)
+
+A board that missed that budget would have a genuine problem no amount of slow
+trimming would reveal, which is why the test asserts it rather than only reporting it.
 
 ## Known limits
 

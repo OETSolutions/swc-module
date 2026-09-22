@@ -762,6 +762,95 @@ static void ProbeAuxPins()
     Log::Printf("");
     Log::Printf("  SWC1 is the control: it is known good, so if IT reports anything other");
     Log::Printf("  than 'rests HIGH', this probe is not measuring what it thinks it is.");
+
+    // ---------------------------------------------------------------------
+    // The AUX test rig, line by line.
+    //
+    // Test 31 drives these three spare pins to pull the AUX inputs down. When only
+    // some inputs respond, the cause is one of: the wire is on the wrong test point,
+    // the spare pin cannot drive, or the AUX input cannot be pulled. Those are very
+    // different and the AUX reading alone cannot separate them -- so this drives each
+    // spare pin HIGH and LOW and reports BOTH ends: what the spare pin does, and what
+    // the AUX input does in response.
+    // ---------------------------------------------------------------------
+    // ---------------------------------------------------------------------
+    // The AUX test rig: the full 3x3 RESPONSE MATRIX.
+    //
+    // Which spare pin pulls which AUX input is assumed by test 31, and if that
+    // assumption is wrong (a wire one test point over, or two wires swapped) the test
+    // reports "no response" for a line that is perfectly healthy -- it is just on a
+    // different point than the code believes.
+    //
+    // So this drives each spare pin LOW in turn, one at a time, and records which AUX
+    // inputs move. The resulting matrix says exactly how the rig is actually wired,
+    // which is a fact the ADC can measure and my assumptions cannot.
+    // ---------------------------------------------------------------------
+    Log::Printf("");
+    Log::Printf("  AUX test rig -- which spare pin pulls which AUX input?");
+    Log::Printf("  Driving each spare pin LOW, one at a time:");
+    Log::Printf("");
+
+    const uint8_t stimpins[3] = {PIN_AUX_STIM1, PIN_AUX_STIM2, PIN_AUX_STIM3};
+    const char *stimnames[3] = {"IO16/TP5", "IO21/TP6", "IO43/TP7"};
+    const Adc::Ch auxch[3] = {Adc::kAux1, Adc::kAux2, Adc::kAux3};
+    const char *auxnames[3] = {"AUX1/J5.4", "AUX2/J5.3", "AUX3/J5.2"};
+
+    // Baseline: everything floating.
+    for (int k = 0; k < 3; ++k) pinMode(stimpins[k], INPUT);
+    delay(30);
+    uint32_t base[3];
+    for (int k = 0; k < 3; ++k) Adc::ReadAvgMv(auxch[k], 32, &base[k]);
+
+    Log::Printf("  %-11s %-12s %-12s %-12s", "spare pin", "AUX1 mV", "AUX2 mV", "AUX3 mV");
+    Log::Printf("  %-11s %-12u %-12u %-12u", "(all float)", base[0], base[1], base[2]);
+
+    int pulled[3] = {-1, -1, -1};      // for each AUX, which stim pin pulled it
+    for (int k = 0; k < 3; ++k) {
+        gpio_reset_pin((gpio_num_t)stimpins[k]);
+        gpio_set_pull_mode((gpio_num_t)stimpins[k], GPIO_FLOATING);
+        pinMode(stimpins[k], OUTPUT);
+        digitalWrite(stimpins[k], HIGH);
+        delay(5);
+        const int rb_hi = digitalRead(stimpins[k]);
+        digitalWrite(stimpins[k], LOW);
+        delay(30);
+        const int rb_lo = digitalRead(stimpins[k]);
+        uint32_t mv[3];
+        for (int j = 0; j < 3; ++j) Adc::ReadAvgMv(auxch[j], 32, &mv[j]);
+        gpio_set_pull_mode((gpio_num_t)stimpins[k], GPIO_FLOATING);
+        pinMode(stimpins[k], INPUT);
+
+        // Reading the OUTPUT pin back separates "this pin cannot drive" from "the
+        // wire is not connected": a pin that will not follow itself is a pad problem,
+        // and one that follows itself but moves no AUX input is a wiring problem.
+        Log::Printf("  %-11s %-12u %-12u %-12u   (pin reads back HIGH=%d LOW=%d -> %s)",
+                    stimnames[k], mv[0], mv[1], mv[2], rb_hi, rb_lo,
+                    (rb_hi == 1 && rb_lo == 0) ? "pin drives" : "PIN WILL NOT DRIVE");
+        for (int j = 0; j < 3; ++j) {
+            if (base[j] > 1500 && mv[j] < 1200) pulled[j] = k;
+        }
+    }
+
+    Log::Printf("");
+    // Report the wiring as measured, and flag any disagreement with what test 31
+    // assumes (stim k <-> AUX k).
+    for (int j = 0; j < 3; ++j) {
+        if (pulled[j] < 0) {
+            Log::Printf("  %s: NOT pulled by any spare pin -- no wire, or the wire is "
+                        "on an untested point.", auxnames[j]);
+        } else if (pulled[j] == j) {
+            Log::Printf("  %s: pulled by %s  (as expected)", auxnames[j],
+                        stimnames[pulled[j]]);
+        } else {
+            Log::Printf("  %s: pulled by %s  <-- SWAPPED, test 31 expects %s",
+                        auxnames[j], stimnames[pulled[j]], stimnames[j]);
+        }
+    }
+    Log::Printf("");
+    Log::Printf("  Test 31 DISCOVERS this mapping itself, so the order does not matter and");
+    Log::Printf("  a swapped wire is not a fault. What this matrix is for:");
+    Log::Printf("    - an input pulled by NO pin  -> that wire is missing or on a bad point");
+    Log::Printf("    - two inputs pulled by the SAME pin -> a short between them");
 }
 
 static void PrintMenu()

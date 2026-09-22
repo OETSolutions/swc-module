@@ -1225,3 +1225,59 @@ reported `NotOurDevice` rather than sent a request that would stall.
 order, a two-instance composite device (where picking the *first* comm interface
 would address the wrong CDC), the no-comm case, and the non-adjacent fallback.
 Mutation-tested: returning `dataId` (the old behaviour) fails all five.
+
+## A driven key tripped its own head-unit-gone check, flooding the link with events
+
+Found 2026-09-24, on hardware — by the two-board bench rig (`code_driver_board/`:
+a second SWC board presenting ladder stimuli into this board's SWC inputs, with the
+DUT's own KEY output looped back into the driver's sensor inputs). This is the
+defect the host suite could not see because it needs the analog loop closed by a
+real sense node.
+
+**Symptom.** A learned-only button — no binding, and no head unit to map onto —
+re-emitted its gesture every poll tick while held. Measured: a steady 2 s hold at
+the learned level produced **26–177 identical `event{…,"gesture":"SINGLE"}` frames**
+~70 ms apart, where `SINGLE` means exactly one frame. A *higher*-level button
+(the bound `OUT_VOLTAGE` path) emitted exactly one, which is the tell: the fault
+depends on the commanded level, not on the press.
+
+**Mechanism.** Spec §6.2 step 2's envelope check is on `V_KEY_idle` — the line's
+**resting** level — but the check ran every tick, including while this device was
+**driving** a pulse. While driving, the sense node reads **this device's own
+output**; there is no other actor on the line. A learned-only button (`ConfigDefault`
+ships `binding_count == 0`) has `head_unit_idle_mv_ == 0`, so it presents the
+button's ratio onto the command band's **1800 mV floor** — which is *at* the
+envelope's low edge. The reading therefore fell (just) outside the 1.80–5.20 V
+envelope, `head_unit_gone` went true, and the tail did `ReleaseKey` +
+`gestures.Reset()` **every tick**. The line floated back up, the still-held button
+re-classified on the next tick, and re-emitted. The `Reset()` also discarded the
+press state, so a held button could never reach `LONG`.
+
+The user's own read of the signal was right and is the design intent: `/SENSEn` is
+"only relevant while things stabilize on power up, … to determine the gain we
+need". It is a **boot/gain** input (§6.2 step 1–5), not a per-tick supervision
+input — and the one per-tick use it had was reading the device's own output back.
+
+**Fix.** `SystemOrchestrator::HeadUnitGone(index, sense_mv, now_ms)` centralises
+the test (both call sites — the enabled path and the disabled-channel path — had
+their own copy of the raw comparison). It does not ask "is the line driven"; it
+asks "is the reading **consistent with what we are driving**":
+
+1. **A driven line is judged only on a deep sag.** Every command clamps to the
+   band floor, so a driven reading at or above `kFaultSagMaxMv` (1600 mV = the
+   1800 mV floor less a 200 mV margin, covering the servo's undershoot and the
+   ADC's calibration of the commanded level — measured ~1790 mV for a 1800 mV
+   command) is one we produced, not a fault. A **rail collapse** is the other
+   out-of-envelope case while driving, and it drives the line far *below* that, so
+   FR-39's phantom-key release still fires.
+2. **A released line is judged on the whole envelope** — the spec's own reading —
+   and the verdict must **persist** for `kHeadUnitGoneSettleMs` (250 ms), so a line
+   settling after a release, or a rail coming up at boot, is not read as an absent
+   head unit. A `-1` conversion failure holds the settle clock rather than being
+   treated as out-of-envelope (the N-43 sentinel — `0 mV` is legal).
+
+Pinned by `ADrivenLineAtTheCommandFloorIsNotAHeadUnitGoneFault`, mutation-checked:
+disabling the sag guard fails exactly that test. `ARailSagDuringAPressReleasesTheKey`
+still covers the deep-sag release, so the fix's two halves are each held by a test
+that fails without it. Native suite 503 → 504. Device build clean (RAM 44.0%,
+Flash 19.7%).

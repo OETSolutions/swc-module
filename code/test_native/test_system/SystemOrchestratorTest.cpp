@@ -326,6 +326,42 @@ TEST(SystemOrchestrator, ARailSagDuringAPressReleasesTheKey) {
         << "a rail fault during a driven key must release it, not hold it";
 }
 
+TEST(SystemOrchestrator, ADrivenLineAtTheCommandFloorIsNotAHeadUnitGoneFault) {
+    // The defect this closes, measured on the two-board bench rig: a learned-only
+    // button (no binding, and no head unit to map onto) presents the command
+    // band's 1800 mV FLOOR. The device's OWN sense node then reads that level,
+    // which is AT the envelope's low edge, and the old per-tick envelope check
+    // read it as "head unit gone": the tail released the line and RESET the
+    // gesture machine every tick, the line floated up, and the still-held button
+    // re-classified on the next tick and re-emitted. Measured: 26-177 `event`
+    // frames for a 2 s hold, and because the reset discarded the press state a
+    // held button could never advance to LONG.
+    //
+    // `V_KEY_idle` is the line's IDLE. While this device DRIVES, the sense node
+    // reads the device's own output -- there is no head-unit reading to take --
+    // and a driven level at or above the band floor is one WE produced.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int idle_code = hal.LastDacCode(DAC_CH_KEY1);
+
+    // Hold a key at exactly the band floor, past the test.
+    ASSERT_TRUE(o.TestDriveKeyMv(0, 1800, 5000, hal.NowMs()));
+    ASSERT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code) << "the bench drive must hold a key";
+
+    // Our own command reaches the sense node a touch low: a commanded 1800 mV
+    // read back ~1790 mV (the servo's undershoot plus the ADC's calibration of
+    // that level). 895 x 2 = 1790, i.e. 10 mV BELOW the envelope floor -- exactly
+    // what tripped the old check.
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 895);
+    PollFor(o, hal, 1200);   // ~5x the settle window, so a re-release would show
+
+    EXPECT_NE(hal.LastDacCode(DAC_CH_KEY1), idle_code)
+        << "a driven line at the command-band floor must stay driven -- the old "
+           "check released and reset it every tick, flooding the link with events";
+}
+
 TEST(SystemOrchestrator, AnUnlearnedLevelNeverChangesTheOutput) {
     MockHal hal;
     auto o = MakeOrch(hal);

@@ -41,6 +41,16 @@ constexpr int kPassThroughPressDeltaMv = 300;
 constexpr int kKeyEnvelopeLowMv  = kOutputFloorMv;    // 1800
 constexpr int kKeyEnvelopeHighMv = kOutputCeilingMv;  // 5200
 
+// While this device is DRIVING a key, a sense reading at or above this is one we
+// produced, not a fault: every command is clamped to `kKeyEnvelopeLowMv` or
+// above, so a driven line can never legitimately read below the floor except on a
+// real collapse. The margin covers the servo's own undershoot and the ADC's
+// calibration of the commanded level (measured on the bench: a commanded 1800 mV
+// read back at ~1790 mV). Below this, the line has sagged away under a held key
+// -- the rail fault FR-39 must release (see `HeadUnitGone`).
+constexpr int kFaultSagMarginMv = 200;
+constexpr int kFaultSagMaxMv = kKeyEnvelopeLowMv - kFaultSagMarginMv;  // 1600
+
 // The maintenance hold is `SystemOrchestrator::kMaintenanceHoldMs` (the class
 // declares it, so a test or caller names the same number). It lives there rather
 // than here because the nesting with the programming hold is part of the AUX1
@@ -152,6 +162,67 @@ GestureBindings SystemOrchestrator::BindingsForButton(uint8_t channel_index,
         if (b.gesture == Gesture::kLong) out.has_long = true;
     }
     return out;
+}
+
+// Spec 6.2 step 2's "no head unit" test, made usable per-tick.
+//
+// **The envelope is on `V_KEY_idle` -- the line's resting level -- but while this
+// device drives a key pulse, its own sense node reads the DEVICE'S OWN output.
+// There is no other actor on the line.** So a naive per-tick envelope check is a
+// verdict about this device, not the head unit, and it is wrong in the exact
+// case the product's headless path creates:
+//
+//   A learned-only button (`binding_count == 0`, the `ConfigDefault` a headless
+//   learn runs on) has no head unit to map onto (`head_unit_idle_mv_` is 0), so
+//   it presents the button's RATIO onto the command band's 1800 mV FLOOR (spec
+//   6.2). The sense node then reads ~1800 mV, which is AT the envelope's low
+//   edge, so the check fired, the tail released and RESET the gesture machine,
+//   the line floated back up, and the still-held button re-classified on the next
+//   tick and re-emitted. Measured on the bench rig: 26-177 `event` frames for a
+//   2 s hold, and because the reset discarded the press state a held button could
+//   never advance to LONG.
+//
+// The discriminator is therefore not "is the line driven" but "is the reading
+// consistent with what we are driving":
+//
+//   1. **A driven line is judged only on a deep sag.** Our own commands clamp to
+//      the envelope floor, so a reading at or above `kFaultSagMaxMv` is one we
+//      produced -- not a fault. A rail collapse, the other out-of-envelope case
+//      while driving, drives the line far BELOW the floor and still releases
+//      (FR-39's phantom-key hazard; `ARailSagDuringAPressReleasesTheKey`).
+//   2. **A released line is judged on the whole envelope** -- the spec's own
+//      reading -- and the verdict must persist for `kHeadUnitGoneSettleMs`, so a
+//      line settling after a pulse, or a rail coming up at boot, is not mistaken
+//      for an absent head unit.
+bool SystemOrchestrator::HeadUnitGone(uint8_t index, int sense_mv, uint64_t now_ms) {
+    if (index >= kMaxChannels) return false;
+    ChannelState &cs = channels_[index];
+    if (sense_mv < 0) {
+        // A failed conversion is not a reading (the `-1` sentinel; 0 mV is legal).
+        // HOLD the settle clock rather than treating it as out-of-envelope.
+        return cs.envelope_bad_since_ms != 0 &&
+               (now_ms - cs.envelope_bad_since_ms) >= kHeadUnitGoneSettleMs;
+    }
+    const int key_idle_now_mv = sense_mv * kSenseDividerRatio;
+    const bool out = (key_idle_now_mv < kKeyEnvelopeLowMv) ||
+                     (key_idle_now_mv > kKeyEnvelopeHighMv);
+    if (!out) {
+        cs.envelope_bad_since_ms = 0;
+        return false;
+    }
+    // Guard 1: while driving, only a sag below anything our own commands can
+    // reach is a fault. The command band floor IS the envelope low edge, so this
+    // is what keeps the headless default's own level from reading as "gone".
+    if (cs.key_driven && key_idle_now_mv >= kFaultSagMaxMv) {
+        cs.envelope_bad_since_ms = 0;
+        return false;
+    }
+    // Guard 2: persist the verdict.
+    if (cs.envelope_bad_since_ms == 0) {
+        cs.envelope_bad_since_ms = now_ms;
+        return false;
+    }
+    return (now_ms - cs.envelope_bad_since_ms) >= kHeadUnitGoneSettleMs;
 }
 
 void SystemOrchestrator::EstablishSafeIdle() {
@@ -1090,11 +1161,6 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     // through branch nor the gesture machine can fire.
     if (!cc.enabled) {
         cs.reader.Update(now_ms);
-        const int sense_mv =
-            hal_->adc_read_mv(hal_->ctx, (index == 0) ? ADC_CH_KEY_SENSE1 : ADC_CH_KEY_SENSE2);
-        const int key_idle_now_mv = sense_mv * kSenseDividerRatio;
-        const bool head_unit_gone = (key_idle_now_mv < kKeyEnvelopeLowMv) ||
-                                    (key_idle_now_mv > kKeyEnvelopeHighMv);
         // Release, but do NOT latch. This envelope is spec 6.2 step 2's "no head
         // unit" test, and spec 6.8's head-unit-gone row requires "keep
         // classifying" -- because spec 4.4 says the head unit "may sleep,
@@ -1103,7 +1169,13 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
         // forever the first time the head unit sleeps, reporting a fault the
         // device is not in. The latch belongs to the LADDER's own out-of-range
         // (FR-4), which this branch cannot see because the channel is disabled.
-        if (head_unit_gone) {
+        //
+        // The envelope test itself lives in `HeadUnitGone`, which refuses to
+        // judge the line while it is being driven (spec 6.2: the envelope is on
+        // `V_KEY_idle`) and requires the verdict to hold for a settle.
+        const int sense_mv =
+            hal_->adc_read_mv(hal_->ctx, (index == 0) ? ADC_CH_KEY_SENSE1 : ADC_CH_KEY_SENSE2);
+        if (HeadUnitGone(index, sense_mv, now_ms)) {
             ReleaseKey(index);
             cs.gestures.Reset();
             return;
@@ -1155,11 +1227,15 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     // 4.4), so the response is "release and keep classifying". Named for what it
     // measures rather than "rail_fault", which invited exactly the mistake of
     // folding it in with FR-4's ladder fault.
+    //
+    // The test is `HeadUnitGone`, which refuses to judge `V_KEY_idle` while a
+    // pulse is on the line (the sense node then reads THIS device's own output)
+    // and requires the verdict to persist -- see its comment for the self-trip it
+    // closes. `sense_mv` is still read here because `PresentLevel` and the servo
+    // trim consume the raw value.
     const int sense_mv = hal_->adc_read_mv(hal_->ctx,
                                            (index == 0) ? ADC_CH_KEY_SENSE1 : ADC_CH_KEY_SENSE2);
-    const int key_idle_now_mv = sense_mv * kSenseDividerRatio;
-    const bool head_unit_gone = (key_idle_now_mv < kKeyEnvelopeLowMv) ||
-                                (key_idle_now_mv > kKeyEnvelopeHighMv);
+    const bool head_unit_gone = HeadUnitGone(index, sense_mv, now_ms);
 
     // FR-25 / spec 6.9: with no config there are no learned windows to classify
     // against, so the press is detected by the ratio moving off idle and mapped

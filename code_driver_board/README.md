@@ -131,24 +131,39 @@ mv_tolerance:120`, and a subsequent synthetic SINGLE classified as
 `event{channel:0, button:"rig1", gesture:"SINGLE"}` — with `config_state`
 flipping `"none"` → `"ok"`.
 
-**One DUT defect found and NOT yet fixed: a learned-only button (no binding)
-re-emits its gesture every poll tick while held, and never advances to a later
-gesture.** Measured on hardware: a 2 s steady hold at the learned level produced
-26–177 identical `event{…,"gesture":"SINGLE"}` frames ~70 ms apart, versus
-exactly 1 at a higher button level.
+**One DUT defect found: a learned-only button (no binding) re-emitted its gesture
+every poll tick while held, and never advanced to a later gesture.** Measured on
+hardware: a 2 s steady hold at the learned level produced 26–177 identical
+`event{…,"gesture":"SINGLE"}` frames ~70 ms apart, versus exactly 1 at a higher
+button level.
 
 The mechanism, from the loopback (`w`): the DUT drives its KEY pulse, and its
 **own** KEY sense reads that pulse below the 1800 mV envelope floor, so
-`head_unit_gone` goes true (`SystemOrchestrator.cpp:1161`), the tail does
-`ReleaseKey + gestures.Reset()` (`:1513–1524`) every tick, and the next tick
-re-classifies the still-held press and re-emits. A learned-only button (the
-headless learn path — `ConfigDefault` ships `binding_count = 0`) maps to the
-command-band floor of 1800 mV, which is what trips it; a bound `OUT_VOLTAGE` at a
-higher level does not. `gestures.Reset()` on the recurring `head_unit_gone`
-condition also discards the press state, so a held button can never reach LONG.
+`head_unit_gone` went true, the tail did `ReleaseKey + gestures.Reset()` every
+tick, and the next tick re-classified the still-held press and re-emitted. A
+learned-only button (the headless learn path — `ConfigDefault` ships
+`binding_count = 0`) maps to the command-band floor of 1800 mV, which is what
+tripped it; a bound `OUT_VOLTAGE` at a higher level did not. `gestures.Reset()` on
+the recurring `head_unit_gone` condition also discarded the press state, so a held
+button could never reach LONG.
 
-Not a rig problem, and not a duplicate-emit bug in the emit path — it is the
-head-unit-gone response acting on the DUT's own output through its own sense
-node. Worth a proper fix in the DUT firmware before relying on long-press
-delivery at low learned levels.
+Not a rig problem, and not a duplicate-emit bug in the emit path — the
+head-unit-gone response acting on the DUT's own output through its own sense node.
+
+**FIXED 2026-09-24** in `SystemOrchestrator::HeadUnitGone`. `V_KEY_idle` is the
+line's IDLE, so the envelope is only meaningful on a *released* line; while the
+device DRIVES, the sense node reads the device's own output and there is no
+head-unit reading to take. A driven line is now judged only on a DEEP sag: every
+command clamps to the band floor, so a reading at or above `kFaultSagMaxMv`
+(1600 mV, the floor less a 200 mV margin) is one we produced, not a fault. A rail
+collapse still drives the line far below that and still releases (FR-39's
+phantom-key hazard). The verdict also now has to persist for 250 ms
+(`kHeadUnitGoneSettleMs`), so a line settling after a pulse — or a rail coming up
+at boot — is not mistaken for an absent head unit.
+
+Regression test `ADrivenLineAtTheCommandFloorIsNotAHeadUnitGoneFault`
+(`SystemOrchestratorTest.cpp`), mutation-checked: removing the sag guard fails
+exactly that test. `ARailSagDuringAPressReleasesTheKey` still covers the deep-sag
+release. Native suite 503 → 504.
+
 

@@ -200,6 +200,19 @@ parses to `+inf`); semver digit comparison dropping a component and overflowing 
 validity and config-write collapse; the unreachable pass-through. **This session
 added** the `sizeof(Config)` assertion (§4) and made the stack gate read it.
 
+**This session's hardware work (2026-09-24)** added the two-board bench rig
+(`code_driver_board/`, committed `308c3c7`) and **found and fixed N-79**: the
+head-unit-gone envelope check ran every tick *including while the device was
+driving a key*, so a learned-only button — mapped onto the command band's
+1800 mV floor, read back ~1790 mV through the device's own sense node — tripped
+it, releasing and resetting the gesture machine every tick. On hardware that was
+**26–177 duplicate `event` frames for a 2 s hold**, and `LONG` was unreachable.
+Host-invisible: it needs the analog loop closed by a real sense node. Fixed by
+`SystemOrchestrator::HeadUnitGone` (a driven line is judged only on a deep sag;
+a released line's verdict must persist 250 ms). Native suite 503 → 504; device
+build clean. Details in `code/docs/bring-up-log.md` and spec §12.1 (N-79).
+
+
 ## 8. Environment notes
 
 - **PlatformIO needs the pioarduino fork** (stock stops at IDF 4.6.1). Pinned in

@@ -148,6 +148,17 @@ public:
     static constexpr uint32_t kMaintenanceHoldMs = 3000;
 
     /*
+     * How long a released KEY line must read outside the 1.80-5.20 V envelope
+     * before this device calls the head unit absent (spec 6.8's "head unit
+     * disappears" row). A settle, not a debounce: a line released from a pulse
+     * takes a moment to return to rail, and a rail coming up at boot is outside
+     * the envelope for that moment. Without it, either is read as an absent head
+     * unit. Longer than the pulse-settle, shorter than a head unit's own power
+     * blip.
+     */
+    static constexpr uint32_t kHeadUnitGoneSettleMs = 250;
+
+    /*
      * How long `identify` borrows LED_STAT for its double-flash burst before the
      * normal state is restored (spec 7.3's "borrows while it runs"). Long enough
      * for a user to see the flash, short enough that it reads as an event.
@@ -524,7 +535,21 @@ private:
         // continuous beep. Cleared when the level returns to idle or a real
         // button, so the next unrecognised press reports again.
         bool                unknown_reported = false;
+        // Spec 6.8's head-unit-gone detection. `V_KEY_idle` is the line's IDLE,
+        // so it can only be judged on a RELEASED line -- while this device drives
+        // a pulse its own sense node reads that pulse (see `HeadUnitGone`).
+        // `envelope_bad_since_ms` is when the released level first read outside
+        // the envelope, or 0 when it reads inside; the condition must persist for
+        // `kHeadUnitGoneSettleMs` before it counts, so the settle of a released
+        // pulse or a rail coming up is not read as an absent head unit.
+        uint64_t            envelope_bad_since_ms = 0;
     };
+
+    // Spec 6.2 step 2's "no head unit" test, per channel, with the two guards it
+    // needs to be usable per-tick. `sense_mv` is the channel's KEY-sense reading
+    // (may be the `-1` failure sentinel). Returns true only when the line is at
+    // REST and has read outside the envelope for `kHeadUnitGoneSettleMs`.
+    bool HeadUnitGone(uint8_t index, int sense_mv, uint64_t now_ms);
 
     void EstablishSafeIdle();
     /*

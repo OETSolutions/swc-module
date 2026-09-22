@@ -297,6 +297,63 @@ void SystemOrchestrator::EstablishSafeIdle() {
     // Set BEFORE the state machines are constructed, so anything that observes
     // SafeIdleEstablished() knows the output is already safe (FR-13).
     safe_idle_established_ = true;
+
+    // ...and then PROVE it, which is FR-13's step 3b and was implemented by
+    // nothing (open item N-21). This runs after the writes so it checks what the
+    // part actually holds, not what the firmware believes it sent.
+    VerifySafeIdleIdleCodes();
+}
+
+bool SystemOrchestrator::VerifySafeIdleIdleCodes() {
+    const uint8_t n = (config_.channel_count <= kMaxChannels) ? config_.channel_count
+                                                              : kMaxChannels;
+    bool all_ok = true;
+    for (uint8_t i = 0; i < n; ++i) {
+        const DacChannel ch = (i == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
+        uint16_t read_code = 0;
+        if (!hal_->dac_read_code(hal_->ctx, ch, &read_code)) {
+            // The bus did not answer. That is §6.8's persistent failure; the HAL
+            // has already latched `dac_faulted`, and the line's state is whatever
+            // the failed write left.
+            dac_verify_failed_ = true;
+            all_ok = false;
+            continue;
+        }
+        if (read_code != idle_code_[i]) {
+            // The part answers, with a code the firmware did not write. The read
+            // value is exactly what this check says is untrustworthy, so driving
+            // it would be §6.8's forbidden "guessed code". Re-assert the IDLE code
+            // instead -- the idle code IS the released state (spec 6.7), so this
+            // is the row's "release the line" -- and report the fault. See the
+            // header comment.
+            //
+            // Deliberately NOT `ReleaseKey(i)`: that reads `channels_[i]`, which
+            // `SeedChannelState` has not built yet at this point in Boot, and it
+            // early-returns unless `key_driven` is set, which nothing has done.
+            DriveKeyCode(i, idle_code_[i]);
+            // The HAL latch cannot carry this: the transaction SUCCEEDED. Latching
+            // it here is what makes a wrong value falsify FR-37's gate.
+            dac_verify_failed_ = true;
+            all_ok = false;
+        }
+    }
+    if (!all_ok) ReportDacFault();
+    return all_ok;
+}
+
+void SystemOrchestrator::ReportDacFault() {
+    if (dac_fault_reported_) return;
+    dac_fault_reported_ = true;
+    // The LAMP is the fault channel (spec 7.3) and this is a hardware condition,
+    // so it latches exactly as FR-4's wiring fault does.
+    ReportFault();
+    // **§7.2's `FAULT_DAC` finally has a caller.** The pattern's meaning is
+    // "I2C/DAC fault", which is precisely this condition -- unlike the ladder and
+    // rail faults, which ReportFault deliberately leaves silent because no
+    // pattern names them (N-10). Playing it is the audible half the row asks for
+    // ("report a fault"), and the buzzer's OFF level cannot suppress a FAULT_*
+    // pattern (spec 7.2).
+    buzzer_.Play(BuzzerPattern::kFaultDac);
 }
 
 /*
@@ -654,6 +711,11 @@ void SystemOrchestrator::ApplyConfig(const Config &c) {
 }
 
 void SystemOrchestrator::Tick(uint64_t now_ms) {
+    // Spec 6.8's I2C row: a write that fails on the key path must be REPORTED, not
+    // merely survived. The HAL latches `dac_faulted` on any failed transmit, and
+    // `ReportDacFault` is an edge, so this is one pattern per boot however many
+    // writes fail afterwards.
+    if (hal_ != nullptr && hal_->dac_faulted(hal_->ctx)) ReportDacFault();
     for (uint8_t i = 0; i < channel_count_; ++i) {
         ServiceChannel(i, now_ms);
     }

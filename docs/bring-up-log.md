@@ -1,4 +1,57 @@
 
+## The DAC fault path was three-quarters absent — and two comments asserted otherwise
+
+Found 2026-09-24, continuing audit (N-21). Spec §6.8's I²C row promises four
+things for a DAC failure: *retry with backoff*, *latch*, *release the line*,
+*never drive a guessed code*. Only the last held, and two doc-comments claimed the
+first two were implemented.
+
+- **No read-back.** FR-13 step 3b and §6.1's startup sequence say "VERIFY the DAC
+  is in the safe state (read back)", and `EspHal` called no `i2c_master_receive` at
+  all. The firmware believed its own write.
+- **No retry, no backoff.** `IHAL.h` and `EspHal.cpp` both said `dac_set_code`
+  "retries with backoff internally and latches a fault on persistent failure".
+  Neither was true: one synchronous `i2c_master_transmit`, one `ESP_LOGE`.
+- **No `FAULT_DAC` emitter.** §7.2 gives the pattern the I²C/DAC meaning and
+  nothing played it, because `dac_set_code` returns `void` so no caller could learn
+  of a failure.
+
+**Fixed.** `IHAL` gains `dac_read_code`; `EspHal` issues the MCP4728 Read Command
+and `DacFrame::DecodeReadCode` (pure, host-tested) owns the byte layout — 24
+sequential bytes, 3 of input register then 3 of EEPROM per channel A→D, code =
+`buf[6n+2] | ((buf[6n+1] & 0x0F) << 8)`. That layout is from DS22187E Figure
+5-15, cross-checked against Adafruit's driver, and pinned by a round-trip test
+through the existing encoder. `DacRetry.h` holds the retry policy — 3 attempts,
+1 ms then 2 ms, short on purpose because the whole sequence must fit inside the
+200 ms key pulse — applied to both the code and the power-mode writes.
+
+`SystemOrchestrator::VerifySafeIdleIdleCodes` runs the read-back per channel at
+the end of `EstablishSafeIdle` and compares against the code just written.
+
+**A mismatch releases rather than driving the read value.** The read value is
+exactly what the check just declared untrustworthy, so driving it is the
+"guessed code" §6.8 forbids; the firmware re-asserts the idle code, which *is*
+the released state (§6.7).
+
+**A wrong value needed a second latch.** The HAL's `dac_faulted` is set by a
+failed I²C *transaction* — but a mismatch is a transaction that succeeded, so the
+HAL cannot see it. `OutputVerified()` therefore folds in the orchestrator's own
+`dac_verify_failed_` as well; without it FR-37's rollback gate could not see the
+one failure the read-back exists to find. `ReportDacFault` plays `FAULT_DAC` once
+per boot (an edge — the latch is permanent, so a per-tick report would `Play`
+it every tick forever) and `Tick` checks the HAL latch, so a write that fails on
+the key path is reported too, not only the boot one.
+
+Pinned by 4 `DacFrame` read/round-trip tests, 4 `DacRetry` tests and 5
+orchestrator tests, mutation-tested three ways: dropping the read-back call,
+driving the read value instead of the written one, and removing
+`dac_verify_failed_` from the gate — each fails the suite.
+
+One contract drift was caught on the way: the `ack` row in `contract_schema.py`
+did not declare `result`, which `ota_end`'s ack had started emitting in the
+previous session's OTA work. The gate self-test (`test_gen_contract.py`) found
+it; the row now declares it.
+
 ## The firmware dropped a binding's second action — and its first, if the app's came first
 
 Found 2026-09-24, continuing audit (N-29). §3.5 is explicit that a binding's

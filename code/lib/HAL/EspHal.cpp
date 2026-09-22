@@ -17,9 +17,12 @@
 #include "Analog/CalibrationCurve.h"
 #include "HAL/PinMap.h"
 #include "HAL/DacFrame.h"
+#include "HAL/DacRetry.h"
 
 #include "driver/gpio.h"
 #include "driver/i2c_master.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 #include "esp_adc/adc_cali.h"
 #include "esp_adc/adc_cali_scheme.h"
 #include "esp_adc/adc_oneshot.h"
@@ -161,23 +164,32 @@ static void HalDacSetCode(void *ctx, DacChannel ch, uint16_t code)
     DacFrame::EncodeSet(frame, dac_sel, 0 /* VREF = VDD */, 0 /* normal power */,
                         0 /* gain x1 */, code);
 
-    // NO RETRY. An earlier version of this comment said "the driver retries
-    // internally on a bus fault" -- it does not. `i2c_master_transmit` is one
-    // synchronous transaction that delegates straight to
-    // `i2c_multi_buffer_transmit` (no loop), so a NACK or a timeout is logged
-    // once and the write is simply lost. Spec 6.8 asks for "retry with backoff;
-    // if persistent, release the line and report a fault"; only the log exists.
-    // IHAL's void return is what prevents a caller from acting on it, which is
-    // why the fix there is a signature change -- see open item N-21.
-    esp_err_t err = i2c_master_transmit(g_state.dac, frame, sizeof(frame), 100);
+    // Spec 6.8's "retry with backoff". The policy (3 attempts, 1 ms then 2 ms) is
+    // in DacRetry.h rather than inline here, because EspHal is excluded from the
+    // host build and a loop written here would be executed by no test. What this
+    // comment used to claim -- that the driver retries internally -- was false:
+    // `i2c_master_transmit` is one synchronous transaction that delegates straight
+    // to `i2c_multi_buffer_transmit` (no loop), so a NACK or timeout was logged
+    // once and the write was lost.
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < DacRetry::kMaxAttempts; ++attempt) {
+        if (attempt > 0) {
+            vTaskDelay(pdMS_TO_TICKS(DacRetry::BackoffMsBefore(attempt)));
+        }
+        err = i2c_master_transmit(g_state.dac, frame, sizeof(frame), 100);
+        if (err == ESP_OK) break;
+    }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "dac write failed: %s", esp_err_to_name(err));
-        // LATCHED, and never cleared: spec 7.3's reboot-only rule covers exactly
-        // this (a hardware condition that does not fix itself). FR-37's health
-        // gate reads it through `dac_faulted` -- without it the gate had no
-        // signal that could say NO, so it was constant-true and would confirm a
-        // bricked image. The return type stays `void` (N-21); this is the
-        // accessor that makes a failed write observable without one.
+        ESP_LOGE(TAG, "dac write failed after %d attempts: %s", DacRetry::kMaxAttempts,
+                 esp_err_to_name(err));
+        // "Never drive a guessed code" (spec 6.8) is already honoured: the write
+        // was refused, so the channel keeps whatever code it held. What the row
+        // also asks for -- "release the line and report a fault" -- is the
+        // LATCH below. It is never cleared, because spec 7.3's reboot-only rule
+        // covers a hardware condition that does not fix itself. FR-37's health
+        // gate reads it through `dac_faulted`; without it the gate had no signal
+        // that could say NO, so it was constant-true and would confirm a bricked
+        // image.
         g_state.dac_failed = true;
     }
 }
@@ -210,14 +222,55 @@ static void HalDacPowerMode(void *ctx, DacChannel ch, DacPowerMode mode)
                         DacFrame::PowerDownCode(mode), 0 /* gain x1 */,
                         0 /* code field */);
 
-    esp_err_t err = i2c_master_transmit(g_state.dac, frame, sizeof(frame), 100);
+    esp_err_t err = ESP_FAIL;
+    for (int attempt = 0; attempt < DacRetry::kMaxAttempts; ++attempt) {
+        if (attempt > 0) {
+            vTaskDelay(pdMS_TO_TICKS(DacRetry::BackoffMsBefore(attempt)));
+        }
+        err = i2c_master_transmit(g_state.dac, frame, sizeof(frame), 100);
+        if (err == ESP_OK) break;
+    }
     if (err != ESP_OK) {
-        ESP_LOGE(TAG, "dac power-mode write failed: %s", esp_err_to_name(err));
+        ESP_LOGE(TAG, "dac power-mode write failed after %d attempts: %s",
+                 DacRetry::kMaxAttempts, esp_err_to_name(err));
         // Same latch as the code write: a gain-mode write that did not land
         // leaves the output on the wrong gain, which is precisely "cannot do its
         // job" for FR-37's gate.
         g_state.dac_failed = true;
     }
+}
+
+/*
+ * FR-13's "VERIFY the DAC is in the safe state" / spec 6.1 step 3b.
+ *
+ * The MCP4728 Read Command (DS22187E Fig 5-15, §5.6.5) is the address byte with
+ * R/W = 1 and then 24 sequential bytes: 3 of input register + 3 of EEPROM, per
+ * channel A to D. `DacFrame::DecodeReadCode` owns the byte layout, here only the
+ * transfer and the fault accounting.
+ *
+ * **This is a CHECK, not the write path's arbiter.** A read that fails latches
+ * the same fault as a failed write (the bus is not answering, which is exactly
+ * what §6.8's "persistent" fault is), but a read that succeeds never CLEARS the
+ * latch: spec 7.3's rule is reboot-only, and a transient that recovered is still
+ * a bus that failed. It also deliberately does not retry -- the retry policy
+ * exists to get a code ONTO the part, and a failed verification is a reportable
+ * fact rather than something to paper over.
+ */
+static bool HalDacReadCode(void *ctx, DacChannel ch, uint16_t *out)
+{
+    (void)ctx;
+    if (g_state.dac == NULL || out == nullptr) return false;
+    uint8_t dac_sel;
+    if (!DacFrame::SelectForChannel(static_cast<uint8_t>(ch), &dac_sel)) return false;
+
+    uint8_t buf[DacFrame::kReadBytes] = {};
+    esp_err_t err = i2c_master_receive(g_state.dac, buf, sizeof(buf), 100);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "dac read failed: %s", esp_err_to_name(err));
+        g_state.dac_failed = true;
+        return false;
+    }
+    return DacFrame::DecodeReadCode(buf, dac_sel, out);
 }
 
 static void HalDacLdac(void *ctx, bool assert)
@@ -512,6 +565,7 @@ IHAL *EspHalInit(void)
     iface.dac_set_code   = HalDacSetCode;
     iface.dac_power_mode = HalDacPowerMode;
     iface.dac_ldac       = HalDacLdac;
+    iface.dac_read_code  = HalDacReadCode;
     iface.dac_faulted    = HalDacFaulted;
     iface.gpio_write     = HalGpioWrite;
     iface.gpio_read      = HalGpioRead;

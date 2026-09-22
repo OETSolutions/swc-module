@@ -129,4 +129,45 @@ inline bool SelectForChannel(uint8_t ch_ordinal, uint8_t *out)
     }
 }
 
+/*
+ * The READ side: turn the MCP4728's Read Command response into a channel's code.
+ *
+ * FR-13's step 3b is "VERIFY the DAC is in the safe state (read back)" and §6.1's
+ * sequence puts it before USB comes up. Nothing implemented it: `EspHal` issued no
+ * read of any kind (open item N-21). The parse lives HERE, beside the encoder, for
+ * the same reason the encoder does -- EspHal is the one file the host build
+ * excludes, so a byte layout written inline there is checked by nothing.
+ *
+ * The Read Command (DS22187E Figure 5-15, §5.6.5) is the address byte with R/W = 1
+ * and then a SEQUENTIAL stream, 6 bytes per channel from A to D: three bytes of
+ * the DAC INPUT REGISTER followed by three of the EEPROM. So channel `n`'s input
+ * register begins at byte `6*n`, and its code is
+ *
+ *   byte[6n]   : RDY/POR/BSY + DAC1:DAC0 + A2:A0   (status, NOT config)
+ *   byte[6n+1] : VREF PD1 PD0 Gx D11 D10 D9 D8
+ *   byte[6n+2] : D7 ... D0
+ *
+ * which is the same bit layout `EncodeSet` writes, read back one field over:
+ * the code is `byte[6n+2] | ((byte[6n+1] & 0x0F) << 8)`.
+ *
+ * **The status byte is deliberately not checked.** RDY/BSY is only meaningful
+ * while an EEPROM write is in progress, which this firmware never issues (it
+ * drives the input registers only), and POR is a power-on fact, not a per-read
+ * one. Gating the decode on them would refuse a perfectly good reading. The
+ * caller decides what a code MEANS; this function only refuses a channel that is
+ * not a real output.
+ */
+constexpr size_t kReadBytes = 6 * 4;   // 3 input-register + 3 EEPROM, per channel
+
+inline bool DecodeReadCode(const uint8_t *buf, uint8_t ch_ordinal, uint16_t *out)
+{
+    if (buf == nullptr || out == nullptr) return false;
+    uint8_t sel = 0;
+    if (!SelectForChannel(ch_ordinal, &sel)) return false;   // not a real output
+    const size_t base = 6u * static_cast<size_t>(sel);
+    *out = static_cast<uint16_t>(buf[base + 2] |
+                                 ((static_cast<uint16_t>(buf[base + 1]) & 0x0Fu) << 8));
+    return true;
+}
+
 }  // namespace DacFrame

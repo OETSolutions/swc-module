@@ -61,6 +61,16 @@ public:
     // member *name* is fixed by the harness API, so the type is qualified.
     void DacPowerMode(DacChannel ch, ::DacPowerMode mode);
     void DacLdac(bool assert) { ldac_asserted_ = assert; }
+    // FR-13's read-back. By default it answers with the code last written to that
+    // channel, which is what a healthy part reports; `FailNextDacRead` and
+    // `SetDacReadBackBias` are the two ways a test drives it to disagree. The
+    // mismatch hook matters because "the read failed" and "the read succeeded with
+    // the wrong value" are different defects and only the second exercises the
+    // comparison the verification exists for.
+    bool DacReadCode(DacChannel ch, uint16_t *out);
+    void FailNextDacRead() { fail_dac_read_ = true; }
+    void SetDacReadBackBias(int bias) { read_back_bias_ = bias; }
+    int DacReadCount(DacChannel ch) const { return dac_reads_[static_cast<int>(ch)]; }
     // FR-37's falsifiable signal. `FailNextDacWrite` arms exactly one failure so
     // a test can drive the health gate to NO -- the case the gate previously
     // could not reach, because it read a constant-true condition.
@@ -126,6 +136,7 @@ private:
     static void DacSetCodeThunk(void *ctx, DacChannel ch, uint16_t code);
     static void DacPowerModeThunk(void *ctx, DacChannel ch, ::DacPowerMode m);
     static void DacLdacThunk(void *ctx, bool assert);
+    static bool DacReadCodeThunk(void *ctx, DacChannel ch, uint16_t *out);
     static bool DacFaultedThunk(void *ctx);
     static void GpioWriteThunk(void *ctx, GpioPin pin, bool level);
     static bool GpioReadThunk(void *ctx, GpioPin pin);
@@ -152,6 +163,9 @@ private:
     bool ldac_asserted_ = false;
     bool dac_failed_ = false;
     bool fail_next_dac_write_ = false;
+    bool fail_dac_read_ = false;
+    int  read_back_bias_ = 0;      // added to the stored code on a read-back
+    int  dac_reads_[DAC_CH_COUNT] = {};
     bool gpio_out_[GPIO_COUNT] = {};
     bool gpio_in_[GPIO_COUNT] = {};
     int gpio_writes_[GPIO_COUNT] = {};

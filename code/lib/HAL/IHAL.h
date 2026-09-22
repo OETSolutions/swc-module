@@ -78,28 +78,35 @@ typedef enum {
  * a power-mode change (spec 2.3: PD1:PD0 = 01 selects gain 1.82), and it is
  * made independently of any code write, so it is its own member.
  *
- * dac_set_code returns void. **It does NOT retry** (spec 6.8 asks for "retry with
- * backoff"; one synchronous `i2c_master_transmit` and an `ESP_LOGE` is what is
- * implemented), and changing the return type to `esp_err_t` is the fix -- open
- * item N-21. What IS honoured is the last clause: a failed write drives nothing
- * rather than a guessed code. Do not read this comment as a description of
- * working behavior.
+ * dac_set_code returns void. **It DOES retry** (spec 6.8's "retry with backoff";
+ * the policy is `DacRetry.h`: 3 attempts, 1 ms then 2 ms), and a write that fails
+ * every attempt latches the fault that `dac_faulted` reports. What is also
+ * honoured is the row's last clause: a failed write drives nothing rather than a
+ * guessed code, because the frame is never partially applied.
  *
  * **`dac_faulted` exists because a void write is not a checkable one, and FR-37
  * needs a checkable one.** The rollback health-gate must confirm the device "can
  * drive the DAC" before cancelling a pending rollback; with a void write there is
  * no signal to branch on, so the gate in `app_main` evaluated a condition that
  * was constant-true (see open item N-21's sibling, and `OutputVerified`).
- * `dac_faulted` LATCHES: true once ANY DAC write has failed since boot, and it is
- * never cleared, because spec 7.3's reboot-only rule applies to a hardware
- * condition that does not fix itself. It is an accessor rather than a return
- * value so the existing void-write call sites do not all have to change.
+ * `dac_faulted` LATCHES: true once ANY DAC write or read-back has failed since
+ * boot, and it is never cleared, because spec 7.3's reboot-only rule applies to a
+ * hardware condition that does not fix itself. It is an accessor rather than a
+ * return value so the existing void-write call sites do not all have to change.
+ *
+ * dac_read_code implements FR-13's step 3b, "VERIFY the DAC is in the safe state
+ * (read back)": it issues the MCP4728 Read Command and decodes one output's input
+ * register. Returns false for a bus failure (which also latches `dac_faulted`) or
+ * for a channel that is not a real output. A successful read never CLEARS the
+ * latch -- spec 7.3's rule is reboot-only.
  */
 typedef struct IHAL {
     int      (*adc_read_mv)(void *ctx, AdcChannel ch);
     void     (*dac_set_code)(void *ctx, DacChannel ch, uint16_t code);
     void     (*dac_power_mode)(void *ctx, DacChannel ch, DacPowerMode mode);
     void     (*dac_ldac)(void *ctx, bool assert);
+    // Read back a channel's code from the MCP4728's input register (FR-13).
+    bool     (*dac_read_code)(void *ctx, DacChannel ch, uint16_t *out);
     // True once any DAC write has failed since boot. Never cleared. The one
     // falsifiable signal that the output is actually reachable (FR-13/FR-37).
     bool     (*dac_faulted)(void *ctx);

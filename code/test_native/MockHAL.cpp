@@ -68,6 +68,7 @@ MockHal::MockHal() {
     iface_.dac_set_code   = &MockHal::DacSetCodeThunk;
     iface_.dac_power_mode = &MockHal::DacPowerModeThunk;
     iface_.dac_ldac       = &MockHal::DacLdacThunk;
+    iface_.dac_read_code  = &MockHal::DacReadCodeThunk;
     iface_.dac_faulted    = &MockHal::DacFaultedThunk;
     iface_.gpio_write     = &MockHal::GpioWriteThunk;
     iface_.gpio_read      = &MockHal::GpioReadThunk;
@@ -120,6 +121,28 @@ void MockHal::DacSetCode(DacChannel ch, uint16_t code) {
 
 void MockHal::DacPowerMode(DacChannel ch, ::DacPowerMode mode) {
     dac_mode_[static_cast<int>(ch)] = mode;
+}
+
+bool MockHal::DacReadCode(DacChannel ch, uint16_t *out) {
+    ++dac_reads_[static_cast<int>(ch)];
+    if (fail_dac_read_) {
+        // A failed read latches the same fault as a failed write (the bus is not
+        // answering), and reports nothing -- mirroring EspHal, where a failed
+        // `i2c_master_receive` leaves `out` untouched.
+        fail_dac_read_ = false;
+        dac_failed_ = true;
+        return false;
+    }
+    if (out == nullptr) return false;
+    // The READ-BACK MISMATCH hook. Without it a test can only exercise "the read
+    // failed"; this lets one exercise the other half of FR-13 -- a bus that
+    // answers, with a code that is NOT what was written. `read_back_bias_` is
+    // added to the stored code, so a test that wants a mismatch arms a nonzero
+    // bias without needing a second DAC model.
+    const uint16_t stored = dac_code_[static_cast<int>(ch)];
+    const int biased = static_cast<int>(stored) + read_back_bias_;
+    *out = static_cast<uint16_t>(biased < 0 ? 0 : (biased > 4095 ? 4095 : biased));
+    return true;
 }
 
 void MockHal::CorruptNvsValue(const char *key, size_t offset) {
@@ -216,6 +239,9 @@ void MockHal::DacPowerModeThunk(void *ctx, DacChannel ch, ::DacPowerMode m) {
 }
 void MockHal::DacLdacThunk(void *ctx, bool assert) {
     static_cast<MockHal *>(ctx)->ldac_asserted_ = assert;
+}
+bool MockHal::DacReadCodeThunk(void *ctx, DacChannel ch, uint16_t *out) {
+    return static_cast<MockHal *>(ctx)->DacReadCode(ch, out);
 }
 bool MockHal::DacFaultedThunk(void *ctx) {
     return static_cast<MockHal *>(ctx)->dac_failed_;

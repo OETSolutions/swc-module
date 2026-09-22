@@ -117,3 +117,97 @@ TEST(DacFrame, MapsEachHalChannelToItsOutputAndRejectsTheRest) {
     EXPECT_FALSE(DacFrame::SelectForChannel(static_cast<uint8_t>(DAC_CH_COUNT), &sel))
         << "the sentinel past the last channel must be refused too";
 }
+
+/*
+ * The READ side: FR-13's step 3b, "VERIFY the DAC is in the safe state (read
+ * back)". The byte layout is the Read Command's (DS22187E Figure 5-15, §5.6.5),
+ * confirmed against Adafruit's MCP4728 driver, which reads 24 bytes and takes
+ * each channel's code from `buf[6n+2] | ((buf[6n+1] & 0x0F) << 8)`.
+ *
+ * The defect these catch is "no read-back at all" (open item N-21): EspHal called
+ * no receive of any kind, so FR-13's verify step was unimplemented and FR-37's
+ * health gate had no signal that could say NO.
+ */
+
+TEST(DacFrame, DecodesAChannelFromItsInputRegisterAtTheRightOffset) {
+    uint8_t buf[DacFrame::kReadBytes] = {};
+    // Channel A (offset 0) carries 0xABC; channel C (offset 12) carries 0x123.
+    // Distinct values at distinct offsets, so an off-by-one base or a wrong
+    // channel-select multiplier fails rather than coinciding.
+    buf[0] = 0x00;          // status byte -- deliberately NOT consulted
+    buf[1] = 0x0A;          // high nibble of 0xABC
+    buf[2] = 0xBC;          // low byte of 0xABC
+    buf[12] = 0x00;
+    buf[13] = 0x01;
+    buf[14] = 0x23;
+
+    uint16_t code = 0;
+    ASSERT_TRUE(DacFrame::DecodeReadCode(buf, DacFrame::kChannelA, &code));
+    EXPECT_EQ(code, 0x0ABC);
+    ASSERT_TRUE(DacFrame::DecodeReadCode(buf, DacFrame::kChannelC, &code));
+    EXPECT_EQ(code, 0x0123)
+        << "each channel sits at 6-byte strides from A; channel C is 12 bytes in";
+    // The middle two are zero-filled here, so they decode to 0 rather than
+    // borrowing a neighbour's bytes.
+    ASSERT_TRUE(DacFrame::DecodeReadCode(buf, DacFrame::kChannelB, &code));
+    EXPECT_EQ(code, 0);
+    ASSERT_TRUE(DacFrame::DecodeReadCode(buf, DacFrame::kChannelD, &code));
+    EXPECT_EQ(code, 0);
+}
+
+TEST(DacFrame, TheStatusByteAndTheTopNibbleAreNotPartOfTheCode) {
+    // Byte 6n carries RDY/POR/BSY and the address; byte 6n+1 carries VREF PD1 PD0
+    // Gx in its TOP nibble and only D11:D8 in its bottom one. A decoder that read
+    // the whole of byte 6n+1 would fold the power-down mode into the code and
+    // report a mismatch for a perfectly good write.
+    uint8_t buf[DacFrame::kReadBytes] = {};
+    buf[0] = 0xE7;          // status/address bits -- must not leak into the code
+    buf[1] = 0xF0;          // VREF=1, PD=11, Gx=1 -- none of it is D11:D8
+    buf[2] = 0x00;
+    uint16_t code = 0xFFFF;
+    ASSERT_TRUE(DacFrame::DecodeReadCode(buf, DacFrame::kChannelA, &code));
+    EXPECT_EQ(code, 0) << "only byte 6n+1's LOW nibble is D11:D8";
+}
+
+TEST(DacFrame, RoundTripsEveryCodeThroughTheEncoderAndTheDecoder) {
+    // The property that makes the verification meaningful: what EncodeSet puts on
+    // the wire is what DecodeReadCode gets back. 0, 1, the low-byte boundary, the
+    // 12-bit ceiling and two interior values -- the boundaries are where a mask
+    // error shows.
+    const uint16_t codes[] = {0, 1, 0x00FF, 0x0100, 0x0ABC, 0x0FFF};
+    for (DacChannel ch : {DAC_CH_KEY1, DAC_CH_ADJ1, DAC_CH_KEY2, DAC_CH_ADJ2}) {
+        for (uint16_t code : codes) {
+            uint8_t frame[DacFrame::kSize];
+            uint8_t sel = 0;
+            ASSERT_TRUE(DacFrame::SelectForChannel(static_cast<uint8_t>(ch), &sel));
+            DacFrame::EncodeSet(frame, sel, 0, 0, 0, code);
+
+            // A write frame is 3 bytes; the read response is 6 per channel with
+            // the SAME two data bytes, so splice the write frame into the read
+            // buffer at its channel's offset -- status byte first, exactly as the
+            // part would return it.
+            uint8_t buf[DacFrame::kReadBytes] = {};
+            const size_t base = 6u * sel;
+            buf[base + 0] = 0x00;
+            buf[base + 1] = frame[1];
+            buf[base + 2] = frame[2];
+
+            uint16_t decoded = 0;
+            ASSERT_TRUE(DacFrame::DecodeReadCode(buf, sel, &decoded));
+            EXPECT_EQ(decoded, code)
+                << "channel " << static_cast<int>(ch) << ", code " << code;
+        }
+    }
+}
+
+TEST(DacFrame, RefusesANullBufferOrOutputAndANonChannel) {
+    uint8_t buf[DacFrame::kReadBytes] = {};
+    uint16_t code = 0;
+    EXPECT_FALSE(DacFrame::DecodeReadCode(nullptr, DacFrame::kChannelA, &code));
+    EXPECT_FALSE(DacFrame::DecodeReadCode(buf, DacFrame::kChannelA, nullptr));
+    // A value past the last output is refused rather than indexed: it would read
+    // past the 24-byte response. Passed as an ORDINAL, so the guard is testable
+    // without forming an out-of-range DacChannel (see SelectForChannel's note).
+    EXPECT_FALSE(DacFrame::DecodeReadCode(buf, 99, &code));
+    EXPECT_FALSE(DacFrame::DecodeReadCode(buf, static_cast<uint8_t>(DAC_CH_COUNT), &code));
+}

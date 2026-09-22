@@ -126,6 +126,114 @@ TEST(SystemOrchestrator, TheHealthGateCanSayNoWhenADacWriteFails) {
         << "a device that cannot drive the DAC must not be confirmed healthy";
 }
 
+TEST(SystemOrchestrator, BootReadsBackTheSafeIdleCodeOnEveryChannel) {
+    // FR-13's step 3b: "VERIFY the DAC is in the safe state (read back)". Open
+    // item N-21: nothing implemented it, so the firmware believed its own write
+    // and `OutputVerified()` was the only (latched) evidence. Asserting the read
+    // HAPPENED is the half a mismatch test cannot cover -- an implementation that
+    // never reads also never finds a mismatch, and would pass that test.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    EXPECT_GT(hal.DacReadCount(DAC_CH_KEY1), 0)
+        << "the safe idle must be READ BACK, not merely written";
+    EXPECT_TRUE(o.OutputVerified()) << "a clean part verifies";
+    EXPECT_FALSE(hal.DacFaulted());
+}
+
+TEST(SystemOrchestrator, AReadBackMismatchReportsAFaultAndDrivesTheWrittenCode) {
+    // The defect the read-back exists to catch: the write reports success and the
+    // part holds a DIFFERENT code. §6.8's row is explicit that on a persistent
+    // failure the firmware must "release the line and report a fault" and "never
+    // drive a guessed code" -- and a mismatched read is exactly a value the check
+    // has just declared untrustworthy.
+    //
+    // Asserting the code ON THE LINE is what separates the two implementations
+    // that both report the fault: re-asserting the idle code (correct) versus
+    // driving what the part reported (the forbidden guess).
+    MockHal hal;
+    // A NEGATIVE bias, because the default idle code is full scale (4095) and a
+    // positive one would clamp back onto the stored value -- a fixture that
+    // silently tested the clean path.
+    hal.SetDacReadBackBias(-1);   // the part answers, with the wrong code
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    const int before = hal.BuzzerOnCount();
+    o.Boot();
+
+    // NOTE: `hal.DacFaulted()` is deliberately NOT asserted here. That latch
+    // belongs to a FAILED I2C TRANSACTION, and this read succeeded -- a wrong
+    // value is a defect the HAL cannot see. The orchestrator's own verification
+    // latch is what carries it, so the assertions are on OutputVerified and on
+    // the fault being raised and announced.
+    EXPECT_FALSE(o.OutputVerified()) << "a mismatched read-back must not be healthy";
+    EXPECT_TRUE(o.Faulted()) << "and the hardware fault must latch";
+    EXPECT_GT(hal.BuzzerOnCount(), before)
+        << "and it must be audible: FAULT_DAC is the I2C/DAC pattern";
+    EXPECT_TRUE(o.SafeIdleEstablished())
+        << "which is again why the flag alone could not be the gate";
+
+    // The written code, derived independently: the idle code the config names.
+    // MockHal's defaults ship `idle_dac_code = 4095`.
+    const uint16_t written = 4095;
+    const uint16_t on_line = hal.LastDacCode(DAC_CH_KEY1);
+    EXPECT_EQ(on_line, written)
+        << "the line must hold the code the firmware WROTE; 4095-1 is the read "
+           "value, and driving that is the 'guessed code' spec 6.8 forbids";
+}
+
+TEST(SystemOrchestrator, AFailedReadBackReportsAFault) {
+    // The other disagreeing case: the bus does not answer at all. Both halves are
+    // covered because they arrive from different code paths (a receive error vs a
+    // successful receive with a wrong value).
+    MockHal hal;
+    hal.FailNextDacRead();
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    EXPECT_TRUE(hal.DacFaulted());
+    EXPECT_FALSE(o.OutputVerified());
+}
+
+TEST(SystemOrchestrator, TheDacFaultIsReportedOnceNotEveryTick) {
+    // The HAL latch is permanent (spec 7.3's reboot-only rule), so a tick-driven
+    // check that re-fired every tick would `Play`-replace FAULT_DAC with itself
+    // forever, holding the buzzer in a 500/300 loop. The report is an EDGE.
+    MockHal hal;
+    hal.SetDacReadBackBias(-1);
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int after_boot = hal.BuzzerOnCount();
+    // Run well past FAULT_DAC's own 2.1 s so a re-play would show as more calls.
+    for (uint32_t t = 0; t < 3000; t += 10) {
+        o.Tick(hal.NowMs());
+        hal.AdvanceMs(10);
+    }
+    EXPECT_EQ(hal.BuzzerOnCount(), after_boot + 2)
+        << "FAULT_DAC is 500/300 x3 = three ON transitions, counted once: a "
+           "re-report each tick would multiply that by the tick count";
+}
+
+TEST(SystemOrchestrator, ADacWriteFailureOnTheKeyPathIsReported) {
+    // The runtime half: §6.8's row applies to every write, not only the boot
+    // one, so a failure while driving a resolved action must also be reported.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+    const int before = hal.BuzzerOnCount();
+    hal.FailNextDacWrite();
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);   // vol_up SINGLE -> OUT_VOLTAGE 2400
+    PollFor(o, hal, 300);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 300);
+    EXPECT_TRUE(hal.DacFaulted()) << "the failed key write must latch";
+    EXPECT_GT(hal.BuzzerOnCount(), before)
+        << "and the fault must be audible (FAULT_DAC), not merely latched";
+}
+
 TEST(SystemOrchestrator, BootDrivesTheAdjustChannelIntoTheOneKiloOhmPulldown) {
     MockHal hal;
     auto o = MakeOrch(hal);

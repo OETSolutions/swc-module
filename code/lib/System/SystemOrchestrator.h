@@ -212,13 +212,20 @@ public:
      * pending rollback CANCELLED: bricked-but-"valid", the exact state FR-37
      * exists to prevent.
      *
-     * So the condition reads the HAL's `dac_faulted` latch as well. A write that
-     * fails leaves the latch set for the rest of the boot (spec 7.3: a hardware
-     * condition that does not fix itself), and this accessor is false from then
-     * on -- which is what makes the gate able to say NO.
+     * So the condition reads the verification result as well, and BOTH sources
+     * are needed because they cover different failures:
+     *
+     * - `hal_->dac_faulted` latches a **failed I2C transaction** -- the bus did not
+     *   answer. That covers a failed write at any point, boot or key path.
+     * - `dac_verify_failed_` records FR-13's **read-back** disagreeing -- the bus
+     *   answered, with a code the firmware did not write. A stuck bus and a wrong
+     *   value are different defects and only the second is invisible to the HAL.
+     *
+     * Either one makes this false, which is what lets FR-37's gate say NO.
      */
     bool OutputVerified() const {
-        return safe_idle_established_ && !hal_->dac_faulted(hal_->ctx);
+        return safe_idle_established_ && !dac_verify_failed_ &&
+               !hal_->dac_faulted(hal_->ctx);
     }
 
     /*
@@ -690,6 +697,16 @@ private:
     // raised through `ReportFault` and never cleared, because the condition does
     // not fix itself.
     bool        hw_faulted_ = false;
+    // Whether the DAC fault has been ANNOUNCED. The HAL latch it reads is
+    // permanent, so this is what makes the report an edge rather than a per-tick
+    // re-play (see ReportDacFault).
+    bool        dac_fault_reported_ = false;
+    // FR-13's read-back disagreed: the part answered with a code the firmware did
+    // not write, OR did not answer at all. Latched like the HAL's own flag (spec
+    // 7.3: reboot-only) and separate from it because a wrong VALUE is a defect the
+    // HAL cannot see -- its latch is set by a failed transaction, and this one
+    // succeeded. See OutputVerified.
+    bool        dac_verify_failed_ = false;
     // The CONFIG fault latch (spec 6.8): the boot load fell back to defaults. It
     // is not a hardware condition, so a commit that persists a valid config clears
     // it -- see `ApplyConfig`. Kept separate from `hw_faulted_` for exactly that
@@ -717,6 +734,35 @@ private:
     LogSink     log_sink_ = nullptr;
     void       *log_sink_ctx_ = nullptr;
     void RestatLeds();
+
+    /*
+     * FR-13's step 3b: "VERIFY the DAC is in the safe state (read back)".
+     *
+     * Runs at the end of `EstablishSafeIdle`, per channel, and compares the part's
+     * own input register against the code just written. **A mismatch or a failed
+     * read is a DAC fault**, which is §6.8's "if persistent, release the line and
+     * report a fault" -- the read-back is the only way to learn that a write that
+     * reported success did not land (a stuck bus, a mis-strapped address that
+     * still ACKs, a part holding a code the firmware never sent).
+     *
+     * **A mismatch RELEASES the channel rather than driving the read value.** The
+     * read value is not trustworthy -- that is the premise of the check -- so
+     * driving it would be §6.8's forbidden "guessed code". Releasing is the safe
+     * direction: Q4 off, the head unit sees no key, and the fault is reported.
+     *
+     * Returns whether every channel verified.
+     */
+    bool VerifySafeIdleIdleCodes();
+    /*
+     * Raise the §6.8 I2C/DAC fault: latch the hardware fault and play `FAULT_DAC`.
+     *
+     * **Once, not per tick.** The HAL's `dac_faulted` latch stays set for the rest
+     * of the boot (spec 7.3's reboot-only rule), so a tick-driven check would
+     * re-fire this every tick and `Play`-replace the pattern with itself, holding
+     * the buzzer in a 500/300 loop forever. `dac_fault_reported_` makes the
+     * report an edge.
+     */
+    void ReportDacFault();
 
     /*
      * FR-31's headless learn, and the AUX1 hold that enters and leaves it.

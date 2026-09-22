@@ -98,7 +98,14 @@ FRAMES = [
     # phantom-field shape as N-22's `status` row. The list below is asserted
     # against the router's actual emit sites (test_frame_field_lists_match_the_router),
     # so it cannot drift back.
-    Frame("ack",           "fw2app", "for_seq,ok,mv_center,mv_tolerance"),
+    #
+    # `result` is the same shape on the OTA path: `ota_end`'s ack
+    # (CommandRouter::HandleOtaEnd) reports WHICH outcome it reached -- `installed`
+    # on a device, `not_supported` on a host build with no partitions. That
+    # distinction is the point: spec 9.3's install is a device-only action, and an
+    # ack that only said `ok:true` would let a bench run read an install that never
+    # happened as a success.
+    Frame("ack",           "fw2app", "for_seq,ok,mv_center,mv_tolerance,result"),
     Frame("nack",          "fw2app", "for_seq,err,detail"),
     Frame("log",           "fw2app", "level,msg"),
     Frame("link_gap",      "fw2app", "channel,button,gesture,expected_seq,got_seq"),

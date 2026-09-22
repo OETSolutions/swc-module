@@ -1,5 +1,33 @@
 # SWC firmware + Android app — session handoff
 
+> **STATUS — the tree has been COMMITTED.** The 100+ uncommitted files this
+> document was written around are now commit **`38f579c`** ("Land the
+> host-verified firmware and app, and make CI honest"; 104 files, +10,819/−673)
+> on `feat/swc-firmware-android-app`. **§5 below is now historical** — the
+> hazards it describes (the `.env`, the directory-wide-add trap) still apply to
+> any future commit, but there is no longer a large uncommitted tree to lose.
+>
+> What the commit covered: all tracked modifications under `code/`, the
+> repo-root `.github/workflows/` move (N-33 — Actions never read the old path,
+> so no gate had ever run in CI), the six previously-untracked static gates +
+> three gate self-tests, `code/docs/HANDOFF.md` itself, and the spec/plan
+> corrections. The staged set was audited file-by-file before committing.
+>
+> Deliberately **left uncommitted**: `SWC.kicad_pcb` / `SWC.kicad_prl` and
+> `plastic_case/SWC_Enclosure.3mf` (PCB half), plus three pieces of debris that
+> are **not** product source and should not be swept in later by accident:
+> a stray extension-less Kotlin file `code/android/.../swc/module`, a stray
+> 47-line log fragment at **`docs/bring-up-log.md`** (repo root — its content
+> was folded verbatim into `code/docs/bring-up-log.md`, so this copy is now
+> redundant), and the resistor-values PNG.
+>
+> **Verified at commit time:** 503/503 native tests under ASan+UBSan, zero
+> sanitizer reports; 120/120 Android unit tests; device build + size gate pass.
+> The Android suite **requires JDK 17** — the machine default is JDK 25, which
+> makes Robolectric fail 25 tests with `IllegalArgumentException at
+> ClassReader.java:200` (an ASM bytecode-version error, NOT a code defect). Run
+> it with `JAVA_HOME=$(/usr/libexec/java_home -v 17)` and `ANDROID_HOME` set.
+
 Written 2026-09-24, at the point the **assembled PCB is in hand and the next
 session is bring-up on real hardware**. This is a starting point for a new
 session: read it top to bottom, then open the two governing documents.

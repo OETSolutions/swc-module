@@ -306,6 +306,12 @@ object ConfigJson {
     fun problems(c: Config): List<String> {
         val out = mutableListOf<String>()
         if (c.deviceId.isEmpty()) out += "device_id must not be empty"
+        // The width too: `ReadStr` refuses a value `>= kDeviceIdLen`, so an
+        // over-width id encodes fine and then fails to DECODE -- a round-trip
+        // violation surfacing as "corrupt config". The app never edits this field,
+        // so it is latent today, but the rule belongs with the other width checks.
+        if (c.deviceId.length >= K_DEVICE_ID_LEN)
+            out += "device_id must be under $K_DEVICE_ID_LEN chars"
         // At least one channel, and not more than the max -- the firmware refuses
         // `channel_count == 0` (`ConfigValidate`), and an app that only bounded
         // the upper end would send a config with no channels that the device then
@@ -376,13 +382,119 @@ object ConfigJson {
             }
         }
         c.channels.forEachIndexed { i, ch ->
-            ch.ladder.buttons.forEach { btn ->
+            // Mirror `ConfigValidate`'s per-channel checks, which refused a name
+            // `ReadStr` cannot decode and (in `LadderProfileIsValid`) bounded the
+            // whole learned profile. These four rules had NO app-side check (open
+            // item N-40), so a config the app accepted carried a profile the device
+            // refused -- the very failure the local gate exists to prevent,
+            // reported as a nack naming a check rather than the field.
+            if (ch.name.isEmpty())
+                out += "channel $i: name must not be empty"
+            if (ch.name.length >= K_CHANNEL_NAME_LEN)
+                out += "channel $i: name must be under $K_CHANNEL_NAME_LEN chars"
+
+            val p = ch.ladder
+            if (p.learnedIdleMv <= 0 || p.learnedIdleMv > K_ADC_CEILING_MV)
+                out += "channel $i: learned_idle_mv must be between 1 and $K_ADC_CEILING_MV"
+            if (p.buttons.size > K_LADDER_MAX_BUTTONS)
+                out += "channel $i: at most $K_LADDER_MAX_BUTTONS buttons"
+            p.buttons.forEach { btn ->
+                if (btn.id.isEmpty())
+                    out += "channel $i button '${btn.id}': id must not be empty"
                 if (btn.id.length >= K_LADDER_ID_LEN)
                     out += "channel $i button '${btn.id}': id must be under $K_LADDER_ID_LEN chars"
+                // A centre at or above the idle reference is physically impossible
+                // (a press pulls the input DOWN), and 0 is unreachable from a learn
+                // (an unreadable ADC reports 0). Both bounds are against the ADC
+                // ceiling, not the rail -- `LadderProfileIsValid`.
+                if (btn.mvCenter == 0 || btn.mvCenter > K_ADC_CEILING_MV)
+                    out += "channel $i button '${btn.id}': mv_center must be between 1 and " +
+                        "$K_ADC_CEILING_MV"
                 if (btn.mvTolerance == 0)
                     out += "channel $i button '${btn.id}': mv_tolerance must not be zero"
+                // The DERIVED window must be a real one: a tolerance that rounds to
+                // zero permille can never match anything. The ratio is computed here
+                // exactly as `LadderRatioPermille` does it, so the two cannot
+                // disagree on which tolerances round to zero.
+                if (p.learnedIdleMv > 0 &&
+                    ladderRatioPermille(btn.mvTolerance, p.learnedIdleMv) <= 0
+                ) {
+                    out += "channel $i button '${btn.id}': mv_tolerance is too small against " +
+                        "learned_idle_mv to form a window"
+                }
             }
+            // Overlapping windows: the device's `LadderWindowsAreDistinguishable`
+            // refuses them, so the app must too. Only meaningful with a reference
+            // and at least two buttons -- both are checked above.
+            if (p.learnedIdleMv > 0 && p.buttons.size > 1 &&
+                !ladderWindowsDistinguishable(p)
+            ) {
+                out += "channel $i: two buttons' windows overlap, so a press could " +
+                    "match both"
+            }
+        }
+
+        // Mirror `BindingNamesARealInput`: a binding that names an id on no ladder
+        // and no AUX input is a binding to nothing, which the device refuses. "NONE"
+        // is the programming button, a legal target for a gesture.
+        val knownIds = buildSet {
+            c.channels.forEach { ch -> ch.ladder.buttons.forEach { add(it.id) } }
+            c.aux.forEach { add(it.id) }
+            add("NONE")
+        }
+        c.bindings.forEach { b ->
+            if (b.button !in knownIds)
+                out += "binding '${b.id}': button '${b.button}' is not a button on any " +
+                    "channel or AUX input"
         }
         return out
     }
+}
+
+/**
+ * Ratio in permille, byte-for-byte the same arithmetic as the firmware's
+ * `LadderRatioPermille` (`LadderDecode.cpp`): rounded division, `Long` to avoid any
+ * intermediate overflow, and the same `-1` for a non-positive idle.
+ *
+ * Duplicated rather than shared because there is no cross-language codegen for
+ * this predicate (the contract generator covers frames and enums, not arithmetic),
+ * and the two must round IDENTICALLY -- a tolerance that one side rounds to zero
+ * permille and the other to one is a profile one accepts and the other refuses.
+ * `N-40`'s guard test pins the agreement.
+ */
+internal fun ladderRatioPermille(levelMv: Int, idleMv: Int): Int {
+    if (idleMv <= 0) return -1
+    val scaled = (levelMv.toLong() * 1000L + idleMv / 2) / idleMv
+    if (scaled > 32767L) return 32767
+    if (scaled < -32768L) return -32768
+    return scaled.toInt()
+}
+
+/**
+ * Whether every pair of windows is separated by more than the wider of the two
+ * tolerances, mirroring `LadderWindowsAreDistinguishable` (`LadderDecode.cpp`).
+ *
+ * The relation is what `LadderClassify` relies on: within a window's half-width of
+ * a centre, the nearest centre is unambiguous. Two windows closer than that mean a
+ * press could fall in both, and the device refuses the profile rather than firing
+ * whichever it happens to test first.
+ */
+internal fun ladderWindowsDistinguishable(p: com.oetsolutions.swc.model.LadderProfile): Boolean {
+    if (p.learnedIdleMv == 0) return false
+    val n = minOf(p.buttons.size, K_LADDER_MAX_BUTTONS)
+    for (i in 0 until n) {
+        for (j in i + 1 until n) {
+            val bi = p.buttons[i]
+            val bj = p.buttons[j]
+            val ci = ladderRatioPermille(bi.mvCenter, p.learnedIdleMv)
+            val cj = ladderRatioPermille(bj.mvCenter, p.learnedIdleMv)
+            val ti = ladderRatioPermille(bi.mvTolerance, p.learnedIdleMv)
+            val tj = ladderRatioPermille(bj.mvTolerance, p.learnedIdleMv)
+            if (ci < 0 || cj < 0 || ti < 0 || tj < 0) return false
+            val distance = kotlin.math.abs(ci - cj)
+            val tolerance = maxOf(ti, tj)
+            if (distance <= tolerance) return false
+        }
+    }
+    return true
 }

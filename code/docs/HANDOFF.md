@@ -191,6 +191,11 @@ detail is in the auto-memory index (`MEMORY.md`) under the N-numbers.
 comment-vs-code drifts remain unrecorded from the last audit passes. None are
 logic or safety bugs. Do **not** spend a bring-up session on these.
 
+**App-side items resolved 2026-09-24 (no board needed):** N-27 (the app's
+keepalive + liveness), N-12 (the app's release check + USB install path), and
+N-40 (the app's validator brought to rule-level parity with `ConfigValidate`,
+with a differential harness over 55 mutants). None has a board-gated half left.
+
 ## 7. What was actually fixed recently (context, not TODO)
 
 The audit history (~78 numbered findings) includes real, load-bearing fixes:

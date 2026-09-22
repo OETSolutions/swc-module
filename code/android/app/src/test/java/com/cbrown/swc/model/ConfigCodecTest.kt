@@ -287,6 +287,204 @@ class ConfigCodecTest {
         assertTrue("encoded JSON must be single-line", !text.contains('\n'))
         assertTrue("encoded JSON must not be pretty-printed", !text.contains(": "))
     }
+
+    /**
+     * The four rules the app's validator used to be missing (open item N-40): it
+     * checked the NUMERIC limits but not the ladder-geometry rules, so a config
+     * carrying an out-of-range `mv_center`, an over-width name, overlapping windows
+     * or a binding to a nonexistent button passed the app's local gate and was then
+     * refused by the device at decode -- the failure the local gate exists to
+     * prevent, reported as a nack naming a check rather than the field.
+     */
+    private fun problemsWithChannels(channels: List<ChannelConfig>): List<String> =
+        // Bindings cleared: these tests exercise the CHANNEL rules, and the sample's
+        // bindings name `vol_up`/`next`, which a replaced ladder no longer has -- so
+        // keeping them would trip the (separately tested) dangling-binding rule and
+        // confuse which check failed.
+        ConfigJson.problems(sampleConfig().copy(channels = channels, bindings = emptyList()))
+
+    private fun ladderOf(vararg buttons: LadderButton, idleMv: Int = 2835) =
+        sampleConfig().channels[0].copy(
+            ladder = LadderProfile(source = 0, learnedIdleMv = idleMv, buttons = buttons.toList())
+        )
+
+    @Test
+    fun `an over-width channel name is refused`() {
+        // `ReadStr` refuses `n >= kChannelNameLen`, so an over-width name encodes
+        // fine and then fails to decode as "corrupt config" -- a round-trip
+        // violation (FR-27).
+        val atWidth = "N".repeat(K_CHANNEL_NAME_LEN)      // 16 -> refused
+        assertTrue(
+            "a name at the width is refused at decode",
+            problemsWithChannels(listOf(ladderOf().copy(name = atWidth)))
+                .any { it.contains("name") },
+        )
+        assertTrue(
+            "a 15-char name is accepted",
+            problemsWithChannels(listOf(ladderOf().copy(name = "N".repeat(K_CHANNEL_NAME_LEN - 1))))
+                .isEmpty(),
+        )
+        assertTrue(
+            "an empty name is refused",
+            problemsWithChannels(listOf(ladderOf().copy(name = ""))).any { it.contains("name") },
+        )
+    }
+
+    @Test
+    fun `an over-width device id is refused`() {
+        val c = sampleConfig().copy(deviceId = "d".repeat(K_DEVICE_ID_LEN))
+        assertTrue(
+            "a device_id at the width is refused at decode",
+            ConfigJson.problems(c).any { it.contains("device_id") },
+        )
+    }
+
+    @Test
+    fun `a ladder centre outside the ADC ceiling is refused`() {
+        // `LadderProfileIsValid`: a press pulls the input DOWN, so a centre at or
+        // above the idle reference is physically impossible, and 0 is unreachable
+        // from a learn. Bounds are against the ADC CEILING (2900), not the rail.
+        assertTrue(
+            "mv_center 0 is refused",
+            problemsWithChannels(listOf(ladderOf(LadderButton("a", "A", 0, 120))))
+                .any { it.contains("mv_center") },
+        )
+        // Above the ceiling: no pin reading can exceed it.
+        assertTrue(
+            "mv_center above the ADC ceiling is refused",
+            problemsWithChannels(listOf(ladderOf(LadderButton("a", "A", K_ADC_CEILING_MV + 1, 120))))
+                .any { it.contains("mv_center") },
+        )
+        // The boundary itself is legal.
+        assertTrue(
+            "mv_center exactly at the ceiling is accepted",
+            problemsWithChannels(listOf(ladderOf(LadderButton("a", "A", K_ADC_CEILING_MV, 120))))
+                .isEmpty(),
+        )
+    }
+
+    @Test
+    fun `a learned idle outside the plausible ADC range is refused`() {
+        // `LadderProfileIsValid`: `(0, kAdcCeilingMv]`.
+        assertTrue(
+            "idle 0 is refused",
+            problemsWithChannels(listOf(ladderOf(LadderButton("a", "A", 1000, 120), idleMv = 0)))
+                .any { it.contains("learned_idle_mv") },
+        )
+        assertTrue(
+            "idle above the ceiling is refused",
+            problemsWithChannels(
+                listOf(ladderOf(LadderButton("a", "A", 1000, 120), idleMv = K_ADC_CEILING_MV + 1))
+            ).any { it.contains("learned_idle_mv") },
+        )
+    }
+
+    @Test
+    fun `a tolerance that rounds to zero permille is refused`() {
+        // The DERIVED window must be real: `LadderRatioPermille(tolerance, idle)`
+        // must be positive. A tolerance of 1 mV against a large idle rounds to 0.
+        assertTrue(
+            "a sub-permille tolerance forms no window",
+            problemsWithChannels(
+                listOf(ladderOf(LadderButton("a", "A", 1000, 1), idleMv = 2835))
+            ).any { it.contains("too small") },
+        )
+        // **The rounding boundary, which is where this app's copy must agree with
+        // the firmware's EXACTLY.** `LadderRatioPermille` does rounded division
+        // (`+ idle/2`); truncating it instead gives a different answer here: a 2 mV
+        // tolerance against a 2835 mV idle is `2000+1417)/2835 = 1` permille ROUNDED
+        // but `2000/2835 = 0` truncated -- so a truncating copy refuses a window the
+        // device accepts, and the app would block a legal learned profile. Verified
+        // by mutation: making this predicate truncate survives every other case.
+        assertTrue(
+            "a 2 mV tolerance against a 2835 mV idle is 1 permille rounded, so it " +
+                "must be accepted: ${problemsWithChannels(
+                    listOf(ladderOf(LadderButton("a", "A", 1000, 2), idleMv = 2835))
+                )}",
+            problemsWithChannels(
+                listOf(ladderOf(LadderButton("a", "A", 1000, 2), idleMv = 2835))
+            ).isEmpty(),
+        )
+    }
+
+    @Test
+    fun `overlapping windows are refused`() {
+        // `LadderWindowsAreDistinguishable`: two centres closer than the wider
+        // tolerance mean a press could match both, and the device refuses the
+        // profile rather than firing whichever it tests first.
+        val overlapping = listOf(
+            ladderOf(
+                LadderButton("a", "A", 1430, 200),
+                LadderButton("b", "B", 1500, 200),   // 70 mV apart, 200 tolerance
+            )
+        )
+        assertTrue(
+            "windows that overlap must be refused",
+            problemsWithChannels(overlapping).any { it.contains("overlap") },
+        )
+        // Far enough apart is fine.
+        val separated = listOf(
+            ladderOf(
+                LadderButton("a", "A", 1430, 120),
+                LadderButton("b", "B", 2145, 110),
+            )
+        )
+        assertTrue(
+            "well-separated windows are accepted",
+            problemsWithChannels(separated).isEmpty(),
+        )
+    }
+
+    @Test
+    fun `a binding to a button on no channel is refused`() {
+        // `BindingNamesARealInput`: a binding that names an id on no ladder and no
+        // AUX input is a binding to nothing, which the device refuses.
+        val base = sampleConfig()
+        val dangling = base.copy(
+            bindings = base.bindings + Binding(
+                "b5", BindingChannel.SWC1, "nonexistent", Gesture.SINGLE, true,
+                listOf(Action(ActionKind.OUT_RELEASE)),
+            )
+        )
+        assertTrue(
+            "a binding naming a button that exists nowhere must be refused",
+            ConfigJson.problems(dangling).any { it.contains("not a button") },
+        )
+        // A binding naming an AUX input IS real.
+        val auxBinding = base.copy(
+            bindings = base.bindings + Binding(
+                "b6", BindingChannel.AUX2, "aux1", Gesture.SINGLE, true,
+                listOf(Action(ActionKind.OUT_RELEASE)),
+            )
+        )
+        assertTrue(
+            "an AUX binding must not be refused as dangling: ${ConfigJson.problems(auxBinding)}",
+            ConfigJson.problems(auxBinding).none { it.contains("not a button") },
+        )
+        // "NONE" (the programming button) is a legal target too.
+        val noneBinding = base.copy(
+            bindings = base.bindings + Binding(
+                "b7", BindingChannel.ANY, "NONE", Gesture.LONG, true,
+                listOf(Action(ActionKind.OUT_RELEASE)),
+            )
+        )
+        assertTrue(
+            "'NONE' is a legal button target",
+            ConfigJson.problems(noneBinding).none { it.contains("not a button") },
+        )
+    }
+
+    @Test
+    fun `a button count above the ladder maximum is refused`() {
+        val many = (0 until K_LADDER_MAX_BUTTONS + 1).map {
+            LadderButton("b$it", "B$it", 100 + it * 150, 50)
+        }
+        assertTrue(
+            "more buttons than the firmware array holds must be refused",
+            problemsWithChannels(listOf(ladderOf(*many.toTypedArray())))
+                .any { it.contains("at most") },
+        )
+    }
 }
 
 class GainModeRoundTripTest {

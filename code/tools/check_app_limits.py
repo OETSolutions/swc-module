@@ -30,6 +30,7 @@ CONFIG_MODEL = REPO / "lib" / "Config" / "ConfigModel.h"
 LADDER_DECODE = REPO / "lib" / "Analog" / "LadderDecode.h"
 BASE64_H = REPO / "lib" / "Util" / "Base64.h"
 CONFIG_CODEC_H = REPO / "lib" / "Config" / "ConfigCodec.h"
+CALIBRATION_H = REPO / "lib" / "Analog" / "CalibrationCurve.h"
 OTA_USB_H = REPO / "lib" / "Update" / "OtaUsb.h"
 NDJSON_H = REPO / "lib" / "Link" / "Ndjson.h"
 CONFIG_KT = REPO / "android" / "app" / "src" / "main" / "java" / "com" / "oetsolutions" / "swc" / "model" / "Config.kt"
@@ -96,6 +97,18 @@ PAIRS = [
     # hand-written copies of the slot size with nothing comparing them is the exact
     # drift this tool exists for, so it is pinned here too.
     ("image download cap",   "kAppSlotBytes",         "kMaxImageBytes",          OTA_USB_H),
+    # The ladder-geometry bounds the app's validator now mirrors (open item N-40).
+    # The app's `ConfigJson.problems()` is a hand-written copy of `ConfigValidate`
+    # + `LadderProfileIsValid`, and these four facts -- two string widths, the ADC
+    # ceiling the geometry is measured against, and the button-count ceiling -- had
+    # NO pair here and no app check at all, so the app accepted a config the device
+    # refused at decode. `check_app_limits.py` cannot see the RULE level (that is
+    # `ConfigCodecTest`'s job); it can see that the CONSTANTS the rules use agree,
+    # which is what these rows pin.
+    ("channel-name width",   "kChannelNameLen",       "K_CHANNEL_NAME_LEN",      CONFIG_MODEL),
+    ("device-id width",      "kDeviceIdLen",          "K_DEVICE_ID_LEN",         CONFIG_MODEL),
+    ("adc ceiling",          "kAdcFullScaleMv12dB",   "K_ADC_CEILING_MV",        CALIBRATION_H),
+    ("ladder button max",    "kLadderMaxButtons",     "K_LADDER_MAX_BUTTONS",    LADDER_DECODE),
 ]
 
 
@@ -134,7 +147,7 @@ def _kt_constant(text, name):
 
 def main() -> int:
     for p in (CONFIG_MODEL, LADDER_DECODE, BASE64_H, CONFIG_CODEC_H, NDJSON_H,
-              OTA_USB_H, CONFIG_KT, SWC_CLIENT_KT, MANIFEST_FETCHER_KT):
+              OTA_USB_H, CALIBRATION_H, CONFIG_KT, SWC_CLIENT_KT, MANIFEST_FETCHER_KT):
         if not p.is_file():
             print(f"FAIL: {p} not found", file=sys.stderr)
             return 2
@@ -146,6 +159,7 @@ def main() -> int:
         CONFIG_CODEC_H: CONFIG_CODEC_H.read_text(),
         NDJSON_H: NDJSON_H.read_text(),
         OTA_USB_H: OTA_USB_H.read_text(),
+        CALIBRATION_H: CALIBRATION_H.read_text(),
     }
     kt_by_file = {
         CONFIG_KT: CONFIG_KT.read_text(),

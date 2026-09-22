@@ -54,6 +54,37 @@ const val K_BINDING_ID_LEN = 16
 const val K_LADDER_ID_LEN = 16
 
 /**
+ * The channel-name width, mirroring `kChannelNameLen` (ConfigModel.h). `ReadStr`
+ * refuses a value `>= width`, so an over-width name is a config the device cannot
+ * decode — a round-trip violation (FR-27) surfacing as "corrupt config".
+ */
+const val K_CHANNEL_NAME_LEN = 16
+
+/**
+ * The device-id width, mirroring `kDeviceIdLen` (ConfigModel.h). Same rule as
+ * [K_CHANNEL_NAME_LEN]: an over-width value is refused at decode by `ReadStr`.
+ */
+const val K_DEVICE_ID_LEN = 24
+
+/**
+ * The ADC's calibrated ceiling in millivolts, mirroring `kAdcFullScaleMv12dB`
+ * (CalibrationCurve.h), which the firmware's `LadderDecode.cpp` aliases as its own
+ * `kAdcCeilingMv`.
+ *
+ * Ladder geometry is bounded against THIS, not the 3300 mV rail: no pin reading can
+ * exceed the calibrated ceiling, so a value above it is not a measurement. The app
+ * must use the same bound, or it accepts a profile the device's `LadderProfileIsValid`
+ * refuses.
+ */
+const val K_ADC_CEILING_MV = 2900
+
+/**
+ * The ladder's button count ceiling, mirroring `kLadderMaxButtons`
+ * (LadderDecode.h). A stored count above it is refused by the firmware.
+ */
+const val K_LADDER_MAX_BUTTONS = 16
+
+/**
  * The maintenance window's upper bound, mirroring `kMaintenanceTimeoutMaxMs`
  * (ConfigModel.h). A `uint32` maximum would be ~49.7 days, i.e. a window that
  * never closes on its own — the "device left unable to serve presses" state FR-38

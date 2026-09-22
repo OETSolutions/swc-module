@@ -7,20 +7,34 @@
   Declaring it required keeps the app off those devices entirely rather than
   installing it and failing at the first connect.
 
-  There is no `INTERNET` permission here YET, and that is a gap rather than a
-  decision. An earlier version of this comment claimed it was deliberate, that "the
-  device fetches its own manifest", which contradicts spec 9.5: the ESP32 may
-  have no WiFi in the car, so the spec puts the release check in the APP, over the
-  phone's own connection, with the resulting file pushed to the device over USB.
-  That path needs `INTERNET` plus a pinned-CA TLS client, and neither exists. It
-  is recorded as open item N-12, and until it lands `checkForUpdates` reports that
-  it cannot check rather than claiming the device is current.
+  There is an `INTERNET` permission here for spec 9.5's release check (open item
+  N-12, resolved 2026-09-24). An earlier version of this comment claimed the
+  absence was deliberate, that "the device fetches its own manifest", which
+  contradicts spec 9.5: the ESP32 may have no WiFi in the car, so the spec puts the
+  release check in the APP, over the phone's own connection, with the resulting
+  file pushed to the device over USB. The permission is declared below; the fetch
+  itself is `HttpManifestFetcher`, over HTTPS, and the comparison is
+  `ReleaseManifest` (a mirror of the firmware's `ReleaseCheck`).
 -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
     <uses-feature
         android:name="android.hardware.usb.host"
         android:required="true" />
+
+    <!--
+      Spec 9.5's release check runs in the app because the ESP32 may have no WiFi
+      in the car. `AppViewModel.checkForUpdates` fetches `version_manifest.json`
+      through `HttpManifestFetcher` and compares it against the running firmware
+      with `ReleaseManifest`, so the app needs the network. Without this every
+      fetch fails with a SecurityException that reads as "the release server is
+      unreachable".
+
+      It is `INTERNET` alone, deliberately NOT `ACCESS_NETWORK_STATE`: the fetcher
+      makes one short GET on an explicit user action and needs no connectivity
+      query to decide anything.
+    -->
+    <uses-permission android:name="android.permission.INTERNET" />
 
     <!--
       Package visibility (Android 11+, API 30+), and the app targets 34.

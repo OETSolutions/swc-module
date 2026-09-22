@@ -23,6 +23,12 @@ import com.oetsolutions.swc.ui.LinkUiState
 import com.oetsolutions.swc.ui.PushResult
 import com.oetsolutions.swc.ui.UpdateStatus
 import com.oetsolutions.swc.ui.UpdateUiState
+import com.oetsolutions.swc.update.ImageDownloader
+import com.oetsolutions.swc.update.ManifestCheck
+import com.oetsolutions.swc.update.ManifestFetcher
+import com.oetsolutions.swc.update.ReleaseDecision
+import com.oetsolutions.swc.update.ReleaseManifest
+import com.oetsolutions.swc.update.kReleaseManifestUrl
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -90,6 +96,36 @@ class AppViewModel(
      * `when` it already is.
      */
     private val runAppAction: ((kind: String, target: String, payload: String) -> ActionOutcome)? = null,
+
+    /**
+     * Fetches the release manifest over the phone's own connection (spec §9.5,
+     * open item N-12). Null means this build cannot check — a test, a preview, a
+     * build without the permission — and `checkForUpdates` says so rather than
+     * claiming the device is current.
+     *
+     * Injected so the whole decision path is JVM-testable with no network: the real
+     * app passes `HttpManifestFetcher`, every test passes a fake.
+     */
+    private val fetchManifest: ManifestFetcher? = null,
+
+    /** The manifest URL, overridable so a test is never coupled to the real host. */
+    private val manifestUrl: String = kReleaseManifestUrl,
+
+    /**
+     * Where the manifest fetch runs. Injected so a JVM test can keep the whole
+     * check on its virtual clock: `Dispatchers.IO` is not a `TestDispatcher`, so a
+     * hard-coded IO dispatch would let `advanceUntilIdle()` return before the fetch
+     * completed and make the update tests flaky. Defaults to IO, which is what the
+     * real app wants for a network round trip.
+     */
+    private val ioDispatcher: kotlinx.coroutines.CoroutineDispatcher = Dispatchers.IO,
+
+    /**
+     * Downloads a released image (spec §9.5 step 5) for [installAvailableUpdate] to
+     * verify and push. Null means this build does not install from a release — a
+     * test, a preview — and the install path is a no-op rather than a crash.
+     */
+    private val downloadImage: ImageDownloader? = null,
 ) {
 
     private val _actionOutcomes = MutableStateFlow<List<String>>(emptyList())
@@ -130,6 +166,17 @@ class AppViewModel(
     val update: StateFlow<UpdateUiState> = _update.asStateFlow()
 
     private var pendingEdits: MutableMap<String, Action?> = mutableMapOf()
+
+    /**
+     * The release the last check found to be installable, or null.
+     *
+     * Held so [installAvailableUpdate] has the url/size/sha256 to download and
+     * verify against. It is cleared by any check that does not end in NEWER, so a
+     * stale release cannot be installed after a later check found none — the same
+     * "the state you act on must be the state you last observed" rule the rest of
+     * this class follows.
+     */
+    private var _availableRelease: com.oetsolutions.swc.update.ReleaseInfo? = null
 
     init {
         // `run()` never returns: it is the transport's only consumer, and the
@@ -990,19 +1037,99 @@ class AppViewModel(
     fun checkForUpdates() {
         scope.launch {
             val version = _link.value.firmwareVersion
+            if (version == null) {
+                _update.value = _update.value.copy(
+                    currentVersion = "—",
+                    status = UpdateStatus.Failed("No device is connected."),
+                    inProgress = false,
+                )
+                return@launch
+            }
+            val fetcher = fetchManifest
+            if (fetcher == null) {
+                // No client in this build. Truthful refusal, never a green "up to
+                // date" that would hide a real update -- see the class note.
+                _update.value = _update.value.copy(
+                    currentVersion = version,
+                    status = UpdateStatus.Failed(
+                        "This build cannot check for updates (no release client). " +
+                            "Open the device's maintenance page over WiFi to check there."
+                    ),
+                    inProgress = false,
+                )
+                return@launch
+            }
+
+            // Real work now, so the in-progress gate is live: set before the fetch,
+            // cleared in `finally` so a thrown transport error cannot leave the
+            // button disabled forever.
             _update.value = _update.value.copy(
-                currentVersion = version ?: "—",
-                status = when {
-                    version == null -> UpdateStatus.Failed("No device is connected.")
-                    else -> UpdateStatus.Failed(
-                        "This build has no release-manifest client, so it cannot check " +
-                            "for updates (spec §9.5). Open the device's maintenance page " +
-                            "over WiFi to check there."
-                    )
-                },
+                currentVersion = version,
+                status = UpdateStatus.Unknown,
+                inProgress = true,
             )
+            try {
+                val body = fetchManifestBody(fetcher)
+                _update.value = _update.value.copy(
+                    status = statusFor(version, body),
+                    inProgress = false,
+                )
+            } catch (e: Exception) {
+                // The device is unaffected and keeps running whatever it was: the
+                // failure is the CHECK, and the screen says exactly that.
+                _update.value = _update.value.copy(
+                    status = UpdateStatus.Failed(
+                        "Could not reach the release server: " +
+                            (e.message ?: e.javaClass.simpleName)
+                    ),
+                    inProgress = false,
+                )
+            }
         }
     }
+
+    /**
+     * Fetch on IO, decide on the caller's dispatcher. `Dispatchers.IO` because the
+     * fetch is a network round trip and this runs from the UI; the parse and compare
+     * are cheap and stay where the state lives.
+     */
+    private suspend fun fetchManifestBody(fetcher: ManifestFetcher): String =
+        kotlinx.coroutines.withContext(ioDispatcher) { fetcher.fetch(manifestUrl) }
+
+    /** Map a manifest body to the screen's status, folding the malformed case in. */
+    private fun statusFor(current: String, body: String): UpdateStatus =
+        when (val check = ReleaseManifest.check(body, current)) {
+            ManifestCheck.Malformed -> {
+                _availableRelease = null
+                UpdateStatus.Failed(
+                    "The release manifest could not be read. The device is unaffected."
+                )
+            }
+            is ManifestCheck.Decided -> {
+                // Remembered ONLY for an installable release, and cleared otherwise,
+                // so `installAvailableUpdate` can never act on a release a later
+                // check found is not being offered.
+                _availableRelease =
+                    if (check.decision == ReleaseDecision.NEWER) check.info else null
+                when (check.decision) {
+                    ReleaseDecision.UP_TO_DATE -> UpdateStatus.UpToDate(current)
+                    ReleaseDecision.NEWER ->
+                        UpdateStatus.Newer(current, check.info.latestVersion)
+                    ReleaseDecision.NOT_NEWER -> UpdateStatus.NotNewer(
+                        current, check.info.latestVersion
+                    )
+                    ReleaseDecision.TOO_OLD_TO_UPGRADE_FROM -> UpdateStatus.TooOldToUpgradeFrom(
+                        current, check.info.latestVersion, check.info.minFromVersion
+                    )
+                    // Unreachable: a malformed manifest is `ManifestCheck.Malformed`
+                    // above, never a `Decided`. Listed so adding a decision is a
+                    // compile error here rather than a silent fallthrough.
+                    ReleaseDecision.MALFORMED -> UpdateStatus.Failed(
+                        "The release manifest could not be read. The device is unaffected."
+                    )
+                }
+            }
+        }
 
     /**
      * Push a firmware image over USB (spec §9.3). `image` is the file the user
@@ -1019,34 +1146,107 @@ class AppViewModel(
      */
     fun pushFirmwareOverUsb(image: ByteArray) {
         if (_update.value.pushInProgress) return
+        scope.launch { pushImage(image) }
+    }
+
+    /**
+     * Install the release just found, over USB (spec §9.5's full app path: check,
+     * download, verify, then push the resulting file over USB).
+     *
+     * **The image is verified BEFORE any of it reaches the device**, per §9.5 step
+     * 3: `sha256` and `size_bytes` are checked against the manifest that was
+     * checked. A download that does not match is discarded whole — the device's own
+     * `ImageVerify` gate would refuse it too, but refusing here means a substituted
+     * or truncated image never occupies the link at all, and the message names the
+     * cause (a bad hash) rather than the device's vaguer "verify failed".
+     *
+     * Does nothing if no release was found or one is already installing.
+     */
+    fun installAvailableUpdate() {
+        if (_update.value.pushInProgress) return
+        val release = _availableRelease ?: return
+        val downloader = downloadImage ?: return
         scope.launch {
             _update.value = _update.value.copy(
                 pushInProgress = true,
                 pushSent = 0,
-                pushTotal = image.size,
+                // Unknown until the download lands; the manifest's figure is a good
+                // pre-download estimate and is corrected below.
+                pushTotal = release.sizeBytes.toInt(),
                 pushResult = null,
             )
-            val result = try {
-                client.pushFirmware(image, onProgress = { sent, _ ->
-                    _update.value = _update.value.copy(pushSent = sent)
-                })
+            val image = try {
+                kotlinx.coroutines.withContext(ioDispatcher) { downloader.download(release.url) }
             } catch (e: Exception) {
-                AckResult.Nacked("link", e.message ?: "the link failed")
+                _update.value = _update.value.copy(
+                    pushInProgress = false,
+                    pushResult = PushResult.Failed(
+                        "could not download the update: " + (e.message ?: e.javaClass.simpleName)
+                    ),
+                )
+                return@launch
             }
-            _update.value = _update.value.copy(
-                pushInProgress = false,
-                pushResult = when (result) {
-                    is AckResult.Ok -> PushResult.Installed
-                    is AckResult.Nacked -> when (result.err) {
-                        "not_supported" ->
-                            PushResult.Refused("this build has no update slot to write")
-                        else -> PushResult.Refused("${result.err} (${result.detail})")
-                    }
-                    AckResult.Timeout ->
-                        PushResult.Failed("the device stopped answering mid-transfer")
-                },
-            )
+            // Size first, then digest: a truncated download then reports the
+            // specific cause rather than the vaguer checksum failure -- the same
+            // order the device's own `ImageVerifyEnd` uses.
+            if (image.size.toLong() != release.sizeBytes) {
+                _update.value = _update.value.copy(
+                    pushInProgress = false,
+                    pushResult = PushResult.Failed(
+                        "the downloaded image was ${image.size} bytes, not the " +
+                            "${release.sizeBytes} the release declares"
+                    ),
+                )
+                return@launch
+            }
+            if (sha256Hex(image) != release.sha256.lowercase()) {
+                _update.value = _update.value.copy(
+                    pushInProgress = false,
+                    pushResult = PushResult.Failed(
+                        "the downloaded image did not match the release's checksum"
+                    ),
+                )
+                return@launch
+            }
+            _update.value = _update.value.copy(pushTotal = image.size)
+            pushImage(image)
         }
+    }
+
+    /**
+     * The push itself, shared by the file picker and the release download.
+     *
+     * Assumes the caller has already set `pushInProgress` and the totals, so the
+     * two entry points do not each re-derive the progress bookkeeping; it owns only
+     * the transfer and its outcome.
+     */
+    private suspend fun pushImage(image: ByteArray) {
+        _update.value = _update.value.copy(
+            pushInProgress = true,
+            pushSent = 0,
+            pushTotal = image.size,
+            pushResult = null,
+        )
+        val result = try {
+            client.pushFirmware(image, onProgress = { sent, _ ->
+                _update.value = _update.value.copy(pushSent = sent)
+            })
+        } catch (e: Exception) {
+            AckResult.Nacked("link", e.message ?: "the link failed")
+        }
+        _update.value = _update.value.copy(
+            pushInProgress = false,
+            pushResult = when (result) {
+                is AckResult.Ok -> PushResult.Installed
+                is AckResult.Nacked -> when (result.err) {
+                    "not_supported" ->
+                        PushResult.Refused("this build has no update slot to write")
+                    else -> PushResult.Refused("${result.err} (${result.detail})")
+                }
+                AckResult.Timeout ->
+                    PushResult.Failed("the device stopped answering mid-transfer")
+            },
+        )
     }
 
     /**
@@ -1071,5 +1271,13 @@ class AppViewModel(
     private companion object {
         /** How many device log lines the link screen keeps. */
         const val kMaxLogLines = 20
+
+        /**
+         * Lowercase hex SHA-256, matching the firmware's in-tree implementation and
+         * `SwcClient`'s own — spec §9.5 step 3's download verification.
+         */
+        fun sha256Hex(data: ByteArray): String =
+            java.security.MessageDigest.getInstance("SHA-256")
+                .digest(data).joinToString("") { "%02x".format(it) }
     }
 }

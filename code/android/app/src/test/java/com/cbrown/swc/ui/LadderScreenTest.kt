@@ -160,7 +160,7 @@ class UpdateScreenHonestyTest {
 
     private fun show(state: UpdateUiState) {
         rule.setContent {
-            UpdateScreen(state = state, onCheck = {}, onPushOverUsb = {}, onUpdateOverWifi = {})
+            UpdateScreen(state = state, onCheck = {}, onInstallAvailable = {}, onPushOverUsb = {}, onUpdateOverWifi = {})
         }
     }
 
@@ -199,5 +199,47 @@ class UpdateScreenHonestyTest {
     fun `an unchecked build says so instead of claiming to be current`() {
         show(UpdateUiState(status = UpdateStatus.Unknown))
         rule.onNodeWithText("Not checked yet").assertExists()
+    }
+
+    @Test
+    fun `the install button appears only when a newer release was found`() {
+        // Spec §9.5's install path. A button offered with no release behind it is
+        // how a user taps it and gets a confusing failure, so it is gated on the
+        // NEWER status rather than always present.
+        show(UpdateUiState(status = UpdateStatus.Newer(current = "1.0.0", available = "9.9.9")))
+        rule.onNodeWithText("Download and install").assertIsEnabled()
+    }
+
+    @Test
+    fun `with no newer release there is no install button`() {
+        // The other half of the gate, in its own test because a Compose test rule
+        // allows one `setContent` per test.
+        show(UpdateUiState(status = UpdateStatus.Unknown))
+        rule.onNodeWithText("Download and install").assertDoesNotExist()
+    }
+
+    @Test
+    fun `an ahead-of-release device is told, not shown as up to date`() {
+        // `NotNewer` is its own state (spec §9.5 step 2): a device ahead of the
+        // published release is usually bench-flashed, and saying "up to date" hides
+        // that. No install button either -- a downgrade is never offered.
+        show(UpdateUiState(status = UpdateStatus.NotNewer(current = "2.0.0", available = "1.0.0")))
+        rule.onNodeWithText("No update offered").assertExists()
+        rule.onNodeWithText("Download and install").assertDoesNotExist()
+    }
+
+    @Test
+    fun `a below-floor device is told why the update is not offered`() {
+        // Spec §9.5 step 4: `min_from_version` gates an update needing a staged
+        // migration, and the user must be told the reason rather than shown nothing.
+        show(
+            UpdateUiState(
+                status = UpdateStatus.TooOldToUpgradeFrom(
+                    current = "0.4.0", available = "9.9.9", minFrom = "5.0.0",
+                )
+            )
+        )
+        rule.onNodeWithText("Update not offered for this version").assertExists()
+        rule.onNodeWithText("5.0.0", substring = true).assertExists()
     }
 }

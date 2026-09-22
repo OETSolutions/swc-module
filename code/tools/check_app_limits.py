@@ -34,6 +34,7 @@ OTA_USB_H = REPO / "lib" / "Update" / "OtaUsb.h"
 NDJSON_H = REPO / "lib" / "Link" / "Ndjson.h"
 CONFIG_KT = REPO / "android" / "app" / "src" / "main" / "java" / "com" / "oetsolutions" / "swc" / "model" / "Config.kt"
 SWC_CLIENT_KT = REPO / "android" / "app" / "src" / "main" / "java" / "com" / "oetsolutions" / "swc" / "link" / "SwcClient.kt"
+MANIFEST_FETCHER_KT = REPO / "android" / "app" / "src" / "main" / "java" / "com" / "oetsolutions" / "swc" / "update" / "ManifestFetcher.kt"
 
 # (label, C++ constant, Kotlin constant, C++ header). The header is explicit because
 # not every width the app mirrors lives in ConfigModel.h: `LadderButton.id` is
@@ -88,6 +89,13 @@ PAIRS = [
     # still emits (or, worse, accumulating a partial line the device no longer
     # sends whole). A plain `val`, not a `const val`, so the matcher allows both.
     ("ndjson line cap",      "kNdjsonMaxFrame",       "lineCap",                 NDJSON_H),
+    # The release-image download bound (spec §9.5 step 5, open item N-12). A SECOND
+    # copy of the app slot: `HttpImageDownloader` caps the response it will hold in
+    # the phone's memory at the same figure `SwcClient` refuses to push, so an
+    # oversize response is stopped before it fills memory rather than after. Two
+    # hand-written copies of the slot size with nothing comparing them is the exact
+    # drift this tool exists for, so it is pinned here too.
+    ("image download cap",   "kAppSlotBytes",         "kMaxImageBytes",          OTA_USB_H),
 ]
 
 
@@ -126,7 +134,7 @@ def _kt_constant(text, name):
 
 def main() -> int:
     for p in (CONFIG_MODEL, LADDER_DECODE, BASE64_H, CONFIG_CODEC_H, NDJSON_H,
-              OTA_USB_H, CONFIG_KT, SWC_CLIENT_KT):
+              OTA_USB_H, CONFIG_KT, SWC_CLIENT_KT, MANIFEST_FETCHER_KT):
         if not p.is_file():
             print(f"FAIL: {p} not found", file=sys.stderr)
             return 2
@@ -142,6 +150,7 @@ def main() -> int:
     kt_by_file = {
         CONFIG_KT: CONFIG_KT.read_text(),
         SWC_CLIENT_KT: SWC_CLIENT_KT.read_text(),
+        MANIFEST_FETCHER_KT: MANIFEST_FETCHER_KT.read_text(),
     }
 
     def kt_find(name):

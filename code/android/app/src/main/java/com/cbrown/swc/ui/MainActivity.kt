@@ -30,6 +30,8 @@ import com.oetsolutions.swc.app.AppViewModel
 import com.oetsolutions.swc.link.SwcClient
 import com.oetsolutions.swc.link.UsbSerialTransport
 import com.oetsolutions.swc.model.Action
+import com.oetsolutions.swc.update.HttpImageDownloader
+import com.oetsolutions.swc.update.HttpManifestFetcher
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -69,6 +71,9 @@ class MainActivity : ComponentActivity() {
             // what makes an app-side binding (launch an app, send an intent)
             // actually fire when the wheel reports a press.
             runAppAction = ActionRunner(applicationContext)::run,
+            // Spec §9.5's release check over the phone's own connection (N-12).
+            fetchManifest = HttpManifestFetcher(),
+            downloadImage = HttpImageDownloader(),
         )
         vm = model
         lifecycleScope.launch {
@@ -125,6 +130,7 @@ fun AppRoot(model: AppViewModel) {
         onEdit = model::editBinding,
         onSave = model::save,
         onCheck = model::checkForUpdates,
+        onInstallAvailable = model::installAvailableUpdate,
         onEnterMaintenance = model::enterMaintenance,
         onExitMaintenance = model::exitMaintenance,
         onPushOverUsb = picker::launch,
@@ -142,6 +148,7 @@ fun AppRoot() = AppScaffold(
     onEdit = { _, _ -> },
     onSave = {},
     onCheck = {},
+    onInstallAvailable = {},
     onEnterMaintenance = {},
     onExitMaintenance = {},
     onPushOverUsb = {},
@@ -157,6 +164,7 @@ private fun AppScaffold(
     onEdit: (BindingCell, Action?) -> Unit,
     onSave: () -> Unit,
     onCheck: () -> Unit,
+    onInstallAvailable: () -> Unit,
     onEnterMaintenance: () -> Unit,
     onExitMaintenance: () -> Unit,
     onPushOverUsb: () -> Unit,
@@ -201,6 +209,7 @@ private fun AppScaffold(
                 Screen.UPDATE -> UpdateScreen(
                     state = update,
                     onCheck = onCheck,
+                    onInstallAvailable = onInstallAvailable,
                     // The USB push is live (N-14); the WiFi path still opens the
                     // device's maintenance page, and the radio is not started yet
                     // (open item N-15), so the screen keeps that button disabled.

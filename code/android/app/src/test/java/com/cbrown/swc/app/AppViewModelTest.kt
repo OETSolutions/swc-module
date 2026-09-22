@@ -54,8 +54,24 @@ class AppViewModelTest {
     private class FakeTransport : SwcTransport {
         val written = mutableListOf<String>()
         private val flow = MutableSharedFlow<ByteArray>(extraBufferCapacity = 64)
+
+        /**
+         * When set, every written frame is answered with an `ack` naming its `seq`.
+         *
+         * Off by default so a test that depends on an unanswered request still sees
+         * silence; on for the OTA install tests, whose push needs the `ota_*` acks a
+         * real device sends. Mirrors `SwcClientTest`'s fake, since the view model's
+         * push goes through the same chunked transport.
+         */
+        var autoAck = false
         override suspend fun write(bytes: ByteArray) {
-            written += String(bytes)
+            val s = String(bytes)
+            written += s
+            if (!autoAck) return
+            val seq = Regex("\"seq\":(\\d+)").find(s)?.groupValues?.get(1) ?: return
+            flow.tryEmit(
+                "{\"v\":1,\"seq\":$seq,\"type\":\"ack\",\"for_seq\":$seq}\n".toByteArray()
+            )
         }
         override val incoming: Flow<ByteArray> = flow
         override fun close() {}
@@ -1523,6 +1539,384 @@ class AppViewModelTest {
             status is UpdateStatus.Failed)
         assertTrue("the message must name the real reason: ${(status as UpdateStatus.Failed).reason}",
             status.reason.contains("cannot check") || status.reason.contains("manifest"))
+    }
+
+    // --- spec 9.5: the app's release check (open item N-12) ----------------
+
+    /** A manifest fetch that returns a fixed body, or throws, with no network. */
+    private class FakeFetcher(
+        var body: String = "",
+        var fail: Exception? = null,
+    ) : com.oetsolutions.swc.update.ManifestFetcher {
+        var fetches = 0
+        override suspend fun fetch(url: String): String {
+            ++fetches
+            fail?.let { throw it }
+            return body
+        }
+    }
+
+    private fun releaseManifest(
+        latest: String,
+        minFrom: String? = null,
+        url: String = "https://github.com/oetsolutions/swc-module/releases/download/v1/firmware.bin",
+    ): String = buildString {
+        append("""{"latest_version":"$latest","channel":"stable",""")
+        append(""""firmware":{"version":"$latest","url":"$url","size_bytes":1543210,""")
+        append(""""sha256":"e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"}""")
+        if (minFrom != null) append(""","min_from_version":"$minFrom"""")
+        append("}")
+    }
+
+    @Test
+    fun `a release check fetches the manifest and offers a newer version`() = runTest {
+        // The whole point of N-12: the app checks over its OWN connection (spec
+        // 9.5) because the ESP32 may have no WiFi in the car. Before this the app
+        // reported "this build cannot check" and the user had no way to know a
+        // release existed without standing in the car with a laptop.
+        val t = FakeTransport()
+        val fetcher = FakeFetcher(body = releaseManifest("9.9.9"))
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            fetchManifest = fetcher,
+            ioDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+        )
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+
+        vm.checkForUpdates()
+        advanceUntilIdle()
+
+        assertEquals("the manifest must actually be fetched", 1, fetcher.fetches)
+        val status = vm.update.value.status
+        assertTrue("a newer release must be offered, was $status", status is UpdateStatus.Newer)
+        assertEquals("1.0.0", (status as UpdateStatus.Newer).current)
+        assertEquals("9.9.9", status.available)
+        assertFalse("the check finished", vm.update.value.inProgress)
+    }
+
+    @Test
+    fun `the running version is compared against the manifest, not assumed`() = runTest {
+        // Up to date is only reachable after a REAL comparison: the manifest's
+        // version equals the device's. This is what the old build could never say.
+        val t = FakeTransport()
+        val fetcher = FakeFetcher(body = releaseManifest("2.5.0"))
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            fetchManifest = fetcher,
+            ioDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+        )
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"2.5.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+
+        vm.checkForUpdates()
+        advanceUntilIdle()
+
+        assertTrue(
+            "an equal version is up to date: ${vm.update.value.status}",
+            vm.update.value.status is UpdateStatus.UpToDate,
+        )
+    }
+
+    @Test
+    fun `a version below the manifest floor is not offered`() = runTest {
+        // Spec 9.5 step 4: `min_from_version` gates an update that needs a staged
+        // migration. The device MUST NOT be offered it, and the user must be told
+        // why rather than shown nothing.
+        val t = FakeTransport()
+        val fetcher = FakeFetcher(body = releaseManifest("9.9.9", minFrom = "5.0.0"))
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            fetchManifest = fetcher,
+            ioDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+        )
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+
+        vm.checkForUpdates()
+        advanceUntilIdle()
+
+        val status = vm.update.value.status
+        assertTrue(
+            "a below-floor device must not be offered the update: $status",
+            status is UpdateStatus.TooOldToUpgradeFrom,
+        )
+        assertEquals("5.0.0", (status as UpdateStatus.TooOldToUpgradeFrom).minFrom)
+    }
+
+    @Test
+    fun `a failed fetch is reported and the device is declared unaffected`() = runTest {
+        // A network failure must be a message, not a crash and not a false "up to
+        // date". The device is running whatever it was, and the copy says so.
+        val t = FakeTransport()
+        val fetcher = FakeFetcher(fail = java.io.IOException("no route to host"))
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            fetchManifest = fetcher,
+            ioDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+        )
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+
+        vm.checkForUpdates()
+        advanceUntilIdle()
+
+        val status = vm.update.value.status
+        assertTrue("a transport failure is a Failed, was $status", status is UpdateStatus.Failed)
+        assertTrue(
+            "the message names the cause: ${(status as UpdateStatus.Failed).reason}",
+            status.reason.contains("no route to host"),
+        )
+        assertFalse("a failure must not leave the button disabled forever",
+            vm.update.value.inProgress)
+    }
+
+    @Test
+    fun `a malformed manifest is a failure, never a false up to date`() = runTest {
+        val t = FakeTransport()
+        val fetcher = FakeFetcher(body = "{ not a manifest")
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            fetchManifest = fetcher,
+            ioDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+        )
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+
+        vm.checkForUpdates()
+        advanceUntilIdle()
+
+        assertTrue(
+            "an unreadable manifest must not read as current: ${vm.update.value.status}",
+            vm.update.value.status is UpdateStatus.Failed,
+        )
+    }
+
+    @Test
+    fun `a check with no device connected does not fetch`() = runTest {
+        val t = FakeTransport()
+        val fetcher = FakeFetcher(body = releaseManifest("9.9.9"))
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            fetchManifest = fetcher,
+            ioDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+        )
+        started(vm)
+        // No hello: firmwareVersion is null.
+        vm.checkForUpdates()
+        advanceUntilIdle()
+
+        assertEquals("no version to compare: do not hit the network", 0, fetcher.fetches)
+        assertTrue(vm.update.value.status is UpdateStatus.Failed)
+    }
+
+    // --- spec 9.5 step 5: download, verify, push over USB ------------------
+
+    private class FakeDownloader(var image: ByteArray = ByteArray(0), var fail: Exception? = null) :
+        com.oetsolutions.swc.update.ImageDownloader {
+        var downloads = 0
+        override suspend fun download(url: String): ByteArray {
+            ++downloads
+            fail?.let { throw it }
+            return image
+        }
+    }
+
+    private fun sha256Hex(data: ByteArray): String =
+        java.security.MessageDigest.getInstance("SHA-256")
+            .digest(data).joinToString("") { "%02x".format(it) }
+
+    /** A manifest whose declared size and sha256 match `image`. */
+    private fun manifestForImage(version: String, image: ByteArray): String =
+        """{"latest_version":"$version","channel":"stable",
+            "firmware":{"version":"$version",
+            "url":"https://github.com/oetsolutions/swc-module/releases/download/v$version/firmware.bin",
+            "size_bytes":${image.size},"sha256":"${sha256Hex(image)}"}}"""
+
+    @Test
+    fun `installing a found release downloads, verifies and pushes it`() = runTest {
+        // Spec §9.5's whole app path: check over the phone's connection, then push
+        // the resulting file over USB. Without this the app could tell the user a
+        // release existed and then offer no way to get it.
+        val t = FakeTransport()
+        t.autoAck = true
+        val image = ByteArray(1200) { (it % 251).toByte() }
+        val fetcher = FakeFetcher(body = manifestForImage("9.9.9", image))
+        val downloader = FakeDownloader(image = image)
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            fetchManifest = fetcher,
+            downloadImage = downloader,
+            ioDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+        )
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+
+        vm.checkForUpdates()
+        advanceUntilIdle()
+        assertTrue(vm.update.value.status is UpdateStatus.Newer)
+
+        vm.installAvailableUpdate()
+        advanceUntilIdle()
+
+        assertEquals("the image must be downloaded", 1, downloader.downloads)
+        assertEquals(
+            "a verified image is pushed",
+            PushResult.Installed,
+            vm.update.value.pushResult,
+        )
+        // And the push actually went over the wire.
+        val types = t.written.mapNotNull { Regex("\"type\":\"(\\w+)\"").find(it)?.groupValues?.get(1) }
+        assertTrue("the image reached the device: $types", "ota_end" in types)
+    }
+
+    @Test
+    fun `a download that fails its checksum is NOT pushed`() = runTest {
+        // Spec §9.5 step 3. A substituted or corrupted image must be discarded whole
+        // -- the device's own gate would refuse it too, but refusing here means a bad
+        // image never occupies the link, and the message names the cause.
+        val t = FakeTransport()
+        t.autoAck = true
+        val image = ByteArray(1200) { 7 }
+        val fetcher = FakeFetcher(body = manifestForImage("9.9.9", image))
+        // The downloader hands back DIFFERENT bytes than the manifest hashed.
+        val downloader = FakeDownloader(image = ByteArray(1200) { 9 })
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            fetchManifest = fetcher,
+            downloadImage = downloader,
+            ioDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+        )
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+        vm.checkForUpdates()
+        advanceUntilIdle()
+
+        vm.installAvailableUpdate()
+        advanceUntilIdle()
+
+        val result = vm.update.value.pushResult
+        assertTrue("a bad checksum must be refused: $result", result is PushResult.Failed)
+        assertTrue(
+            "the message names the checksum: ${(result as PushResult.Failed).reason}",
+            result.reason.contains("checksum"),
+        )
+        val types = t.written.mapNotNull { Regex("\"type\":\"(\\w+)\"").find(it)?.groupValues?.get(1) }
+        assertFalse("nothing must reach the device: $types", "ota_begin" in types)
+    }
+
+    @Test
+    fun `a download of the wrong size is refused before the checksum`() = runTest {
+        // Size first, then digest -- the same order the device's `ImageVerifyEnd`
+        // uses, so a truncated image reports the specific cause rather than the
+        // vaguer checksum failure.
+        val t = FakeTransport()
+        t.autoAck = true
+        val declared = ByteArray(1200) { 1 }
+        val fetcher = FakeFetcher(body = manifestForImage("9.9.9", declared))
+        val downloader = FakeDownloader(image = ByteArray(1000) { 1 })  // short
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            fetchManifest = fetcher,
+            downloadImage = downloader,
+            ioDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+        )
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+        vm.checkForUpdates()
+        advanceUntilIdle()
+
+        vm.installAvailableUpdate()
+        advanceUntilIdle()
+
+        val result = vm.update.value.pushResult
+        assertTrue(result is PushResult.Failed)
+        assertTrue(
+            "the message names the size: ${(result as PushResult.Failed).reason}",
+            result.reason.contains("1200") || result.reason.contains("size") ||
+                result.reason.contains("bytes"),
+        )
+    }
+
+    @Test
+    fun `installing does nothing when no release was found`() = runTest {
+        // The state you act on must be the state you last observed: with no
+        // available release (an up-to-date check, or none run), install must not
+        // download anything.
+        val t = FakeTransport()
+        t.autoAck = true
+        val downloader = FakeDownloader(image = ByteArray(10))
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            fetchManifest = FakeFetcher(body = releaseManifest("1.0.0")),
+            downloadImage = downloader,
+            ioDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+        )
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+        vm.checkForUpdates()   // equal -> UP_TO_DATE
+        advanceUntilIdle()
+
+        vm.installAvailableUpdate()
+        advanceUntilIdle()
+
+        assertEquals("no release to install: do not download", 0, downloader.downloads)
+        assertNull(vm.update.value.pushResult)
+    }
+
+    @Test
+    fun `a later check that finds no release clears the installable one`() = runTest {
+        // A stale release must not survive a later check that found none: otherwise
+        // a user who checks, sees nothing to install, then somehow taps install gets
+        // the OLD release.
+        val t = FakeTransport()
+        t.autoAck = true
+        val image = ByteArray(600) { 3 }
+        val fetcher = FakeFetcher(body = manifestForImage("9.9.9", image))
+        val downloader = FakeDownloader(image = image)
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            fetchManifest = fetcher,
+            downloadImage = downloader,
+            ioDispatcher = kotlinx.coroutines.test.StandardTestDispatcher(testScheduler),
+        )
+        started(vm)
+        t.emit(frame("hello", "fw_version" to "\"1.0.0\"", "protocol_v" to "1"))
+        advanceUntilIdle()
+        vm.checkForUpdates()
+        advanceUntilIdle()
+        assertTrue(vm.update.value.status is UpdateStatus.Newer)
+
+        // The release is pulled: the next check finds the device already current.
+        fetcher.body = releaseManifest("1.0.0")
+        vm.checkForUpdates()
+        advanceUntilIdle()
+        assertTrue(vm.update.value.status is UpdateStatus.UpToDate)
+
+        vm.installAvailableUpdate()
+        advanceUntilIdle()
+
+        assertEquals("the stale release must not be installed", 0, downloader.downloads)
     }
 
     // --- spec 8.2: the app's maintenance control --------------------------

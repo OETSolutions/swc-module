@@ -24,6 +24,28 @@ sealed interface UpdateStatus {
     data class UpToDate(val version: String) : UpdateStatus
     data class Newer(val current: String, val available: String) : UpdateStatus
 
+    /**
+     * The running version is AHEAD of the release (spec §9.5 step 2).
+     *
+     * Its own state, not folded into [UpToDate]: they are different facts, and a
+     * device running a newer build than the published one is usually a device that
+     * was bench-flashed, which the user should be told rather than shown "up to
+     * date". A downgrade is never offered — it is a rollback an attacker could
+     * induce to put a known-vulnerable image back on the device.
+     */
+    data class NotNewer(val current: String, val available: String) : UpdateStatus
+
+    /**
+     * The image IS newer, but the running version is below `min_from_version`
+     * (spec §9.5 step 4): applying it directly is unsupported and would need a
+     * staged migration, so the user is told WHY it is not offered.
+     */
+    data class TooOldToUpgradeFrom(
+        val current: String,
+        val available: String,
+        val minFrom: String,
+    ) : UpdateStatus
+
     /** The available image is for different hardware; flashing it would brick the device. */
     data class WrongBoard(val available: String, val deviceBoard: String) : UpdateStatus
     data class Failed(val reason: String) : UpdateStatus
@@ -33,16 +55,14 @@ data class UpdateUiState(
     val currentVersion: String = "—",
     val status: UpdateStatus = UpdateStatus.Unknown,
     /**
-     * Always false in this build, and the screen's `enabled = !inProgress` gate
-     * follows from that.
+     * True while a check is running. It gates the "Check for updates" button, so a
+     * second tap cannot start a second fetch.
      *
-     * It used to be set true and then immediately false inside one `launch` body
-     * with no suspension between, so a `StateFlow` collector could only ever observe
-     * `false` — the "Checking…" label and the disabled button were unreachable, a
-     * gate that never fires. The underlying `checkForUpdates` is genuinely
-     * synchronous (it reports that this build has no manifest client rather than
-     * performing a fetch), so there is no in-progress state to represent. The writes
-     * are gone; when an async check lands (N-12) this becomes real again.
+     * It is a LIVE gate now (open item N-12, resolved 2026-09-24): `checkForUpdates`
+     * fetches the manifest off-thread, so there is a real in-progress window to
+     * represent. Before that it was set `true` and then immediately `false` inside
+     * one `launch` body with no suspension between, so a collector could only ever
+     * observe `false` — a gate that never fired.
      */
     val inProgress: Boolean = false,
 
@@ -89,6 +109,7 @@ sealed interface PushResult {
 fun UpdateScreen(
     state: UpdateUiState,
     onCheck: () -> Unit,
+    onInstallAvailable: () -> Unit,
     onPushOverUsb: () -> Unit,
     onUpdateOverWifi: () -> Unit,
     modifier: Modifier = Modifier,
@@ -125,6 +146,21 @@ fun UpdateScreen(
 
         Button(onClick = onCheck, enabled = !state.inProgress, modifier = Modifier.testTag("check-updates")) {
             Text(if (state.inProgress) "Checking…" else "Check for updates")
+        }
+        // The install path spec §9.5 describes: the check found a newer release, so
+        // offer to download it (over the phone's connection) and push it (over USB).
+        // Shown ONLY for a newer release -- there is nothing to install otherwise,
+        // and a button that looks live with no release behind it is how a user taps
+        // it and gets a confusing failure. Disabled during a check or a push so a
+        // double tap cannot start two transfers.
+        if (state.status is UpdateStatus.Newer) {
+            Button(
+                onClick = onInstallAvailable,
+                enabled = !state.pushInProgress && !state.inProgress,
+                modifier = Modifier.testTag("install-update"),
+            ) {
+                Text(if (state.pushInProgress) "Installing…" else "Download and install")
+            }
         }
         // The USB push is LIVE now that the firmware serves the `ota_*` frames
         // (N-14). It is disabled only while a push is already running, so a second
@@ -201,6 +237,17 @@ internal fun describeStatus(status: UpdateStatus): Pair<String, String> = when (
     is UpdateStatus.Newer -> "A newer version is available" to
         "You are running ${status.current}; ${status.available} is available. " +
         "It is built for this board."
+
+    is UpdateStatus.NotNewer -> "No update offered" to
+        "You are running ${status.current}, which is newer than the released " +
+        "${status.available}. Your device is ahead of the published release, so " +
+        "nothing is offered — a downgrade is never installed."
+
+    is UpdateStatus.TooOldToUpgradeFrom -> "Update not offered for this version" to
+        "This device is running ${status.current}, and ${status.available} can only " +
+        "be installed from ${status.minFrom} or later — it needs an intermediate " +
+        "version first. Update through that version rather than straight to " +
+        "${status.available}."
 
     is UpdateStatus.WrongBoard -> "That image is for different hardware" to
         "The available release targets ${status.available}, but this device is " +

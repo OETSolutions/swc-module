@@ -183,7 +183,7 @@ detail is in the auto-memory index (`MEMORY.md`) under the N-numbers.
 | **NTC temperature** | ✅ **DONE 2026-09-24 (N-67).** `NtcConvert.h` (divider inversion + B3380 model, integer maths) + `SampleNtcTenthsC`; both learn paths record it in `temp_c_at_learn`. **One bring-up validation left:** read a room temperature and compare. |
 | **AUX bindings are inert** | AUX1–3 are declared bindable inputs (spec §3.5, model, validator, app) but **no firmware path services a binding on them** (AUX1 is only the learn/maintenance trigger). An AUX binding is acked and never fires. |
 | **Multi-action bindings** | ✅ **DONE 2026-09-24 (N-29).** `BindingResolve` now returns the whole ordered `ResolvedBinding` list and `SystemOrchestrator::RunBindingActions` executes every firmware-owned action (`OUT_*`, `BUZZ`) while SKIPPING app-owned kinds rather than releasing. Pinned by 3 orchestrator + 2 resolver tests. |
-| **`learn_channel_` is a constant 0** | Only channel 0 is learnable by any shipping means (the app has no learn screen), so SWC2 is not learnable on a two-channel install (N-23). |
+| **`learn_channel_` is a constant 0** | ✅ **DONE 2026-09-24 (N-23).** The headless learn now has **no channel selector and no slot menu** — the user holds AUX1, presses the input being programmed, and releases; the wizard names the target by which input LEFT ITS IDLE (the 2022 `is_key_pressed()` mechanism). SWC1 and SWC2 are learned identically, and AUX2/AUX3 learn as switch windows. Presses during an armed learn no longer drive the radio. |
 | **`status` rail/temp/heap** | `rail_mv`, `temp_c`, `heap_free` have no producer (N-22); `gain_mode` reports channel 0 only (N-60). |
 
 **Documentation-accuracy leftovers (low severity, comment-only):** a handful of

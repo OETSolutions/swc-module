@@ -2,6 +2,12 @@
 #include <gtest/gtest.h>
 #include <cstring>
 
+// The AUX tests below assert the VALIDATOR's refusal of an AUX1 binding, because
+// that is where the rule lives and the only gate between a hand-built config and
+// the wire. The resolver deliberately resolves whatever index it is handed.
+#include "Config/ConfigCodec.h"
+#include "ConfigFixtures.h"
+
 namespace {
 // Spec 3.7's worked example: one channel, three buttons, idle 2835 mV, and the
 // bindings that make the product's core case real -- vol_up SINGLE drives a
@@ -65,6 +71,43 @@ Config MakeConfig() {
     return c;
 }
 GestureEvent Ev(Gesture g, uint8_t b) { return GestureEvent{g, b, 0}; }
+
+/*
+ * Give the config two AUX inputs -- AUX2 and AUX3 -- with the press window
+ * `Aux1ProfileDefault` uses (a switch to the rail, shorted to ground when
+ * pressed). AUX1 is deliberately absent from the table's first slot in these
+ * tests: it is the programming/maintenance hold and is not a gesture source
+ * (`ConfigValidate` refuses a binding on it), so a fixture that made AUX1 the
+ * bindable one would be testing a config the device never accepts.
+ *
+ * The ids are the OTHER half of a binding's identity -- `Binding.button` names an
+ * `AuxButtonConfig.id` for this family, exactly as it names a `LadderButton.id`
+ * for a wheel channel (spec 3.1/3.5) -- so they are distinct from the ladder's.
+ */
+void AddAuxInputs(Config &c) {
+    c.aux_count = kMaxAuxButtons;
+    c.aux[0] = {"aux1", 1, 100, 1600};   // present but not bindable
+    c.aux[1] = {"aux2", 2, 100, 1600};
+    c.aux[2] = {"aux3", 3, 100, 1600};
+}
+
+// One binding on an AUX input, appended after the fixture's own (so its position
+// makes it the LAST match, never a precedence override of a wheel binding).
+void AddAuxBinding(Config &c, const char *button, BindingChannel ch, Gesture g) {
+    const uint8_t i = c.binding_count++;
+    Binding &b = c.bindings[i];
+    b = Binding{};
+    std::strncpy(b.id, "auxbind", sizeof(b.id) - 1);
+    b.channel = static_cast<uint8_t>(ch);
+    std::strncpy(b.button, button, sizeof(b.button) - 1);
+    b.gesture = g;
+    b.enabled = true;
+    b.action_count = 1;
+    b.actions[0].kind = ActionKind::kOutVoltage;
+    // A DISTINCT level from the fixture's own wheel binding (2400), so a test can
+    // tell which binding a resolve actually found.
+    b.actions[0].key_mv = 2500;
+}
 }  // namespace
 
 TEST(BindingResolver, ResolvesAButtonsSinglePressToItsAction) {
@@ -200,4 +243,113 @@ TEST(BindingResolver, AButtonIndexPastTheLadderIsRefusedRatherThanRead) {
     Config c = MakeConfig();
     EXPECT_FALSE(BindingResolve(c, 0, Ev(Gesture::kSingle, 3)).found)
         << "ladder.count is 3, so index 3 is one past the last button";
+}
+
+// --- the AUX inputs, spec 3.1/3.5 ---------------------------------------------
+//
+// The AUX family used to be accepted-and-inert (open item N-26): `Config` carried
+// the `aux[3]` table, the validator accepted a binding naming one, and NO firmware
+// path resolved it -- so the app could store an AUX2 binding, read it back, and
+// watch it never fire. What made the fix possible is the shared scan taking the
+// binding's `channel` ordinal and the input's own id, which is the two facts a
+// binding actually matches on; `Binding.resolve` could not see an AUX input at all
+// because that family's ids live in `cfg.aux`, not in a channel's ladder.
+
+TEST(BindingResolver, ResolvesAnAuxInputsGestureToItsAction) {
+    Config c = MakeConfig();
+    AddAuxInputs(c);
+    AddAuxBinding(c, "aux2", BindingChannel::kAux2, Gesture::kSingle);
+    const ResolvedBinding r = BindingResolveAux(c, 1, Ev(Gesture::kSingle, 0));
+    ASSERT_TRUE(r.found) << "an AUX2 binding must be reachable from the AUX2 input";
+    ASSERT_EQ(r.action_count, 1);
+    EXPECT_EQ(r.actions[0].kind, ActionKind::kOutVoltage);
+    EXPECT_EQ(r.actions[0].key_mv, 2500);
+}
+
+TEST(BindingResolver, AnAuxInputIsMatchedByItsOwnIdNotByIndex) {
+    // The two facts a binding matches on are its channel and the INPUT's id. Two
+    // AUX inputs with the same window but different ids must not be
+    // interchangeable: resolving AUX3 must not find the AUX2 binding.
+    Config c = MakeConfig();
+    AddAuxInputs(c);
+    AddAuxBinding(c, "aux2", BindingChannel::kAux2, Gesture::kSingle);
+    EXPECT_FALSE(BindingResolveAux(c, 2, Ev(Gesture::kSingle, 0)).found)
+        << "AUX3 pressed: the id differs, so the AUX2 binding must not fire";
+}
+
+TEST(BindingResolver, AnAuxBindingDoesNotFireForAWheelPress) {
+    // The mirror of `ABindingOnAnotherChannelIsNotResolved`, for the other family:
+    // the two families share ONE scan, so a press on SWC1's `vol_up` must resolve
+    // SWC1's own binding and never the AUX2 one. The two bindings carry different
+    // levels (2400 vs 2500), so "which binding was found" is decidable -- an
+    // assertion on `found` alone could not tell them apart.
+    Config c = MakeConfig();
+    AddAuxInputs(c);
+    AddAuxBinding(c, "aux2", BindingChannel::kAux2, Gesture::kSingle);
+    const ResolvedBinding r = BindingResolve(c, 0, Ev(Gesture::kSingle, 0));
+    ASSERT_TRUE(r.found);
+    EXPECT_EQ(r.actions[0].key_mv, 2400)
+        << "a wheel press must resolve the wheel's binding, not the AUX one";
+}
+
+TEST(BindingResolver, AnyChannelAlsoCoversTheAuxInputs) {
+    // Spec 3.5's `ANY` is a real wildcard over the whole input enum, so a binding
+    // written with it must be honoured from an AUX input too. Restricting ANY to
+    // the wheel channels would silently make it a SWC-only alias.
+    Config c = MakeConfig();
+    AddAuxInputs(c);
+    AddAuxBinding(c, "aux2", BindingChannel::kAny, Gesture::kLong);
+    EXPECT_TRUE(BindingResolveAux(c, 1, Ev(Gesture::kLong, 0)).found)
+        << "ANY must be honoured from an AUX input as well";
+}
+
+TEST(BindingResolver, AnAuxInputHasExactlyOneButton) {
+    // An AUX input is a single switch with a single id, so `ev.button_index` can
+    // only be 0. Any other value names a button this input does not have, and
+    // reading the config as if it had one would resolve a binding for a button
+    // the user never pressed.
+    Config c = MakeConfig();
+    AddAuxInputs(c);
+    AddAuxBinding(c, "aux2", BindingChannel::kAux2, Gesture::kSingle);
+    EXPECT_FALSE(BindingResolveAux(c, 1, Ev(Gesture::kSingle, 1)).found)
+        << "an AUX input has no button index 1";
+}
+
+TEST(BindingResolver, AnAuxCountPastTheTableIsRefusedRatherThanRead) {
+    // The same count-is-untrusted rule as every other array, on the AUX table.
+    Config c = MakeConfig();
+    AddAuxInputs(c);
+    AddAuxBinding(c, "aux2", BindingChannel::kAux2, Gesture::kSingle);
+    c.aux_count = static_cast<uint8_t>(kMaxAuxButtons + 1);
+    EXPECT_FALSE(BindingResolveAux(c, 1, Ev(Gesture::kSingle, 0)).found);
+}
+
+TEST(BindingResolver, Aux1IsRefusedAsABindingSourceByTheValidator) {
+    // AUX1 carries spec 7.5's 1.5 s programming hold and spec 8.2's 3 s
+    // maintenance hold, so a binding on the same switch would be ambiguous with
+    // them. The decision lives in the validator (`ConfigValidate`), which is the
+    // single gate between a hand-built config and the wire -- so this asserts the
+    // refusal where it is made rather than in the resolver, which deliberately
+    // resolves whatever index it is handed.
+    //
+    // This needs a config that is valid in every OTHER respect, or the refusal
+    // would be indistinguishable from a refusal for some unrelated reason. The
+    // local `MakeConfig` is not that config -- it has no `device_id`, which the
+    // validator refuses on its first line -- so the suite's shared, fully valid
+    // fixture is used instead. That distinction is the whole test: it asserts the
+    // config is accepted, then refused after ONE field changes.
+    Config c = swctest::MakeConfig();
+    AddAuxInputs(c);
+    ASSERT_TRUE(ConfigValidate(c))
+        << "fixture guard: the config must be valid before the AUX1 binding is added";
+    AddAuxBinding(c, "aux1", BindingChannel::kAux1, Gesture::kSingle);
+    EXPECT_FALSE(ConfigValidate(c))
+        << "a binding on AUX1 must be refused: that switch is the programming button";
+    // And the SAME config with the binding moved to AUX2 is accepted, so the
+    // refusal is about AUX1 specifically and not about AUX bindings in general.
+    c.bindings[c.binding_count - 1].channel =
+        static_cast<uint8_t>(BindingChannel::kAux2);
+    std::strncpy(c.bindings[c.binding_count - 1].button, "aux2",
+                 sizeof(c.bindings[c.binding_count - 1].button) - 1);
+    EXPECT_TRUE(ConfigValidate(c)) << "AUX2 and AUX3 ARE bindable";
 }

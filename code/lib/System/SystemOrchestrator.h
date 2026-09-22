@@ -359,6 +359,28 @@ public:
     };
 
     /*
+     * The wire `channel` value for a gesture that came from an AUX input.
+     *
+     * **The wire `event.channel` is a plain integer, and an AUX press has to name
+     * its input there without colliding with the two wheel channels.** The
+     * spec's example binds name AUX1/AUX2/AUX3, but every concrete use of the
+     * index in code (the ladder screen's channel, `ladder_sample`, the learn
+     * frames) treats 0 and 1 as SWC1/SWC2. So AUX inputs are encoded AFTER the
+     * wheel channels: `kAuxWireChannelBase + aux_index`, i.e. AUX1=2, AUX2=3,
+     * AUX3=4. The app decodes the same way; there is one definition here so the
+     * two cannot disagree about which input an event names.
+     *
+     * A base rather than AUX1=2 hardcoded at the emit site, because the arithmetic
+     * is what a reader gets wrong: `channel_index` in a `GestureEventRecord` is
+     * this wire value, so every consumer must translate, and one home is the only
+     * way that stays true.
+     */
+    static constexpr uint8_t kAuxWireChannelBase = kMaxChannels;   // 2
+    static uint8_t AuxWireChannel(uint8_t aux_index) {
+        return static_cast<uint8_t>(kAuxWireChannelBase + aux_index);
+    }
+
+    /*
      * Register the sink a recognized gesture is handed to, and the context to
      * call it with. One slot, no allocation.
      *
@@ -578,6 +600,38 @@ private:
         uint64_t            envelope_bad_since_ms = 0;
     };
 
+    /*
+     * One AUX input's runtime state (spec 3.1/3.5). An AUX input carries exactly
+     * ONE button -- its own `AuxButtonConfig.id` -- so unlike a wheel channel
+     * there is no ladder and no "which button" question: the classifier's
+     * `button_index` is always 0.
+     *
+     * A window is built from the config's `mv_center`/`mv_tolerance` into a
+     * one-entry `LadderProfile`, so the AUX path reuses the SAME classifier and
+     * gesture machine a wheel button uses rather than a second, parallel
+     * implementation of "is it pressed" and "was that a double". The profile's
+     * `learned_idle_mv` is the rail, because an AUX input is a switch to ground
+     * whose idle IS the rail (the same convention `Aux1ProfileDefault` uses).
+     */
+    struct AuxState {
+        AuxState()
+            : classifier(LadderProfile{}, GestureTimingsDefault()),
+              gestures(GestureTimingsDefault()),
+              reader() {}
+
+        PressClassifier     classifier;
+        GestureStateMachine gestures;
+        AdcReader           reader;
+        // FR-12's one-report-per-unrecognised-press latch, per input (see the
+        // channel's twin).
+        bool                unknown_reported = false;
+    };
+
+    // Build the one-button profile an AUX input classifies against. Shared by
+    // Boot and ApplyConfig so a config that arrives over the link classifies an
+    // AUX press the same way one stored before boot does.
+    static LadderProfile AuxProfileFor(const AuxButtonConfig &a);
+
     // Spec 6.2 step 2's "no head unit" test, per channel, with the two guards it
     // needs to be usable per-tick. `sense_mv` is the channel's KEY-sense reading
     // (may be the `-1` failure sentinel). Returns true only when the line is at
@@ -601,6 +655,23 @@ private:
      */
     bool SeedChannelState();
     void ServiceChannel(uint8_t index, uint64_t now_ms);
+    /*
+     * Service the AUX inputs that act as gesture sources (spec 3.1/3.5).
+     *
+     * **AUX2 and AUX3 are bindable inputs; AUX1 is not.** AUX1 carries the
+     * programming (1.5 s) and maintenance (3 s) holds (spec 7.5/8.2), so a
+     * *binding* on it would be ambiguous with those holds; `ConfigValidate`
+     * refuses one and this loop starts at index 1. AUX2/AUX3 have no other role,
+     * so each is a plain switch: one button (its own `AuxButtonConfig.id`), a
+     * window (`mv_center`/`mv_tolerance`), and the same SINGLE/DOUBLE/LONG
+     * grammar a wheel button gets.
+     *
+     * An AUX press resolves through `BindingResolveAux` and, for an `OUT_VOLTAGE`
+     * action, drives KEY channel 0: the spec does not give an AUX input its own
+     * output line, and routing it to the primary head-unit input is the choice
+     * that needs no new config field.
+     */
+    void ServiceAux(uint64_t now_ms);
     // FR-31: the headless learn wizard and the AUX1 hold that drives it.
     void ServiceLearn(uint64_t now_ms);
     // Return a channel's KEY line to its safe idle. One definition, because every
@@ -671,11 +742,26 @@ private:
     // tick (a LONG fires when its threshold elapses, a SINGLE when its ambiguity
     // window closes).
     void ReportGesture(uint8_t index, const GestureEvent &ev, int level_mv);
+    // The same report for an input that is not a wheel channel. Takes the wire
+    // channel value and the id directly, because an AUX input has neither a
+    // ladder nor a channel index to derive them from.
+    void ReportInputGesture(uint8_t wire_channel, const char *button_id, Gesture g,
+                            int level_mv, uint64_t at_ms);
     // What ONE button's own bindings say about how long its press must stay
     // undecided. Derived from the config, not assumed -- a button that binds
     // only SINGLE must not wait out the double-press window (spec 6.6 rule 3,
     // which is a PER-BUTTON property).
     GestureBindings BindingsForButton(uint8_t channel_index, uint8_t button_index) const;
+    /*
+     * The same adaptive-resolve question for an AUX input: does any binding on
+     * THIS input name DOUBLE or LONG, so the wait is per-input rather than
+     * per-device?
+     *
+     * `input_id` is the input's button id (`config_.aux[i].id`), or null on a
+     * release, where the gesture machine's own tracked button is used -- the same
+     * fallback `ServiceChannel` performs through `cs.gestures.Button()`.
+     */
+    GestureBindings AuxBindingsForInput(uint8_t aux_index, const char *input_id) const;
 
     IHAL          *hal_;
     Config         config_;
@@ -684,6 +770,12 @@ private:
     LedGrammar     leds_;
     ChannelState   channels_[kMaxChannels];
     uint8_t        channel_count_ = 0;
+    // The AUX inputs that act as gesture sources: AUX2 and AUX3 (indices 1 and 2
+    // of `config_.aux`). AUX1 (index 0) is the programming/maintenance hold and is
+    // never serviced here. Sized to the whole table so an index is always in
+    // range; `aux_count_` bounds which entries are live.
+    AuxState       aux_[kMaxAuxButtons];
+    uint8_t        aux_count_ = 0;
 
     // Per-channel idle DAC codes, written at boot and returned to on release.
     uint16_t       idle_code_[kMaxChannels] = {};
@@ -789,22 +881,39 @@ private:
      */
     void ReportDacFault();
     /*
-     * FR-31's headless learn, and the AUX1 hold that enters and leaves it.
+     * (Re)build one AUX input's servicing state from its config entry. ONE home:
+     * `SeedChannelState` runs it for every AUX input on a config apply, and a
+     * headless AUX learn runs it for the one input it just wrote.
+     */
+    void SeedAuxState(uint8_t aux_index);
+    /*
+     * Apply what a headless learn produced (spec 7.4/7.5). A LADDER result is the
+     * channel's whole ladder and is assigned over it; a SWITCH result is one
+     * window written into the AUX input's `aux[]` entry. One home for both, so the
+     * two learn paths write a config the same way.
+     */
+    void ApplyLearnedResult(uint8_t wire_channel, bool is_ladder, const LadderProfile &profile);
+    /*
+     * FR-31's headless learn, and the AUX1 hold that arms and commits it.
      *
      * Everything here is what makes the device programmable with no phone: the
      * wizard is driven by the poll loop, the AUX1 hold is detected on raw ADC
      * reads (it must work even while a learn is running, so it cannot go through
      * the wizard's own classifier), and a commit is written straight to NVS.
+     *
+     * **The interaction is the 2022 one** (spec 7.5): hold AUX1, press the input
+     * being programmed, release AUX1. The target input is NAMED BY WHICH ONE LEFT
+     * ITS IDLE -- there is no menu and no channel selection -- which is how the
+     * 2022 `is_key_pressed()` named its key.
      */
     LearnWizard  wizard_;
     ConfigStore *store_ = nullptr;
     // The AUX1 level at the last tick, for the hold detector's edge.
     uint64_t     aux_hold_ms_ = 0;
     bool         aux_holding_ = false;
-    // Set when a hold has already toggled, cleared only on release. A continuous
-    // hold must toggle ONCE: `aux_holding_` alone would fire again on every tick
-    // past the threshold, and a user who held AUX1 a little long would exit the
-    // learn they had just entered.
+    // Set when a hold has already armed the wizard, cleared only on release. A
+    // continuous hold must arm ONCE: `aux_holding_` alone would re-arm on every
+    // tick past the threshold.
     bool         aux_hold_latch_ = false;
     /*
      * The maintenance state the LED_STAT pattern was last restated for.
@@ -829,10 +938,6 @@ private:
     // does exactly that in one tick) -- a sentinel cannot encode "restate owed"
     // for both desired values.
     bool         leds_owed_restat_ = false;
-    // The idle reference captured when a learn started (spec 3.4: the idle AS
-    // MEASURED AT LEARN TIME). Captured on entry, because during the prompt the
-    // user is holding the wheel button and the live reading is the pressed level.
-    int          learn_idle_mv_ = 0;
     // The last NTC temperature that converted successfully, in tenths of a degree
     // C (FR-1/N-67). Starts at the "not measured" sentinel and is only ever
     // advanced by a GOOD reading, so `SampleNtcTenthsC` can hold this value
@@ -840,21 +945,18 @@ private:
     // measured. Named for the NTC and not for learn because a future runtime
     // consumer wants the same hold.
     int16_t      last_ntc_tenths_c_ = kTempNotMeasuredTenths;
-    // Which channel a wizard learn is filling, and the last profile it committed
-    // -- kept so the link can report what the headless learn produced.
-    int          learn_channel_ = 0;
     /*
      * FR-33's maintenance window, and the sustained-AUX1 hold that opens it.
      *
      * Spec 8.2 nests the two holdings deliberately: 1.5 s is PROGRAMMING and 3 s
      * is MAINTENANCE, the shorter a subset of the longer, so holding too long to
      * program escalates cleanly into maintenance rather than into an undefined
-     * state. `maint_fired_latch_` is what makes the escalation one-way: the
-     * programming hold has already toggled the wizard by 3 s, and the maintenance
-     * entry must not be lost to it.
+     * state. `maint_fired_latch_` is what makes the escalation one-way.
      */
     MaintenanceMode  maintenance_;
     bool             maint_fired_latch_ = false;
+    // The channel a headless ladder learn last filled, and the profile it
+    // committed -- kept so the link can report what the learn produced.
     int          learned_channel_ = -1;
     LadderProfile learned_profile_{};
     // Whether the last commit reached NVS (see LastLearnPersisted).

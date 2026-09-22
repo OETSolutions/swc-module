@@ -70,6 +70,14 @@ int Aux1PressedMaxMv() {
     return p.buttons[0].mv_center + p.buttons[0].mv_tolerance;
 }
 
+// The ADC channel an AUX input's index names. AUX1..3 are contiguous in
+// `AdcChannel`, so the mapping is an offset rather than a switch, and the one
+// caller (`ServiceAux`) passes an index it has already bounded against
+// `aux_count_`.
+AdcChannel AuxAdcChannel(uint8_t aux_index) {
+    return static_cast<AdcChannel>(static_cast<int>(ADC_CH_AUX1) + aux_index);
+}
+
 
 }  // namespace
 
@@ -81,7 +89,7 @@ SystemOrchestrator::SystemOrchestrator(IHAL *hal, const Config &config,
       // FR-31's headless learn. Constructed with the SAME timings the channels
       // use, so "what counts as an AUX1 press" matches "what counts as a wheel
       // press" -- one debounce definition in the firmware.
-      wizard_(hal, &buzzer_, &leds_, Aux1ProfileDefault(), timings),
+      wizard_(hal, &buzzer_, &leds_),
       // Spec 8.2's default maintenance window (5 minutes). A config may carry a
       // different one; this default exists so a bare device still has a BOUNDED
       // window rather than an unbounded one.
@@ -351,6 +359,33 @@ void SystemOrchestrator::ReportDacFault() {
  * only `Boot` consults -- after boot, `pass_through_` has already been decided
  * and `ApplyConfig` never revives a disabled pass-through.
  */
+LadderProfile SystemOrchestrator::AuxProfileFor(const AuxButtonConfig &a) {
+    LadderProfile p{};
+    // An AUX input is a switch pulled to the rail and shorted to ground when
+    // pressed (spec 2.4: "electrically identical [to the SWC channels] but use a
+    // 1 kohm series resistor"), so its idle IS the rail. The nominal +3V3 is the
+    // same value `Aux1ProfileDefault` uses and for the same reason: this profile
+    // only has to answer "pressed vs not", not to be accurate about the rail.
+    p.source = a.source;
+    p.learned_idle_mv = kNominalRailMv;
+    p.count = 1;
+    std::strncpy(p.buttons[0].id, a.id, sizeof(p.buttons[0].id) - 1);
+    // A window whose centre is at or below zero is a config the validator should
+    // have refused; refuse to build a classifier from it rather than making every
+    // reading a match. An empty profile (count 0) classifies nothing, which is the
+    // safe direction: an AUX input with no window fires no binding.
+    const int centre = a.mv_center;
+    const int half = a.mv_tolerance;
+    if (centre <= 0 || half < 0) {
+        p.count = 0;
+        return p;
+    }
+    p.buttons[0].mv_center = static_cast<MilliVolt>(centre);
+    p.buttons[0].mv_tolerance = static_cast<MilliVolt>(half);
+    p.buttons[0].learned_at_rail_mv = kNominalRailMv;
+    return p;
+}
+
 bool SystemOrchestrator::SeedChannelState() {
     bool any_reference = false;
     for (uint8_t i = 0; i < channel_count_; ++i) {
@@ -416,7 +451,39 @@ bool SystemOrchestrator::SeedChannelState() {
             if (cs.pass_through_idle_mv > 0) any_reference = true;
         }
     }
+
+    // The AUX gesture inputs (AUX2/AUX3). Re-seeded here rather than only at Boot
+    // so a config that arrives over the link picks up its new windows, exactly as
+    // the wheel channels do -- one derivation, so the two paths cannot classify an
+    // AUX press differently.
+    //
+    // AUX1 (index 0) is deliberately NOT seeded: it is the programming and
+    // maintenance hold (spec 7.5/8.2), and a binding on it is refused by the
+    // validator, so servicing it as a gesture source would be a second meaning for
+    // the same switch.
+    aux_count_ = (config_.aux_count <= kMaxAuxButtons) ? config_.aux_count : kMaxAuxButtons;
+    for (uint8_t i = 0; i < aux_count_; ++i) SeedAuxState(i);
     return any_reference;
+}
+
+/*
+ * (Re)build one AUX input's servicing state from its config entry.
+ *
+ * **ONE home, because two callers must agree.** `SeedChannelState` runs it for
+ * every AUX input on a config apply, and a headless learn of an AUX switch runs it
+ * for the one input it just wrote -- where the config has changed without going
+ * through `ApplyConfig`. Deriving the classifier in two places is how the two
+ * would drift about what counts as a press on that switch.
+ */
+void SystemOrchestrator::SeedAuxState(uint8_t aux_index) {
+    if (aux_index >= kMaxAuxButtons || aux_index >= aux_count_) return;
+    AuxState &as = aux_[aux_index];
+    as.classifier = PressClassifier(AuxProfileFor(config_.aux[aux_index]), timings_);
+    as.gestures = GestureStateMachine(timings_);
+    as.reader.Bind(*hal_, AuxAdcChannel(aux_index));
+    // The same per-press latch reset the channels do, and for the same reason: a
+    // stale latch would swallow the first report of a press on the new window.
+    as.unknown_reported = false;
 }
 
 void SystemOrchestrator::Boot() {
@@ -705,6 +772,9 @@ void SystemOrchestrator::Tick(uint64_t now_ms) {
     for (uint8_t i = 0; i < channel_count_; ++i) {
         ServiceChannel(i, now_ms);
     }
+    // The AUX gesture inputs, after the wheel channels so a shared resolve cannot
+    // reorder what the head unit sees from a single tick's presses.
+    ServiceAux(now_ms);
     // FR-31: after the channels, so a learn commit is applied before the next
     // tick classifies against the new profile.
     ServiceLearn(now_ms);
@@ -736,8 +806,11 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
     const bool aux_pressed = (aux_mv >= 0) && (aux_mv < Aux1PressedMaxMv());
 
     // The rising edge starts the hold clock; any release clears it. A hold that
-    // survives to kEnterHoldMs TOGGLES the wizard, which is what lets the same
-    // gesture both enter and leave (spec 7.4 step 5).
+    // survives to kEnterHoldMs ARMS the wizard (spec 7.5), and the RELEASE that
+    // follows is what commits (spec 7.5: "release the button -> the setting is
+    // stored"). The hold no longer toggles a modal state -- the interaction is
+    // stateless from the user's side, which is what the 2022 design did and what
+    // avoids colliding with the 3 s maintenance tier.
     if (aux_pressed) {
         if (!aux_holding_) {
             aux_holding_ = true;
@@ -747,58 +820,33 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
             // below sets `aux_hold_latch_`, so a separate "already fired" branch
             // ahead of this one would swallow every tick after the programming
             // hold and the 3 s tier would be UNREACHABLE -- the escalation spec
-            // 8.2 requires would silently never happen. (It did not, until
-            // measured.) The two tiers are one escalation, so they share one
-            // latch-checked chain rather than each guarding itself.
+            // 8.2 requires would silently never happen.
+            //
             // Spec 8.2 nests the two holdings: 1.5 s is PROGRAMMING and 3 s is
             // MAINTENANCE, the shorter a subset of the longer, so holding too long
-            // to program escalates cleanly into maintenance rather than into an
-            // undefined state. By 3 s the programming hold has already toggled the
-            // wizard, so this must fire on its own latch and leave the wizard
-            // alone -- otherwise a long hold would enter programming and then
-            // immediately exit it again.
+            // to program escalates cleanly into maintenance. **A user who over-held
+            // is trying to reach maintenance, not to finish a programming session**,
+            // so a running learn is ABANDONED (no commit) before the window opens --
+            // committing here would store a half-measured button the user was not
+            // trying to complete.
             maint_fired_latch_ = true;
             if (wizard_.Active()) {
-                // Leave the learn first: a user who over-held is trying to reach
-                // maintenance, not to abandon a half-finished programming session
-                // in a state they cannot see.
-                wizard_.Exit(now_ms);
+                wizard_.Abandon(now_ms);
             }
             maintenance_.Enter(MaintenanceTrigger::kAux1Hold, now_ms);
         } else if ((now_ms - aux_hold_ms_) >= LearnWizard::kEnterHoldMs && !aux_hold_latch_) {
-            // Consume the edge. The LATCH, not this flag, is what prevents a
-            // second toggle: the flag is cleared so the next release re-arms.
+            // The hold has armed the wizard. The LATCH, not this flag, prevents a
+            // second arm: the flag is cleared so the next release re-arms.
             aux_hold_latch_ = true;
-            if (wizard_.Active()) {
-                wizard_.Exit(now_ms);
-            } else {
-                // The learn's idle reference is captured HERE, on entry, because
-                // spec 3.4 wants the idle AS MEASURED AT LEARN TIME. At this
-                // instant the wheel is still idle (the user is holding AUX1, not a
-                // wheel button), so the live reading is the denominator the commit
-                // will store as `learned_idle_mv` -- the app-driven path captures
-                // the same quantity. Reading it later, during the prompt, would
-                // sample the pressed level instead.
-                const int live = hal_->adc_read_mv(
-                    hal_->ctx, (learn_channel_ == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2);
-                // A zero reading means the ADC is unreadable, so fall back to the
-                // channel's tracked idle reference rather than committing a learn
-                // whose denominator is 0. Both are live idles; neither is the
-                // stored `learned_idle_mv`, which is the value a re-learn corrects.
-                learn_idle_mv_ = (live > 0)
-                                     ? live
-                                     : IdleReferenceMv(static_cast<uint8_t>(learn_channel_));
-                // The channel's CURRENT ladder seeds the session. `Commit`'s
-                // profile replaces the channel's ladder wholesale, so a learn that
-                // did not start from the existing buttons would DELETE them: a user
-                // re-measuring one button would lose the rest. The wizard has no
-                // Config of its own, so the caller supplies it.
-                const bool ch_ok = (learn_channel_ >= 0) && (learn_channel_ < channel_count_);
-                wizard_.Enter(now_ms, /*aux_held=*/true,
-                              ch_ok ? &config_.channels[learn_channel_].ladder : nullptr);
-            }
+            if (!wizard_.Active()) wizard_.Arm(now_ms);
         }
     } else {
+        // AUX1 released: COMMIT whatever was being programmed (spec 7.5). Done
+        // here, on the release edge, rather than in the wizard, because the hold
+        // detector is what sees the edge.
+        if (wizard_.Active() && aux_holding_) {
+            wizard_.Release(now_ms);
+        }
         aux_holding_ = false;
         aux_hold_latch_ = false;
         maint_fired_latch_ = false;
@@ -858,25 +906,106 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
     }
 
     if (wizard_.Active()) {
-        // A learn with no usable idle reference cannot measure anything: the
-        // press detector would compare a reading against zero and call every
-        // level "pressed", then commit a window computed from a fabricated
-        // denominator. Refusing is the same direction FR-12 takes.
-        if (learn_idle_mv_ > 0) {
-            wizard_.Tick(learn_channel_, now_ms, learn_idle_mv_, SampleNtcTenthsC());
+        // The candidate inputs, each with its LIVE idle -- the wizard judges
+        // "which one left idle" against these, so a cached value would compare a
+        // reading to a stale denominator. SWC1/SWC2 are ladders (their button ids
+        // are generated); AUX2/AUX3 are switches and carry their config ids.
+        // AUX1 is the modifier and is deliberately absent.
+        LearnInputs inputs;
+        for (uint8_t i = 0; i < channel_count_ && i < kMaxChannels && inputs.count < kMaxLearnInputs;
+             ++i) {
+            LearnInput &in = inputs.in[inputs.count++];
+            in.wire_channel = i;
+            in.adc = (i == 0) ? ADC_CH_SWC1 : ADC_CH_SWC2;
+            in.idle_mv = IdleReferenceMv(i);
+            in.is_ladder = true;
+            in.existing = &config_.channels[i].ladder;
+            in.id = nullptr;
         }
+        for (uint8_t i = 1; i < aux_count_ && i < kMaxAuxButtons && inputs.count < kMaxLearnInputs;
+             ++i) {
+            LearnInput &in = inputs.in[inputs.count++];
+            in.wire_channel = AuxWireChannel(i);
+            in.adc = AuxAdcChannel(i);
+            // An AUX switch's idle IS the rail (spec 2.4), and its live reading is
+            // the reference the classifier normalizes against (`ServiceAux` uses
+            // the same constant, so the two cannot disagree).
+            in.idle_mv = kNominalRailMv;
+            in.is_ladder = false;
+            in.existing = nullptr;
+            in.id = config_.aux[i].id;
+        }
+        wizard_.Tick(inputs, now_ms, SampleNtcTenthsC());
     }
 
     if (wizard_.ConsumeCommitted()) {
-        learned_channel_ = learn_channel_;
-        learned_profile_ = wizard_.Profile();
-        ApplyLearnedProfile(learn_channel_, learned_profile_);
+        ApplyLearnedResult(wizard_.TargetWireChannel(), wizard_.TargetIsLadder(),
+                           wizard_.Profile());
     }
     if (wizard_.ConsumeExited()) {
         // The wizard drove the LEDs for its prompts; hand them back so the normal
         // grammars resume rather than leaving a stale solid LED2 behind.
         leds_.Set2(Led2Pattern::kOff);
     }
+}
+
+/*
+ * Apply what a headless learn just produced. TWO kinds of result, because a
+ * headless learn serves two kinds of input (spec 7.4/7.5):
+ *
+ *  - a LADDER (SWC1/SWC2): the profile is the channel's whole ladder (seed plus
+ *    the measured button), so it is ASSIGNED over the channel's ladder and the
+ *    channel is re-seeded;
+ *  - a SWITCH (AUX2/AUX3): the profile holds one measured window, which is
+ *    written into that AUX input's `aux[]` entry -- an AUX input's window IS its
+ *    config (spec 3.1), not a ladder.
+ *
+ * The one home for both is here, so the two learn paths (this and
+ * `CommandRouter::HandleLearnCommit`) write a config the same way.
+ */
+void SystemOrchestrator::ApplyLearnedResult(uint8_t wire_channel, bool is_ladder,
+                                            const LadderProfile &profile) {
+    if (is_ladder) {
+        const int channel = static_cast<int>(wire_channel);
+        if (channel < 0 || channel >= channel_count_) return;
+        learned_channel_ = channel;
+        learned_profile_ = profile;
+        ApplyLearnedProfile(channel, profile);
+        return;
+    }
+
+    // A switch: find the `aux[]` entry this wire channel names and write the
+    // measured window into it. The wire channel is `kAuxWireChannelBase + index`.
+    const int aux_index = static_cast<int>(wire_channel) - static_cast<int>(kAuxWireChannelBase);
+    if (aux_index < 0 || aux_index >= kMaxAuxButtons) return;
+    if (profile.count == 0) return;
+    const LadderButton &b = profile.buttons[0];
+
+    if (aux_index >= config_.aux_count) {
+        // The input is present in the hardware but has never been configured, so
+        // there is no entry to write. Grow the table to include it, which is what
+        // learning an AUX switch for the first time means.
+        config_.aux_count = static_cast<uint8_t>(aux_index + 1);
+        memset(&config_.aux[aux_index], 0, sizeof(config_.aux[aux_index]));
+    }
+    AuxButtonConfig &a = config_.aux[aux_index];
+    // The id, if the entry had none -- a fresh entry needs one, and the learn
+    // generated `aux<n>` for exactly this.
+    if (a.id[0] == '\0' && b.id[0] != '\0') {
+        strncpy(a.id, b.id, sizeof(a.id) - 1);
+    }
+    a.source = static_cast<uint8_t>(aux_index + 1);   // 1-based, spec 3.1
+    a.mv_center = static_cast<int16_t>(b.mv_center);
+    a.mv_tolerance = static_cast<int16_t>(b.mv_tolerance);
+
+    // Re-seed the AUX servicing state so the new window takes effect on the next
+    // tick rather than at the next boot.
+    SeedAuxState(static_cast<uint8_t>(aux_index));
+
+    // Persist, and report durability the same way the ladder path does -- the
+    // RESULT of Save, not the pointer.
+    persisted_ = (store_ != nullptr) && store_->Save(config_);
+    if (persisted_) NoteConfigCommitted();
 }
 
 void SystemOrchestrator::ApplyLearnedProfile(int channel, const LadderProfile &profile) {
@@ -939,6 +1068,40 @@ void SystemOrchestrator::ApplyLearnedProfile(int channel, const LadderProfile &p
     if (persisted_) NoteConfigCommitted();
 }
 
+GestureBindings SystemOrchestrator::AuxBindingsForInput(uint8_t aux_index,
+                                                       const char *input_id) const {
+    GestureBindings out;
+    // The conservative default, like `BindingsForButton`: a caller that cannot
+    // name the input must not have its press resolved early.
+    out.has_double = true;
+    out.has_long = true;
+    if (aux_index >= aux_count_ || config_.binding_count > kMaxBindings) return out;
+    // On release the input's own id is supplied by the caller; the gesture
+    // machine holds the press's button index, which for an AUX input is 0 (its
+    // only button). Both name the same input, so use the config's id.
+    const char *id = input_id;
+    if (id == nullptr) {
+        if (aux_[aux_index].gestures.Button() != 0) return out;
+        id = config_.aux[aux_index].id;
+    }
+    if (id[0] == '\0') return out;
+    const uint8_t as_aux =
+        static_cast<uint8_t>(BindingChannel::kAux1) + aux_index;
+    out.has_double = false;
+    out.has_long = false;
+    for (uint8_t i = 0; i < config_.binding_count; ++i) {
+        const Binding &b = config_.bindings[i];
+        if (!b.enabled) continue;
+        if (b.channel != as_aux && b.channel != static_cast<uint8_t>(BindingChannel::kAny)) {
+            continue;
+        }
+        if (strcmp(b.button, id) != 0) continue;
+        if (b.gesture == Gesture::kDouble) out.has_double = true;
+        if (b.gesture == Gesture::kLong) out.has_long = true;
+    }
+    return out;
+}
+
 void SystemOrchestrator::ReportGesture(uint8_t index, const GestureEvent &ev, int level_mv) {
     if (gesture_sink_ == nullptr) return;
 
@@ -958,6 +1121,97 @@ void SystemOrchestrator::ReportGesture(uint8_t index, const GestureEvent &ev, in
     const char *id = config_.channels[index].ladder.buttons[ev.button_index].id;
     const GestureEventRecord rec{index, id, ev.gesture, level_mv, ev.at_ms};
     gesture_sink_(gesture_sink_ctx_, rec);
+}
+
+void SystemOrchestrator::ReportInputGesture(uint8_t wire_channel, const char *button_id,
+                                            Gesture g, int level_mv, uint64_t at_ms) {
+    if (gesture_sink_ == nullptr) return;
+    const GestureEventRecord rec{wire_channel, button_id, g, level_mv, at_ms};
+    gesture_sink_(gesture_sink_ctx_, rec);
+}
+
+/*
+ * The AUX gesture inputs (AUX2/AUX3), spec 3.1/3.5.
+ *
+ * An AUX input is a switch, not a ladder, so this is simpler than
+ * `ServiceChannel`: one window, no pass-through (spec 6.9's pass-through is a
+ * property of an unconfigured WHEEL), no servo. What it shares is the parts that
+ * must not have two implementations -- the classifier, the gesture machine, the
+ * FR-12 unknown report and the binding resolve.
+ *
+ * **AUX1 is not serviced here.** It is the programming hold (1.5 s) and the
+ * maintenance hold (3 s) per spec 7.5/8.2, so it starts at index 1.
+ */
+void SystemOrchestrator::ServiceAux(uint64_t now_ms) {
+    // While the headless learn is armed, an AUX press is being TAUGHT, not driven
+    // -- the same suppression `ServiceChannel` applies, for the same reason: the
+    // user holds AUX1 to program, so a press during the hold must not fire a
+    // binding. The readers still run so the wizard's own detection sees the level.
+    if (wizard_.Active()) {
+        for (uint8_t i = 0; i < aux_count_; ++i) aux_[i].reader.Update(now_ms);
+        return;
+    }
+    for (uint8_t i = 1; i < aux_count_; ++i) {
+        AuxState &as = aux_[i];
+        const AuxButtonConfig &ac = config_.aux[i];
+
+        // FR-3's filter, the same one the wheel channels use, so AUX noise
+        // rejection has one definition.
+        as.reader.Update(now_ms);
+        const MilliVolt level_mv = as.reader.Value();
+        // Idle is the rail for a switch to ground, and `AuxProfileFor` stores it
+        // as the profile's `learned_idle_mv`; the classifier normalizes against
+        // the SAME value so an AUX press is measured on the scale its window was
+        // written in.
+        const int idle_mv = kNominalRailMv;
+        const ChannelLevel level = as.classifier.Update(level_mv, idle_mv, now_ms);
+
+        // The pressed input's own bindings, with the same per-button granularity
+        // the channels use (spec 6.6 rule 3). An AUX input has one button, so the
+        // index is always 0 -- but the gesture machine's tracked button is read on
+        // release, so this is not a constant.
+        GestureBindings for_button;
+        {
+            const char *pressed_id = (level == ChannelLevel::kPressed) ? ac.id : nullptr;
+            for_button = AuxBindingsForInput(i, pressed_id);
+        }
+        GestureEvent ev{};
+        const bool fired = as.gestures.Update(level, as.classifier.ButtonIndex(), now_ms, &ev,
+                                              for_button);
+
+        if (level == ChannelLevel::kUnknown) {
+            if (!as.unknown_reported) {
+                as.unknown_reported = true;
+                // FR-12 for an AUX input: a press outside the window is reported
+                // with a null button, exactly as an unlearned wheel level is. The
+                // level is not a learned button's, so naming one would be the guess
+                // FR-12 forbids.
+                ReportInputGesture(AuxWireChannel(i), nullptr, Gesture::kNone, level_mv, now_ms);
+                buzzer_.Play(BuzzerPattern::kKeyUnknown);
+            }
+        } else {
+            as.unknown_reported = false;
+        }
+
+        if (!fired) continue;
+
+        const ResolvedBinding resolved = BindingResolveAux(config_, i, ev);
+        ReportInputGesture(AuxWireChannel(i), ac.id, ev.gesture, level_mv, ev.at_ms);
+        if (resolved.found) {
+            // AUX actions drive KEY channel 0: the spec gives an AUX input no
+            // output line of its own, and the primary head-unit input is the
+            // choice that needs no new config field.
+            RunBindingActions(0, resolved, hal_->adc_read_mv(hal_->ctx, ADC_CH_KEY_SENSE1),
+                              now_ms);
+        } else {
+            // Recognised but unbound: spec 6.6 rule 4's pass-through is a property
+            // of the WHEEL's own level, and an AUX switch has no ladder level to
+            // present, so there is nothing for the head unit to see. The press is
+            // reported (above) and otherwise inert -- which is the honest
+            // behaviour, not a fabricated key voltage.
+            buzzer_.Play(BuzzerPattern::kKeyUnknown);
+        }
+    }
 }
 
 bool SystemOrchestrator::TestDriveKeyMv(uint8_t channel_index, int key_mv, uint32_t hold_ms,
@@ -1311,6 +1565,31 @@ bool SystemOrchestrator::PresentLevel(uint8_t index, int level_mv, int wheel_idl
 void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     ChannelState &cs = channels_[index];
     const ChannelConfig &cc = config_.channels[index];
+
+    /*
+     * **While the headless learn is armed, no press drives the radio.** The 2022
+     * firmware suppressed output whenever the modifier was held
+     * (`!is_program_button_pressed` guarded every transition to `SEND_KEY_VALUE`),
+     * and the reason is the same here: the user holds AUX1 to program, and any
+     * button they press during that hold is being TAUGHT, not driven. The head
+     * unit must not receive it.
+     *
+     * Without this the button being learned is delivered to the radio on every
+     * press of the learn -- the phantom-key hazard FR-39 exists to prevent,
+     * arriving from the one path whose whole purpose is "nothing is being pressed
+     * for real".
+     *
+     * The SAFETY releases still run (a pulse timeout, a lost head unit), because
+     * they are not classification: a key driven before the learn started must
+     * still be let go. `cs.gestures.Reset()` discards any half-recognised gesture
+     * so a press in flight when the learn began cannot complete afterwards.
+     */
+    if (wizard_.Active()) {
+        cs.reader.Update(now_ms);
+        if (cs.key_driven && now_ms >= cs.key_released_at_ms) ReleaseKey(index);
+        cs.gestures.Reset();
+        return;
+    }
 
     // Spec 3.4: `Channel.enabled` gates whether this channel's LEARNED LADDER is
     // classified -- "this channel has no learned ladder to compare against, do not

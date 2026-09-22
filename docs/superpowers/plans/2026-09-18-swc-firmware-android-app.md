@@ -7703,6 +7703,23 @@ short) even though macOS accepts it. Format into a 32-byte local and copy with a
 explicit bound. The host toolchain is more permissive here than the device one, so
 this class of error is invisible until the device build.
 
+**CORRECTION 2026-09-24 (open item N-23, resolved): "AUX1 as the select button"
+above is superseded — there is NO selection at all.** The step above was written
+against §7.4's then-current slot menu (AUX1 press-count picks the *n*-th button),
+and its `PressClassifier`-on-AUX1 machinery is gone. The wizard now takes a
+`LearnInputs` list and **names the target by which input LEFT ITS IDLE**, exactly
+as the 2022 `is_key_pressed()` did — the user's own words: *"You just hold the
+aux1 button and then do the gesture on whichever swc_in switch you're working
+with. No complicated menu or selecting which one, just do it."* So the
+`GestureTimings` constructor parameter is dropped (the wizard debounces nothing),
+AUX2/AUX3 become learn targets too (switch windows, not ladder entries), and
+`SystemOrchestrator`'s `learn_channel_`/`learn_idle_mv_` members are deleted in
+favour of the wizard's detected `target_wire_channel_`. Two further fixes ride
+with it: presses during an armed learn no longer drive the radio (both
+`ServiceChannel` and `ServiceAux` suppress output — the 2022 `!is_program_button_pressed`
+guard), and the re-learn match is by VOLTAGE rather than id. The test count below
+is now 35 `LearnWizard` tests; see §7.4 for the full rationale.
+
 Run: `cd code && pio test -e native -f '*test_learning'`
 Expected: PASS — 36 tests green (14 `LearnSession` + 22 `LearnWizard`).
 

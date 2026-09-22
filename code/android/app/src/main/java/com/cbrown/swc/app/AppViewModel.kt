@@ -313,12 +313,31 @@ class AppViewModel(
                     // windows -- reporting the wrong button for a perfectly healthy
                     // second wheel. The label and the bands must move together or
                     // neither.
-                    val shown = ladderFor(client.config.value, channel)
-                    _ladder.value = _ladder.value.copy(
-                        liveMv = level,
+                    //
+                    // **Only a WHEEL channel has a ladder to plot.** An AUX press
+                    // (wire channels 2/3/4) is a switch, not a ladder: it has no
+                    // learned windows and no rail to scale against, so feeding its
+                    // level into this view would plot a ~100 mV switch closure
+                    // against the wheel's ~2835 mV idle and draw every band in the
+                    // wrong place. A frame the firmware could not name a channel
+                    // for is the same case. The AUX press is still fully handled
+                    // below (its app-side actions run); only the BANDS AND RAIL are
+                    // left alone.
+                    //
+                    // The READING still updates either way: `level_mv` is real
+                    // whatever the channel, and leaving the view frozen at its last
+                    // value would look like a device that stopped seeing presses.
+                    val shown = if (channel != null && channel < 2)
+                        ladderFor(client.config.value, channel) else null
+                    val next = _ladder.value.copy(liveMv = level)
+                    _ladder.value = if (shown == null) next else next.copy(
                         idleMv = shown.idleMv,
                         channelName = shown.channelName,
                         buttons = shown.buttons,
+                    )
+                    // The gesture label always follows, for the same reason as the
+                    // reading: it describes the press, not the scale.
+                    _ladder.value = _ladder.value.copy(
                         lastGesture = Gesture.fromWireName(gesture) ?: Gesture.NONE,
                         lastGestureButton = id,
                     )
@@ -508,10 +527,21 @@ class AppViewModel(
         val asSwc = when (channelIndex) {
             0 -> BindingChannel.SWC1
             1 -> BindingChannel.SWC2
+            // An AUX press names its input AFTER the two wheel channels: the
+            // firmware encodes AUX1..3 as `kAuxWireChannelBase + index`, i.e.
+            // 2/3/4. That base is `kMaxChannels` (SystemOrchestrator.h), and the
+            // firmware's `ServiceAux` only ever emits AUX2 (3) and AUX3 (4) as
+            // gesture events -- AUX1 is the programming hold and is not a gesture
+            // source. Decoding all three keeps the app's map the inverse of the
+            // firmware's, rather than silently mismatching an index.
+            in 2..4 -> when (channelIndex) {
+                2 -> BindingChannel.AUX1
+                3 -> BindingChannel.AUX2
+                else -> BindingChannel.AUX3
+            }
             // An unknown or absent channel cannot be matched against a binding's
-            // channel field without guessing. The firmware only resolves the two SWC
-            // channels here (an AUX input has no ladder and never arrives as a
-            // channel index), so anything else matches nothing but `ANY`.
+            // channel field without guessing. Anything else matches nothing but
+            // `ANY`.
             else -> null
         }
         // ONLY THE FIRST matching binding, mirroring `BindingResolve`, which
@@ -625,7 +655,7 @@ class AppViewModel(
         // behaviour a `NONE` cell could bind, and no cell is offered for it. A
         // config carrying a `NONE` binding still round-trips untouched.
         val gestures = listOf(Gesture.SINGLE, Gesture.DOUBLE, Gesture.LONG)
-        return config.channels.flatMapIndexed { index, channel ->
+        val ladderCells = config.channels.flatMapIndexed { index, channel ->
             val asSwc = swcChannel(index) ?: return@flatMapIndexed emptyList()
             channel.ladder.buttons.flatMap { b ->
                 gestures.map { g ->
@@ -641,6 +671,48 @@ class AppViewModel(
                     )
                 }
             }
+        }
+        // The AUX gesture inputs (spec 3.1/3.5). AUX2 and AUX3 are bindable; AUX1
+        // is NOT, because it carries the programming (1.5 s) and maintenance (3 s)
+        // holds (spec 7.5/8.2) and the firmware's validator refuses a binding on
+        // it. Offering an AUX1 cell would let the user make an edit the device
+        // rejects -- so the grid starts at index 1, the same place the firmware's
+        // `ServiceAux` starts.
+        //
+        // Each AUX input carries exactly ONE button (its own id), so unlike a
+        // ladder there is no per-button fan-out: three cells, one per gesture.
+        val auxCells = config.aux.drop(1).flatMap { a ->
+            val channel = auxChannelFor(config, a.id) ?: return@flatMap emptyList()
+            gestures.map { g ->
+                val key = editKey(channel, a.id, g.wireName)
+                val edit = pendingEdits[key]
+                BindingCell(
+                    channel = channel,
+                    buttonId = a.id,
+                    buttonName = a.id,
+                    gesture = g.wireName,
+                    action = if (pendingEdits.containsKey(key)) edit
+                    else resolvedBindingFor(config, channel, a.id, g)?.actions?.firstOrNull(),
+                )
+            }
+        }
+        return ladderCells + auxCells
+    }
+
+    /**
+     * The binding channel an AUX input id names, or null when the config's `aux`
+     * table does not hold it.
+     *
+     * The index in `cfg.aux` is what selects AUX1/AUX2/AUX3 (spec 3.1), so the
+     * lookup is by identity of the entry, not by parsing its id.
+     */
+    private fun auxChannelFor(config: Config, auxId: String): BindingChannel? {
+        val at = config.aux.indexOfFirst { it.id == auxId }
+        return when (at) {
+            0 -> BindingChannel.AUX1
+            1 -> BindingChannel.AUX2
+            2 -> BindingChannel.AUX3
+            else -> null
         }
     }
 
@@ -845,17 +917,25 @@ class AppViewModel(
     }
 
     /**
-     * Whether [buttonId] is on the ladder [channel] names.
+     * Whether [buttonId] is on the input [channel] names.
      *
-     * Only SWC1/SWC2 have ladders, so those are the two channels this can answer
-     * for; an AUX button is a separate table (`cfg.aux`) and never appears in the
-     * bindings grid, so it never reaches here. A channel with no ladder (an index
-     * past the two, or AUX) answers false.
+     * For SWC1/SWC2 that is the channel's ladder; for AUX1/AUX2/AUX3 it is that
+     * entry of `cfg.aux`, whose id is the input's single button. A channel with no
+     * such input answers false.
+     *
+     * The firmware's `BindingNamesARealInput` accepts an id that is on ANY channel
+     * or in ANY AUX entry, so it does not enforce that a binding's button belongs
+     * to the input its channel names; a mismatch would be stored and then never
+     * resolve. This is the stricter, per-input check the save relies on.
      */
     private fun buttonOnThatLadder(config: Config, channel: BindingChannel, buttonId: String): Boolean {
         val index = when (channel) {
             BindingChannel.SWC1 -> 0
             BindingChannel.SWC2 -> 1
+            BindingChannel.AUX1, BindingChannel.AUX2, BindingChannel.AUX3 -> {
+                val at = channel.ordinal - BindingChannel.AUX1.ordinal
+                return config.aux.getOrNull(at)?.id == buttonId
+            }
             else -> return false
         }
         val ch = config.channels.getOrNull(index) ?: return false

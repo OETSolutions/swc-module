@@ -346,6 +346,14 @@ object ConfigJson {
             // check belongs here where the user can see it.
             if (b.id.length >= K_BINDING_ID_LEN)
                 out += "binding '${b.id}': id must be under $K_BINDING_ID_LEN chars"
+            // AUX1 carries the programming (1.5 s) and maintenance (3 s) holds
+            // (spec 7.5/8.2), so the firmware REFUSES a binding on it
+            // (`ConfigValidate`). Refusing here keeps the app's gate at parity:
+            // otherwise the edit reaches the device and the whole save is nacked
+            // with the offending binding unnamed. AUX2/AUX3 are bindable.
+            if (b.channel == BindingChannel.AUX1)
+                out += "binding '${b.id}': AUX1 is the programming button and cannot be bound " +
+                    "(use AUX2 or AUX3)"
             if (b.actions.size > K_MAX_ACTIONS_PER_BINDING)
                 out += "binding '${b.id}': at most $K_MAX_ACTIONS_PER_BINDING actions"
             b.actions.forEach { a ->

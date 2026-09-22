@@ -157,6 +157,13 @@ bool ConfigValidate(const Config &c) {
         const Binding &b = c.bindings[i];
         if (b.action_count > kMaxActionsPerBinding) return false;
         if (b.channel >= static_cast<uint8_t>(BindingChannel::kAny) + 1) return false;
+        // **AUX1 carries two holds and cannot also be a gesture source.** Spec
+        // 7.5 gives AUX1 the 1.5 s programming hold and spec 8.2 the 3 s
+        // maintenance hold; a binding on the same switch would be ambiguous with
+        // those, so it is REFUSED here rather than accepted and then never fired
+        // (which is what the whole AUX family used to do, open item N-26). AUX2
+        // and AUX3 have no other role and ARE bindable.
+        if (b.channel == static_cast<uint8_t>(BindingChannel::kAux1)) return false;
         // `button` is a LadderButton.id, "NONE", or -- for the AUX inputs -- an
         // AUX id. A binding that names neither is a binding to nothing, which
         // would silently never fire; refuse it instead.

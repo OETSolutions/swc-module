@@ -155,6 +155,24 @@ class AppViewModelTest {
     }
 
     @Test
+    fun `an event frame carries the live idle the device classified against`() = runTest {
+        // Open item N-25's wire half. `matched()` reproduces `LadderClassify` by
+        // normalizing the reading against the LIVE idle and the windows against the
+        // LEARNED rail, so the event's `idle_mv` has to reach the state. Without it
+        // the view falls back to the learned rail and disagrees with the device the
+        // moment the rail moves.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(frame("event", "channel" to "0", "button" to "\"vol_up\"",
+            "gesture" to "\"SINGLE\"", "t_ms" to "5", "level_mv" to "1500", "idle_mv" to "2977"))
+        advanceUntilIdle()
+
+        assertEquals(2977, vm.ladder.value.liveIdleMv)
+    }
+
+    @Test
     fun `a config reply populates the ladder window and the bindings grid`() = runTest {
         // The screens render from the config. Before this wiring the ladder showed
         // no buttons and the bindings grid showed no cells, which is exactly what a
@@ -201,6 +219,48 @@ class AppViewModelTest {
             "a config fallback must reach the user, not just the state object",
             vm.link.value.configWarning,
         )
+    }
+
+    @Test
+    fun `a status frame carries the board temperature and free heap to the screen`() = runTest {
+        // Open item N-22's last two fields. Both were declared in spec 4.3 and
+        // produced by nothing, so the app could not show them. Now they arrive and
+        // must reach the state the Link screen renders -- a value the transport
+        // delivers and the app forgets is the same "produced, consumed by nobody"
+        // shape the loss counters were.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(
+            frame(
+                "status",
+                "config_state" to "\"ok\"",
+                "temp_c" to "23.5",
+                "heap_free" to "123456",
+            ),
+        )
+        advanceUntilIdle()
+
+        assertEquals(23.5, vm.link.value.lastTempC!!, 1e-6)
+        assertEquals(123456L, vm.link.value.lastHeapFree)
+    }
+
+    @Test
+    fun `a null temperature reads as no reading, never as zero degrees`() = runTest {
+        // The firmware reports JSON null until an NTC conversion is good, because
+        // 0 C is a LEGAL temperature. The app must keep that distinction: folding
+        // null to 0.0 would show a measured freezing board for a device that has
+        // measured nothing.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(frame("status", "config_state" to "\"ok\"", "temp_c" to "null", "heap_free" to "9"))
+        advanceUntilIdle()
+
+        assertNull("a JSON-null temperature is `no reading`", vm.link.value.lastTempC)
+        assertEquals(9L, vm.link.value.lastHeapFree)
     }
 
     @Test

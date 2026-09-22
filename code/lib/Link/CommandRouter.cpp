@@ -381,11 +381,46 @@ void CommandRouter::EmitStatusBody(bool with_for_seq, uint32_t for_seq) {
     // layer down. `tx_dropped` is N-24's outbound twin.
     const uint32_t tx_dropped = (cdc_ != nullptr) ? cdc_->DroppedFrames() : 0u;
     const uint32_t rx_overflows = (cdc_ != nullptr) ? cdc_->RxOverflows() : 0u;
-    char body[288];
+    // Spec 4.3's two diagnostic fields (open item N-22). `temp_c` is the last
+    // good NTC reading, written as a DECIMAL exactly as the config codec writes
+    // `temp_c_at_learn` (ConfigCodec.cpp's `AddTenths`): one wire convention for a
+    // temperature, so a reader parses both the same way. The device keeps tenths
+    // internally; the split is done with integer math because the xtensa `printf`
+    // is the newlib-nano one with `%f` disabled, and a `%f` here would print
+    // nothing at all on the device while working on the host.
+    // Read from the orchestrator rather than sampled here, so formatting a
+    // keepalive never triggers an ADC conversion as a side effect -- and the
+    // sentinel (no reading) is reported as JSON null, never a fabricated 0 C.
+    // `heap_free` comes from the HAL, the only layer that knows the platform's
+    // allocator; null means the platform could not answer.
+    const int temp_tenths = (sys_ != nullptr) ? sys_->LastNtcTenthsC() : 0;
+    const bool have_temp = (sys_ != nullptr) && (temp_tenths != SystemOrchestrator::kTempNotMeasuredTenths);
+    char temp_field[24];
+    if (have_temp) {
+        const int whole = temp_tenths / 10;
+        int frac = temp_tenths % 10;
+        const char *sign = "";
+        if (temp_tenths < 0) {
+            // C integer division truncates toward zero, so a negative tenths
+            // gives a negative whole and a negative remainder; take the absolute
+            // remainder and keep the sign on the whole part so "-0.5" is written
+            // "-0.5" and not "0.-5".
+            if (frac < 0) frac = -frac;
+            if (whole == 0) sign = "-";
+            snprintf(temp_field, sizeof(temp_field), "%s%d.%d", sign, whole, frac);
+        } else {
+            snprintf(temp_field, sizeof(temp_field), "%d.%d", whole, frac);
+        }
+    } else {
+        snprintf(temp_field, sizeof(temp_field), "null");
+    }
+    const uint32_t heap_free = (hal_ != nullptr && hal_->heap_free != nullptr)
+                                   ? hal_->heap_free(hal_->ctx) : 0u;
+    char body[352];
     snprintf(body, sizeof(body),
              "%s\"vbus_present\":%s,\"gain_mode\":\"%s\",\"uptime_ms\":%llu,"
              "\"config_state\":\"%s\",\"output_safe\":%s,"
-             "\"tx_dropped\":%u,\"rx_overflows\":%u",
+             "\"tx_dropped\":%u,\"rx_overflows\":%u,\"temp_c\":%s,\"heap_free\":%u",
              reply_field, vbus ? "true" : "false",
              (sys_ != nullptr) ? (sys_->ChannelGainMode(0) == GainMode::kAmplified ? "amplified"
                                                                                   : "tracking")
@@ -393,7 +428,8 @@ void CommandRouter::EmitStatusBody(bool with_for_seq, uint32_t for_seq) {
              static_cast<unsigned long long>(hal_ ? hal_->now_ms(hal_->ctx) : 0ULL),
              cfg,
              ((sys_ != nullptr) && sys_->SafeIdleEstablished()) ? "true" : "false",
-             static_cast<unsigned>(tx_dropped), static_cast<unsigned>(rx_overflows));
+             static_cast<unsigned>(tx_dropped), static_cast<unsigned>(rx_overflows),
+             temp_field, static_cast<unsigned>(heap_free));
     Emit("status", body);
 }
 
@@ -1266,9 +1302,10 @@ void CommandRouter::EmitGesture(const SystemOrchestrator::GestureEventRecord &ev
         button[len + 2] = '\0';
     }
     snprintf(body, sizeof(body),
-             "\"channel\":%u,\"button\":%s,\"gesture\":\"%s\",\"t_ms\":%llu,\"level_mv\":%d",
+             "\"channel\":%u,\"button\":%s,\"gesture\":\"%s\",\"t_ms\":%llu,\"level_mv\":%d,"
+             "\"idle_mv\":%d",
              static_cast<unsigned>(ev.channel_index), button, g,
-             static_cast<unsigned long long>(ev.at_ms), ev.level_mv);
+             static_cast<unsigned long long>(ev.at_ms), ev.level_mv, ev.idle_mv);
     Emit("event", body);
 }
 

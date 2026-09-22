@@ -43,11 +43,28 @@ data class LearnedButton(
 )
 
 data class LadderUiState(
-    /** The idle ("rail") reading the ratios are taken against. */
+    /**
+     * The LEARN-TIME idle ("rail"), from the config's `learned_idle_mv`.
+     *
+     * This is the denominator the bands are PLACED against: the stored
+     * `mv_center` values were measured at this rail, so their ratio against it is
+     * rail-invariant and every band stays in the same screen position as the real
+     * rail moves.
+     */
     val idleMv: Int,
     val buttons: List<LearnedButton>,
     /** The current reading, or null when no samples have arrived yet. */
     val liveMv: Int? = null,
+    /**
+     * The LIVE idle the last `event` was normalized against (spec 6.3's
+     * `V_ADC_idle`), or null when none has arrived.
+     *
+     * This is the denominator the device's `LadderClassify` actually used, so it
+     * is what the MATCH must run against -- not [idleMv], which is the learn-time
+     * rail. Keeping the two separate is the whole point: the bands are placed by
+     * the invariant ratio, the match is decided by the live one.
+     */
+    val liveIdleMv: Int? = null,
     val channelName: String = "SWC1",
     /**
      * The gesture of the most recent `event` (spec 4.3), and the button it was on.
@@ -64,35 +81,61 @@ data class LadderUiState(
     val lastGestureButton: String? = null,
 ) {
     /**
-     * The firmware's own ratio: level/idle x 1000 (`LadderRatioPermille`).
+     * The firmware's own ratio: level/idle x 1000 (`LadderRatioPermille`),
+     * including its rounding (`(mv*1000 + idle/2)/idle`).
      *
      * Note the direction -- "at idle" is ~1000, NOT ~0. A view that assumed the
      * usual "0 is idle" convention would render every band mirrored.
      */
-    fun ratioPermille(mv: Int): Int =
-        if (idleMv <= 0) 0 else (mv.toLong() * 1000 / idleMv).toInt()
+    fun ratioPermille(mv: Int): Int = ratioOf(mv, idleMv)
 
     /**
      * The button whose window contains the live reading, if any.
      *
-     * **This is an ABSOLUTE-millivolt test, and the firmware's is a RATIO test
-     * against the live idle (spec 6.3, `LadderClassify`). The two disagree once the
-     * rail moves.** `idleMv` here is the config's `learned_idle_mv` -- the
-     * learn-TIME rail -- because that is the only idle the wire carries; there is
-     * no live idle in any frame (`event`/`status`/`ladder_sample` do not carry one,
-     * and `status.rail_mv` has no producer). So a real press at a drifted rail can
-     * be marked "nothing" here while the device classifies it correctly and fires
-     * the right key -- the screen reporting the adapter as broken when it is
-     * working, which is the diagnosis it exists to make.
+     * **This reproduces the firmware's decision** (`LadderClassify`,
+     * LadderDecode.cpp): normalize the reading and each button's centre/tolerance
+     * against the LEARNED idle to permille, then take the nearest centre within
+     * its half-width. The device normalizes the reading against the LIVE idle and
+     * the centres against the LEARNED idle, and so does this -- [liveIdleMv] is
+     * the denominator for the reading, [idleMv] for the windows. Running both on
+     * the same denominator was the earlier bug: the device cancels the rail by
+     * dividing a live reading by a live idle, while comparing the stored centre
+     * to the learned rail, so a view that compared absolute millivolts (or used
+     * one idle for both) disagreed with the device the moment the rail moved
+     * (spec N-25).
      *
-     * Recorded as N-25 in the spec. The fix is a §4.3 decision to carry the live
-     * idle (or the event's own ratio) on the wire, then matching on
-     * `ratioPermille` against it, as `LadderDecode.cpp` does.
+     * The idle-band and fault guards are deliberately NOT reproduced here: this
+     * screen explains a press the device already classified, and re-deriving
+     * "would the device have called this a fault" from a frame that arrived is a
+     * second classifier that can drift. The frame's own `button` field already
+     * says what the device decided; this is the picture behind that answer.
      */
     fun matched(): LearnedButton? {
         val live = liveMv ?: return null
-        return buttons.firstOrNull { abs(live - it.mvCenter) <= it.mvTolerance }
+        // The live idle when the event carried one; otherwise fall back to the
+        // learn-time idle, which is the best available denominator and no worse
+        // than the old absolute-millivolt test.
+        val denom = liveIdleMv?.takeIf { it > 0 } ?: idleMv
+        if (denom <= 0 || idleMv <= 0) return null
+        val ratio = ratioOf(live, denom)
+        var best: LearnedButton? = null
+        var bestDistance = 0
+        for (b in buttons) {
+            val centre = ratioOf(b.mvCenter, idleMv)
+            val half = ratioOf(b.mvTolerance, idleMv)
+            val distance = abs(ratio - centre)
+            if (distance > half) continue
+            if (best == null || distance < bestDistance) {
+                best = b
+                bestDistance = distance
+            }
+        }
+        return best
     }
+
+    /** The firmware's own rounding: `(mv * 1000 + idle/2) / idle` (`LadderRatioPermille`). */
+    private fun ratioOf(mv: Int, idle: Int): Int =
+        if (idle <= 0) 0 else ((mv.toLong() * 1000 + idle / 2) / idle).toInt()
 }
 
 /**

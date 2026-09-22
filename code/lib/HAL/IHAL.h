@@ -115,6 +115,12 @@ typedef struct IHAL {
     void     (*buzzer_on)(void *ctx, bool on);
     uint64_t (*now_ms)(void *ctx);
     uint64_t (*now_us)(void *ctx);
+    // Free heap in bytes, for spec 4.3's `status.heap_free` (open item N-22). A
+    // function rather than a field because the value is read at emit time and a
+    // stored copy would be a snapshot that ages between frames. Returns 0 when
+    // the platform cannot answer, which the status body reports as 0 -- an
+    // honest "unknown" for a diagnostic field, never a fabricated size.
+    uint32_t (*heap_free)(void *ctx);
     int      (*nvs_get)(void *ctx, const char *key, void *out, size_t len);
     int      (*nvs_set)(void *ctx, const char *key, const void *in, size_t len);
     void     (*reboot)(void *ctx);

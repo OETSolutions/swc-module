@@ -913,6 +913,14 @@ TEST(SystemOrchestrator, ARecognizedGestureIsReportedAsAnEventWithTheLearnedButt
     // and not an unfiltered one labelled "raw".
     EXPECT_GT(g_reported[0].level_mv, 0);
     EXPECT_FALSE(g_reported[0].button_id == nullptr);
+    // Open item N-25's wire half: the event names the LIVE idle the classification
+    // normalized against, so the app can reproduce the device's decision as a
+    // ratio instead of comparing absolute millivolts against the config's
+    // learn-TIME rail. It is the reference the classifier actually used, not a
+    // constant -- the app's whole match depends on this being the same denominator.
+    EXPECT_EQ(g_reported[0].idle_mv, o.IdleReferenceMv(0))
+        << "the event's idle must be the denominator the classifier used";
+    EXPECT_GT(g_reported[0].idle_mv, 0);
 }
 
 TEST(SystemOrchestrator, NoReportedEventWithoutASink) {
@@ -4463,6 +4471,11 @@ TEST(SystemOrchestrator, AnAux2PressDrivesKeyChannelZeroAndIsReportedAsItsOwnInp
     // arithmetic; asserting the number here is what pins the agreement.
     EXPECT_EQ(g_reported[0].channel_index, SystemOrchestrator::AuxWireChannel(1));
     EXPECT_EQ(g_reported[0].channel_index, 3);
+    // The AUX switch has no learned idle of its own, so the denominator the
+    // classifier used is the nominal rail -- and the event must report exactly
+    // that, the same value `ServiceAux` normalized the press against (N-25).
+    EXPECT_EQ(g_reported[0].idle_mv, kNominalRailMv)
+        << "an AUX event's idle is the rail the switch classifier used";
 }
 
 TEST(SystemOrchestrator, AnAux3PressReportsWireChannelFour) {

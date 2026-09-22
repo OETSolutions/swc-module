@@ -320,6 +320,17 @@ static uint64_t HalNowUs(void *ctx)
     return (uint64_t)esp_timer_get_time();
 }
 
+static uint32_t HalHeapFree(void *ctx)
+{
+    (void)ctx;
+    // The default-capability malloc's free total, which is the number a
+    // fragmentation or leak question is actually about. `esp_get_free_heap_size`
+    // reports the internal-region figure; the minimum-ever value is a different
+    // question (a low-water mark, not the current headroom) and is deliberately
+    // not what a periodic `status` reports.
+    return static_cast<uint32_t>(esp_get_free_heap_size());
+}
+
 static int HalNvsGet(void *ctx, const char *key, void *out, size_t len)
 {
     (void)ctx;
@@ -572,6 +583,7 @@ IHAL *EspHalInit(void)
     iface.buzzer_on      = HalBuzzerOn;
     iface.now_ms         = HalNowMs;
     iface.now_us         = HalNowUs;
+    iface.heap_free      = HalHeapFree;
     iface.nvs_get        = HalNvsGet;
     iface.nvs_set        = HalNvsSet;
     iface.reboot         = HalReboot;

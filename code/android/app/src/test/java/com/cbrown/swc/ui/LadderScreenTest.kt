@@ -51,17 +51,22 @@ class LadderScreenTest {
 
     @Test
     fun `a reading inside the tolerance band matches that button`() {
-        // 1500 is 70 mV from vol_up's 1430 and inside its ±120 window.
+        // 1500 is 70 mV from vol_up's 1430 and well inside its ±120 window.
         assertEquals("vol_up", state(liveMv = 1500).matched()?.id)
     }
 
     @Test
-    fun `a reading just outside the band matches nothing`() {
-        // 1430 + 121 is one millivolt outside the window. The boundary is asserted
-        // rather than a far-away value, because an off-by-one here is exactly the
-        // kind of gap the firmware would disagree about.
-        assertNull(state(liveMv = 1430 + 121).matched())
-        assertEquals("vol_up", state(liveMv = 1430 + 120).matched()?.id)
+    fun `the match runs on the devices permille ratio, not on absolute millivolts`() {
+        // The window is now compared in PERMILLE, exactly as `LadderClassify`
+        // does: the centre and half-width are derived from millivolts against the
+        // learned idle, then the reading's ratio is tested against them. The
+        // tolerance is therefore QUANTIZED -- vol_up's ±120 mV becomes ±42 ‰ of
+        // 2835, which is ~±119 mV -- so the boundary is one millivolt tighter than
+        // the raw window. That is the device's boundary, and matching it is the
+        // whole point of open item N-25: the app must not put the edge of a band
+        // somewhere the device does not.
+        assertEquals("vol_up", state(liveMv = 1549).matched()?.id)
+        assertNull(state(liveMv = 1550).matched())
     }
 
     @Test
@@ -71,6 +76,40 @@ class LadderScreenTest {
         // render every band mirrored, which is why this is asserted by name.
         assertEquals(1000, state(null).ratioPermille(2835))
         assertEquals(504, state(null).ratioPermille(1430))
+    }
+
+    @Test
+    fun `a live idle lets the match reproduce the device on a moved rail`() {
+        // Open item N-25. The device classifies the reading against the LIVE idle
+        // spec 6.3 maintains, while the stored windows are ratios against the
+        // LEARNED idle. When the rail moves, an absolute-millivolt test (or one
+        // that used a single idle for both) marks the wrong thing -- here the
+        // rail is 5% high, so a real press reads ~5% higher in millivolts than its
+        // stored centre and falls OUTSIDE the raw window, yet the device fires it
+        // because the RATIO is unchanged. With the live idle on the wire the app
+        // now agrees with the device instead of calling it broken.
+        val raisedRail = (2835 * 3465) / 3300          // 2977 mV, the +5% band edge
+        val press = (1430L * raisedRail / 2835L).toInt()   // vol_up's ratio, at the new rail
+        // A tight window is what makes the disagreement observable: vol_up's
+        // centre is 1430 ±40 mV. The rail's +5% moves the reading to 1501 mV --
+        // 71 mV from the stored centre, OUTSIDE the raw window -- while its RATIO
+        // is unchanged, so the device still fires it. This is exactly the "screen
+        // says broken, device is working" failure N-25 describes.
+        val tight = listOf(LearnedButton("vol_up", "vol_up", mvCenter = 1430, mvTolerance = 40))
+        // Absent a live idle the app falls back to the learned rail and misses it.
+        assertNull(
+            LadderUiState(idleMv = 2835, buttons = tight, liveMv = press).matched(),
+        )
+        // With the device's live idle the same press matches, as the device says.
+        assertEquals(
+            "vol_up",
+            LadderUiState(
+                idleMv = 2835,
+                buttons = tight,
+                liveMv = press,
+                liveIdleMv = raisedRail,
+            ).matched()?.id,
+        )
     }
 
     @Test

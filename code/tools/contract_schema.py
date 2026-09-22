@@ -82,13 +82,22 @@ FRAMES = [
     # field names the quantity the device actually decided on, and confidence is
     # a learned-button property rather than a classification output, so there is
     # nothing honest to send. See spec 4.3's notes on `event`.
-    Frame("event",         "fw2app", "channel,button,gesture,t_ms,level_mv"),
+    #
+    # `idle_mv` is the LIVE idle the device normalized `level_mv` against (spec
+    # 6.3's `V_ADC_idle`) -- the denominator of the classification. It exists so
+    # the app can reproduce the device's decision as a ratio instead of comparing
+    # absolute millivolts against the config's `learned_idle_mv`, which is the
+    # learn-TIME rail spec 6.3 forbids (open item N-25). Without it the app's
+    # match indicator can disagree with a working device once the rail drifts.
+    Frame("event",         "fw2app", "channel,button,gesture,t_ms,level_mv,idle_mv"),
     # `tx_dropped`/`rx_overflows` are the DEVICE transport's own loss counters
-    # (N-24 and its inbound twin). They are declared because the app now reads
-    # them; the router's emit site is asserted against this row in both
-    # directions by test_frame_field_lists_match_the_router, so the row cannot
-    # drift back to the N-22 phantom-field shape.
-    Frame("status",        "fw2app", "vbus_present,gain_mode,uptime_ms,config_state,output_safe,tx_dropped,rx_overflows"),
+    # (N-24 and its inbound twin). `temp_c` and `heap_free` are the last two N-22
+    # phantoms, now real: `temp_c` is the last good NTC reading as a decimal (the
+    # same unit as the config's `temp_c_at_learn`, null when nothing has been
+    # measured), and `heap_free` is the HAL's free-heap figure at emit time. All
+    # are declared because the app reads them; the router's emit site is asserted
+    # against this row in both directions by test_frame_field_lists_match_the_router.
+    Frame("status",        "fw2app", "vbus_present,gain_mode,uptime_ms,config_state,output_safe,tx_dropped,rx_overflows,temp_c,heap_free"),
     Frame("ladder_sample", "fw2app", "channel,level_mv,n"),
     # `ack` carries `for_seq` and `ok` -- and `mv_center`/`mv_tolerance` on the
     # ONE ack that has them, `learn_commit`'s (CommandRouter::HandleLearnCommit),

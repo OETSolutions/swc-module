@@ -1119,14 +1119,19 @@ void SystemOrchestrator::ReportGesture(uint8_t index, const GestureEvent &ev, in
     // view are keyed by -- an index would force every consumer to re-derive a
     // mapping the device already has.
     const char *id = config_.channels[index].ladder.buttons[ev.button_index].id;
-    const GestureEventRecord rec{index, id, ev.gesture, level_mv, ev.at_ms};
+    const GestureEventRecord rec{index, id, ev.gesture, level_mv, IdleReferenceMv(index),
+                                 ev.at_ms};
     gesture_sink_(gesture_sink_ctx_, rec);
 }
 
 void SystemOrchestrator::ReportInputGesture(uint8_t wire_channel, const char *button_id,
                                             Gesture g, int level_mv, uint64_t at_ms) {
     if (gesture_sink_ == nullptr) return;
-    const GestureEventRecord rec{wire_channel, button_id, g, level_mv, at_ms};
+    // An AUX switch has no learned idle of its own -- it is a switch, not a
+    // ladder -- so the denominator the classifier used is the nominal rail, the
+    // same constant `ServiceAux` normalizes against. Reporting the same value the
+    // decision was made on is what keeps the app's ratio a copy of the device's.
+    const GestureEventRecord rec{wire_channel, button_id, g, level_mv, kNominalRailMv, at_ms};
     gesture_sink_(gesture_sink_ctx_, rec);
 }
 
@@ -1843,7 +1848,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                     // A null id is the whole point: naming a button here would be
                     // the guess FR-12 forbids, and no binding can match a null.
                     const GestureEventRecord rec{index, nullptr, Gesture::kNone, level_mv,
-                                                 now_ms};
+                                                 IdleReferenceMv(index), now_ms};
                     gesture_sink_(gesture_sink_ctx_, rec);
                 }
                 buzzer_.Play(BuzzerPattern::kKeyUnknown);

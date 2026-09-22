@@ -113,4 +113,40 @@ class LinkScreenTimeoutTest {
         composeRule.onNodeWithText("Turn the device's WiFi on", substring = true)
             .assertDoesNotExist()
     }
+
+    @Test
+    fun `the device card shows the board temperature and free heap`() {
+        // Open item N-22: `temp_c` and `heap_free` now arrive, so the screen must
+        // show them -- a value the transport delivers and no screen renders is the
+        // "produced, consumed by nobody" shape this project keeps finding.
+        composeRule.setContent {
+            LinkScreen(
+                state = LinkUiState(lastTempC = 23.5, lastHeapFree = 123456L),
+                onRetry = {},
+                onEnterMaintenance = {},
+                onExitMaintenance = {},
+            )
+        }
+        composeRule.onNodeWithText("Board temp: 23.5 C").assertIsDisplayed()
+        composeRule.onNodeWithText("Free heap: 123456 bytes").assertIsDisplayed()
+    }
+
+    @Test
+    fun `an unmeasured temperature says so rather than showing zero degrees`() {
+        // The firmware sends JSON null until an NTC conversion is good, and 0 C is
+        // a legal temperature -- so a `0.0` here would claim a measured freezing
+        // board. The screen must say "no reading" instead. A heap figure means a
+        // status HAS arrived, which is what distinguishes "no reading" from
+        // "nothing has been heard from the device yet".
+        composeRule.setContent {
+            LinkScreen(
+                state = LinkUiState(lastTempC = null, lastHeapFree = 900L),
+                onRetry = {},
+                onEnterMaintenance = {},
+                onExitMaintenance = {},
+            )
+        }
+        composeRule.onNodeWithText("Board temp: no reading").assertIsDisplayed()
+        composeRule.onNodeWithText("Board temp: 0.0 C").assertDoesNotExist()
+    }
 }

@@ -107,6 +107,25 @@ data class LinkUiState(
     val deviceTxDropped: Int = 0,
     val deviceRxOverflows: Int = 0,
     /**
+     * The device's last reported NTC temperature in degrees C, or null when no
+     * reading has been measured (spec 4.3's `status.temp_c`).
+     *
+     * Null is a MEANINGFUL value, not "not yet arrived": the firmware reports JSON
+     * null until a conversion is good, because 0 C is a legal temperature and a
+     * bare `0.0` would be indistinguishable from a measured freezing board. Kept
+     * as null here so the renderer can say "no reading" rather than show a false
+     * zero.
+     */
+    val lastTempC: Double? = null,
+    /**
+     * The device's free heap in bytes at the last `status`, or null before one.
+     *
+     * A `Long` because the figure is a byte count that exceeds `Int` on the S3's
+     * total RAM budget in the general case, and truncating it would be a wrong
+     * number rather than a missing one.
+     */
+    val lastHeapFree: Long? = null,
+    /**
      * App-side actions the device's press asked for and this app could not run.
      *
      * Spec 3.6 splits the library: the `OUT_` family is the firmware's and
@@ -195,6 +214,25 @@ fun LinkScreen(
                 )
                 state.firmwareVersion?.let {
                     Text("Firmware: $it", style = MaterialTheme.typography.bodyMedium)
+                }
+                // The device's own health figures (spec 4.3's `status`, N-22).
+                // Shown only once a `status` has arrived, and the temperature says
+                // "no reading" rather than a false 0 C when the device has measured
+                // nothing. These are diagnostics, so they sit with "Firmware:"
+                // rather than in a warning card -- a non-zero temperature is not a
+                // problem, and neither is a heap figure on its own.
+                state.lastTempC?.let {
+                    Text("Board temp: $it C", style = MaterialTheme.typography.bodyMedium)
+                } ?: run {
+                    // Only claim "no reading" once the link is up and a status has
+                    // been seen at all; before the first frame, saying so would be
+                    // noise. `lastHeapFree` shares the first-status signal.
+                    if (state.lastHeapFree != null) {
+                        Text("Board temp: no reading", style = MaterialTheme.typography.bodyMedium)
+                    }
+                }
+                state.lastHeapFree?.let {
+                    Text("Free heap: $it bytes", style = MaterialTheme.typography.bodyMedium)
                 }
             }
         }

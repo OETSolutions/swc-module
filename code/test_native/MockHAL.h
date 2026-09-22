@@ -40,6 +40,13 @@ public:
     uint64_t NowUs() { return now_ms_ * 1000ULL; }
     void AdvanceMs(uint64_t ms) { now_ms_ += ms; }
 
+    // --- heap --------------------------------------------------------------
+    // Spec 4.3's `status.heap_free` (open item N-22). A settable value so a test
+    // asserts the frame carries the platform's number rather than a literal, and
+    // a default of 0 so a test that does not care gets the "unknown" reading.
+    void SetHeapFree(uint32_t bytes) { heap_free_ = bytes; }
+    uint32_t HeapFree() { return heap_free_; }
+
     // --- analog ------------------------------------------------------------
     void SetAdcMilliVolts(AdcChannel ch, int mv) { adc_mv_[static_cast<int>(ch)] = mv; }
     void ReleaseInputs();
@@ -143,6 +150,7 @@ private:
     static void BuzzerOnThunk(void *ctx, bool on);
     static uint64_t NowMsThunk(void *ctx);
     static uint64_t NowUsThunk(void *ctx);
+    static uint32_t HeapFreeThunk(void *ctx);
     static int  NvsGetThunk(void *ctx, const char *key, void *out, size_t len);
     static int  NvsSetThunk(void *ctx, const char *key, const void *in, size_t len);
     static void RebootThunk(void *ctx);
@@ -162,6 +170,7 @@ private:
     int dac_writes_[DAC_CH_COUNT] = {};
     bool ldac_asserted_ = false;
     bool dac_failed_ = false;
+    uint32_t heap_free_ = 0;
     bool fail_next_dac_write_ = false;
     bool fail_dac_read_ = false;
     int  read_back_bias_ = 0;      // added to the stored code on a read-back

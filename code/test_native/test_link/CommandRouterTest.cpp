@@ -1006,6 +1006,7 @@ TEST(CommandRouter, AGestureRendersTheLearnedButtonIdAsAQuotedString) {
     ev.button_id = "vol_up";
     ev.gesture = Gesture::kSingle;
     ev.level_mv = 1430;
+    ev.idle_mv = 2835;
     ev.at_ms = 1234;
     r.EmitGesture(ev);
     ASSERT_EQ(cap.lines.size(), 1u);
@@ -1015,7 +1016,52 @@ TEST(CommandRouter, AGestureRendersTheLearnedButtonIdAsAQuotedString) {
         << "the app matches this against Binding.button, so it must be the quoted id";
     EXPECT_NE(l.find("\"gesture\":\"SINGLE\""), std::string::npos);
     EXPECT_NE(l.find("\"level_mv\":1430"), std::string::npos);
+    EXPECT_NE(l.find("\"idle_mv\":2835"), std::string::npos)
+        << "the live idle is the denominator the device classified against; the app "
+           "needs it to reproduce the decision as a ratio (N-25)";
     EXPECT_LT(l.size(), kNdjsonMaxFrame);
+}
+
+TEST(CommandRouter, TheEventCarriesTheLiveIdleTheClassificationUsed) {
+    // Open item N-25's wire half. `LadderClassify` normalizes the reading against
+    // the LIVE idle and each window against `learned_idle_mv`; the app can only
+    // reproduce that ratio if the frame carries the denominator the device used.
+    // The value must be the reading's own denominator, not a constant: a frame
+    // that reported a fixed 3300 would move the app's match by the same error the
+    // ratio exists to cancel.
+    //
+    // Driven through the whole chain (Boot -> classify -> gesture -> EmitGesture)
+    // rather than a hand-built record, so the test covers the wiring that fills the
+    // field -- the system suite owns that path and has the poll helpers; here the
+    // router is handed the record it would have received.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    store.Save(d.config);
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    const int live_idle = sys.IdleReferenceMv(0);
+    ASSERT_GT(live_idle, 0) << "fixture: Boot must have seeded a live idle";
+
+    // The fixture's `vol_up` centre, classified against the live idle.
+    SystemOrchestrator::GestureEventRecord ev{};
+    ev.channel_index = 0;
+    ev.button_id = "vol_up";
+    ev.gesture = Gesture::kSingle;
+    ev.level_mv = 1430;
+    ev.idle_mv = live_idle;
+    ev.at_ms = 1;
+    r.EmitGesture(ev);
+
+    ASSERT_TRUE(HasType(cap, "event"));
+    const std::string &l = cap.lines.back();
+    char want[32];
+    std::snprintf(want, sizeof(want), "\"idle_mv\":%d", live_idle);
+    EXPECT_NE(l.find(want), std::string::npos)
+        << "the event must carry the idle the classifier used, so the app's ratio is "
+           "a copy of the device's decision; want " << want << ", got: " << l;
 }
 
 TEST(CommandRouter, AnUnrecognizedPressRendersANullButtonAndNotAQuotePair) {
@@ -1030,6 +1076,7 @@ TEST(CommandRouter, AnUnrecognizedPressRendersANullButtonAndNotAQuotePair) {
     ev.button_id = nullptr;
     ev.gesture = Gesture::kNone;
     ev.level_mv = 2400;
+    ev.idle_mv = 2835;
     ev.at_ms = 99;
     r.EmitGesture(ev);
     ASSERT_EQ(cap.lines.size(), 1u)
@@ -1881,6 +1928,65 @@ TEST(CommandRouter, StatusReportsTheTransportsLossCounters) {
         << "the reported count must be the transport's own; got: " << s;
     EXPECT_NE(s.find("\"rx_overflows\":0"), std::string::npos)
         << "a quiet inbound side reports zero; got: " << s;
+}
+
+TEST(CommandRouter, StatusReportsTheNtcTemperatureAndTheFreeHeap) {
+    // Open item N-22's last two fields. Both were declared in spec 4.3's row and
+    // written by nothing, so the app read a field that never arrived. What is
+    // under test is that each now has a REAL producer: the temperature from the
+    // NTC reading path, the heap from the HAL.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+
+    // A settled NTC: 25.0 C is 250 tenths, and the reading path records the last
+    // GOOD value. The mock's NTC node voltage must convert through the B3380
+    // model, so drive it with a value the converter accepts and prove the status
+    // reports what `LastNtcTenthsC` holds rather than a literal.
+    hal.SetAdcMilliVolts(ADC_CH_TEMP, 1500);
+    const int tenths = sys.SampleNtcTenthsC();
+    ASSERT_NE(tenths, SystemOrchestrator::kTempNotMeasuredTenths)
+        << "fixture: the NTC reading must be a real temperature";
+    ASSERT_EQ(sys.LastNtcTenthsC(), tenths)
+        << "fixture: SampleNtcTenthsC must have recorded the value";
+    hal.SetHeapFree(123456u);
+
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    ASSERT_TRUE(HasType(cap, "status"));
+    const std::string &s = cap.lines.back();
+
+    // The temperature is written as a DECIMAL, the same convention the config
+    // codec uses for `temp_c_at_learn`. Build the expected string from the tenths
+    // so the assertion does not hardcode a model constant.
+    char want[24];
+    std::snprintf(want, sizeof(want), "\"temp_c\":%d.%d", tenths / 10,
+                  (tenths < 0 ? -tenths : tenths) % 10);
+    EXPECT_NE(s.find(want), std::string::npos)
+        << "the status must carry the NTC temperature; want " << want << ", got: " << s;
+    EXPECT_NE(s.find("\"heap_free\":123456"), std::string::npos)
+        << "the status must carry the HAL's free-heap figure; got: " << s;
+}
+
+TEST(CommandRouter, StatusReportsNoTemperatureRatherThanZeroWhenNoneWasMeasured) {
+    // The NTC sentinel is `kTempNotMeasuredTenths` (0), and 0 C is a LEGAL
+    // temperature -- so reporting a bare `0.0` for "never measured" is the same
+    // lie the sentinel exists to prevent elsewhere. The field is JSON null until a
+    // reading is good.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);   // no orchestrator
+    cap.Attach(r);
+    const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    ASSERT_TRUE(HasType(cap, "status"));
+    const std::string &s = cap.lines.back();
+    EXPECT_NE(s.find("\"temp_c\":null"), std::string::npos)
+        << "no measured temperature is `null`, never a fabricated 0 C; got: " << s;
+    EXPECT_EQ(s.find("\"temp_c\":0.0"), std::string::npos)
+        << "a `0.0` would be indistinguishable from a measured freezing board; got: " << s;
 }
 
 // --- config_patch value bounds (spec 4.3: a patch is one field) --------------

@@ -218,6 +218,19 @@ public:
     // value against it must not have to know the number.
     static constexpr int kTempNotMeasuredTenths = 0;
 
+    /*
+     * The last GOOD NTC reading, in tenths of a degree C, without forcing a new
+     * conversion. This is the reader for spec 4.3's `status.temp_c` (open item
+     * N-22): the periodic frame must report the temperature the device has, not
+     * trigger an ADC conversion as a side effect of formatting a frame.
+     *
+     * Returns `kTempNotMeasuredTenths` until a reading has ever been good, so a
+     * `status` on a board whose NTC is unpopulated or off-span reports "no
+     * reading" rather than 0 C. `SampleNtcTenthsC` is what fills it, and it is
+     * called every learn tick and every `RecordLearnSample`.
+     */
+    int LastNtcTenthsC() const { return last_ntc_tenths_c_; }
+
     // True once the safe idle state has been written (FR-13). Boot() sets it
     // before it does anything else, so a caller that observes it true knows the
     // output is already safe.
@@ -349,12 +362,24 @@ public:
      * made on (FR-3) -- the same figure `FilteredLevelMv` reports and the same
      * one `ladder_sample` streams, so the app cannot show a level the device did
      * not decide on.
+     *
+     * **`idle_mv` is the LIVE idle the classification actually normalized
+     * against** (spec 6.3's `V_ADC_idle`), the denominator of `level_mv`, so the
+     * app can reproduce the device's decision as a ratio instead of comparing
+     * absolute millivolts. It is `IdleReferenceMv(channel_index)` for a wheel and
+     * `kNominalRailMv` for an AUX switch. Without it the app's ladder view can
+     * only match against the config's `learned_idle_mv` -- the learn-TIME rail
+     * spec 6.3 forbids -- so once the rail drifts the screen reports a working
+     * device as broken or a firing button as unmatched (open item N-25). Sending
+     * the denominator the device used is what makes the app's match a copy of the
+     * device's rather than a second, divergent rule.
      */
     struct GestureEventRecord {
         uint8_t     channel_index;
         const char *button_id;
         Gesture     gesture;
         int         level_mv;
+        int         idle_mv;
         uint64_t    at_ms;
     };
 

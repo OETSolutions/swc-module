@@ -32,10 +32,12 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.intOrNull
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.longOrNull
 
 /**
  * The join between the protocol client and the four screens.
@@ -292,6 +294,14 @@ class AppViewModel(
                     ?.takeIf { it !is JsonNull }
                     ?.jsonPrimitive?.content
                 val level = frame.fields["level_mv"]?.jsonPrimitive?.intOrNull
+                // The LIVE idle the device normalized `level_mv` against (spec
+                // 6.3's `V_ADC_idle`). This is the denominator `LadderClassify`
+                // actually used, so the view can reproduce the device's decision
+                // as a ratio instead of comparing absolute millivolts against the
+                // config's learn-TIME rail (open item N-25). Read as nullable:
+                // a frame from a build that predates the field still parses, and
+                // the view falls back to the config's idle.
+                val idle = frame.fields["idle_mv"]?.jsonPrimitive?.intOrNull
                 val gesture = frame.fields["gesture"]?.jsonPrimitive?.content
                 val channel = frame.fields["channel"]?.jsonPrimitive?.intOrNull
                 if (gesture != null && level != null) {
@@ -329,7 +339,7 @@ class AppViewModel(
                     // value would look like a device that stopped seeing presses.
                     val shown = if (channel != null && channel < 2)
                         ladderFor(client.config.value, channel) else null
-                    val next = _ladder.value.copy(liveMv = level)
+                    val next = _ladder.value.copy(liveMv = level, liveIdleMv = idle)
                     _ladder.value = if (shown == null) next else next.copy(
                         idleMv = shown.idleMv,
                         channelName = shown.channelName,
@@ -407,26 +417,29 @@ class AppViewModel(
             // the CONFIG's state, which spec 4.3 says exists so a config fault has
             // "a name the app could read" (§6.8's `config_state: defaults`).
             //
-            // This branch used to read `rail_mv` into the ladder's idle. That field
-            // has no producer anywhere in the firmware (grep-confirmed, spec N-22),
-            // so the read was dead -- and it would have been WRONG if it had ever
-            // been sent: `rail_mv` is the +3V3 rail (~3300), not the wheel's idle
-            // KEY level (~2835), and `LadderScreen` divides every band by whatever
-            // it is given.
-            //
-            // The idle the view uses comes from the config (`onConfig` reads
-            // `ladder.learnedIdleMv`). **That is the learn-TIME rail, and it is NOT
-            // the denominator the firmware classifies against** -- spec 6.3's
-            // `V_ADC_idle` is the LIVE idle. No frame carries a live idle, so the
-            // app's match indicator can disagree with the device once the rail
-            // drifts; recorded as spec open item N-25 with the required repair.
-            //
-            // `vbus_present`, `output_safe` and `uptime_ms` are deliberately not
-            // mirrored yet: no screen consumes them, and inventing a place for them
-            // is not this fix.
+            // The two diagnostic fields this branch used to lack now arrive:
+            // `temp_c` (the last good NTC reading, as a decimal; JSON null when
+            // nothing has been measured) and `heap_free`. Neither has a screen
+            // yet, so they are recorded on the link state rather than dropped --
+            // a value the transport delivers and the app forgets is the same
+            // "produced, consumed by nobody" shape the link counters were (N-24).
+            // The `rail_mv` this branch used to read stays gone: it was the +3V3
+            // rail with no producer, and the quantity the ladder view needs is
+            // the LIVE idle, which now arrives per press on `event.idle_mv`.
             Frames.STATUS -> {
                 val cs = frame.fields["config_state"]?.jsonPrimitive?.content
                 if (cs != null) _link.value = _link.value.copy(configState = cs)
+                // `temp_c` is nullable on purpose: absent and JSON-null both mean
+                // "no reading", and neither is 0 C. `JsonNull.jsonPrimitive` is a
+                // JsonPrimitive whose `doubleOrNull` is null, so a JSON null needs
+                // no special case here -- it falls through exactly like an absent
+                // field.
+                frame.fields["temp_c"]?.jsonPrimitive?.doubleOrNull?.let { t: Double ->
+                    _link.value = _link.value.copy(lastTempC = t)
+                }
+                frame.fields["heap_free"]?.jsonPrimitive?.longOrNull?.let { h: Long ->
+                    _link.value = _link.value.copy(lastHeapFree = h)
+                }
                 // The DEVICE-side loss counters, spec 4.3's `status`. `lostFrames`
                 // above counts `link_gap`, which the device reports when the APP's
                 // frame went missing; these two are the other direction -- frames

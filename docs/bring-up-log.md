@@ -1,4 +1,58 @@
 
+## FR-1's NTC clause: the channel was never converted, so `temp_c_at_learn` was a constant
+
+Found 2026-09-24, continuing audit (N-67). FR-1 requires the firmware to "sample
+both ladder channels **and the NTC** continuously". The ladder half was real —
+every poll tick converts each channel through `AdcReader`. The NTC half had no
+implementation at all:
+
+- `ADC_CH_TEMP` was mapped to `ADC_CHANNEL_6` in `EspHal`'s `AdcPinFor` and read
+  by **nothing** — every `adc_read_mv` call site named SWC1/SWC2, AUX1 or
+  KEY_SENSE1/2.
+- There was no NTC-to-temperature conversion anywhere in the tree — no B3380
+  routine, no Steinhart-Hart, no divider inversion — so the raw millivolts would
+  not have been a temperature even if read.
+- Both learn paths passed a literal 0 for `temp_tenths_c`, so the field a future
+  compensation is meant to consume could not hold a measurement.
+
+Three separate surfaces said otherwise (spec 6.4's honesty paragraph, §11's FR-1
+row, and a comment in `SystemOrchestrator.cpp` that quoted a sentence appearing
+nowhere in the spec). Those were corrected in an earlier pass; this closes the
+feature they had described.
+
+**Fixed.** The divider values came off the schematic rather than needing the
+board: `SWC.kicad_sch` carries `RT1` (`Device:Thermistor_NTC`, value `10k B3380`)
+from the `TEMP_ADC` node to `GND`, and `R29` (`Device:R`, `10k`) from `+3V3` to
+that node. So the part is on the **low side** — the node RISES with temperature —
+and `R = R_series * V / (VDD - V)`.
+
+`lib/Analog/NtcConvert.h` holds the inversion and the B-constant model
+(`1/T = 1/T0 + ln(R/R0)/B`) in integer maths, because the config carries no
+floating point. `ln` is the expansion `2*(y + y³/3 + y⁵/5 + …)` with
+`y = (R-R0)/(R+R0)` in 2^16 fixed point. **Thirty series terms, not the
+conventional eight**: at the hot end `y` approaches -0.9 and eight terms are
++0.8 °C wrong; thirty bring the error under 0.25 °C across -40 to +120 °C. A
+tenfold-wider fixed-point scale does not help — the truncation is the error term,
+not the scale.
+
+`SystemOrchestrator::SampleNtcTenthsC` reads `ADC_CH_TEMP` and converts, and
+**both** learn paths now record the result in `temp_c_at_learn`: the headless
+wizard (every tick of a prompt) and `CommandRouter::RecordLearnSample` (the
+app-driven session). A failed read **holds** the last good value rather than
+reporting the sentinel, because the ADC returns -1 on error (N-43) and a learn
+that stored "0 C" from a transient would record a temperature nothing measured.
+
+Pinned by 8 `NtcConvert` tests whose expectations come from the **datasheet
+model applied to the schematic's divider**, not from the implementation — so a
+swapped divider side or a sign error fails rather than cancelling out — plus one
+orchestrator test that drives a whole headless learn and checks the committed
+profile's `temp_c_at_learn` is the converted value. Mutation-tested by reverting
+the headless call site to the sentinel, which fails the suite.
+
+**Still board-gated:** the conversion is validated against the datasheet's
+B-constant table, not against a thermometer. Reading one room temperature and
+comparing is the bring-up step that would close even that.
+
 ## The DAC fault path was three-quarters absent — and two comments asserted otherwise
 
 Found 2026-09-24, continuing audit (N-21). Spec §6.8's I²C row promises four

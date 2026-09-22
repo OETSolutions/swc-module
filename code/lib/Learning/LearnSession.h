@@ -58,7 +58,10 @@ public:
     // live idle reference; `rail_mv` is spec 3.4's "+3V3 rail measured during
     // learn" and is a PARAMETER because this board has no rail sense channel
     // (AdcChannel has SWC1/SWC2/TEMP/AUX1-3/KEY_SENSE1-2 and none is the rail).
-    // `temp_tenths_c` comes from ADC_CH_TEMP -- the NTC on the ladder.
+    // `temp_tenths_c` comes from ADC_CH_TEMP -- the NTC on the ladder, through
+    // `Ntc::NodeMvToTenthsC` (FR-1 / N-67). Both callers pass
+    // `SystemOrchestrator::SampleNtcTenthsC`, or the sentinel when no reading has
+    // been good.
     void AddSample(int level_mv, int idle_mv, MilliVolt rail_mv, int16_t temp_tenths_c,
                    uint64_t now_ms);
 

@@ -193,6 +193,31 @@ public:
         return (learned_channel_ == channel) ? &learned_profile_ : nullptr;
     }
 
+    /*
+     * FR-1's first clause: "sample both ladder channels and the NTC continuously".
+     *
+     * Returns the NTC temperature in TENTHS of a degree C, or
+     * `kTempNotMeasuredTenths` when no reading has ever been good. **A failed read
+     * HOLDS the last good value rather than reporting the sentinel**, because the
+     * ADC returns -1 on error (N-43) and a learn that recorded "0 C" from a
+     * transient would store a temperature nothing measured -- the precise lie the
+     * sentinel exists to avoid.
+     *
+     * Public because BOTH learn paths call it: the headless wizard samples it every
+     * tick of a prompt, and the app-driven session (`CommandRouter::RecordLearnSample`)
+     * does the same. One implementation, so the two record the same quantity for
+     * `temp_c_at_learn`, exactly as they share `kNominalRailMv` for the rail.
+     *
+     * The rail is the board's NOMINAL 3V3: there is no rail sense channel on this
+     * board, so the divider's supply is a constant rather than a measurement (the
+     * same reason `LearnWizard` records `kNominalRailMv` in `learned_at_rail_mv`).
+     */
+    int SampleNtcTenthsC();
+    // The sensor's "no reading" sentinel, in the same tenths-of-a-degree-C unit as
+    // `temp_c_at_learn`. Public beside its accessor: a caller comparing the return
+    // value against it must not have to know the number.
+    static constexpr int kTempNotMeasuredTenths = 0;
+
     // True once the safe idle state has been written (FR-13). Boot() sets it
     // before it does anything else, so a caller that observes it true knows the
     // output is already safe.
@@ -763,7 +788,6 @@ private:
      * report an edge.
      */
     void ReportDacFault();
-
     /*
      * FR-31's headless learn, and the AUX1 hold that enters and leaves it.
      *
@@ -809,6 +833,13 @@ private:
     // MEASURED AT LEARN TIME). Captured on entry, because during the prompt the
     // user is holding the wheel button and the live reading is the pressed level.
     int          learn_idle_mv_ = 0;
+    // The last NTC temperature that converted successfully, in tenths of a degree
+    // C (FR-1/N-67). Starts at the "not measured" sentinel and is only ever
+    // advanced by a GOOD reading, so `SampleNtcTenthsC` can hold this value
+    // through a transient ADC failure rather than reporting a temperature nothing
+    // measured. Named for the NTC and not for learn because a future runtime
+    // consumer wants the same hold.
+    int16_t      last_ntc_tenths_c_ = kTempNotMeasuredTenths;
     // Which channel a wizard learn is filling, and the last profile it committed
     // -- kept so the link can report what the headless learn produced.
     int          learn_channel_ = 0;

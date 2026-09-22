@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "Analog/NtcConvert.h"
 #include "Config/ConfigDefaults.h"
 #include "Config/ConfigStore.h"
 #include "MockHAL.h"
@@ -4008,32 +4009,52 @@ TEST(SystemOrchestrator, PassThroughWithAnEmptyCommandBandDrivesNothing) {
            "must drive nothing, rather than a level the radio cannot read";
 }
 
-// --- FR-1's NTC clause: the channel that is never converted (open item N-67) ---
+// --- FR-1's NTC clause: sampling the NTC and recording its temperature (N-67) ---
 
-TEST(SystemOrchestrator, TheNtcChannelIsNeverConvertedSoFR1sFirstClauseIsUnmet) {
-    // FR-1 requires the firmware to "sample both ladder channels AND THE NTC
-    // continuously". The ladder half is real: every poll tick converts each
-    // channel through `AdcReader`. The NTC half has no implementation at all --
-    // `ADC_CH_TEMP` is mapped to `ADC_CHANNEL_6` in EspHal's `AdcPinFor` and is
-    // read by NOTHING, and there is no NTC-to-temperature conversion anywhere in
-    // the tree. So `temp_c_at_learn` is stamped from a literal 0 on both learn
-    // paths, and a field a future compensation is meant to consume is a constant.
+TEST(SystemOrchestrator, TheNtcIsConvertedAndItsTemperatureReachesTheLearnRecord) {
+    // FR-1's first clause -- "sample both ladder channels AND the NTC
+    // continuously" -- was unimplemented until 2026-09-24 (open item N-67):
+    // `ADC_CH_TEMP` was mapped in EspHal and read by nothing, no NTC conversion
+    // existed anywhere in the tree, and both learn paths passed a literal 0 for
+    // `temp_tenths_c`, so `temp_c_at_learn` could not hold a measurement.
     //
-    // This test drives a full poll loop -- boot, a press, a release, and an
-    // entire headless learn -- and asserts the NTC was converted ZERO times
-    // throughout. It is written to PASS today, so it is a PROBE, not a bug: it
-    // pins the gap so the day the sampling path is added, the counter goes
-    // non-zero and this test fails, which is the moment to delete it and record
-    // that FR-1 is met. Without it the gap is invisible: nothing else in the
-    // suite would notice the difference between "the NTC is read" and "it is not",
-    // because the field it would fill is never consulted.
+    // This test was a PROBE before the fix (asserting the channel was converted
+    // ZERO times, so the day the path landed it would fail and demand attention).
+    // It failed exactly as designed, and is now the positive assertion instead:
+    // the raw node reading is converted through the divider and the B3380 model,
+    // and the RESULT is what the learn records.
+    //
+    // The fixture reading is chosen so the expected temperature is unambiguous:
+    // 1500 mV on a 3300 mV rail is 10,000 * 1500 / 1800 = 8333 ohm, which the
+    // datasheet model puts near 30.6 C. The assertion is on the CONVERSION, not
+    // on a magic number -- it is checked against `Ntc::NodeMvToTenthsC`, the same
+    // function under test elsewhere, so this test asks only "is it wired in".
+    // An EMPTY ladder, like the neighbouring learn tests: the default fixture
+    // carries three buttons, and a new one held at 1430 mV lands on `vol_up`'s own
+    // window, which the wizard rejects as too close rather than committing. The
+    // reject would make this test measure "no learn happened" and fail for a
+    // reason unrelated to the NTC.
     MockHal hal;
-    auto o = MakeOrch(hal);
+    MockHal::Defaults d;
+    d.config.channels[0].ladder.count = 0;
+    d.config.channels[0].ladder.learned_idle_mv = 2835;
+    d.config.binding_count = 0;   // the default bindings name buttons this ladder drops
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.SetStore(&store);
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
     hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
-    hal.SetAdcMilliVolts(ADC_CH_TEMP, 1500);   // a plausible NTC divider reading
+    hal.SetAdcMilliVolts(ADC_CH_TEMP, 1500);
     o.Boot();
+
+    int expected_tenths = 0;
+    ASSERT_TRUE(Ntc::NodeMvToTenthsC(1500, kNominalRailMv, &expected_tenths))
+        << "fixture guard: the chosen reading must be convertible";
+    EXPECT_EQ(o.SampleNtcTenthsC(), expected_tenths)
+        << "the sample must be the CONVERTED temperature, not the raw millivolts";
 
     // A press and a release, so the full classification path runs.
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
@@ -4047,12 +4068,18 @@ TEST(SystemOrchestrator, TheNtcChannelIsNeverConvertedSoFR1sFirstClauseIsUnmet) 
     PressAux(o, hal, 1);
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 1430);
     PollFor(o, hal, 400);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    PollFor(o, hal, 300);
 
-    EXPECT_GT(hal.AdcReadCount(ADC_CH_SWC1), 0)
-        << "the ladder channel IS converted (FR-1's second half), so a zero here "
-           "would mean the test is not driving the loop at all";
-    EXPECT_EQ(hal.AdcReadCount(ADC_CH_TEMP), 0)
-        << "ADC_CH_TEMP was converted -- FR-1's NTC clause now has an "
-           "implementation. Update open item N-67, delete this probe, and assert "
-           "the recorded temperature instead of the read count";
+    EXPECT_GT(hal.AdcReadCount(ADC_CH_TEMP), 0)
+        << "the NTC must be sampled during a learn -- that is where the value is "
+           "recorded (FR-1's first clause)";
+    const LadderProfile *p = o.LastLearnedProfile(0);
+    ASSERT_NE(p, nullptr) << "the fixture guard: the learn must have committed";
+    EXPECT_EQ(p->buttons[0].temp_c_at_learn, expected_tenths)
+        << "the committed profile must carry the MEASURED temperature, not the "
+           "0 sentinel the two call sites used to pass";
+    EXPECT_NE(p->buttons[0].temp_c_at_learn, 0)
+        << "0 is the sentinel's value and is also a legal temperature (0.0 C), "
+           "which is why the assertion above is on the value and not on non-zero";
 }

@@ -6,6 +6,7 @@
 
 #include "Bindings/BindingResolver.h"
 #include "Analog/LadderDecode.h"
+#include "Analog/NtcConvert.h"
 #include "Config/ConfigDefaults.h"
 #include "Config/ConfigStore.h"
 #include "Output/GainPolicy.h"
@@ -69,39 +70,6 @@ int Aux1PressedMaxMv() {
     return p.buttons[0].mv_center + p.buttons[0].mv_tolerance;
 }
 
-/*
- * `temp_c_at_learn`, in tenths of a degree C, when the NTC has not been read.
- *
- * **An earlier revision of this comment attributed a claim to spec 6.4 that spec
- * 6.4 does not make, and quoted a sentence that appears nowhere in it.** It read
- * "Spec 6.4 says v1's temperature compensation is a linear correction with a
- * coefficient defaulting to zero, so that it 'does not change behavior until the
- * user or a bring-up measurement supplies a non-zero coefficient'." The spec says
- * the OPPOSITE, and says it explicitly: "No correction is implemented in v1, and
- * this is stated plainly rather than claimed as a zero-valued one. There is no
- * coefficient field, no correction function, and no test of one." So there is no
- * default-zero coefficient to describe -- there is no coefficient at all -- and
- * the quoted sentence is not in the document. A reader who trusted the opening
- * line would believe a correction exists behind a zero default, which is exactly
- * the reading spec 6.4 was rewritten to prevent. See open item N-67.
- *
- * **What actually exists is the two halves the coefficient would need and not the
- * correction itself:** `temp_c_at_learn` is recorded per button, and
- * `temp_comp_enabled` is carried through the config. There is no coefficient field,
- * no correction function, and no test of one. Recording the input to a correction
- * is not implementing it. See open item N-9.
- *
- * **The sentinel is 0 in every case today, because the NTC is never converted.**
- * `ADC_CH_TEMP` is mapped in EspHal and read by nothing; no NTC conversion exists
- * anywhere in the tree; and both call sites pass a literal 0 (`RecordLearnSample`
- * and the headless `Tick`). So `temp_c_at_learn` cannot hold a measurement, which
- * is FR-1's "sample ... the NTC continuously" unmet -- see open item N-67.
- *
- * The sentinel is deliberate regardless: 23.5 would be a plausible-looking number
- * that nothing measured, and a plausible number in a field a future engineer uses
- * to compute a correction is worse than a visibly unmeasured one.
- */
-constexpr int kTempNotMeasuredTenths = 0;
 
 }  // namespace
 
@@ -339,6 +307,24 @@ bool SystemOrchestrator::VerifySafeIdleIdleCodes() {
     }
     if (!all_ok) ReportDacFault();
     return all_ok;
+}
+
+int SystemOrchestrator::SampleNtcTenthsC() {
+    const int node_mv = hal_->adc_read_mv(hal_->ctx, ADC_CH_TEMP);
+    // A -1 is a FAILED CONVERSION, not a cold board: 0 mV is a legal reading
+    // (N-43). Hold the last good value and report that, rather than storing "0 C"
+    // for a temperature nothing measured -- the exact lie `kTempNotMeasuredTenths`
+    // exists to prevent. The very first failure, before any good reading, leaves
+    // the sentinel in place.
+    if (node_mv < 0) return last_ntc_tenths_c_;
+    int tenths = 0;
+    if (!Ntc::NodeMvToTenthsC(node_mv, kNominalRailMv, &tenths)) {
+        // Off the divider's valid span (an open or shorted part, a rail fault).
+        // Same direction: hold, do not fabricate.
+        return last_ntc_tenths_c_;
+    }
+    last_ntc_tenths_c_ = static_cast<int16_t>(tenths);
+    return last_ntc_tenths_c_;
 }
 
 void SystemOrchestrator::ReportDacFault() {
@@ -877,7 +863,7 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
         // level "pressed", then commit a window computed from a fabricated
         // denominator. Refusing is the same direction FR-12 takes.
         if (learn_idle_mv_ > 0) {
-            wizard_.Tick(learn_channel_, now_ms, learn_idle_mv_, kTempNotMeasuredTenths);
+            wizard_.Tick(learn_channel_, now_ms, learn_idle_mv_, SampleNtcTenthsC());
         }
     }
 

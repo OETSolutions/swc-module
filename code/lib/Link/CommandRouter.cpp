@@ -1186,7 +1186,15 @@ void CommandRouter::RecordLearnSample() {
     // and uses to detect a sagging regulator. The headless wizard records the
     // nominal rail; the app path recorded a different quantity for the same field,
     // so the two learn paths disagreed. Both now use `kNominalRailMv`.
-    session_.AddSample(level_mv, idle_mv, kNominalRailMv, 0,
+    // The fourth argument is the NTC temperature (FR-1's first clause / N-67). It
+    // used to be a literal 0 with the comment that the channel is never converted
+    // -- true then, and fixed here: `SampleNtcTenthsC` reads `ADC_CH_TEMP` through
+    // the divider and the B3380 model. The same call the headless wizard makes, so
+    // the two learn paths record the same quantity for the same field, exactly as
+    // the rail above.
+    const int temp_tenths = (sys_ != nullptr) ? sys_->SampleNtcTenthsC() : 0;
+    session_.AddSample(level_mv, idle_mv, kNominalRailMv,
+                       static_cast<int16_t>(temp_tenths),
                        hal_ != nullptr ? hal_->now_ms(hal_->ctx) : 0);
 }
 

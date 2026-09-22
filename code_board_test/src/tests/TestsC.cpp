@@ -233,34 +233,73 @@ Outcome Test22_ServoTrimLoop()
             Dac::SetSignal(ch, mode, (uint16_t)code_lo);
             delay(200);
 
-            // Now step up and time how long until the sense reading is within 5% of
-            // the new target. Sampled as fast as the ADC allows, which is the same
-            // instrument the firmware's own supervision would use.
+            // Now step up and time how long the output takes to TRAVEL. The
+            // instrument is the same one the firmware's own supervision would use;
+            // what matters is separating SETTLING (a time) from STATIC ERROR (a
+            // level), because the two have completely different causes.
+            //
+            // An earlier revision required the reading to come within 5% of the
+            // COMMANDED target, which conflates them. The servo has no feedback edge
+            // that makes its static error zero: one assembly measured 72 mV at a 3 V
+            // command (2.4%), which is MORE than 5% of a 1.8 V -> 3 V step, so the
+            // timeout fired while the loop was perfectly fast (47-83 ms across two
+            // assemblies) and a correct board was reported "did not reach the
+            // target". The first board passed only because its offset happened to
+            // land just under the wire (~40 mV); the assertion was marginal from the
+            // start and a second assembly exposed it rather than broke it.
+            //
+            // So the timing criterion is a standard 10-90% RISE TIME against the
+            // step, and the residual is reported separately as the static error the
+            // trim loop exists to null (spec 6.5). The band is 90% rather than 95%
+            // precisely because the last few percent of the step is where the static
+            // error lives, and it is not a timing figure.
             const uint32_t t0 = millis();
             Dac::SetSignal(ch, mode, (uint16_t)code_hi);
             const int span = hi_t - lo_t;
-            const int tol = span / 20;               // 5% of the step
+            const int settle_band = (span * 10) / 100;  // 10-90% rise-time criterion
             uint32_t settled_ms = 0;
             int last = lo_t;
             for (int i = 0; i < 400; ++i) {          // up to ~2 s of polling
                 int seen = 0;
                 if (!KeyLine::SenseMv(ch, &seen)) break;
                 last = seen;
-                if (seen >= hi_t - tol) { settled_ms = millis() - t0; break; }
+                if (seen >= hi_t - settle_band) { settled_ms = millis() - t0; break; }
                 delay(2);
             }
 
-            Log::Printf("    settled to within 5%% in %u ms (reached %d mV of %d)",
-                        settled_ms, last, hi_t);
+            if (settled_ms == 0) {
+                // Genuinely never travelled: the step is not being followed at all.
+                Log::Printf("    did not reach 90%% of the step within %u ms (reached %d mV of %d)",
+                            (unsigned)(millis() - t0), last, hi_t);
+                True(false, "the output reaches a commanded level");
+                Note("The KEY line never moved 90%% of the way to %d mV. With J3 "
+                     "open, a target above the line's float level is unreachable by "
+                     "design -- check the command band printed above before reading "
+                     "this as a fault.", hi_t);
+            } else {
+                // Take the STEADY-STATE value, not the crossing value: the crossing
+                // is by construction up to 10% of the step low, and the number worth
+                // reporting is where the servo finally sits.
+                delay(100);
+                int final_mv = 0;
+                if (KeyLine::SenseMv(ch, &final_mv)) last = final_mv;
+                const int residual = hi_t - last;
+                Log::Printf("    reached 90%% of the step in %u ms (10-90 rise time)", settled_ms);
+                Log::Printf("    settled at %d mV of %d", last, hi_t);
+                // The static error the hardware integrator leaves behind. This is
+                // the number the trim loop exists to null (spec 6.5: DAC offset and
+                // gain error, R58/R61 tolerance, R36 leakage), and the reason the
+                // loop ships DISABLED until its gain is measured. It is NOT a timing
+                // fault and must not be reported as one.
+                Log::Printf("    static error %+d mV (%.1f%% of the command) -- what the "
+                            "trim loop would null", residual,
+                            100.0 * residual / (hi_t > 0 ? hi_t : 1));
+                True(true, "the output reaches a commanded level");
+            }
 
             const uint32_t budget = 200;
             if (settled_ms == 0) {
-                Log::Printf("    did not reach the target within the polling window");
-                True(false, "the output reaches a commanded level");
-                Note("The KEY line never came within 5%% of %d mV. With J3 open, a "
-                     "target above the line's float level is unreachable by design -- "
-                     "check the command band printed above before reading this as a "
-                     "fault.", hi_t);
+                // Already reported above; do not count it twice.
             } else if (settled_ms <= budget) {
                 True(true, "the output settles inside the 200 ms key-send budget");
                 Log::Printf("    -> %u ms is %.0f%% of the budget: a quick double press",

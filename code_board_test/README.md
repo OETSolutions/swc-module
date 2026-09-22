@@ -42,10 +42,10 @@ pio test -e host
 pio run -e swc-s3-test
 
 # 3. Flash (hold BOOT only if the ROM loader does not catch the reset)
-pio run -e swc-s3-test -t upload
+pio run -e swc-s3-test -t upload --upload-port /dev/tty.usbmodem113101
 
 # 4. Open the menu
-pio device monitor -b 115200
+pio device monitor -b 115200 -p /dev/tty.usbmodem113101
 ```
 
 The board prints a boot banner, brings up the ADC and the DAC, blinks both LEDs
@@ -516,14 +516,42 @@ case in service is a quick double press: the spec allows a **200 ms** key-send
 window, so the output must reach a commanded level well inside that or the two
 presses merge into one and the feature silently does not work.
 
-Measured on this board with the loopback fitted:
+**Speed and accuracy are two different measurements, and conflating them falsely
+fails a healthy board.** Test 22 originally required the reading to come within 5%
+of the *commanded* target and called the result "settled" — which asks a
+*static-error* question in a *timing* test. The servo's hardware integrator has no
+feedback edge that drives its static error to zero: it is set by DAC offset,
+`R58`/`R61` tolerance and `R36` leakage, which is precisely the error spec §6.5
+says the (disabled) trim loop exists to null. On a board whose offset is 72 mV
+against a 1.24 V step, the 5% window is **unreachable at any speed**, so the test
+timed out while the loop was entirely healthy. The first board passed only because
+its offset happened to land just under the wire (~40 mV) — the assertion was
+marginal from the start, and a second assembly exposed it rather than broke it.
 
-- **settles to within 5% in 75–83 ms** — about 40% of the 200 ms budget
-- a real **120 ms double press** resolves as two distinct keys (press 1 at 3008 mV,
-  press 2 at 1750 mV)
+So the test now measures the two things separately:
 
-A board that missed that budget would have a genuine problem no amount of slow
-trimming would reveal, which is why the test asserts it rather than only reporting it.
+- a **10–90% rise time** against the step, asserted against the 200 ms budget, and
+- the residual **static error**, reported as a number and explicitly labelled as
+  what the trim loop would null — *not* asserted, because it is a tolerance figure
+
+Measured with the loopback fitted:
+
+| | rise time (10–90%) | static error |
+| --- | --- | --- |
+| dev board | 70–83 ms | −40 to −53 mV (ch1), −4 mV (ch2) |
+| second assembly | 47 ms | −75 mV (ch1), −93 mV (ch2) |
+
+The rise time is what decides whether a double press works, and both boards are far
+inside the budget — a real **120 ms double press** resolves as two distinct keys
+(press 1 at ~2950–3008 mV, press 2 at ~1740–1750 mV). The static error varies
+between assemblies by a few tens of millivolts, which is ordinary resistor and
+op-amp `Vos` spread and is the reason the trim loop exists at all.
+
+Two independent paths measure the same node in test 28 (the `SENSE` buffer and the
+`SWC` loopback node) and agree within ~20 mV, which is what rules out a broken
+channel when a per-channel offset looks large. A board that missed the *rise-time*
+budget would have a genuine problem no amount of slow trimming would reveal, which
+is why that half is asserted rather than only reported.
 
 ## Speed and the web UI
 

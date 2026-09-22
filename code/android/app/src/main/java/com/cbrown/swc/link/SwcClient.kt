@@ -512,6 +512,69 @@ class SwcClient(private val transport: SwcTransport) {
     suspend fun exitMaintenance(timeoutMs: Long = 5_000): AckResult =
         request(Frames.MAINTENANCE_EXIT, timeoutMs)
 
+    /**
+     * Push a firmware image over USB (spec §9.3, Route A).
+     *
+     * The in-car update path, and the one the user asked for first: it needs no
+     * WiFi, no BLE and no maintenance page, only the cable the app is already on.
+     *
+     * The shape mirrors [setConfig] because it is the same chunked transport: the
+     * offset is the byte offset of the chunk's first DECODED byte, so each chunk
+     * decodes independently and the device can reject a gap rather than splice two
+     * images into one. The difference is the payload — a whole `firmware.bin`
+     * rather than a config — and its own bound: the device's app slot
+     * (`kAppSlotBytes`, 1920 KiB), which is larger than any config.
+     *
+     * Refused locally if the image is empty or larger than the slot, because the
+     * device would refuse it anyway and a local refusal can name the size while the
+     * device's nack can only name a check.
+     *
+     * **The result is the device's, not an assumption.** A `not_supported` result
+     * (a build with no partitions) is reported as a nack with that err, so the UI
+     * can say "this device cannot install over USB" rather than a false success.
+     * [onProgress] is called with (sent, total) after each acked chunk, so a caller
+     * can render real progress rather than a spinner.
+     */
+    suspend fun pushFirmware(
+        image: ByteArray,
+        onProgress: (sent: Int, total: Int) -> Unit = { _, _ -> },
+        timeoutMs: Long = 20_000,
+    ): AckResult {
+        if (image.isEmpty()) {
+            return AckResult.Nacked("empty_image", "the selected file is empty")
+        }
+        if (image.size > kWireFirmwareMaxBytes) {
+            return AckResult.Nacked(
+                "too_large",
+                "the image is ${image.size} bytes; the device slot holds $kWireFirmwareMaxBytes",
+            )
+        }
+
+        val sha = sha256Hex(image)
+        var result = request(Frames.OTA_BEGIN) { o ->
+            o.with("size", image.size).with("sha256", sha)
+        }
+        if (result !is AckResult.Ok) return result
+
+        var offset = 0
+        while (offset < image.size) {
+            val end = minOf(offset + CHUNK_BYTES, image.size)
+            val slice = image.copyOfRange(offset, end)
+            result = request(Frames.OTA_CHUNK) { o ->
+                o.with("offset", offset).with("data_b64", base64(slice))
+            }
+            if (result !is AckResult.Ok) return result
+            offset = end
+            onProgress(offset, image.size)
+        }
+
+        // `ota_end` verifies the digest and, only then, commits. On the device the
+        // commit switches the boot partition; the caller is offered a reboot
+        // separately, because the firmware does not reboot on its own while a key
+        // value may be presented (spec §9.3).
+        return request(Frames.OTA_END, timeoutMs)
+    }
+
     /** Send a frame of [type] and wait for the reply carrying its `for_seq`. */
     private suspend fun request(
         type: String,
@@ -562,6 +625,16 @@ class SwcClient(private val transport: SwcTransport) {
          * a peer's `total_len` cannot choose an allocation size.
          */
         const val kWireConfigMaxBytes = 22_407
+
+        /**
+         * The app slot's size, from the firmware's `kAppSlotBytes` (1,920 KiB,
+         * `partitions.csv`; spec §9.2). Used to refuse an oversize image before a
+         * single chunk goes out — the device refuses it too, but a local refusal can
+         * name the size while the device's nack can only name a check, and it avoids
+         * chattering a doomed transfer over the link. Pinned to the firmware by
+         * `check_app_limits.py`.
+         */
+        const val kWireFirmwareMaxBytes = 1_966_080
     }
 }
 

@@ -41,8 +41,12 @@ enum class OtaResult {
  * tests exercise. On the device the slot really is this size, so the two agree;
  * `esp_ota_begin` independently refuses anything larger, so this is the earlier
  * of two checks rather than the only one.
+ *
+ * Written as a single literal (1,920 × 1024 = 1,966,080) because the
+ * `check_app_limits.py` gate reads this declaration to pin the app's mirror; a
+ * product expression there would not parse.
  */
-constexpr size_t kAppSlotBytes = 1920u * 1024u;
+constexpr size_t kAppSlotBytes = 1966080;
 
 // Starts a run. Validates the size and hash up front, exactly as ImageVerify
 // does, so a bad image is refused before anything is written.

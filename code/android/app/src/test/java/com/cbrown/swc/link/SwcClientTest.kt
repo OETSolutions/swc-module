@@ -35,6 +35,10 @@ class SwcClientTest {
         // Opt-in: several tests depend on an unanswered request timing out, so the
         // default transport stays silent like a device that never replied.
         var autoAck = false
+        // When set, the named frame `type` is answered with a `nack` of `nackErr`
+        // instead of an ack, so a test can exercise the client's mid-run abort.
+        var nackType: String? = null
+        var nackErr: String = "gap"
         override suspend fun write(bytes: ByteArray) {
             val s = String(bytes)
             written += s
@@ -42,7 +46,13 @@ class SwcClientTest {
             // A real device answers every command. The buffer is large so the ack
             // queues even when the reader is momentarily behind.
             val seq = Regex("\"seq\":(\\d+)").find(s)?.groupValues?.get(1)?.toInt() ?: return
-            flow.tryEmit("{\"v\":1,\"seq\":$seq,\"type\":\"ack\",\"for_seq\":$seq}\n".toByteArray())
+            val type = Regex("\"type\":\"(\\w+)\"").find(s)?.groupValues?.get(1)
+            val reply = if (type != null && type == nackType) {
+                "{\"v\":1,\"seq\":$seq,\"type\":\"nack\",\"for_seq\":$seq,\"err\":\"$nackErr\",\"detail\":\"\"}\n"
+            } else {
+                "{\"v\":1,\"seq\":$seq,\"type\":\"ack\",\"for_seq\":$seq}\n"
+            }
+            flow.tryEmit(reply.toByteArray())
         }
         override val incoming: Flow<ByteArray> = flow
         override fun close() {}
@@ -642,5 +652,97 @@ class SwcClientTest {
         }
         reader.interrupt()
         client.close()
+    }
+
+    // ---------------------------------------------------------------- USB OTA
+    // Spec §9.3's in-car update path. The firmware side is wired (N-14); these
+    // cover the app half -- that a push emits begin/chunk/end in order, that the
+    // offsets are the DECODED byte offsets (the same rule config uses), and that an
+    // oversize or empty image is refused locally rather than streamed.
+
+    @Test
+    fun `pushFirmware sends begin then chunks then end`() = runTest {
+        val t = FakeTransport().apply { autoAck = true }
+        val client = SwcClient(t)
+        val job = startClient(client)
+        val image = ByteArray(1024) { it.toByte() }
+        val result = client.pushFirmware(image)
+        assertTrue("the push must succeed when every frame is acked", result is AckResult.Ok)
+
+        val types = t.written.map { Regex("\"type\":\"(\\w+)\"").find(it)?.groupValues?.get(1) }
+        assertEquals("ota_begin", types.first())
+        assertEquals("ota_end", types.last())
+        assertEquals("the image needs two 512-byte chunks", 2, types.count { it == "ota_chunk" })
+        job.cancel()
+    }
+
+    @Test
+    fun `pushFirmware offsets are decoded byte offsets not chunk indices`() = runTest {
+        val t = FakeTransport().apply { autoAck = true }
+        val client = SwcClient(t)
+        val job = startClient(client)
+        client.pushFirmware(ByteArray(1200) { 7 })
+        val offsets = t.written.mapNotNull {
+            Regex("\"type\":\"ota_chunk\".*?\"offset\":(\\d+)").find(it)?.groupValues?.get(1)?.toInt()
+        }
+        assertEquals(listOf(0, 512, 1024), offsets)
+        job.cancel()
+    }
+
+    @Test
+    fun `pushFirmware reports progress per acked chunk`() = runTest {
+        val t = FakeTransport().apply { autoAck = true }
+        val client = SwcClient(t)
+        val job = startClient(client)
+        val progress = mutableListOf<Pair<Int, Int>>()
+        client.pushFirmware(ByteArray(1024) { 1 }, onProgress = { sent, total ->
+            progress += sent to total
+        })
+        assertEquals(listOf(512 to 1024, 1024 to 1024), progress)
+        job.cancel()
+    }
+
+    @Test
+    fun `pushFirmware refuses an empty image without sending anything`() = runTest {
+        val t = FakeTransport().apply { autoAck = true }
+        val client = SwcClient(t)
+        val job = startClient(client)
+        val result = client.pushFirmware(ByteArray(0))
+        assertTrue(result is AckResult.Nacked)
+        assertEquals("empty_image", (result as AckResult.Nacked).err)
+        assertTrue("nothing must reach the wire", t.written.isEmpty())
+        job.cancel()
+    }
+
+    @Test
+    fun `pushFirmware refuses an oversize image locally`() = runTest {
+        val t = FakeTransport().apply { autoAck = true }
+        val client = SwcClient(t)
+        val job = startClient(client)
+        // One byte past the app slot (1,920 KiB = 1,966,080, the firmware's
+        // `kAppSlotBytes`). The device would refuse it at ota_begin; the app refuses
+        // it before a single chunk, which is what this asserts.
+        val result = client.pushFirmware(ByteArray(1_966_080 + 1))
+        assertTrue(result is AckResult.Nacked)
+        assertEquals("too_large", (result as AckResult.Nacked).err)
+        assertTrue("nothing must reach the wire", t.written.isEmpty())
+        job.cancel()
+    }
+
+    @Test
+    fun `pushFirmware stops when the device nacks a chunk`() = runTest {
+        // The device rejects a gap or an oversize run mid-transfer. The app must
+        // not keep streaming chunks into a run the device already closed, and the
+        // caller must see the nack rather than a timeout.
+        val t = FakeTransport().apply { autoAck = true; nackType = "ota_chunk" }
+        val client = SwcClient(t)
+        val job = startClient(client)
+        val result = client.pushFirmware(ByteArray(1024) { 3 })
+        assertTrue("the nack must reach the caller, not become a timeout", result is AckResult.Nacked)
+        assertEquals("gap", (result as AckResult.Nacked).err)
+        // begin + exactly one chunk, then it stopped. No further chunk, no end.
+        val types = t.written.map { Regex("\"type\":\"(\\w+)\"").find(it)!!.groupValues[1] }
+        assertEquals(listOf("ota_begin", "ota_chunk"), types)
+        job.cancel()
     }
 }

@@ -30,6 +30,7 @@ CONFIG_MODEL = REPO / "lib" / "Config" / "ConfigModel.h"
 LADDER_DECODE = REPO / "lib" / "Analog" / "LadderDecode.h"
 BASE64_H = REPO / "lib" / "Util" / "Base64.h"
 CONFIG_CODEC_H = REPO / "lib" / "Config" / "ConfigCodec.h"
+OTA_USB_H = REPO / "lib" / "Update" / "OtaUsb.h"
 NDJSON_H = REPO / "lib" / "Link" / "Ndjson.h"
 CONFIG_KT = REPO / "android" / "app" / "src" / "main" / "java" / "com" / "oetsolutions" / "swc" / "model" / "Config.kt"
 SWC_CLIENT_KT = REPO / "android" / "app" / "src" / "main" / "java" / "com" / "oetsolutions" / "swc" / "link" / "SwcClient.kt"
@@ -76,6 +77,11 @@ PAIRS = [
     #     is read from the `inline constexpr` body).
     ("wire config chunk",    "kConfigWireChunkBytes", "CHUNK_BYTES",             BASE64_H),
     ("wire config ceiling",  "ConfigMaxSerializedSize", "kWireConfigMaxBytes",   CONFIG_CODEC_H),
+    # The firmware image slot, which the app's USB-OTA push mirrors (spec §9.3).
+    # Too SMALL and the app refuses an image the device would accept; too LARGE and
+    # it streams megabytes the device rejects at `ota_begin`. The firmware constant
+    # moved to `OtaUsb.h` from a literal when USB OTA was wired (N-14).
+    ("firmware slot",        "kAppSlotBytes",         "kWireFirmwareMaxBytes",   OTA_USB_H),
     # The inbound NDJSON line cap. The app's `lineCap` carries the comment
     # "// kNdjsonMaxFrame, spec 4.2" -- a hand-mirror with nothing comparing it, so
     # a firmware re-tune of the cap would leave the app refusing lines the device
@@ -120,7 +126,7 @@ def _kt_constant(text, name):
 
 def main() -> int:
     for p in (CONFIG_MODEL, LADDER_DECODE, BASE64_H, CONFIG_CODEC_H, NDJSON_H,
-              CONFIG_KT, SWC_CLIENT_KT):
+              OTA_USB_H, CONFIG_KT, SWC_CLIENT_KT):
         if not p.is_file():
             print(f"FAIL: {p} not found", file=sys.stderr)
             return 2
@@ -131,6 +137,7 @@ def main() -> int:
         BASE64_H: BASE64_H.read_text(),
         CONFIG_CODEC_H: CONFIG_CODEC_H.read_text(),
         NDJSON_H: NDJSON_H.read_text(),
+        OTA_USB_H: OTA_USB_H.read_text(),
     }
     kt_by_file = {
         CONFIG_KT: CONFIG_KT.read_text(),

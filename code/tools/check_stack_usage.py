@@ -166,14 +166,15 @@ def is_project_source(path: str, repo: pathlib.Path) -> bool:
     return False
 
 
-def compile_with_stack_usage(compile_db: pathlib.Path, outdir: pathlib.Path,
-                             repo: pathlib.Path) -> None:
-    """Recompile every project TU with -fstack-usage, using the real flags."""
-    entries = json.loads(compile_db.read_text())
+def compile_with_stack_usage(entries: list[dict], outdir: pathlib.Path) -> None:
+    """Recompile every project TU with -fstack-usage, using the real flags.
+
+    `entries` comes from `load_compile_entries`, which has already merged the two
+    databases per file and filtered to this project's sources -- so a TU whose
+    recompile fails is a real problem, not a database-selection artifact.
+    """
     outdir.mkdir(parents=True, exist_ok=True)
     for e in entries:
-        if not is_project_source(e.get("file", ""), repo):
-            continue
         f = e["file"]
         parts = shlex.split(e["command"])
         parts[0] = resolve_compiler(parts[0])
@@ -454,47 +455,91 @@ USB_TASK_ROOTS = (
 )
 
 
-def find_compile_db(repo: pathlib.Path, build: pathlib.Path) -> pathlib.Path | None:
-    """The compile database that can actually rebuild this project's sources.
+def load_compile_entries(repo: pathlib.Path, build: pathlib.Path) -> list[dict]:
+    """Every project TU's compile entry, from BOTH databases, best-covering wins.
 
-    There are TWO, and they are not equivalent -- both list `src/main.cpp`, but
-    only the root file carries the include set that compiles it:
+    There are TWO databases and they are not equivalent, in opposite directions:
 
         compile_commands.json          main.cpp with 220 -I paths, incl.
-                                       spi_flash/include (needs esp_flash.h)
-        .pio/build/<env>/compile   main.cpp with 90 -I paths, NO spi_flash,
-          _commands.json                so the recompile dies on esp_flash.h
+                                       spi_flash/include (needs esp_flash.h);
+                                       but it is only written by a `compiledb`-style
+                                       run and goes STALE -- on this machine it was
+                                       five days old and did not list a TU added
+                                       since, so that TU was silently never
+                                       stack-checked while the gate stayed green.
+        .pio/build/<env>/compile   the database `pio run` itself refreshes, so it
+          _commands.json                always lists every current TU -- but its
+                                        main.cpp entry carries only 143 -I paths
+                                        and dies on esp_flash.h.
+
+    Neither one alone is sufficient, and picking one per FILE is what makes the
+    check honest: for each source, take the entry with the most `-I` paths (the
+    one that can actually compile it), and let the two files that need different
+    databases each get the one they need. A single-database choice was the
+    original bug in two stages -- first it picked the build db and lost `main.cpp`
+    ("no chain" for the boot path), then it picked the root db and lost every file
+    added since the root db was last written.
 
     Both also spell the compiler differently (bare name vs absolute path), which
-    `resolve_compiler` handles. So the choice is made on the INCLUDE COVERAGE of
-    the `src/main.cpp` entry -- the file whose absence is hardest to notice,
-    since it is the main task's root and its chain is the boot path. A database
-    that cannot compile `main.cpp` silently reports "no chain" for the task that
-    runs `Boot()`.
+    `resolve_compiler` handles.
     """
     candidates = [c for c in (repo / "compile_commands.json",
                               build / "compile_commands.json") if c.is_file()]
-    best, best_includes = None, -1
+    by_key: dict[str, tuple[int, dict]] = {}
+    order: list[str] = []
     for cand in candidates:
         try:
             entries = json.loads(cand.read_text())
         except (OSError, json.JSONDecodeError):
             continue
         for e in entries:
-            # The file is spelled two ways: relative (`src/main.cpp`) in the root
-            # database, absolute in the build one. Match the tail, not the
-            # leading separator -- requiring `/src/main.cpp` misses the relative
-            # form and silently picks the database that cannot compile it.
-            if e.get("file", "").replace("\\", "/").endswith("src/main.cpp"):
-                n = sum(1 for p in shlex.split(e.get("command", "")) if p.startswith("-I"))
-                if n > best_includes:
-                    best, best_includes = cand, n
-                break
-    if best is not None:
-        return best
-    # No `main.cpp` entry anywhere: fall back to whichever exists, so the frame
-    # check still runs (it just cannot see the main-task chain).
-    return candidates[0] if candidates else None
+            f = e.get("file", "").replace("\\", "/")
+            if not is_project_source(f, repo):
+                continue
+            # Key on the tail, because the databases spell the path two ways
+            # (relative `src/main.cpp` vs absolute). The tail is unique within
+            # this project's lib/ and src/.
+            key = "/".join(f.split("/")[-2:])
+            n = sum(1 for p in shlex.split(e.get("command", "")) if p.startswith("-I"))
+            if key not in by_key:
+                order.append(key)
+            if key not in by_key or n > by_key[key][0]:
+                by_key[key] = (n, e)
+    return [by_key[k][1] for k in order]
+
+
+def build_tree_error(build) -> str | None:
+    """Why the build tree is unusable, or None if it is present and fresh.
+
+    A missing `compile_commands.json` must be an ERROR, not a silent fall back to
+    the stale root database. The fallback is exactly the silent-undercoverage
+    this gate exists to prevent, one layer down: the root db predates the newest
+    TUs, so it still compiles `main.cpp` but the freshly-added device-only units
+    vanish from the call graph -- and a task root (`app_main`) that is no longer
+    in the graph is then reported as a RENAMED root, which sends the reader off
+    to edit MAIN_TASK_ROOTS/USB_TASK_ROOTS at whatever name is current that day.
+
+    The real cause is almost always the one measured in HANDOFF section 2: a
+    PlatformIO invocation under a different `SWC_FW_VERSION`/`SWC_GIT_SHA` (or
+    none set) computes a different project checksum against the shared
+    `.pio/build/project.checksum`, and PlatformIO's auto-clean deletes the WHOLE
+    of `.pio/build/` before rebuilding. So the two env dirs evict each other
+    unless every invocation names the same pair.
+
+    Pure over its input, so `test_check_stack_usage.py` can exercise it without
+    a device build -- the same reason `chain_precondition_error` is pure.
+    """
+    import os
+
+    if not os.path.isfile(os.path.join(str(build), "compile_commands.json")):
+        return (f"{build}/compile_commands.json is missing, so the call graph "
+                f"would come from the STALE root database and every TU added "
+                f"since it was written would go unchecked (with `app_main` "
+                f"reported as a renamed root). Run `SWC_FW_VERSION=dev "
+                f"SWC_GIT_SHA=local pio run -e esp32s3` first, with the SAME "
+                f"SWC_FW_VERSION/SWC_GIT_SHA on EVERY PlatformIO invocation -- a "
+                f"change in either makes PlatformIO auto-clean all of .pio/build/.")
+    return None
 
 
 def chain_precondition_error(objdump, graph, frames_by_mangled, roots) -> str | None:
@@ -541,14 +586,18 @@ def main() -> int:
 
     repo = pathlib.Path(args.repo)
     build = repo / args.build_dir
-    db = find_compile_db(repo, build)
-    if db is None:
-        print(f"stack gate: no compile_commands.json under {repo} -- "
-              "run `pio run -e esp32s3` first", file=sys.stderr)
+    why = build_tree_error(build)
+    if why:
+        print(f"stack gate: {why}", file=sys.stderr)
+        return 2
+    entries = load_compile_entries(repo, build)
+    if not entries:
+        print(f"stack gate: no compile_commands.json for this project's sources "
+              f"under {repo} -- run `pio run -e esp32s3` first", file=sys.stderr)
         return 2
 
     outdir = build / "stack-usage"
-    compile_with_stack_usage(db, outdir, repo)
+    compile_with_stack_usage(entries, outdir)
     frames, where = parse_su(outdir)
     if not frames:
         print("stack gate: no -fstack-usage output produced", file=sys.stderr)

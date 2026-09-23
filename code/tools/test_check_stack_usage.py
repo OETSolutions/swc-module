@@ -156,3 +156,77 @@ def test_a_missing_config_assertion_is_an_error_not_a_fallback():
         else:
             raise AssertionError("a missing assertion must raise, not fall back")
 
+
+
+def test_the_two_compile_databases_are_merged_per_file():
+    # The defect this pins: the gate used to pick ONE database. Picking the build
+    # db lost `src/main.cpp` ("no chain" for the boot path); picking the root db
+    # lost every TU added after it was last written, so a brand-new device-only
+    # file was NEVER stack-checked while the gate stayed green -- exactly the
+    # silent-undercoverage the module docstring is about, one layer down.
+    #
+    # The merge must keep BOTH: main.cpp (which only the root db can compile) and
+    # a TU that only the build db lists.
+    import tempfile, json
+    with tempfile.TemporaryDirectory() as td:
+        repo = pathlib.Path(td)
+        (repo / "src").mkdir(parents=True)
+        (repo / "lib" / "New").mkdir(parents=True)
+        (repo / "src" / "main.cpp").write_text("int main(){return 0;}")
+        (repo / "lib" / "New" / "Fresh.cpp").write_text("int f(){return 1;}")
+
+        # Root db: has main.cpp (many includes), predates Fresh.cpp.
+        (repo / "compile_commands.json").write_text(json.dumps([
+            {"file": "src/main.cpp", "directory": str(repo),
+             "command": "cc -I" + " -I".join(["a"] * 40) + " -c src/main.cpp"},
+        ]))
+        # Build db: fresh, lists Fresh.cpp with fewer includes on main.cpp.
+        build = repo / ".pio" / "build" / "esp32s3"
+        build.mkdir(parents=True)
+        (build / "compile_commands.json").write_text(json.dumps([
+            {"file": str(repo / "src" / "main.cpp"), "directory": str(repo),
+             "command": "cc -I" + " -I".join(["b"] * 10) + " -c src/main.cpp"},
+            {"file": str(repo / "lib" / "New" / "Fresh.cpp"), "directory": str(repo),
+             "command": "cc -Ix -c lib/New/Fresh.cpp"},
+        ]))
+
+        entries = cs.load_compile_entries(repo, build)
+        names = sorted(pathlib.Path(e["file"]).name for e in entries)
+        assert names == ["Fresh.cpp", "main.cpp"], names
+
+        # And main.cpp got the RICHER entry (the root db's, 40 includes).
+        main_entry = next(e for e in entries if e["file"].endswith("main.cpp"))
+        assert sum(1 for p in main_entry["command"].split() if p.startswith("-I")) == 40
+
+
+def test_a_missing_build_tree_is_an_error_not_a_stale_db_fallback():
+    # The defect this pins: when `.pio/build/<env>/compile_commands.json` is gone,
+    # `load_compile_entries` silently falls back to the ROOT database. Its
+    # `main.cpp` entry still compiles, so the gate went green -- while every TU
+    # added after that file was last written (including a whole device-only
+    # unit) was missing from the call graph. The visible symptom was a task root
+    # reported as RENAMED, which reads as a source drift and is not one.
+    #
+    # The realistic cause is PlatformIO's auto-clean: it keys on ONE
+    # `.pio/build/project.checksum` shared by every env, and `platformio.ini`
+    # bakes `SWC_FW_VERSION`/`SWC_GIT_SHA` (from the environment) into the
+    # checksummed config. So a `pio test -e native` after a dev-var'd `pio run
+    # -e esp32s3` wipes the device tree. The gate must say THAT, not "update
+    # MAIN_TASK_ROOTS to the new mangled names".
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        build = pathlib.Path(td) / ".pio" / "build" / "esp32s3"
+        build.mkdir(parents=True)
+        why = cs.build_tree_error(build)
+        assert why is not None, "a missing build tree must be an error"
+        assert "compile_commands.json" in why
+        assert "pio run -e esp32s3" in why
+        # It must name the two env vars, because they are what triggers the
+        # auto-clean that empties the tree in the first place.
+        assert "SWC_FW_VERSION" in why and "SWC_GIT_SHA" in why
+        # And it must NOT send the reader off to edit the root name list.
+        assert "MAIN_TASK_ROOTS" not in why
+
+        (build / "compile_commands.json").write_text("[]")
+        assert cs.build_tree_error(build) is None, "a present tree is not an error"
+

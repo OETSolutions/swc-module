@@ -310,23 +310,31 @@ esp_err_t HandleUpload(httpd_req_t *req)
 
     // Stream the body. A short read or a write failure ABORTS the run, so a
     // partial image is never left as a candidate boot image.
-    int remaining = req->content_len;
+    //
+    // `size_t`, not `int`: `httpd_req_t::content_len` is a `size_t`, and narrowing
+    // a peer-controlled length to `int` first is the cast-before-bounds family
+    // (N-50) -- a body over 2 GB would go negative and the loop would silently
+    // stream NOTHING, so the run would fail closed but report "install failed"
+    // rather than "truncated". `OtaBegin` above bounds the DECLARED size to the
+    // slot; this bounds the stream itself.
+    size_t remaining = req->content_len;
     char buf[1024];
     while (remaining > 0) {
-        const int want = (remaining < static_cast<int>(sizeof(buf))) ? remaining
-                                                                    : static_cast<int>(sizeof(buf));
+        const int want = (remaining < sizeof(buf)) ? static_cast<int>(remaining)
+                                                   : static_cast<int>(sizeof(buf));
         const int got = httpd_req_recv(req, buf, want);
         if (got == HTTPD_SOCK_ERR_TIMEOUT) continue;   // the socket stalled; retry
         if (got <= 0) {
             OtaAbort();
-            ESP_LOGE(TAG, "OTA upload: the body ended early (%d bytes unread)", remaining);
+            ESP_LOGE(TAG, "OTA upload: the body ended early (%u bytes unread)",
+                     static_cast<unsigned>(remaining));
             return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "upload truncated");
         }
         if (OtaChunk(reinterpret_cast<const uint8_t *>(buf), static_cast<size_t>(got)) != OtaResult::kOk) {
             OtaAbort();
             return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "image failed the digest check");
         }
-        remaining -= got;
+        remaining -= static_cast<size_t>(got);
     }
 
     // Verify, then switch the boot partition. Nothing is installed unless the
@@ -356,16 +364,18 @@ esp_err_t HandleJoinWifi(httpd_req_t *req)
 {
     // The body is small (two short strings) and the handler's stack is limited, so
     // it is read into a fixed buffer with an explicit bound rather than trusted.
+    // Clamped in `size_t` before the cast, for the same N-50 reason as the upload:
+    // narrowing `content_len` to `int` first would make a body over 2 GB read as
+    // negative and be reported as "empty" rather than "too long".
     char body[256];
-    const int want = (req->content_len < static_cast<int>(sizeof(body) - 1))
-                         ? req->content_len
-                         : static_cast<int>(sizeof(body) - 1);
-    if (want <= 0) {
+    const size_t want = (req->content_len < sizeof(body) - 1) ? req->content_len
+                                                             : sizeof(body) - 1;
+    if (want == 0) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "empty body");
     }
     int got = 0;
-    while (got < want) {
-        const int n = httpd_req_recv(req, body + got, want - got);
+    while (static_cast<size_t>(got) < want) {
+        const int n = httpd_req_recv(req, body + got, static_cast<int>(want) - got);
         if (n == HTTPD_SOCK_ERR_TIMEOUT) continue;
         if (n <= 0) return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "short read");
         got += n;
@@ -765,12 +775,31 @@ bool StartProvisioning(const MaintenanceInfo &info)
     wifi_prov_mgr_config_t pcfg = {};
     pcfg.scheme = wifi_prov_scheme_ble;
     /*
-     * FREE_BTDM releases the classic-BT controller memory at INIT and the whole
-     * BT/BLE pool at DEINIT. Both matter here: this is a 4 MB part with no PSRAM
-     * (spec 9.2 chose NimBLE over Bluedroid for exactly this), and the BLE
-     * controller must not stay resident after the window closes.
+     * `FREE_BT` -- release CLASSIC BT at init, and do NOT release the BLE/BTDM
+     * pool at deinit.
+     *
+     * **`FREE_BTDM` was the obvious choice and it makes the window ONE-SHOT per
+     * boot.** That handler calls `esp_bt_mem_release(ESP_BT_MODE_BTDM)` on
+     * WIFI_PROV_DEINIT, and IDF's own contract for that call is that it "cannot
+     * be reversed. This means you cannot use the Bluetooth Controller mode that
+     * you have released" (`esp_bt.h`). So the SECOND `wifi_prov_mgr_init` in a
+     * boot re-initialises the controller on memory that was handed back to the
+     * heap and the device PANICS AND REBOOTS. Measured on the bench 2026-09-24:
+     * enter -> exit -> enter reboots the DUT every time (the app link drops and
+     * `uptime_ms` restarts), while a user has no reason to expect a second trip
+     * to maintenance to restart their adapter.
+     *
+     * The trade is real and deliberately taken: `FREE_BTDM` returns a few KB
+     * more heap at the end of a window, and `FREE_BT` keeps the BLE controller
+     * pool reserved for the boot. **FR-32 is not weakened by this** -- what it
+     * forbids is a radio INITIALIZED in normal operation, and after `deinit` the
+     * controller is de-initialized and idle either way; a reserved-but-idle pool
+     * is not a radio. A reboot on the second entry, by contrast, is a hard
+     * failure of the feature. Classic BT is still released at init, because this
+     * device never uses it and that is the memory that actually matters here
+     * (spec 9.2's 4 MB/no-PSRAM budget).
      */
-    pcfg.scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM;
+    pcfg.scheme_event_handler = WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BT;
 
     if (wifi_prov_mgr_init(pcfg) != ESP_OK) {
         ESP_LOGE(TAG, "wifi_prov_mgr_init failed");

@@ -33,10 +33,27 @@ a shape this project has already shipped once:
      running total, which answers a different question than "did this window's
      radio come up" and grows without bound.
 
+  5. **A peer-controlled body length must be clamped in `size_t` before it is
+     narrowed.** `httpd_req_t::content_len` is a `size_t`; narrowing it to `int`
+     first is the cast-before-bounds family (N-50). A body over 2 GB would read
+     as negative, so the stream loop would run zero times and the failure would
+     be reported as "install failed" / "empty body" rather than "truncated" --
+     the wrong diagnosis for the wrong reason.
+
+  6. **The BLE scheme must be `FREE_BT`, NOT `FREE_BTDM`.** The BTDM handler
+     calls `esp_bt_mem_release(ESP_BT_MODE_BTDM)` on deinit, and IDF's own
+     contract for that call is that it "cannot be reversed ... you cannot use the
+     Bluetooth Controller mode that you have released" (`esp_bt.h`). A second
+     `wifi_prov_mgr_init` in a boot therefore re-initialises the controller on
+     freed memory and the device REBOOTS -- measured on the bench, every time,
+     on the second trip through the window (N-82). The window is a feature a
+     user re-enters; a one-shot radio is a broken one.
+
 Each check is structural, which is the point: none can tell a working bring-up
 from a broken one (that is the bench's job, per the header), but each pins the
 shape that silently rots -- a resource created with no teardown, a reply path
-that forgets the status line, a counter that outlives its window.
+that forgets the status line, a counter that outlives its window, a length cast
+before it is bounded, or a scheme that makes the radio one-shot.
 
 Exit codes: 0 clean, 1 a violation, 2 a file could not be found.
 """
@@ -200,6 +217,59 @@ def check_the_failure_count_is_window_scoped(src: str):
     return problems
 
 
+def check_body_lengths_are_clamped_before_narrowing(src: str):
+    """(5) `content_len` (a size_t) must be bounded in `size_t`, not `int`."""
+    problems = []
+    # Any line that names content_len AND casts it to int ON THE SAME line, before
+    # any comparison against a constant -- i.e. `static_cast<int>(...content_len)`
+    # appearing to the LEFT of a `<`/`<=`/`?`.
+    for m in re.finditer(r"[^\n]*content_len[^\n]*", src):
+        line = m.group(0)
+        cast = line.find("static_cast<int>")
+        if cast < 0:
+            continue
+        # Is the cast applied directly to content_len (rather than to something
+        # already clamped)? Look at the text right after the cast's '('.
+        after = line[cast + len("static_cast<int>") :].lstrip()
+        if after.startswith("(req->content_len") or after.startswith("req->content_len") \
+                or after.startswith("(content_len"):
+            problems.append(
+                "a body length is narrowed with `static_cast<int>(...content_len)` "
+                "before it is bounded. clamp in `size_t` first and cast the CLAMPED "
+                "value, or a body over 2 GB reads as negative and is reported as "
+                "'empty'/'install failed' rather than 'too long' (N-50)."
+            )
+    return problems
+
+
+def check_the_ble_scheme_is_not_one_shot(src: str):
+    """(6) The scheme must not release the BTDM pool that it then needs again."""
+    problems = []
+    if "scheme_event_handler" not in src:
+        problems.append(
+            "no `scheme_event_handler` is set on wifi_prov_mgr_config_t; the "
+            "default releases nothing, which leaks classic-BT memory this part "
+            "cannot spare (spec 9.2)."
+        )
+        return problems
+    if "WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM" in src:
+        problems.append(
+            "the BLE scheme is FREE_BTDM, whose deinit calls "
+            "esp_bt_mem_release(ESP_BT_MODE_BTDM) -- a ONE-WAY release per IDF's "
+            "own contract. The second wifi_prov_mgr_init in a boot re-inits the "
+            "controller on freed memory and REBOOTS the device, so the "
+            "maintenance window would be one-shot (N-82). Use FREE_BT: it "
+            "releases classic BT at init and leaves the BTDM pool reserved."
+        )
+    if "WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BT" not in src:
+        problems.append(
+            "the BLE scheme is not FREE_BT, so classic-BT memory may not be "
+            "released at all -- on a 4 MB/no-PSRAM part that is memory the "
+            "design cannot spare (spec 9.2)."
+        )
+    return problems
+
+
 def main() -> int:
     if not RADIO.exists():
         print(f"FAIL: {RADIO} not found", file=sys.stderr)
@@ -210,6 +280,8 @@ def main() -> int:
     problems += check_teardown_pairs_the_bringup(src)
     problems += check_every_reply_sets_its_status(src)
     problems += check_the_failure_count_is_window_scoped(src)
+    problems += check_body_lengths_are_clamped_before_narrowing(src)
+    problems += check_the_ble_scheme_is_not_one_shot(src)
 
     if problems:
         print("maintenance-radio guard FAILED:", file=sys.stderr)
@@ -221,6 +293,8 @@ def main() -> int:
     print("  TearDown frees by a flag the bring-up sets (FR-32)")
     print("  every reply sets its status line, so no refusal reads as success")
     print("  the failure count is window-scoped and assigned, never accumulated")
+    print("  peer body lengths are clamped in size_t before any narrowing cast")
+    print("  the BLE scheme is re-enterable (FREE_BT, not the one-shot FREE_BTDM)")
     return 0
 
 

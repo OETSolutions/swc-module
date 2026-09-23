@@ -350,11 +350,18 @@ fi
 # The `--flash_*` options belong to the `write_flash` SUBcommand in this esptool
 # (v4.11): `--flash_mode qio` after `write_flash -z` is parsed as the address
 # argument and fails with 'Address "qio" must be a number'.
+#
+# **`--verify` is NOT passed, because esptool v5 removed the flag: verification is
+# now unconditional.** Passing it fails the whole command with
+# "No such option '--verify'" *after* the device has been dropped into the ROM
+# loader, which leaves the board sitting in the loader with nothing written --
+# found on the bench 2026-09-24 when PlatformIO's bundled esptool moved to 5.3.0.
+# The write is verified either way; this only stops asking for what is default.
 echo "== flashing $FLASH_OFFSET"
 # shellcheck disable=SC2086
 $ET --chip esp32s3 --port "$ROM_PORT" \
     --before no_reset --after watchdog_reset \
     write_flash -z --flash_mode qio --flash_freq 80m --flash_size 4MB \
-    --verify "${FLASH_PAIRS[@]}"
+    "${FLASH_PAIRS[@]}"
 
 echo "== done. The device has been reset back into the application."

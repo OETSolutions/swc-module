@@ -95,3 +95,48 @@ def test_a_start_that_never_records_a_failure_is_caught():
     mutated = _mutate_all("g_failures = 1;", "(void)0;")
     problems = cmr.check_the_failure_count_is_window_scoped(mutated)
     assert any("never records a failure" in p for p in problems), problems
+
+
+# --- (5) body lengths clamp before narrowing -------------------------------
+
+def test_narrowing_content_len_before_clamping_is_caught():
+    # The N-50 shape this check was written for: cast the peer length to int
+    # first, so a >2 GB body reads as negative.
+    mutated = _mutate(
+        "const int want = (remaining < sizeof(buf))",
+        "const int want = (static_cast<int>(remaining) < sizeof(buf))",
+    )
+    # The upload loop's cast is applied to an ALREADY-clamped value, so add a
+    # direct one on content_len to model the defect.
+    mutated = mutated.replace(
+        "size_t remaining = req->content_len;",
+        "int remaining = static_cast<int>(req->content_len);",
+    )
+    problems = cmr.check_body_lengths_are_clamped_before_narrowing(mutated)
+    assert any("before it is bounded" in p for p in problems), problems
+
+
+def test_the_real_source_clamps_its_body_lengths():
+    assert cmr.check_body_lengths_are_clamped_before_narrowing(REAL) == []
+
+
+# --- (6) the BLE scheme is re-enterable ------------------------------------
+
+def test_the_one_shot_btdm_scheme_is_caught():
+    # N-82, the bench-found reboot: FREE_BTDM releases the BTDM pool on deinit
+    # and the release cannot be reversed, so a second entry panics.
+    mutated = _mutate("WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BT;",
+                      "WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BTDM;")
+    problems = cmr.check_the_ble_scheme_is_not_one_shot(mutated)
+    assert any("FREE_BTDM" in p for p in problems), problems
+
+
+def test_a_scheme_that_releases_nothing_is_caught():
+    mutated = _mutate("WIFI_PROV_SCHEME_BLE_EVENT_HANDLER_FREE_BT;",
+                      "0;")
+    problems = cmr.check_the_ble_scheme_is_not_one_shot(mutated)
+    assert any("not FREE_BT" in p for p in problems), problems
+
+
+def test_the_real_scheme_is_re_enterable():
+    assert cmr.check_the_ble_scheme_is_not_one_shot(REAL) == []

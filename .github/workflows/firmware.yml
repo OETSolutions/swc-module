@@ -203,9 +203,11 @@ jobs:
       # this job compiles it. The properties it holds are the ones that only
       # surface on a board inside a car: FR-32's teardown pairing (a leaked radio
       # stack), a reply that sets no status line (so a 401 reads as success on the
-      # page), and the window-scoped failure count (which the app branches on
-      # FIRST, so a sticky value makes every later window claim its radio is
-      # down). Each was a real shape before this gate existed.
+      # page), the window-scoped failure count (which the app branches on FIRST,
+      # so a sticky value makes every later window claim its radio is down), and
+      # the BLE scheme (FREE_BTDM makes the window ONE-SHOT per boot -- the
+      # second entry reboots the device, measured on the bench as N-82). Each was
+      # a real defect before this gate existed.
       - name: The maintenance radio's window-scoped invariants hold
         working-directory: code
         run: python3 tools/check_maintenance_radio.py

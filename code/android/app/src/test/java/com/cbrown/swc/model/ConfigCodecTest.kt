@@ -2,6 +2,7 @@ package com.oetsolutions.swc.model
 
 import com.oetsolutions.swc.contract.ActionKind
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -17,6 +18,13 @@ fun sampleConfig(): Config = Config(
         ledLevel = 1,
         tempCompEnabled = true,
         maintenanceTimeoutMs = 300_000L,
+        // TRUE on purpose, so the whole-object round-trip below can FAIL: at the
+        // `false` default, an encoder that dropped the field would decode back to
+        // false and the assertion would pass having proven nothing. True is the
+        // only value that shows the field survived, and it is also what the
+        // checked-in crosscheck fixture carries, so the firmware's own decoder is
+        // asked about it too.
+        maintenanceOnBoot = true,
     ),
     channels = listOf(
         ChannelConfig(
@@ -67,6 +75,28 @@ class ConfigCodecTest {
         val c = sampleConfig()
         val decoded = ConfigJson.decode(ConfigJson.encode(c))
         assertEquals(c, decoded)
+    }
+
+    @Test
+    fun `a config from before FR33s trigger decodes with the trigger off`() {
+        // The firmware treats an absent `maintenance_on_boot` as false so a config
+        // written by an older build still loads. The app must agree: if it refused
+        // the frame, a device configured by an older firmware would read as
+        // corrupt in the app; if it defaulted a PRESENT but malformed value, it
+        // would disagree with the device about what is stored.
+        val text = ConfigJson.encode(sampleConfig()).replace(
+            ",\"maintenance_on_boot\":true",
+            "",
+        )
+        assertFalse(
+            "the field must actually be gone for this test to mean anything",
+            text.contains("maintenance_on_boot"),
+        )
+        val decoded = ConfigJson.decode(text)
+        assertFalse(
+            "an absent field must mean false, as it does in the firmware",
+            decoded.settings.maintenanceOnBoot,
+        )
     }
 
     @Test

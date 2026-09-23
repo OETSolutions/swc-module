@@ -610,6 +610,46 @@ void SystemOrchestrator::Boot() {
     // false about the app (nothing in it reads `config_state` for pass-through).
     if (pass_through_ && !any_reference) pass_through_ = false;
 
+    // 3b. FR-33's next-boot maintenance trigger (spec 8.2, "config flag on next
+    //     boot"). This is the third of §8.2's four entry triggers and the only
+    //     one that is a stored setting; the other three are a live USB command,
+    //     a live AUX1 hold, and the reset-reason case N-13 leaves blocked.
+    //
+    //     **CONSUMED HERE, and the consume is PERSISTED.** Spec 8.2 scopes this
+    //     trigger to the NEXT boot, and nothing on the exit path can clear a
+    //     stored field (only a whole-config commit rewrites `settings`). Left
+    //     set, it would reopen the window on every boot for the life of the
+    //     config -- an unbounded maintenance window, the state FR-38 exists to
+    //     forbid. So it opens the window ONCE and is then cleared and saved.
+    //
+    //     **Ordered AFTER the pass-through resolution above, deliberately.**
+    //     That step can set `pass_through_ = false`, but it does not return, so
+    //     this runs either way and the ordering is for clarity rather than
+    //     correctness. It IS ordered BEFORE step 4's feedback so the boot
+    //     patterns below are chosen for a window that is already open.
+    if (config_.settings.maintenance_on_boot) {
+        // Clear in memory FIRST, unconditionally, so the flag is spent for this
+        // process whatever the save does. A save that fails therefore costs the
+        // user persistence, not a stuck window: the next boot re-reads the OLD
+        // stored config and opens once more, which is a bounded, recoverable
+        // over-trigger rather than an unbounded one.
+        config_.settings.maintenance_on_boot = false;
+
+        // Persist ONLY when a store exists AND the config in force is durable
+        // (`BootConfigState::kOk`/`kRecovered`). Saving under a config that just
+        // fell back to defaults, or that never existed, would write the DEFAULTS
+        // over whatever the user had -- the read-modify-write collapse this
+        // project already paid for once. With no durable config there is nothing
+        // to update, so the in-memory clear above is the whole action.
+        if (store_ != nullptr &&
+            (config_state_ == BootConfigState::kOk ||
+             config_state_ == BootConfigState::kRecovered)) {
+            store_->Save(config_);
+        }
+
+        maintenance_.Enter(MaintenanceTrigger::kConfigFlag, hal_->now_ms(hal_->ctx));
+    }
+
     // 4. Feedback for the load result. A recovered backup is degraded (the user
     //    should know their newest config was lost); a fallback is an error.
     //

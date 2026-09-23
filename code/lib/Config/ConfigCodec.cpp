@@ -560,6 +560,7 @@ cJSON *EncodeSettings(const DeviceSettings &s) {
     AddU32(o, "led_level", s.led_level);
     cJSON_AddBoolToObject(o, "temp_comp_enabled", s.temp_comp_enabled);
     AddU32(o, "maintenance_timeout_ms", s.maintenance_timeout_ms);
+    cJSON_AddBoolToObject(o, "maintenance_on_boot", s.maintenance_on_boot);
     return o;
 }
 
@@ -717,6 +718,19 @@ bool DecodeSettings(const cJSON *o, DeviceSettings *s) {
     if (!ReadU8(o, "led_level", &s->led_level)) return false;
     if (!ReadBool(o, "temp_comp_enabled", &s->temp_comp_enabled)) return false;
     if (!ReadU32(o, "maintenance_timeout_ms", &s->maintenance_timeout_ms)) return false;
+    // OPTIONAL, unlike every field above: a config written before FR-33's
+    // next-boot trigger existed has no `maintenance_on_boot`, and the on-disk
+    // format is JSON with no schema bump to lean on. An ABSENT field means
+    // "false" (the default), which is also what a config that never set it means
+    // -- so refusing a fieldless config would strand every device configured by
+    // an older firmware, and defaulting a PRESENT but malformed one to false
+    // would be the silent-wrong-value shape. Hence: absent -> false, present ->
+    // must parse as a bool or the whole decode fails.
+    s->maintenance_on_boot = false;
+    const cJSON *mob = Member(o, "maintenance_on_boot");
+    if (mob != nullptr && !ReadBool(o, "maintenance_on_boot", &s->maintenance_on_boot)) {
+        return false;
+    }
     return true;
 }
 

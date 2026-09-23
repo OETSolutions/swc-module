@@ -171,6 +171,11 @@ object ConfigJson {
                     ledLevel = s.int("led_level") ?: 2,
                     tempCompEnabled = s.bool("temp_comp_enabled") ?: true,
                     maintenanceTimeoutMs = s.long("maintenance_timeout_ms") ?: 300_000L,
+                    // Absent means false, matching the firmware's optional-field
+                    // rule: a config from an older firmware has no such key, and
+                    // treating that as anything but the default would clear the
+                    // user's setting on the next save.
+                    maintenanceOnBoot = s.bool("maintenance_on_boot") ?: false,
                 )
             } ?: DeviceSettings(),
             channels = root.arr("channels")
@@ -259,6 +264,7 @@ object ConfigJson {
         put("led_level", s.ledLevel)
         put("temp_comp_enabled", s.tempCompEnabled)
         put("maintenance_timeout_ms", s.maintenanceTimeoutMs)
+        put("maintenance_on_boot", s.maintenanceOnBoot)
     }
 
     fun encode(c: Config): String = buildJsonObject {

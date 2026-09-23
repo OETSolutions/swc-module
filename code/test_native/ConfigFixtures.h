@@ -30,6 +30,11 @@ inline Config MakeConfig() {
     c.settings.led_level = 2;
     c.settings.temp_comp_enabled = true;
     c.settings.maintenance_timeout_ms = 300000;   // spec 8.2's default window
+    // FR-33's next-boot trigger, set TRUE here on purpose: a fixture field left at
+    // its zero value cannot distinguish "round-trips correctly" from "the encoder
+    // dropped it and the decoder defaulted it to the same false". True is the
+    // only value that proves the field survives.
+    c.settings.maintenance_on_boot = true;
     c.channel_count = 1;
     c.channels[0].enabled = true;
     std::strncpy(c.channels[0].name, "SWC1", sizeof(c.channels[0].name) - 1);

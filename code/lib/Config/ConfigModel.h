@@ -104,6 +104,22 @@ struct DeviceSettings {
     uint8_t        led_level;         // 0..3
     bool           temp_comp_enabled;
     uint32_t       maintenance_timeout_ms;
+    // FR-33's third trigger (spec 8.2): "Config flag on next boot -- for a user
+    // who wants it up immediately after flashing."
+    //
+    // **CONSUMED at boot, never left set.** Spec 8.2 gives this trigger a
+    // NEXT-BOOT meaning, and the device's own exit path has no way to clear a
+    // persisted field (only a whole-config commit rewrites `settings`). So if the
+    // flag stayed true the window would reopen on EVERY boot forever and never
+    // close except by timeout -- an unbounded maintenance window, which is the
+    // exact state FR-38 exists to forbid. `SystemOrchestrator::Boot` therefore
+    // clears it and persists that clear the first time it acts on it, so the one
+    // boot the user asked for is the only one that opens it.
+    //
+    // Declared LAST so the two bools and the `uint32_t` pack without padding --
+    // `Config` is held by value in places and every byte shows up in the NVS blob
+    // budget (ConfigCodec.h).
+    bool           maintenance_on_boot;
 };
 
 struct OutputProfile {
@@ -136,11 +152,20 @@ struct Config {
     uint64_t        updated_at_ms;
     DeviceSettings  settings;
     ChannelConfig   channels[kMaxChannels];
-    uint8_t         channel_count;
     AuxButtonConfig aux[kMaxAuxButtons];    // AUX1-AUX3 (spec 3.1)
+    // The three count bytes, grouped before the join table so they share ONE
+    // padding slot. Interleaving them among the arrays they count left
+    // `binding_count` at the very end with 7 bytes of tail padding after it, and
+    // adding FR-33's field to `settings` turned that into an 8-byte growth of
+    // `sizeof(Config)`. Moving bytes that cost nothing to move absorbs the new
+    // field at zero size cost, which keeps the 8 KB by-value frame the
+    // stack-safety arithmetic is written against (see the static_assert below).
+    // Reordering is safe because nothing treats `Config` as raw memory -- it
+    // crosses the link as JSON and reaches NVS as a JSON blob.
+    uint8_t         channel_count;
     uint8_t         aux_count;
-    Binding         bindings[kMaxBindings]; // TOP-LEVEL join table (spec 3.1/3.5)
     uint8_t         binding_count;
+    Binding         bindings[kMaxBindings]; // TOP-LEVEL join table (spec 3.1/3.5)
 };
 
 // `sizeof(Config)` is a load-bearing number in this project, not an implementation

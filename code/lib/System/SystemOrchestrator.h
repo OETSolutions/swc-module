@@ -944,9 +944,10 @@ private:
      * The maintenance state the LED_STAT pattern was last restated for.
      *
      * The maintenance window opens from THREE places that are not `RestatLeds`
-     * callers -- the USB command, the AUX1 hold and the boot-time config flag or
-     * no-config offer -- and closes on its own 5-minute timeout inside
-     * `maintenance_.Update`. Rather than make every one of those call `RestatLeds`
+     * callers -- the USB command, the AUX1 hold and the boot-time config flag --
+     * and closes on its own CONFIGURED timeout (`maintenance_timeout_ms`; five
+     * minutes is only the default) inside `maintenance_.Update`. Rather than make
+     * every one of those call `RestatLeds`
      * and then miss the timeout, `Tick` compares this to `maintenance_.Active()`
      * and restates on the edge. That single comparison is what keeps the
      * double-flash honest for a path nobody remembered to wire.

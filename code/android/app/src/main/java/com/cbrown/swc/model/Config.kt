@@ -222,6 +222,16 @@ data class DeviceSettings(
     val ledLevel: Int = 2,
     val tempCompEnabled: Boolean = true,
     val maintenanceTimeoutMs: Long = 300_000L,
+    /**
+     * FR-33's next-boot maintenance trigger (spec 8.2): the device opens its setup
+     * window on the boot that follows a config carrying this set.
+     *
+     * Defaults to false, matching the firmware. It survives a round trip because
+     * the encoder writes it and the decoder reads it back -- a field the app
+     * silently dropped would be cleared on the next save, and the device would
+     * never open the window the user asked for.
+     */
+    val maintenanceOnBoot: Boolean = false,
 )
 
 @Serializable

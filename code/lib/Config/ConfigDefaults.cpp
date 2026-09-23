@@ -20,6 +20,11 @@ void ConfigDefault(Config *out) {
     c.settings.buzzer_level = 2;
     c.settings.led_level = 2;
     c.settings.maintenance_timeout_ms = 300000;
+    // FR-33's next-boot trigger defaults OFF: the device must not open a window
+    // nobody asked for. `ConfigDefault` already zero-inits via `c = Config{}`,
+    // so this assignment is documentation of the intended default, not the thing
+    // that makes it false.
+    c.settings.maintenance_on_boot = false;
 
     c.channel_count = kMaxChannels;
     for (uint8_t i = 0; i < kMaxChannels; ++i) {

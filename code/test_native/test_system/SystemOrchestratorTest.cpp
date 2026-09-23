@@ -1778,16 +1778,118 @@ TEST(SystemOrchestrator, ASustainedAUX1HoldEntersMaintenanceWithNoApp) {
     EXPECT_EQ(o.MaintenanceTriggeredBy(), MaintenanceTrigger::kAux1Hold);
 }
 
+TEST(SystemOrchestrator, AStoredConfigFlagOpensTheWindowOnTheNextBoot) {
+    // FR-33's third trigger, spec 8.2: "Config flag on next boot -- for a user who
+    // wants it up immediately after flashing." It is the only one of the four that
+    // is a STORED setting, and until now `MaintenanceTrigger::kConfigFlag` had no
+    // emitter anywhere (N-13), so the enum value existed and nothing could produce
+    // it.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.settings.maintenance_on_boot = true;
+    // Stored, because that is the whole point of the trigger: the flag survives a
+    // power cycle and `Boot` reads it back. (`MakeOrchWith` is defined further
+    // down this file, so the store is built inline.)
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    o.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+
+    ASSERT_FALSE(o.MaintenanceActive()) << "constructed, not yet booted";
+    o.Boot();
+
+    EXPECT_TRUE(o.MaintenanceActive()) << "the stored flag must open the window at boot";
+    EXPECT_EQ(o.MaintenanceTriggeredBy(), MaintenanceTrigger::kConfigFlag)
+        << "the trigger must name the config flag, not a generic entry";
+}
+
+TEST(SystemOrchestrator, AConfigWithoutTheFlagDoesNotOpenAWindow) {
+    // The default must stay OFF: a device that opened maintenance on every boot
+    // because something defaulted true would be unusable (spec 8.2 makes the
+    // window maintenance-ONLY, so a window means no button presses are served).
+    MockHal hal;
+    auto o = MakeOrch(hal);   // MakeOrch's fixture leaves the flag false
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    EXPECT_FALSE(o.MaintenanceActive());
+}
+
+TEST(SystemOrchestrator, TheConfigFlagIsSpentOnceAndDoesNotReopenOnTheNextBoot) {
+    // Spec 8.2 scopes this trigger to the NEXT boot, and the device's exit path
+    // cannot clear a stored field (only a whole-config commit rewrites `settings`).
+    // So the boot that acts on it must CONSUME it -- clear it and persist that
+    // clear -- or the window reopens on every boot for the life of the config, and
+    // an unbounded maintenance window is the exact state FR-38 exists to forbid.
+    //
+    // This is the assertion that makes the feature safe rather than merely
+    // present: without the consume, `MaintenanceActive()` would be true again on
+    // the second boot below.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.settings.maintenance_on_boot = true;
+    ConfigStore store(&hal.InterfaceRef());
+    ASSERT_TRUE(store.Save(d.config));
+
+    SystemOrchestrator first(&hal.InterfaceRef(), d.config, d.timings);
+    first.SetStore(&store);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    first.Boot();
+    ASSERT_TRUE(first.MaintenanceActive()) << "the first boot must open it";
+
+    // The flag must now be false ON DISK, not merely in the first instance's
+    // memory -- a fresh load is what the second boot actually reads.
+    Config reloaded{};
+    ASSERT_TRUE(ConfigLoadResultIsUsable(store.Load(&reloaded)));
+    EXPECT_FALSE(reloaded.settings.maintenance_on_boot)
+        << "the flag must be CLEARED IN STORAGE, not just in memory";
+
+    // A second boot, from the stored config, must NOT reopen the window.
+    SystemOrchestrator second(&hal.InterfaceRef(), reloaded, d.timings);
+    second.SetStore(&store);
+    second.Boot();
+    EXPECT_FALSE(second.MaintenanceActive())
+        << "the flag was consumed; a second boot must not reopen the window";
+}
+
+TEST(SystemOrchestrator, AConfigFlagBootWithoutAStoreStillOpensTheWindowOnce) {
+    // The bench case: a build with no NVS attached can still honour the flag for
+    // the boot it is running. The consume cannot be persisted (there is nowhere to
+    // put it), so this documents the one observable difference -- it would re-fire
+    // on the next boot -- rather than silently depending on a store.
+    MockHal hal;
+    MockHal::Defaults d;
+    d.config.settings.maintenance_on_boot = true;
+    // Deliberately no SetStore, and the in-memory config still carries true.
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    o.Boot();
+    EXPECT_TRUE(o.MaintenanceActive())
+        << "with no store the window still opens for this boot";
+}
+
 TEST(SystemOrchestrator, TheMaintenanceTriggerIsRecordedAndNothingInProductionBranchesOnIt) {
     // `MaintenanceTrigger` documents itself as existing because "the caller's
     // shutdown path differs": a USB command should be acknowledged, an AUX1 hold
     // gets a buzzer, and a no-config boot "must explain itself on the LED". None of
-    // that exists. Two of its five values (`kConfigFlag`, `kNoConfigAtBoot`) have
-    // NO emitter anywhere, and no production code branches on the trigger at all
-    // -- the only reader in the tree is the accessor `MaintenanceTriggeredBy()`,
-    // whose sole caller is a test. So a device in maintenance mode is
-    // INDISTINGUISHABLE, on the wire and to the user, from one whose window opened
-    // for any other reason.
+    // that exists. `kNoConfigAtBoot` still has NO emitter anywhere, and no
+    // production code branches on the trigger at all -- the only reader in the tree
+    // is the accessor `MaintenanceTriggeredBy()`, whose sole caller is a test. So a
+    // device in maintenance mode is INDISTINGUISHABLE, on the wire and to the user,
+    // from one whose window opened for any other reason.
+    //
+    // (`kConfigFlag` used to be in that list too and is NOT any more: FR-33's
+    // next-boot trigger is now wired -- `settings.maintenance_on_boot`, consumed
+    // and persisted by `Boot` -- so three of the four §8.2 triggers have emitters.
+    // The one still missing is the reset-reason case, N-13's other half.)
     //
     // **That matters most for the AUX1 path, which is the no-app path.** A user who
     // holds AUX1 for 3 s gets LED_STAT's double-flash -- and so does a user whose

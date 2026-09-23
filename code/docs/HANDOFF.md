@@ -70,7 +70,7 @@ Two channels, SWC1 and SWC2. `DacChannel` → A=KEY1, B=ADJ1, C=KEY2, D=ADJ2.
 ```bash
 cd code
 
-# Host suite (586 tests) under ASan+UBSan, in an ISOLATED build dir so a
+# Host suite (591 tests) under ASan+UBSan, in an ISOLATED build dir so a
 # concurrent session cannot clobber it. SWC_FW_VERSION/SHA must be set here too,
 # or PlatformIO auto-cleans .pio/build/ (see the note below the loop):
 SWC_FW_VERSION=dev SWC_GIT_SHA=local \
@@ -95,7 +95,7 @@ python3 tools/check_stack_usage.py
 bash   tools/crosscheck_config.sh
 ```
 
-Last verified: **586/586 native tests green, zero sanitizer reports**; device
+Last verified: **591/591 native tests green, zero sanitizer reports**; device
 build succeeds at 74.5 % of the app slot; Python gates green (incl. the new
 `check_maintenance_radio.py`, which pins the four maintenance-radio defects).
 
@@ -268,6 +268,7 @@ detail is in the auto-memory index (`MEMORY.md`) under the N-numbers.
 | **DAC fault path** | ✅ **DONE 2026-09-24 (N-21).** FR-13's read-back (`IHAL::dac_read_code` → `DacFrame::DecodeReadCode`, compared per channel at boot); §6.8's retry-with-backoff (`DacRetry.h`, 3 attempts 1/2 ms) on both DAC writes; the latch (HAL `dac_faulted` + the orchestrator's `dac_verify_failed_` for a wrong-VALUE read); and `FAULT_DAC` now has a caller (`ReportDacFault`, an edge). **Board-gated:** the actual MCP4728 read needs the real part to confirm the 24-byte response. |
 | **NTC temperature** | ✅ **DONE 2026-09-24 (N-67).** `NtcConvert.h` (divider inversion + B3380 model, integer maths) + `SampleNtcTenthsC`; both learn paths record it in `temp_c_at_learn`. **One bring-up validation left:** read a room temperature and compare. |
 | **AUX bindings are inert** | ✅ **DONE 2026-09-24 (N-26).** `ServiceAux` services AUX2/AUX3 as real gesture inputs (`BindingResolveAux`), and AUX1 is refused a binding by `ConfigValidate` (it carries the programming/maintenance holds). Pinned by `AnAux2PressDrivesKeyChannelZeroAndIsReportedAsItsOwnInput` and siblings. |
+| **Maintenance triggers (FR-33)** | ✅ **DONE 2026-09-24 (N-83, N-13's config-flag half).** §8.2's "config flag on next boot" is now `settings.maintenance_on_boot`, consumed and persisted by `SystemOrchestrator::Boot` so the window opens on the ONE boot the user asked for (without the consume it would reopen every boot forever — an unbounded window, the state FR-38 forbids). The field is optional on the wire, so a config written before it existed still loads. Added at **zero** `sizeof(Config)` cost by grouping the three count bytes into the tail padding. **Still open:** the reset-reason + no-config trigger needs a reset-reason source `IHAL` does not expose, and a no-config device already reaches pass-through, so it is redundant rather than missing. |
 | **Multi-action bindings** | ✅ **DONE 2026-09-24 (N-29).** `BindingResolve` now returns the whole ordered `ResolvedBinding` list and `SystemOrchestrator::RunBindingActions` executes every firmware-owned action (`OUT_*`, `BUZZ`) while SKIPPING app-owned kinds rather than releasing. Pinned by 3 orchestrator + 2 resolver tests. |
 | **`learn_channel_` is a constant 0** | ✅ **DONE 2026-09-24 (N-23).** The headless learn now has **no channel selector and no slot menu** — the user holds AUX1, presses the input being programmed, and releases; the wizard names the target by which input LEFT ITS IDLE (the 2022 `is_key_pressed()` mechanism). SWC1 and SWC2 are learned identically, and AUX2/AUX3 learn as switch windows. Presses during an armed learn no longer drive the radio. |
 | **`status` rail/temp/heap** | ✅ **DONE 2026-09-24 (N-22/N-25).** `temp_c` (last good NTC reading, decimal, JSON null when unmeasured) and `heap_free` (new `IHAL::heap_free`) now have real producers; `rail_mv` is retired (no rail probe on this board). The app's live-idle gap is closed the honest way: `event` now carries `idle_mv` (the denominator the classifier used), and `LadderScreen.matched()` reproduces `LadderClassify`'s permille ratio. `gain_mode` still reports channel 0 only (N-60). |

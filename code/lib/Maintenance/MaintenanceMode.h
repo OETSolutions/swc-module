@@ -29,15 +29,17 @@
 /*
  * Why the window opened, for a caller that wants to say so.
  *
- * **No production code branches on this, and the two values that need a source
- * the board does not have are never produced.** The USB command and the 3 s AUX1
- * hold are wired; `kConfigFlag` needs a setting that does not exist and
- * `kNoConfigAtBoot` needs a reset-reason source `IHAL` does not expose, so both
- * are unreachable (N-13). The only reader in the tree is `Trigger()` below, whose
- * caller is a test. An earlier version of this comment claimed the values were
- * distinct "because the caller's shutdown path differs: a USB command should get
- * an acknowledgement, an AUX1 hold gets a buzzer, and booting with no config is
- * the one case that must explain itself on the LED" -- none of which is
+ * **No production code branches on this, and one value still has no source.**
+ * The USB command, the 3 s AUX1 hold and — since N-83 — spec 8.2's "config flag
+ * on next boot" (`settings.maintenance_on_boot`, consumed by
+ * `SystemOrchestrator::Boot`) are wired. `kNoConfigAtBoot` needs a reset-reason
+ * source `IHAL` does not expose, so it is the one still unreachable (N-13's
+ * remaining half; that path is also redundant, since a device with no config
+ * already reaches pass-through). The only reader in the tree is `Trigger()` below,
+ * whose caller is a test. An earlier version of this comment claimed the values
+ * were distinct "because the caller's shutdown path differs: a USB command should
+ * get an acknowledgement, an AUX1 hold gets a buzzer, and booting with no config
+ * is the one case that must explain itself on the LED" -- none of which is
  * implemented, and none of which spec 8.2 requires: the window opens on
  * `LED_STAT`'s double-flash for every trigger, identical to the app-opened case
  * (N-61). The distinction is available for the per-trigger feedback the spec does

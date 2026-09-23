@@ -58,6 +58,10 @@ TEST(ConfigCodec, JsonRoundTripsEveryFieldThatWasSet) {
     EXPECT_EQ(out.settings.led_level, 2);
     EXPECT_TRUE(out.settings.temp_comp_enabled);
     EXPECT_EQ(out.settings.maintenance_timeout_ms, in.settings.maintenance_timeout_ms);
+    // FR-33's next-boot trigger. The fixture sets it TRUE precisely so this
+    // assertion can fail: an encoder that dropped the field would decode it back
+    // as the `false` default and pass a fixture left at false.
+    EXPECT_TRUE(out.settings.maintenance_on_boot);
 
     EXPECT_EQ(out.channel_count, 1);
     EXPECT_TRUE(out.channels[0].enabled);
@@ -99,6 +103,44 @@ TEST(ConfigCodec, JsonRoundTripIsStableUnderReencode) {
     ASSERT_TRUE(ConfigDecodeJson(a, ConfigEncodeJson(in, a, sizeof(a)), &mid));
     const size_t nb = ConfigEncodeJson(mid, b, sizeof(b));
     EXPECT_EQ(std::string(a), std::string(b, nb));
+}
+
+TEST(ConfigCodec, AConfigWrittenBeforeFR33sTriggerStillDecodes) {
+    // The on-disk format is JSON and carries no schema bump for FR-33's added
+    // `maintenance_on_boot`, so a config written by an older firmware has no such
+    // field -- and every device in the field has one. The decoder must treat an
+    // ABSENT field as `false` (the default) rather than refusing the whole config,
+    // or an upgrade would strand every already-configured device with "no config".
+    //
+    // The other half matters just as much: a field that is PRESENT but not a bool
+    // must FAIL the decode rather than defaulting to false, because a silent
+    // default here is the "wrong value reported as a right one" shape this codec
+    // refuses everywhere else.
+    const Config in = MakeConfig();
+    char buf[kScratch] = {};
+    const size_t n = ConfigEncodeJson(in, buf, sizeof(buf));
+    std::string s(buf, n);
+
+    // Strip the field exactly as an older encoder would have omitted it.
+    const std::string field = ",\"maintenance_on_boot\":true";
+    const size_t pos = s.find(field);
+    ASSERT_NE(pos, std::string::npos) << "the encoder must emit the field for this test to mean anything";
+    s.erase(pos, field.size());
+
+    Config out{};
+    ASSERT_TRUE(ConfigDecodeJson(s.c_str(), s.size(), &out))
+        << "a config from an older firmware must still decode";
+    EXPECT_FALSE(out.settings.maintenance_on_boot)
+        << "an absent field means the default, which is OFF";
+
+    // Present-but-malformed is a hard failure, not a silent default.
+    std::string bad_json(buf, n);
+    const size_t bpos = bad_json.find(field);
+    ASSERT_NE(bpos, std::string::npos);
+    bad_json.replace(bpos, field.size(), ",\"maintenance_on_boot\":\"yes\"");
+    Config bad{};
+    EXPECT_FALSE(ConfigDecodeJson(bad_json.c_str(), bad_json.size(), &bad))
+        << "a non-bool must fail the decode, not silently become false";
 }
 
 TEST(ConfigCodec, MalformedJsonIsRejectedNotPartiallyApplied) {

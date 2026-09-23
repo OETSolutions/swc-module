@@ -635,16 +635,25 @@ void SystemOrchestrator::Boot() {
         // over-trigger rather than an unbounded one.
         config_.settings.maintenance_on_boot = false;
 
-        // Persist ONLY when a store exists AND the config in force is durable
+        // Persist ONLY when the config in force is durable
         // (`BootConfigState::kOk`/`kRecovered`). Saving under a config that just
         // fell back to defaults, or that never existed, would write the DEFAULTS
         // over whatever the user had -- the read-modify-write collapse this
         // project already paid for once. With no durable config there is nothing
         // to update, so the in-memory clear above is the whole action.
-        if (store_ != nullptr &&
-            (config_state_ == BootConfigState::kOk ||
-             config_state_ == BootConfigState::kRecovered)) {
-            store_->Save(config_);
+        //
+        // **The LOCAL `store` from the load above, NOT the `store_` member.**
+        // `store_` is null here on the real device: `SetStore` is called from
+        // `UsbLinkStart`, which runs AFTER `SystemOrchestratorCreate`/`Boot`, so a
+        // `store_ != nullptr` guard skipped this save entirely and the flag was
+        // never spent -- measured on the DUT, where a config with the flag set
+        // reopened the window on every boot. The host tests missed it because they
+        // call `SetStore` BEFORE `Boot`, an order the device never uses. The local
+        // store is already at hand (it did the load) and writes to the same NVS
+        // keys, so it is the correct handle and needs no member.
+        if (config_state_ == BootConfigState::kOk ||
+            config_state_ == BootConfigState::kRecovered) {
+            store.Save(config_);
         }
 
         maintenance_.Enter(MaintenanceTrigger::kConfigFlag, hal_->now_ms(hal_->ctx));

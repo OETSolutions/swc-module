@@ -1784,16 +1784,20 @@ TEST(SystemOrchestrator, AStoredConfigFlagOpensTheWindowOnTheNextBoot) {
     // is a STORED setting, and until now `MaintenanceTrigger::kConfigFlag` had no
     // emitter anywhere (N-13), so the enum value existed and nothing could produce
     // it.
+    //
+    // **NO `SetStore` here, on purpose.** `Boot` must work with the config it
+    // LOADED, not the `store_` member: on the real device `SetStore` is called from
+    // `UsbLinkStart`, which runs AFTER `SystemOrchestratorCreate`/`Boot`, so
+    // `store_` is null throughout Boot. A test that set it first (as this one used
+    // to) silently proved a path the device never takes.
     MockHal hal;
     MockHal::Defaults d;
     d.config.settings.maintenance_on_boot = true;
     // Stored, because that is the whole point of the trigger: the flag survives a
-    // power cycle and `Boot` reads it back. (`MakeOrchWith` is defined further
-    // down this file, so the store is built inline.)
+    // power cycle and `Boot` reads it back.
     ConfigStore store(&hal.InterfaceRef());
     ASSERT_TRUE(store.Save(d.config));
     SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
-    o.SetStore(&store);
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
     hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
@@ -1826,9 +1830,11 @@ TEST(SystemOrchestrator, TheConfigFlagIsSpentOnceAndDoesNotReopenOnTheNextBoot) 
     // clear -- or the window reopens on every boot for the life of the config, and
     // an unbounded maintenance window is the exact state FR-38 exists to forbid.
     //
-    // This is the assertion that makes the feature safe rather than merely
-    // present: without the consume, `MaintenanceActive()` would be true again on
-    // the second boot below.
+    // **`SetStore` AFTER `Boot`, which is the ORDER THE DEVICE USES** (`UsbLinkStart`
+    // runs after `SystemOrchestratorCreate`). This is the regression guard for the
+    // device-only defect measured on the DUT: with a `store_ != nullptr` guard the
+    // save was skipped every boot because `store_` was still null, and the window
+    // reopened forever. A test that set the member first could not see it.
     MockHal hal;
     MockHal::Defaults d;
     d.config.settings.maintenance_on_boot = true;
@@ -1836,11 +1842,11 @@ TEST(SystemOrchestrator, TheConfigFlagIsSpentOnceAndDoesNotReopenOnTheNextBoot) 
     ASSERT_TRUE(store.Save(d.config));
 
     SystemOrchestrator first(&hal.InterfaceRef(), d.config, d.timings);
-    first.SetStore(&store);
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
     hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
-    first.Boot();
+    first.Boot();                 // store_ is STILL null here, as on the device
+    first.SetStore(&store);       // ...and only now does the member exist
     ASSERT_TRUE(first.MaintenanceActive()) << "the first boot must open it";
 
     // The flag must now be false ON DISK, not merely in the first instance's
@@ -1858,22 +1864,30 @@ TEST(SystemOrchestrator, TheConfigFlagIsSpentOnceAndDoesNotReopenOnTheNextBoot) 
         << "the flag was consumed; a second boot must not reopen the window";
 }
 
-TEST(SystemOrchestrator, AConfigFlagBootWithoutAStoreStillOpensTheWindowOnce) {
-    // The bench case: a build with no NVS attached can still honour the flag for
-    // the boot it is running. The consume cannot be persisted (there is nowhere to
-    // put it), so this documents the one observable difference -- it would re-fire
-    // on the next boot -- rather than silently depending on a store.
+TEST(SystemOrchestrator, AConfigFlagWithNoDurableConfigOpensOnceButPersistsNothing) {
+    // The kNone branch: nothing is in NVS, so the config in force is the caller's
+    // and is not durable. The window still opens and the flag is still cleared in
+    // MEMORY, but there is nothing to persist -- and persisting here would write
+    // the caller's config into NVS, which is the read-modify-write collapse this
+    // project already paid for once.
     MockHal hal;
     MockHal::Defaults d;
     d.config.settings.maintenance_on_boot = true;
-    // Deliberately no SetStore, and the in-memory config still carries true.
+    ConfigStore store(&hal.InterfaceRef());
+    // Deliberately do NOT save: the load below returns kNoConfig.
+    // No SetStore either, matching the device order.
     SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
     hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
     o.Boot();
     EXPECT_TRUE(o.MaintenanceActive())
-        << "with no store the window still opens for this boot";
+        << "with no durable config the window still opens for this boot";
+
+    // Nothing may have been written: a load must still report no config.
+    Config probe{};
+    EXPECT_EQ(store.Load(&probe), ConfigLoadResult::kNoConfig)
+        << "a non-durable boot must not persist anything into NVS";
 }
 
 TEST(SystemOrchestrator, TheMaintenanceTriggerIsRecordedAndNothingInProductionBranchesOnIt) {

@@ -198,14 +198,30 @@ one more `dev_usb_reset.py` run re-enumerates it.
   the ROM loader — so the board sat in the loader with nothing written and looked
   broken. Fixed in `dev_flash.sh`; if you see that error, the fix is to drop the
   flag, not to press BOOT.
-- **`--ota` (the default) HUNG on the first real use**, inside
-  `tcdrain`/`select` in `dev_push_ota.py`, with ~1 s of CPU burned in 12 minutes
-  (so: stuck, not slow) — and the device rebooted mid-push, leaving the run
-  aborted and the OLD image running (`ota_end` answered `no_run`). The device was
-  unharmed and no commit had happened. **If a push stalls with no progress output
-  for over a minute, kill it and use `--loader`**, which completed the same image
-  in ~25 s including both slots. The `--ota` path's own hang is un-diagnosed and
-  is worth a look before trusting it unattended.
+- **`--ota` (the default) is SLOW and LOOKS HUNG. Measured 2026-09-24 and
+  re-measured: a full 1,464,592-byte image takes ~7.4 minutes (~3300 B/s), because
+  the wire chunk is 512 B and the device ACKS EACH ONE (2,861 round trips). The CPU
+  sits in `select` the whole time, which is what a slow serial read loop looks like
+  — the earlier "1 s CPU in 12 min = stuck, not slow" reading was WRONG, and the
+  push actually completes: `ota_end` → `ack result=ok`. **So do not kill it on a
+  stall; watch for the progress line**, which `tools/bench_rollback.py` prints every
+  256 chunks. `--loader` remains the faster route (~25 s, both slots) and the one to
+  use when you want speed or the device is not answering. One real caveat from the
+  first run: if the device is rebooted MID-PUSH the run aborts and `ota_end` answers
+  `no_run` — the device is unharmed and no commit happens, but the push must be
+  redone.
+
+**Bench proof scripts** (they need the live device; CI cannot run them):
+
+```bash
+# a corrupt image is REFUSED and the running slot is untouched (FR-36)
+~/.platformio/penv/bin/python tools/bench_ota_corrupt.py --port /dev/cu.usbmodem1234561
+
+# a COMMITTED image that panics is ROLLED BACK (FR-37/FR-41). Builds the bad
+# image itself (-D SWC_BENCH_PANIC_IMAGE), pushes it, reboots, and asserts the
+# device comes back on the old image. ~7 min for the push.
+~/.platformio/penv/bin/python tools/bench_rollback.py --port /dev/cu.usbmodem1234561
+```
 
 ## 4. Static gates
 
@@ -261,7 +277,7 @@ detail is in the auto-memory index (`MEMORY.md`) under the N-numbers.
 
 | Item | What's missing |
 | --- | --- |
-| **OTA — USB path** | ✅ **WIRED 2026-09-24 (N-14).** The router dispatches `ota_begin`/`ota_chunk`/`ota_end` to `OtaUsb`, `hello` advertises `"ota"`, the app's Update screen pushes a picked file with a progress bar. **Still board-gated:** the `esp_ota_*` flash write itself — verify on hardware with a deliberately CORRUPT image first. ✅ **VERIFIED 2026-09-24** by `tools/bench_ota_corrupt.py`: a real 398,592-byte image with ONE payload byte flipped at offset 199,296 was pushed with the TRUE size and TRUE sha256 (so the refusal can only come from OUR stream digest, not a header/magic test); `ota_end` returned **`nack: verify_failed`**, `uptime_ms` kept CLIMBING across the push (215,463 → 415,503 ms, i.e. no reboot), `heap_free` and `config_state` were unchanged, and the device still acked a command afterwards. The corrupt image was refused and the running slot was left untouched. |
+| **OTA — USB path** | ✅ **WIRED 2026-09-24 (N-14).** The router dispatches `ota_begin`/`ota_chunk`/`ota_end` to `OtaUsb`, `hello` advertises `"ota"`, the app's Update screen pushes a picked file with a progress bar. **Still board-gated:** the `esp_ota_*` flash write itself — verify on hardware with a deliberately CORRUPT image first. ✅ **VERIFIED 2026-09-24** by `tools/bench_ota_corrupt.py`: a real 398,592-byte image with ONE payload byte flipped at offset 199,296 was pushed with the TRUE size and TRUE sha256 (so the refusal can only come from OUR stream digest, not a header/magic test); `ota_end` returned **`nack: verify_failed`**, `uptime_ms` kept CLIMBING across the push (215,463 → 415,503 ms, i.e. no reboot), `heap_free` and `config_state` were unchanged, and the device still acked a command afterwards. The corrupt image was refused and the running slot was left untouched. **Also proven 2026-09-24: a COMMITTED image that panics is rolled back** (`tools/bench_rollback.py`; otadata shows the pending entry `ABORTED` and the previous entry `VALID`) — FR-37/FR-41. |
 | **OTA — WiFi path** | ✅ **WIRED 2026-09-24 (N-15).** `OtaWifiCheck`/`OtaWifiInstall` are now reached from the maintenance page's `POST /api/ota/check` and `POST /api/ota/pull`. **Still board-gated:** the end-to-end `esp_https_ota` fetch needs a real network + a published release; the refusal/corruption behaviour is already pinned by `tools/bench_ota_corrupt.py` on the USB path, which shares the same gate. |
 | **Maintenance radio** | ✅ **DONE 2026-09-24 (N-15).** The window now has a radio behind it. `lib/Maintenance/MaintenanceRadio.cpp` (device-only TU, third host-excluded file) brings up `esp_netif` + `esp_event` + `esp_wifi` (APSTA) + NimBLE `wifi_provisioning` (BLE transport, Sec1 with the MAC-derived PoP) + `esp_http_server`, on the OFF→ON transition of `SystemOrchestratorIsMaintenanceActive` in `src/main.cpp`, and `TearDown()` frees exactly what each per-resource flag says exists, in reverse — so FR-32's "no radio outside the window" holds. The PoP, web token, setup URL and BLE name reach the app over the already-trusted USB link as a new `maintenance` frame (emitted only on change; forced on connect so a late-joining app learns an already-open window). The security decision — the token gate, the route table, the upload metadata check — lives in the host-tested `MaintenanceHttp` (17 tests), not in the untestable `esp_http_server` handler. ✅ **VERIFIED ON THE BENCH 2026-09-24 (N-82):** the AP appears in a Wi-Fi scan as `SWC-A1B2` (RSSI −39 dBm); `maintenance_enter` returns the frame with a real PoP (`<PoP>`) and token; heap drops 141,360 → 8,928 on entry and returns to ~135,800 on exit (FR-32 real); **three consecutive enter/exit cycles no longer reboot** after the N-82 fix. **Still to run:** the provisioning handshake itself — the Espressif app on a phone, with the PoP typed in. |
 | **Release check** | ✅ **DONE 2026-09-24 (N-12).** The APP performs the full spec §9.5 path: `update/ReleaseManifest.kt` (a faithful mirror of the firmware's `ReleaseCheck` + `SemverCompare`, differential-verified identical on 19 version pairs), `update/ManifestFetcher.kt` (HTTPS manifest fetch + image download, `INTERNET` now declared), and `AppViewModel`'s check → decide → download → verify `sha256`/`size` → push-over-USB flow. ✅ **The firmware's own `ReleaseCheck` now has a production caller too (N-15):** the maintenance page's `/api/ota/check` reaches it through `OtaWifiCheck`. |

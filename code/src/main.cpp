@@ -54,6 +54,29 @@ static bool VerifyBoard(void)
 // "undefined reference to `app_main`".
 extern "C" void app_main(void)
 {
+#ifdef SWC_BENCH_PANIC_IMAGE
+    /*
+     * A deliberately BROKEN image, for spec §10.4's level-4 rollback test: "flash
+     * a deliberately-faulting image (compiles, panics at startup), assert the
+     * bootloader rolls back and the device comes up on the old image. **This must
+     * be tested with a genuinely broken image**, not a mocked failure, or it
+     * proves nothing."
+     *
+     * The panic is FIRST, before any HAL or orchestrator work, so the image can
+     * never reach `esp_ota_mark_app_valid_cancel_rollback` -- which is the whole
+     * point: an image that panics after confirming itself would test nothing. It
+     * is guarded by a compile-time define that no shipping env sets, so the
+     * product image cannot contain this code path; `tools/bench_rollback.py`
+     * builds it with `-D SWC_BENCH_PANIC_IMAGE`.
+     *
+     * A NULL dereference rather than `abort()`: `abort()` is a straight
+     * exception/panic that CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT also reboots, but
+     * a real crash is the more faithful "faulting image", and it also proves the
+     * panic HANDLER (not just an explicit call) leads to the rollback path.
+     */
+    volatile int *broken = (volatile int *)0;
+    *broken = 1;
+#endif
     if (!VerifyBoard()) {
         // A board that does not match the build must not drive the KEY line at
         // all. Halt rather than loop: a wrong board is a bench condition.

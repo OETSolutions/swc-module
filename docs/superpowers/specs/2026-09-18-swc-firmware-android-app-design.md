@@ -2931,10 +2931,10 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-6 | Classification + hysteresis test | N | A level inside the window's outer edge twice in a row does not re-trigger; each learned button classifies across the **+3V3** tolerance band (3.14–3.47 V, §6.3), and an idle-adjacent button — the worst case for separation, per §6.3 consequence 2 — still resolves |
 | FR-7 | Gesture tests | N | Each of SINGLE/DOUBLE/LONG fires exactly once for its stimulus |
 | FR-8 | Injected-clock suite | N | The entire §3.4 gesture set runs with zero wall-clock sleeps |
-| FR-9 | Dual-channel concurrency test | N + B | Two simultaneous presses produce two independent, correct events |
+| FR-9 | Dual-channel concurrency test | N + B | Two simultaneous presses produce two independent, correct events. **VERIFIED on the bench 2026-09-24** (`tools/bench_ladder.py`): the rig drives SWC1 then SWC2, and each press is reported on its OWN `channel` (0 then 1) — a press on one ladder cannot be resolved as the other |
 | FR-10 | Long-press timing test | N | `LONG` fires at 750 ms ± 1 tick, **before** release |
 | FR-11 | Gesture-exclusivity tests | N | LONG emits no SINGLE; DOUBLE's second press emits no SINGLE |
-| FR-12 | Unlearned-press test | N + B | A never-learned level yields `event{button:null}` + `KEY_UNKNOWN`, never a guess |
+| FR-12 | Unlearned-press test | N + B | A never-learned level yields `event{button:null}` + `KEY_UNKNOWN`, never a guess. **VERIFIED on the bench 2026-09-24** (`tools/bench_ladder.py`): a press at a level clear of every learned window produced `event{button:null,gesture:"NONE",level_mv:…}` — the device reports the unrecognised press rather than guessing |
 | FR-13 | Boot-sequence test | N + **D** + B | **N:** `SafeIdleEstablished()` is true immediately after `Boot()` and the DAC has been written before anything else runs (the tests assert this on every construction, including the pass-through and no-config paths). **D:** the same ordering measured on the real output pin before USB enumerates |
 | FR-14 | Gain-policy tests | N | A channel whose `output.gain_mode` is `AUTO` defers to `settings.gain_policy`, and `Boot` passes that channel's own measured idle into the selection — end to end, both the 3 V and the 5 V side, plus a concrete channel mode overriding the policy. `GainPolicySelect` implements AUTO per §6.2's two-sided rule — a 3 V line measures low and takes gain 1.00, 5 V takes 1.82, the ambiguous guard band and an **absent** measurement both default to 1.82 (the safe direction) — and a forced mode is honoured. `Boot` passes the measured idle into it per channel |
 | FR-15 | Output-command test | N | The bound action's key is driven **only after the gesture resolves** (`TheOutputIsNotDrivenWhileTheGestureIsUndecided`), and the line returns to the idle code afterwards. The **hold duration** is a property of the injected clock, asserted by the gesture tests, not by a wall-clock measurement here |
@@ -2950,10 +2950,10 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-25 | No-config pass-through test | N | With empty config, a press drives a key at the wheel's ratio against the head unit's idle (not a copy of the wheel's volts), each channel against its OWN captured idle, and no usable ladder reference disables pass-through for that input rather than guessing |
 | FR-26 | Config-validation test | N + A | Invalid config → `nack`, and a read-back proves the old config is intact |
 | FR-27 | Export/import test | N + A | Full config JSON round-trips byte-identically through export → import |
-| FR-28 | Learn-mode tests | N + D + B | Measured level, tolerance and rail are stored and match the bench instrument |
+| FR-28 | Learn-mode tests | N + D + B | Measured level, tolerance and rail are stored and match the bench instrument. **VERIFIED on the bench 2026-09-24:** the app-path learn (`learn_start` → stream → `learn_commit`) stored a button at `mv_center: 1816, mv_tolerance: 120` from a rig-held 1840 mV level, and the headless learn stored `swc1_bt1` at a level matching the rig. (Getting this to run required the two harness fixes `bench_ladder.py` documents — the released node floats above the ADC ceiling, and a rig status read releases its DAC.) |
 | FR-29 | Learn-rejection tests | N | Noisy and too-close-to-existing samples are each rejected **with the correct distinct reason** |
 | FR-30 | Rail-renormalization test | N | A button learned at 3.3 V classifies correctly at 3.14 V and 3.47 V (±5 % regulator tolerance); the ratio `n` is unchanged across that sweep. A **separate** fault test asserts that a 3V3 sag to ≤20 % of the learned value is reported as a rail fault, not as idle. **Note:** this is a *+3V3* sweep, not the 11–14.8 V vehicle-rail sweep an earlier revision specified — no vehicle-rail term exists in the transfer function (§6.3). |
-| FR-31 | Headless-learn test | N + D + B | A full learn completes with no USB host attached, driven by AUX1 + buzzes, and the taught button then WORKS (classifies and presents, §6.6 rule 4). `test_system`'s `AHeadlessLearnStoresAButtonAndItClassifiesImmediately` and `AnUnboundGesturePresentsTheButtonRatherThanDoingNothing` cover the host half — the board portion confirms it on hardware |
+| FR-31 | Headless-learn test | N + D + B | A full learn completes with no USB host attached, driven by AUX1 + buzzes, and the taught button then WORKS (classifies and presents, §6.6 rule 4). `test_system`'s `AHeadlessLearnStoresAButtonAndItClassifiesImmediately` and `AnUnboundGesturePresentsTheButtonRatherThanDoingNothing` cover the host half. **VERIFIED on the bench 2026-09-24** (`tools/bench_ladder.py`): the stateless AUX1 interaction (hold AUX1, press SWC1, release AUX1; no app, no menu) taught a new button `swc1_bt1` at the rig's level, and a subsequent press on it classified as `swc1_bt1` with no reboot (FR-31b) |
 | FR-31b | No-app-button test (the unbound pass-through) | N + D + B | **A user with no app binds nothing and still has a working button.** §6.6 rule 4: a recognised but unbound gesture presents the button's own level (§6.9's ratio), so a fresh device learned by AUX1 alone drives a key with no config ever pushed (N-19, resolved 2026-09-21). `test_system` covers it on the host; the board portion confirms it end to end |
 | FR-32 | Radio-absent test | N + D + B | In normal mode, current draw and heap show WiFi/BLE never initialized. **The N half is new** (N-81): `check_maintenance_radio.py` statically pins the shape that keeps the radio windowed — no stack is brought up without a teardown step that frees exactly it, so a resource added to the bring-up cannot silently leak past the window. **MEASURED on the DUT 2026-09-24:** `heap_free` in normal mode is `135,764`; entering maintenance drops it to `8,740` (the radio is ~132 KB); exiting returns it to `135,764`. **Four consecutive enter/exit cycles give the IDENTICAL two numbers** (`8,740` / `135,764` every time), so the teardown is exact and there is no leak. The residual ~5.7 KB below the pre-maintenance baseline is N-82's deliberate trade: `FREE_BT` keeps the BTDM pool reserved for the boot rather than releasing it irreversibly |
 | FR-33 | Maintenance-entry tests | N + D | Three of §8.2's four triggers are wired and tested. The USB command and the 3 s AUX1 hold open the window directly; the **config flag on next boot** is `settings.maintenance_on_boot`, consumed and persisted by `Boot` — an absent field decodes as `false`, so a config written before the field existed still loads (N-13 resolved). The remaining one, reset-reason + no-config, is **not**: it needs a reset-reason source `IHAL` does not expose, and a device with no config already reaches pass-through, so it is a redundant path rather than a missing one |
@@ -2965,7 +2965,7 @@ Test location key: **N** = `test_native/` (GoogleTest, host), **D** =
 | FR-39 | Reset-safety test | D + B | On reset, watchdog, brownout and USB-disconnect, the measured KEY line is idle, **not** driving |
 | FR-40 | Watchdog-recovery test | D + B | After a forced WDT reset, safe idle is re-established before any key can be served |
 | FR-41 | Brick-resistance test | D + B | Repeated failed updates never leave an unbootable device. The failure modes are covered on the bench: a CORRUPT image is refused before any commit (`tools/bench_ota_corrupt.py`, running slot untouched) and a COMMITTED image that panics is rolled back by the bootloader (`tools/bench_rollback.py`). Neither leaves an unbootable device |
-| FR-42 | Headless-operation test | B | Full button function with USB down, no app, no WiFi — the normal in-car case |
+| FR-42 | Headless-operation test | B | Full button function with USB down, no app, no WiFi — the normal in-car case. **VERIFIED in part on the bench 2026-09-24** (`tools/bench_ladder.py`): the device classifies and reports presses with no app and no radio, and re-serves its link after a host has never attached — `uptime_ms` climbs across a run (no reboot to serve a press), which is the observable that survives the host being absent. The full "USB down" case (a press served while the CDC link is closed) is the same code path the host half exercises with no link object |
 
 **Coverage statement:** 41 of the 42 requirements have an automated or scripted
 test. The exception is **FR-17 (temperature compensation), which has no test
@@ -2974,10 +2974,15 @@ satisfied", and its own row above carries `—` rather than a test. (An earlier
 revision of this statement read "42 of 42 … Zero requirements are covered only by
 inspection", which contradicted the FR-17 row three lines above it and §6.4; the
 count is corrected here rather than left as a claim the document itself refutes.
-Open item N-9 owns the implementation.) The six that need
+Open item N-9 owns the implementation.) The ones that need
 physical hardware — FR-16, FR-34, FR-39, FR-40, FR-41, FR-42 and the bench
-portions of FR-6, FR-9, FR-12, FR-19, FR-31, FR-35, FR-37 — are blocked on the
-ordered board and are called out in §12 as the critical path.
+portions of FR-6, FR-9, FR-12, FR-19, FR-31, FR-35, FR-37 — are now **partly
+discharged**: the board is on the bench (2026-09-24) and FR-9, FR-12, FR-28,
+FR-31/31b, FR-32, FR-37 and FR-38 have been measured on it (see the rows above and
+`code/docs/HANDOFF.md`'s bench-status table). Still hardware-gated: FR-16, FR-19
+(enable the trim loop and confirm no ADC-noise injection), FR-34 (the Espressif-app
+provisioning handshake, which needs a phone), FR-35 (a real HTTP OTA fetch), and
+FR-39/FR-40/FR-41's remaining reset-source cases. §12 carries the critical path.
 
 ---
 

@@ -221,7 +221,29 @@ one more `dev_usb_reset.py` run re-enumerates it.
 # image itself (-D SWC_BENCH_PANIC_IMAGE), pushes it, reboots, and asserts the
 # device comes back on the old image. ~7 min for the push.
 ~/.platformio/penv/bin/python tools/bench_rollback.py --port /dev/cu.usbmodem1234561
+
+# the ladder cluster on the two-board rig (FR-9/12/31/31b/42): the rig driver
+# presents a synthetic wheel, the DUT classifies it. Needs --dut AND --rig.
+~/.platformio/penv/bin/python tools/bench_ladder.py \
+    --dut /dev/cu.usbmodem1234561 --rig /dev/cu.usbmodem1121101
 ```
+
+**Two bench traps `bench_ladder.py` documents, because both look like firmware
+bugs and neither is:**
+
+1. **The released SWC node floats to ~3173 mV — above the ADC's 2900 mV
+   calibrated ceiling.** The DUT's own pull-up takes an UNLOADED SWC pin there,
+   while a real wheel ladder idles at ~2835 mV. The DUT SEEDS its idle reference
+   from the live reading at boot and only re-adopts within ±6 % of itself, so a
+   boot on the floating node leaves the reference at 3173 and every learn is
+   refused as `out_of_range` — persisting across re-flashes, because the seed is
+   re-read each boot. **The rig must present a wheel-like idle and REBOOT the DUT
+   with it held** (which is what a car does — the wheel is attached at power-on).
+2. **A rig STATUS read RELEASES its DAC** (`KeyLine::FloatMv` calls
+   `Dac::Release`), and the drive then RAMPS for ~1 s. A level read too early sees
+   the previous float; a `set_level` loop that reads without draining the rig's
+   reply queue parses a stale level and never converges. `drive_now()` re-drives
+   and waits the ramp out.
 
 ## 4. Static gates
 

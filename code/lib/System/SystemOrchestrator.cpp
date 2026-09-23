@@ -1474,8 +1474,10 @@ void SystemOrchestrator::ServiceTrim(uint8_t index, uint64_t now_ms) {
     // than trim toward a sentinel.
     if (sense_mv < 0) return;
 
-    cs.servo.Update(sense_mv);
-    DriveKeyCode(index, cs.servo.Code());
+    // Only rewrite the DAC when the loop actually moved the code: `Update` returns
+    // false inside the deadband, and a redundant I2C write every cadence tick is
+    // both pointless and a second thing that can latch a DAC fault.
+    if (cs.servo.Update(sense_mv)) DriveKeyCode(index, cs.servo.Code());
 }
 
 void SystemOrchestrator::DriveKeyCode(uint8_t index, uint16_t code) {

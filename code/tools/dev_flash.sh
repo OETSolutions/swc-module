@@ -95,7 +95,6 @@ ROM_PORT=""
 NO_BUILD=0
 USE_OTA=1
 FLASH_OFFSET="0x20000"   # app0, per partitions.csv
-BAUD=921600
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -105,8 +104,10 @@ while [[ $# -gt 0 ]]; do
         --app-port)    APP_PORT="${2:?--app-port needs a path}"; shift 2 ;;
         --rom-port)    ROM_PORT="${2:?--rom-port needs a path}"; shift 2 ;;
         --offset)      FLASH_OFFSET="${2:?--offset needs a value}"; shift 2 ;;
-        --baud)        BAUD="${2:?--baud needs a value}"; shift 2 ;;
-        -h|--help)     sed -n '2,60p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        # `--help` prints the header comment block: everything from line 2 up to
+        # the `set -euo pipefail` line, so it cannot drift from the usage text.
+        -h|--help)     sed -n "2,$(($(grep -n '^set -euo' "$0" | head -1 | cut -d: -f1) - 1))p" "$0" \
+                           | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1" >&2; exit 2 ;;
     esac
 done

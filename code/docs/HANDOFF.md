@@ -259,15 +259,32 @@ one more `dev_usb_reset.py` run re-enumerates it.
 # FR-19's bring-up enable: measure the servo's static error with the trim loop
 # DISABLED vs ENABLED. Build the DUT with the loop first:
 #   SWC_FW_VERSION=dev SWC_GIT_SHA=local PLATFORMIO_BUILD_FLAGS="-D SWC_BENCH_TRIM_LOOP" \
-#     PLATFORMIO_BUILD_DIR=/tmp/swc_trimimg pio run -e esp32s3 -t upload --upload-port <loader>
+#     PLATFORMIO_BUILD_DIR=/tmp/swc_trimimg pio run -e esp32s3
+#     ~/.platformio/penv/bin/python tools/dev_push_ota.py --port <app> --image /tmp/swc_trimimg/esp32s3/firmware.bin
 # This is the measurement that found N-84 (the enabled loop moved the output the
 # WRONG way, ~11 mV = one max_step, because it was fed the pre-drive reading).
+# The script now establishes the idle-seeding precondition itself (drive an idle,
+# reboot the DUT holding it) -- without it every pulse acks but never drives.
 ~/.platformio/penv/bin/python tools/bench_trim.py \
     --dut /dev/cu.usbmodem1234561 --rig /dev/cu.usbmodem1121101
 ```
 
-**Two bench traps `bench_ladder.py` documents, because both look like firmware
-bugs and neither is:**
+**Silicon result, 2026-09-24 (the FR-19 fix confirmed).** Settled-level static
+error, ENABLED (trim) vs DISABLED (open-loop), `test_key` held 1 s:
+
+| target | disabled | enabled |
+| --- | --- | --- |
+| 2500 mV | −37 mV | **−29 mV** |
+| 2200 mV | −33 mV | **−33 mV** |
+| 2800 mV | −10 mV | **−6 mV** |
+
+Enabled is **no worse than disabled**, i.e. the N-84 wrong-direction step is
+gone. Enabled repeat spread was 0–9 mV → **no ADC-noise injection**. The loop
+only runs while a pulse is on the line, so a per-pulse settled level is its
+observable; a continuous gain-convergence figure is the only FR-19 item left.
+
+**Bench traps `bench_ladder.py` documents, because they look like firmware bugs
+and are not:**
 
 1. **The released SWC node floats to ~3173 mV — above the ADC's 2900 mV
    calibrated ceiling.** The DUT's own pull-up takes an UNLOADED SWC pin there,
@@ -302,6 +319,17 @@ bugs and neither is:**
    targets must stay BELOW the released (pull-up) level.** The output only sinks,
    so a `test_key` above the line's rest turns the FET off and just floats the
    line — `bench_trim.py`'s sweep stays under it for that reason.
+
+6. **A pulse ACKS but does not DRIVE unless the rig is presenting an idle and the
+   DUT booted holding it (trap 1), and this presents as "nothing drives".** The
+   command band's ceiling is the DUT's own live idle minus the headroom, so with
+   the line floating every target sits above the reachable band: `DriveBoundLevelMv`
+   returns nothing to drive, the pulse is still acked, and the loopback reads the
+   released level for every sweep point. `bench_output.py` and `bench_trim.py`
+   both establish the idle-seeding state first; a script that fires `test_key`
+   against a floating line measures the release and will look like a dead output
+   stage (`bench_output.py` reports "channels observable: none" rather than a
+   pass/fail, which is the signal that the rig is in the wrong state).
 
 ## 4. Static gates
 
@@ -363,7 +391,7 @@ detail is in the auto-memory index (`MEMORY.md`) under the N-numbers.
 | **Release check** | ✅ **DONE 2026-09-24 (N-12).** The APP performs the full spec §9.5 path: `update/ReleaseManifest.kt` (a faithful mirror of the firmware's `ReleaseCheck` + `SemverCompare`, differential-verified identical on 19 version pairs), `update/ManifestFetcher.kt` (HTTPS manifest fetch + image download, `INTERNET` now declared), and `AppViewModel`'s check → decide → download → verify `sha256`/`size` → push-over-USB flow. ✅ **The firmware's own `ReleaseCheck` now has a production caller too (N-15):** the maintenance page's `/api/ota/check` reaches it through `OtaWifiCheck`. |
 | **DAC fault path** | ✅ **DONE 2026-09-24 (N-21).** FR-13's read-back (`IHAL::dac_read_code` → `DacFrame::DecodeReadCode`, compared per channel at boot); §6.8's retry-with-backoff (`DacRetry.h`, 3 attempts 1/2 ms) on both DAC writes; the latch (HAL `dac_faulted` + the orchestrator's `dac_verify_failed_` for a wrong-VALUE read); and `FAULT_DAC` now has a caller (`ReportDacFault`, an edge). ✅ **The real MCP4728 read is now PROVEN on the bench 2026-09-24:** a GOOD image pushed over USB OTA and rebooted left otadata's newest entry **`VALID`** — and `app_main` calls `esp_ota_mark_app_valid_cancel_rollback` only when `OutputVerified()` is true, which requires the read-back to have returned the exact idle code on the real part (`!dac_verify_failed_ && !dac_faulted`). So the 24-byte Read-Command response was parsed correctly against silicon, not just against a fixture |
 | **NTC temperature** | ✅ **DONE 2026-09-24 (N-67).** `NtcConvert.h` (divider inversion + B3380 model, integer maths) + `SampleNtcTenthsC`; both learn paths record it in `temp_c_at_learn`. **VERIFIED ON THE DUT 2026-09-24:** `status.temp_c` reports `26.7` (a real room temperature, stable across frames) -- and the learn path was not enough for FR-1's "continuously": a device serving the wheel never read `ADC_CH_TEMP`, so `temp_c` was permanently `null` until `Tick` gained the ~1 Hz cadence. |
-| **Servo trim loop (FR-19)** | ✅ **DEFECT FOUND+FIXED 2026-09-24 (N-84).** The loop ships DISABLED (spec §6.5); enabling it (`-D SWC_BENCH_TRIM_LOOP`) found a real defect: the enabled loop moved the output ~11 mV (one `max_step`) in the WRONG direction, because `Update` was fed the sense reading taken BEFORE the command — the line's IDLE, not the code just written. The bench's OLD-build repeat spread was 1–5 mV, which is what identified it as a fixed wrong-direction step rather than noise. **Fixed:** the loop is now serviced from `Tick` after the servo settles (`ServiceTrim`, 60 ms settle then 200 ms cadence, reading the DRIVEN line), pinned + mutation-tested, native 592→593. **Host-verified, NOT yet silicon-confirmed:** the failed flash left the DUT off the USB bus before the fixed image could be re-run — re-run `tools/bench_trim.py` when the board is back. The loop stays DISABLED in the shipped build either way. |
+| **Servo trim loop (FR-19)** | ✅ **DEFECT FOUND+FIXED, AND SILICON-CONFIRMED 2026-09-24 (N-84).** The loop ships DISABLED (spec §6.5); enabling it (`-D SWC_BENCH_TRIM_LOOP`) found a real defect: the enabled loop moved the output ~11 mV (one `max_step`) in the WRONG direction, because `Update` was fed the sense reading taken BEFORE the command — the line's IDLE, not the code just written. **Fixed:** serviced from `Tick` after the servo settles (`ServiceTrim`, 60 ms settle then 200 ms cadence, reading the DRIVEN line), pinned + mutation-tested, native 592→593. **Re-measured on the DUT:** enabled settled-level error (−29/−33/−6 mV) is no worse than the disabled baseline (−37/−33/−10 mV), spread 0–9 mV (no noise). Only a continuous gain-convergence figure remains. The loop stays DISABLED in the shipped build either way. |
 | **AUX bindings are inert** | ✅ **DONE 2026-09-24 (N-26).** `ServiceAux` services AUX2/AUX3 as real gesture inputs (`BindingResolveAux`), and AUX1 is refused a binding by `ConfigValidate` (it carries the programming/maintenance holds). Pinned by `AnAux2PressDrivesKeyChannelZeroAndIsReportedAsItsOwnInput` and siblings. |
 | **Maintenance triggers (FR-33)** | ✅ **DONE 2026-09-24 (N-83, N-13's config-flag half).** §8.2's "config flag on next boot" is now `settings.maintenance_on_boot`, consumed and persisted by `SystemOrchestrator::Boot` so the window opens on the ONE boot the user asked for (without the consume it would reopen every boot forever — an unbounded window, the state FR-38 forbids). The field is optional on the wire, so a config written before it existed still loads. Added at **zero** `sizeof(Config)` cost by grouping the three count bytes into the tail padding. **Still open:** the reset-reason + no-config trigger needs a reset-reason source `IHAL` does not expose, and a no-config device already reaches pass-through, so it is redundant rather than missing. **Verified on the bench 2026-09-24:** a config with the flag set opens the window on the boot that follows (`active: true`, real PoP/URL) and clears the stored flag; a second boot reports `active: false`. The first version used `store_` in the persist guard, which is NULL during `Boot` on the device (`SetStore` is called from `UsbLinkStart`, which runs later), so the flag was never spent and the window reopened every boot — a device-only defect the host tests could not see. |
 | **Multi-action bindings** | ✅ **DONE 2026-09-24 (N-29).** `BindingResolve` now returns the whole ordered `ResolvedBinding` list and `SystemOrchestrator::RunBindingActions` executes every firmware-owned action (`OUT_*`, `BUZZ`) while SKIPPING app-owned kinds rather than releasing. Pinned by 3 orchestrator + 2 resolver tests. |

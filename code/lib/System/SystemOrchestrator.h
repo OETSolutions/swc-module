@@ -219,6 +219,26 @@ public:
     static constexpr int kTempNotMeasuredTenths = 0;
 
     /*
+     * How often `Tick` samples the NTC, in milliseconds.
+     *
+     * **FR-1 says "sample both ladder channels and the NTC CONTINUOUSLY", and
+     * that word was unmet in normal operation:** `SampleNtcTenthsC` used to be
+     * called only from the learn paths, so a device that was merely serving the
+     * wheel never read `ADC_CH_TEMP` -- and `status.temp_c` was therefore
+     * permanently `null` in exactly the mode FR-1 describes. Measured on the DUT
+     * before this: `temp_c: null` with `uptime_ms` over 1.1 million.
+     *
+     * 1000 ms, not every poll tick (10 ms), because the NTC's job is to track a
+     * slow thermal drift (spec 6.4) -- one conversion a second is far finer than
+     * the physics, and 100 conversions a second would put an `adc_read_mv` into
+     * the 10 ms loop for no information. The interval is also the reason a
+     * `status` can report a reading promptly after boot: the first sample lands
+     * one second in, so the field is never stuck at "no reading" on a healthy
+     * board.
+     */
+    static constexpr uint32_t kNtcSampleIntervalMs = 1000;
+
+    /*
      * The last GOOD NTC reading, in tenths of a degree C, without forcing a new
      * conversion. This is the reader for spec 4.3's `status.temp_c` (open item
      * N-22): the periodic frame must report the temperature the device has, not
@@ -226,8 +246,9 @@ public:
      *
      * Returns `kTempNotMeasuredTenths` until a reading has ever been good, so a
      * `status` on a board whose NTC is unpopulated or off-span reports "no
-     * reading" rather than 0 C. `SampleNtcTenthsC` is what fills it, and it is
-     * called every learn tick and every `RecordLearnSample`.
+     * reading" rather than 0 C. `SampleNtcTenthsC` is what fills it: `Tick` calls
+     * it on a fixed cadence (`kNtcSampleIntervalMs`), and every learn tick and
+     * every `RecordLearnSample` calls it too.
      */
     int LastNtcTenthsC() const { return last_ntc_tenths_c_; }
 
@@ -971,6 +992,11 @@ private:
     // measured. Named for the NTC and not for learn because a future runtime
     // consumer wants the same hold.
     int16_t      last_ntc_tenths_c_ = kTempNotMeasuredTenths;
+    // When the NTC cadence in `Tick` last sampled, in the same clock as `Tick`'s
+    // `now_ms`. Seeded so the FIRST tick after boot samples: a device whose first
+    // `status` arrives within the first second should not report "no reading" on a
+    // board where the NTC is fine.
+    uint64_t     ntc_next_sample_ms_ = 0;
     /*
      * FR-33's maintenance window, and the sustained-AUX1 hold that opens it.
      *

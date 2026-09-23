@@ -4462,6 +4462,50 @@ TEST(SystemOrchestrator, TheNtcIsConvertedAndItsTemperatureReachesTheLearnRecord
            "which is why the assertion above is on the value and not on non-zero";
 }
 
+TEST(SystemOrchestrator, TheNtcIsSampledInNormalOperationNotOnlyDuringALearn) {
+    // FR-1 says "sample both ladder channels and the NTC CONTINUOUSLY", and the
+    // word is the point. The learn path was the only caller of
+    // `SampleNtcTenthsC`, so a device merely SERVING THE WHEEL -- the normal in-car
+    // case -- never read `ADC_CH_TEMP` and `status.temp_c` was permanently `null`.
+    // Measured on the DUT before this: `temp_c: null` with `uptime_ms` past 1.1
+    // million.
+    //
+    // No learn and no press here, on purpose: this asserts the sampling happens in
+    // ordinary operation, which is the clause that was unmet.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetAdcMilliVolts(ADC_CH_TEMP, 1500);
+    o.Boot();
+
+    int expected_tenths = 0;
+    ASSERT_TRUE(Ntc::NodeMvToTenthsC(1500, kNominalRailMv, &expected_tenths))
+        << "fixture guard: the chosen reading must be convertible";
+
+    // The FIRST tick samples (the cadence is seeded at 0), so `status` on a healthy
+    // board never reports "no reading" for want of having ticked long enough.
+    o.Tick(1);
+    EXPECT_EQ(o.LastNtcTenthsC(), expected_tenths)
+        << "the first tick must sample, so temp_c is never stale-null at boot";
+
+    // And it keeps sampling as time advances -- not once and never again.
+    const int reads_after_first = hal.AdcReadCount(ADC_CH_TEMP);
+    for (uint64_t t = 2; t < 5000; t += 10) o.Tick(t);
+    EXPECT_GT(hal.AdcReadCount(ADC_CH_TEMP), reads_after_first)
+        << "the NTC must be re-sampled as the loop runs, not read once at boot";
+
+    // But NOT every tick: a 10 ms poll must not put an ADC conversion in the loop
+    // 100 times a second for a quantity that tracks thermal drift. Over ~5 s the
+    // 1 Hz cadence allows a handful of samples; assert it stayed in that range so a
+    // future change to every-tick is caught.
+    const int total = hal.AdcReadCount(ADC_CH_TEMP);
+    EXPECT_LE(total, 8)
+        << "the cadence must be ~1 Hz, not once per 10 ms poll tick";
+    EXPECT_GE(total, 4) << "and it must actually recur ~once a second";
+}
+
 // --- the AUX gesture inputs (spec 3.1/3.5), open item N-26 -------------------
 //
 // AUX2 and AUX3 were accepted-and-inert for a revision: the config model carried

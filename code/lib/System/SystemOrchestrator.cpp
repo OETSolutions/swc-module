@@ -818,6 +818,19 @@ void SystemOrchestrator::Tick(uint64_t now_ms) {
     // `ReportDacFault` is an edge, so this is one pattern per boot however many
     // writes fail afterwards.
     if (hal_ != nullptr && hal_->dac_faulted(hal_->ctx)) ReportDacFault();
+    // FR-1's NTC clause: "sample ... the NTC continuously". Until this existed the
+    // channel was read only by the learn paths, so a device serving the wheel never
+    // sampled it and `status.temp_c` was permanently `null`. On a fixed cadence
+    // rather than every tick -- see `kNtcSampleIntervalMs` for why the physics
+    // wants 1 Hz and not 100 Hz.
+    //
+    // The unsigned compare is the same clock-rewind guard `ShouldTimeout` uses: a
+    // `now_ms` earlier than the last sample (a caller bug or a clock reset) must
+    // not sample on every tick forever.
+    if (now_ms >= ntc_next_sample_ms_) {
+        ntc_next_sample_ms_ = now_ms + kNtcSampleIntervalMs;
+        SampleNtcTenthsC();
+    }
     for (uint8_t i = 0; i < channel_count_; ++i) {
         ServiceChannel(i, now_ms);
     }

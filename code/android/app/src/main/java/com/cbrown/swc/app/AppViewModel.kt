@@ -38,6 +38,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.booleanOrNull
 import kotlinx.serialization.json.doubleOrNull
 import kotlinx.serialization.json.int
 import kotlinx.serialization.json.intOrNull
@@ -484,6 +485,37 @@ class AppViewModel(
             // The `rail_mv` this branch used to read stays gone: it was the +3V3
             // rail with no producer, and the quantity the ladder view needs is
             // the LIVE idle, which now arrives per press on `event.idle_mv`.
+            // Spec 4.3's `maintenance`: the device's own report of its window, and
+            // the ONLY delivery path for the two per-device secrets (spec 8.3
+            // option 1). The board has no display and no printed label, so the BLE
+            // Proof-of-Possession and the page token are derived from its MAC and
+            // shown HERE, over the already-trusted USB link, for the user to type
+            // into the Espressif app or to open the setup page with.
+            //
+            // The frame is the authority on whether the window is open, not the
+            // app's own enter/exit request: the device also opens the window on a
+            // 3 s AUX1 hold, which no app request produced. The request's
+            // optimistic set stays, so the button responds immediately; this
+            // corrects it if the device disagreed.
+            //
+            // Every field is empty when `active` is false, so a closed window
+            // cannot leave a stale secret on screen -- which is why they are
+            // assigned rather than merged.
+            Frames.MAINTENANCE -> {
+                val active = frame.fields["active"]?.jsonPrimitive?.booleanOrNull ?: false
+                _link.value = _link.value.copy(
+                    maintenanceOpen = active,
+                    maintenancePop = frame.fields["pop"]?.jsonPrimitive?.content.orEmpty(),
+                    maintenanceToken = frame.fields["token"]?.jsonPrimitive?.content.orEmpty(),
+                    maintenancePageUrl = frame.fields["page_url"]?.jsonPrimitive?.content.orEmpty(),
+                    maintenanceBleName = frame.fields["ble_name"]?.jsonPrimitive?.content.orEmpty(),
+                    maintenanceBleFailures =
+                        frame.fields["ble_failures"]?.jsonPrimitive?.intOrNull ?: 0,
+                    // A frame that reports the window closed clears any stale
+                    // "the device refused" message from an earlier attempt.
+                    maintenanceProblem = if (active) _link.value.maintenanceProblem else null,
+                )
+            }
             Frames.STATUS -> {
                 val cs = frame.fields["config_state"]?.jsonPrimitive?.content
                 if (cs != null) _link.value = _link.value.copy(configState = cs)

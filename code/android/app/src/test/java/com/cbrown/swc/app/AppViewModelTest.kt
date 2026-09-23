@@ -219,6 +219,117 @@ class AppViewModelTest {
     }
 
     @Test
+    fun `a maintenance frame reports an open window with its secrets`() = runTest {
+        // Spec 8.3 option 1. The board has no display, so the BLE Proof-of-
+        // Possession and the page token reach the user through THIS app or not at
+        // all -- a frame that arrives and is dropped makes the provisioning path
+        // unusable, which is the "produced, consumed by nobody" shape (N-22/N-24/
+        // N-45) with a user who cannot provision.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(
+            frame(
+                "maintenance",
+                "active" to "true",
+                "pop" to "\"A1B2C3\"",
+                "token" to "\"ABCDEF123456\"",
+                "page_url" to "\"http://192.168.4.1/?token=ABCDEF123456\"",
+                "ble_name" to "\"A1B2\"",
+                "ble_failures" to "0",
+            ),
+        )
+        advanceUntilIdle()
+
+        val s = vm.link.value
+        assertTrue("the device's window must open in the app too", s.maintenanceOpen)
+        assertEquals("A1B2C3", s.maintenancePop)
+        assertEquals("ABCDEF123456", s.maintenanceToken)
+        assertEquals("http://192.168.4.1/?token=ABCDEF123456", s.maintenancePageUrl)
+        assertEquals("A1B2", s.maintenanceBleName)
+        assertEquals(0, s.maintenanceBleFailures)
+    }
+
+    @Test
+    fun `a maintenance frame reporting the window closed clears every secret`() = runTest {
+        // A stale PoP left on screen after the window shut is a credential for a
+        // session that is no longer listening: the user types it into the
+        // Espressif app and waits out a timeout that looks like an app bug. The
+        // fields are ASSIGNED from the frame, so an empty payload clears them.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(
+            frame(
+                "maintenance", "active" to "true", "pop" to "\"A1B2C3\"",
+                "token" to "\"ABCDEF123456\"", "ble_name" to "\"A1B2\"",
+            ),
+        )
+        advanceUntilIdle()
+        assertEquals("A1B2C3", vm.link.value.maintenancePop)
+
+        t.emit(
+            frame(
+                "maintenance", "active" to "false", "pop" to "\"\"",
+                "token" to "\"\"", "page_url" to "\"\"", "ble_name" to "\"\"",
+            ),
+        )
+        advanceUntilIdle()
+
+        val s = vm.link.value
+        assertFalse("the device closed the window and the app must follow", s.maintenanceOpen)
+        assertEquals("", s.maintenancePop)
+        assertEquals("", s.maintenanceToken)
+        assertEquals("", s.maintenancePageUrl)
+        assertFalse(
+            "a closed window must not render an 'it did not work' message",
+            s.maintenanceProblem != null,
+        )
+    }
+
+    @Test
+    fun `a failed radio reaches the screen so it does not promise a setup page`() = runTest {
+        // The window and the radio are separate: the device opens the window and
+        // only then brings the radio up, and that can fail. `ble_failures` is the
+        // signal, and it must reach the state the card renders -- otherwise the
+        // card sends a user hunting for an access point that does not exist (the
+        // N-76 shape: copy promising a capability the device lacks).
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+
+        t.emit(frame("maintenance", "active" to "true", "ble_failures" to "1"))
+        advanceUntilIdle()
+
+        val s = vm.link.value
+        assertTrue(s.maintenanceOpen)
+        assertEquals(1, s.maintenanceBleFailures)
+        assertEquals("a failed radio leaves no page to offer", "", s.maintenancePageUrl)
+    }
+
+    @Test
+    fun `an AUX1-opened window is visible without the app having asked`() = runTest {
+        // The device opens the window on a 3 s AUX1 hold (spec 8.2), which no app
+        // request produced. Before the `maintenance` frame existed the app could
+        // only ever show a window IT had opened, so a no-app user's window was
+        // invisible to the app -- and with it the PoP and the page URL.
+        val t = FakeTransport()
+        val vm = AppViewModel(SwcClient(t), scope = vmScope())
+        started(vm)
+        assertFalse("nothing has opened a window yet", vm.link.value.maintenanceOpen)
+
+        t.emit(frame("maintenance", "active" to "true", "pop" to "\"A1B2C3\""))
+        advanceUntilIdle()
+
+        assertTrue(
+            "a window the app did not open must still be shown",
+            vm.link.value.maintenanceOpen,
+        )
+    }
+
+    @Test
     fun `a status frame reports the config state the device sends`() = runTest {
         // Spec 4.3: `config_state` exists so a config fault has "a name the app
         // could read" -- §6.8's corrupt-config response is `config_state: defaults`.

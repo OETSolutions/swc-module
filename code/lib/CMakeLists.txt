@@ -46,6 +46,23 @@ idf_component_register(
     #                    fetches it. Declaring it here is also what makes the
     #                    include path exist; without it UsbCdc.cpp fails with
     #                    "tinyusb.h: No such file or directory".
+    #
+    # The maintenance radio's stack (spec 8.1-8.4, MaintenanceRadio.cpp):
+    #   esp_http_server  esp_http_server.h  -- the page and its /api/* endpoints
+    #   esp_wifi         esp_wifi.h         -- the driver, in AP+STA for the page
+    #   esp_netif        esp_netif.h        -- the AP's address, and the netif the
+    #                    page is reachable on before the device joins a network
+    #   esp_event        esp_event.h        -- the default loop the WiFi driver and
+    #                    the provisioning manager both post to
+    #   wifi_provisioning wifi_provisioning/*.h -- the manager + BLE scheme. Its
+    #                    own CMakeLists REQUIRES protocomm and PRIV_REQUIRES bt, so
+    #                    those are pulled transitively; `bt` is named here anyway
+    #                    because ESP_MAC_WIFI_* and the controller's memory release
+    #                    are reached from this library's own file.
+    #   esp_hw_support   esp_mac.h          -- esp_read_mac, the source of BOTH the
+    #                    BLE PoP and the web token (spec 8.3/8.4)
     REQUIRES json esp_driver_gpio esp_driver_i2c esp_adc nvs_flash esp_timer
              app_update esp_http_client esp_https_ota mbedtls esp_tinyusb
+             esp_http_server esp_wifi esp_netif esp_event wifi_provisioning bt
+             esp_hw_support
 )

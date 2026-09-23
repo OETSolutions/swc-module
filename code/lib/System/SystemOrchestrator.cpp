@@ -856,20 +856,20 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
     // device left unable to serve input because someone opened a web page cannot
     // happen. Update() is what performs the close.
     //
-    // **The window is a FIXED deadline from entry, NOT an inactivity timeout, and
-    // that is a spec-versus-code gap rather than the intended behaviour.** Spec 8.2
-    // and FR-38 both say "5 minutes of INACTIVITY", and `MaintenanceMode` has the
-    // machinery for it (`NoteActivity` bumps `last_activity_`, and `ShouldTimeout`
-    // measures from it), but nothing produces an activity event: the only wrapper,
-    // `NoteMaintenanceActivity`, has no caller. It cannot acquire one in this build
-    // -- activity is HTTP requests and PoP entry, and the web server and radio it
-    // would come from do not exist yet (N-15). So a user actively working in a
-    // provisioning page is closed out on the fixed deadline, which is the stricter
-    // direction: a device that closes EARLY serves a press again sooner, whereas an
-    // unbounded window is the "unable to serve input" state FR-38 exists to prevent.
-    // The activity input lands with the radio; the earlier comment here claimed the
-    // close was already on inactivity, which was false and is why this stayed
-    // invisible (open item N-35).
+    // **The close is measured from the LAST ACTIVITY, not from entry** (N-35,
+    // resolved with the radio). The activity source is the maintenance HTTP
+    // server: `MaintenanceRadioRequestCount` counts every request it serves, and
+    // `main.cpp`'s poll loop calls `NoteMaintenanceActivity` whenever that count
+    // has moved. So a user reading the status page or typing a WiFi password is
+    // not reaped mid-task, which is what spec 8.2 and FR-38 specify.
+    //
+    // The wiring lives in `main.cpp` rather than here because the HTTP server is
+    // device-only (`MaintenanceRadio.cpp`, the third host-excluded TU) and this
+    // file is host-compiled: naming it here would cost this state machine its
+    // tests. This call site therefore only performs the close, and an earlier
+    // comment claimed the close was ALREADY on inactivity while nothing produced
+    // an activity event at all -- the false-comment shape that kept N-35
+    // invisible for a revision.
     maintenance_.Update(now_ms);
 
     // Restate the LEDs when the maintenance window opens or closes, whatever
@@ -2002,5 +2002,23 @@ extern "C" bool SystemOrchestratorSafeIdle(const SystemOrchestrator *sys) {
 
 extern "C" bool SystemOrchestratorOutputVerified(const SystemOrchestrator *sys) {
     return sys != nullptr && sys->OutputVerified();
+}
+
+extern "C" bool SystemOrchestratorIsMaintenanceActive(const SystemOrchestrator *sys) {
+    return sys != nullptr && sys->MaintenanceActive();
+}
+
+extern "C" const char *SystemOrchestratorConfigStateWord(const SystemOrchestrator *sys) {
+    // Never null: the caller passes this straight to a `%s`, and a null there is
+    // undefined behaviour rather than an "unknown" reading.
+    return (sys != nullptr) ? sys->ConfigStateWord() : "unknown";
+}
+
+extern "C" void SystemOrchestratorNoteMaintenanceActivity(SystemOrchestrator *sys, uint64_t now_ms) {
+    // No null check needed for the MODE -- `NoteMaintenanceActivity` is a
+    // documented no-op on a closed window -- but the ORCHESTRATOR pointer can be
+    // null on the boot-failure path, and the caller (a poll loop) should not have
+    // to know that.
+    if (sys != nullptr) sys->NoteMaintenanceActivity(now_ms);
 }
 

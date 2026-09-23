@@ -10,6 +10,7 @@
 
 #include "HAL/EspHal.h"
 #include "Link/UsbLink.h"
+#include "Maintenance/MaintenanceRadio.h"
 #include "System/SystemOrchestrator.h"
 
 static const char *TAG = "swc-boot";
@@ -130,8 +131,94 @@ extern "C" void app_main(void)
     // promise -- there is no ordering in which the link is required to boot.
     UsbLinkStart(hal, sys);
 
+    /*
+     * FR-32/FR-34: the maintenance radio is driven by the WINDOW's transitions,
+     * here in the poll loop rather than inside `MaintenanceMode`.
+     *
+     * `MaintenanceMode` is pure state and is host-tested; the moment it named
+     * NimBLE it would lose those tests. Spec 8.2 says the radio work "is driven by
+     * the caller in response to `Active()` transitions", and this loop is that
+     * caller. `last_maintenance` is the applied state, so the bring-up and the
+     * teardown each run exactly once per transition rather than on every tick.
+     *
+     * **A start that FAILED is latched, not retried every tick.** A failed
+     * bring-up means the radio could not come up (no heap, no MAC, a driver
+     * error); retrying at 100 Hz would fill the log and burn heap while telling
+     * the user nothing new. The failure count is published to the app instead, so
+     * a user sees "the window is open and the radio is not up" rather than a mode
+     * that silently does nothing.
+     */
+    bool last_maintenance = false;
+    uint32_t last_requests = 0;
+    uint32_t published_failures = 0;
+    MaintenanceInfo last_info{};
+    bool have_published = false;
+
     for (;;) {
         SystemOrchestratorTick(sys, hal->now_ms(hal->ctx));
+
+        const bool maintenance_now = SystemOrchestratorIsMaintenanceActive(sys);
+        if (maintenance_now != last_maintenance) {
+            last_maintenance = maintenance_now;
+            if (maintenance_now) {
+                MaintenanceInfo info{};
+                if (MaintenanceRadioStart(&info)) {
+                    ESP_LOGI(TAG, "maintenance window open; radio up, page at %s", info.page_url);
+                } else {
+                    // Reported, not hidden: the window is still open (the
+                    // orchestrator's state is its own) and the app is told the
+                    // radio did not come up.
+                    ESP_LOGE(TAG, "maintenance window open but the radio failed to start");
+                }
+            } else {
+                // FR-32: the stacks are freed on the way out, so nothing radio-
+                // shaped is resident while the device serves the wheel.
+                MaintenanceRadioStop();
+                ESP_LOGI(TAG, "maintenance window closed; radio torn down");
+            }
+        }
+
+        // Keep the page's `config_state` current with the config the device is
+        // RUNNING, so a commit during the window is reflected rather than frozen
+        // at the boot value.
+        if (maintenance_now) {
+            MaintenanceRadioSetConfigState(SystemOrchestratorConfigStateWord(sys));
+        }
+
+        /*
+         * FR-38's activity clock. A request served by the maintenance HTTP server
+         * IS activity -- a user reading the status page or typing a WiFi password
+         * -- so the window is bumped whenever the request count has MOVED since the
+         * last tick. Without this the window would be a fixed deadline from entry
+         * and would reap a user mid-provision, which is the gap N-35 recorded while
+         * there was no request source to bump it from.
+         *
+         * A count compared against the last value, not a flag: the server's task
+         * runs concurrently with this loop, so several requests can land between
+         * two ticks and a flag would report only the first.
+         */
+        const uint32_t requests = MaintenanceRadioRequestCount();
+        if (maintenance_now && requests != last_requests) {
+            SystemOrchestratorNoteMaintenanceActivity(sys, hal->now_ms(hal->ctx));
+        }
+        last_requests = requests;
+
+        // Publish the window's facts to the app (spec 8.3 option 1). Every tick,
+        // so a connection that arrives mid-window is handled by the router's own
+        // change detection; the values are only re-sent when something moved.
+        MaintenanceInfo info{};
+        info.active = maintenance_now;
+        if (maintenance_now) MaintenanceRadioDescribe(&info);
+        const uint32_t failures = MaintenanceRadioFailures();
+        if (!have_published || info.active != last_info.active ||
+            strcmp(info.pop, last_info.pop) != 0 || strcmp(info.token, last_info.token) != 0 ||
+            failures != published_failures) {
+            UsbLinkPublishMaintenance(info, failures);
+            last_info = info;
+            published_failures = failures;
+            have_published = true;
+        }
+
         // Drains one deferred router frame and whatever the TX buffer still
         // holds. A large config reply is chunked, so this must be called often
         // enough that a reply finishes in a reasonable time -- 10 ms per chunk

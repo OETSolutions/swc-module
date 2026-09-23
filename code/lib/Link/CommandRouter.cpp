@@ -216,6 +216,14 @@ void CommandRouter::OnConnected() {
              "\"fw_version\":\"%s\",\"hw_id\":\"SWC-S3\",\"protocol_v\":%u,\"caps\":[\"config\",\"learn\",\"ota\"]",
              FwVersionString(), static_cast<unsigned>(kNdjsonProtocolVersion));
     Emit("hello", body);
+    // A connecting app must learn the window's state without asking. `hello`
+    // carries no maintenance fields (spec 4.3), so the frame that does is sent
+    // here -- which is also the only place that reaches an app which did not see
+    // the window OPEN (it was already open, or the app was not attached yet).
+    // Forced by clearing the published flag, so the unchanged-state short circuit
+    // does not suppress it.
+    maintenance_published_ = false;
+    PublishMaintenanceIfChanged();
     BeginConfigReplyRun();
 }
 
@@ -431,6 +439,54 @@ void CommandRouter::EmitStatusBody(bool with_for_seq, uint32_t for_seq) {
              static_cast<unsigned>(tx_dropped), static_cast<unsigned>(rx_overflows),
              temp_field, static_cast<unsigned>(heap_free));
     Emit("status", body);
+}
+
+/*
+ * Spec 8.3 option 1: the BLE PoP and the web token are derived per device and
+ * shown to the user over USB, because the board has no display and no printed
+ * label to carry either secret. This is that delivery path.
+ *
+ * **It emits on CHANGE, not every tick.** `SetMaintenanceInfo` is called from the
+ * poll loop, so an unconditional emit would flood the link at 100 Hz with a frame
+ * that only ever changes when the window opens or closes. The `published_` flag
+ * makes the FIRST call emit too, so an app that connects into an already-open
+ * window receives the state once `hello` has gone out rather than never.
+ */
+void CommandRouter::PublishMaintenanceIfChanged() {
+    if (maintenance_published_) {
+        const MaintenanceInfo &a = maintenance_info_;
+        const MaintenanceInfo &b = published_info_;
+        const bool same = (a.active == b.active) &&
+                          (strcmp(a.pop, b.pop) == 0) &&
+                          (strcmp(a.token, b.token) == 0) &&
+                          (strcmp(a.page_url, b.page_url) == 0) &&
+                          (strcmp(a.ble_name, b.ble_name) == 0) &&
+                          (maintenance_failures_ == published_failures_);
+        if (same) return;
+    }
+
+    char body[512];
+    snprintf(body, sizeof(body),
+             "\"active\":%s,\"pop\":\"%s\",\"token\":\"%s\",\"page_url\":\"%s\","
+             "\"ble_name\":\"%s\",\"ble_failures\":%u",
+             maintenance_info_.active ? "true" : "false",
+             maintenance_info_.pop, maintenance_info_.token,
+             maintenance_info_.page_url, maintenance_info_.ble_name,
+             static_cast<unsigned>(maintenance_failures_));
+    Emit("maintenance", body);
+
+    published_info_ = maintenance_info_;
+    published_failures_ = maintenance_failures_;
+    maintenance_published_ = true;
+}
+
+void CommandRouter::SetMaintenanceInfo(const MaintenanceInfo &info, uint32_t failures) {
+    maintenance_info_ = info;
+    maintenance_failures_ = failures;
+    // Emitting from here rather than from `Tick` keeps the change and the frame
+    // together: the poll loop reports the radio's state as it sees it, and the
+    // frame goes out on the transition, not one tick later.
+    PublishMaintenanceIfChanged();
 }
 
 void CommandRouter::NoteSilenceIfStale(uint64_t now) {

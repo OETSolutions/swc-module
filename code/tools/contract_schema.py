@@ -99,6 +99,17 @@ FRAMES = [
     # against this row in both directions by test_frame_field_lists_match_the_router.
     Frame("status",        "fw2app", "vbus_present,gain_mode,uptime_ms,config_state,output_safe,tx_dropped,rx_overflows,temp_c,heap_free"),
     Frame("ladder_sample", "fw2app", "channel,level_mv,n"),
+    # Spec 8.3 option 1: the BLE Proof-of-Possession and the web token are derived
+    # per device and shown to the user OVER USB, because the board has no display
+    # and no printed label to carry either secret. This frame is that delivery
+    # path -- `pop` for the Espressif provisioning app, `token`/`page_url` for the
+    # maintenance page. Without it the secrets exist and reach nobody.
+    #
+    # Emitted on CHANGE (the window opening or closing) and once on connect, so a
+    # late-joining app sees the state without asking. All fields are empty when
+    # `active` is false, which is what stops a stale secret being read off a
+    # closed window.
+    Frame("maintenance",   "fw2app", "active,pop,token,page_url,ble_name,ble_failures"),
     # `ack` carries `for_seq` and `ok` -- and `mv_center`/`mv_tolerance` on the
     # ONE ack that has them, `learn_commit`'s (CommandRouter::HandleLearnCommit),
     # where the derived window is the answer the learn screen exists to read. It

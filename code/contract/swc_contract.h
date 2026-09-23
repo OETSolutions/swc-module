@@ -106,6 +106,7 @@ enum SwcActionKind {
 #define SWC_FRAME_EVENT "event"
 #define SWC_FRAME_STATUS "status"
 #define SWC_FRAME_LADDER_SAMPLE "ladder_sample"
+#define SWC_FRAME_MAINTENANCE "maintenance"
 #define SWC_FRAME_ACK "ack"
 #define SWC_FRAME_NACK "nack"
 #define SWC_FRAME_LOG "log"

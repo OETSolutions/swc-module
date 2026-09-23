@@ -134,8 +134,8 @@ def test_every_spec_4_3_frame_is_present():
     # Spec 4.3's table, including `link_gap` and the maintenance pair, which the
     # router emits/handles and the table omitted until this task corrected it.
     required = {
-        "hello", "event", "status", "ladder_sample", "ack", "nack", "log",
-        "link_gap",
+        "hello", "event", "status", "ladder_sample", "maintenance", "ack", "nack",
+        "log", "link_gap",
         "config_get", "config_begin", "config_chunk", "config_end",
         "config_patch", "learn_start", "learn_stop", "learn_commit",
         "maintenance_enter", "maintenance_exit",

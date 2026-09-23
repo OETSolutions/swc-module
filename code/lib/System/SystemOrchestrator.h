@@ -1027,6 +1027,35 @@ void SystemOrchestratorTick(SystemOrchestrator *sys, uint64_t now_ms);
 // True once the safe idle state has been written (FR-13).
 bool SystemOrchestratorSafeIdle(const SystemOrchestrator *sys);
 
+/*
+ * FR-32/FR-34: whether the maintenance window is open, so `app_main` can bring
+ * the radio up and take it down on the transitions.
+ *
+ * A free function rather than a method only because `app_main` is a C
+ * translation unit and reaches the orchestrator through this C interface. Null is
+ * safe and means "no window", so the loop needs no null check.
+ */
+bool SystemOrchestratorIsMaintenanceActive(const SystemOrchestrator *sys);
+
+/*
+ * The config's state word (`ok`/`none`/`recovered`/`defaults`), for the
+ * maintenance page's `/api/status` to report the config the device is RUNNING.
+ *
+ * Returns "unknown" for a null orchestrator, never null, so a caller can pass the
+ * result straight to a `%s`.
+ */
+const char *SystemOrchestratorConfigStateWord(const SystemOrchestrator *sys);
+
+/*
+ * FR-38: bump the maintenance window's activity clock, so a window in use is not
+ * reaped mid-task. `app_main` calls this when the HTTP server reports it has
+ * served a request.
+ *
+ * Safe on a null orchestrator or a closed window: `MaintenanceMode::NoteActivity`
+ * is a no-op when inactive, and the guard here means the caller needs no check.
+ */
+void SystemOrchestratorNoteMaintenanceActivity(SystemOrchestrator *sys, uint64_t now_ms);
+
 // True when the safe idle was written AND no DAC write has failed since boot.
 // This is FR-37's health condition: what `app_main` must check before marking an
 // OTA image valid. `SystemOrchestratorSafeIdle` alone cannot falsify anything

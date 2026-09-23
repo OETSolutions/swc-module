@@ -3,11 +3,14 @@
 
 #include <gtest/gtest.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <set>
 #include <string>
+#include <unistd.h>
 #include <vector>
 
 TEST(WebTokenDerive, IsDeterministicAndPerDevice) {
@@ -192,4 +195,73 @@ TEST(WebPageFind, EveryTableEntryIsResolvableAndTheRootHasAnAlias) {
         EXPECT_EQ(e.len, std::string(e.body).size()) << "wrong len for " << e.path;
     }
     EXPECT_NE(WebPageFind("/"), nullptr) << "the root must resolve, or the page is unreachable";
+}
+
+// The page computes the firmware image's SHA-256 in JavaScript, because the
+// device's upload path needs a digest to verify against (spec 9.4) and
+// `crypto.subtle` is undefined outside a secure context -- this page is plain
+// HTTP on the device's own AP, so the browser does not provide it.
+//
+// **A wrong digest here rejects every VALID upload**, and the user sees an
+// "image failed the digest check" that points at their firmware file rather than
+// at the page. So the implementation is not taken on trust: the test extracts it
+// from the served asset and runs it against the published NIST vectors, which is
+// the only way to check a hash without a second implementation to agree with.
+//
+// It runs the JavaScript with `node` rather than reimplementing SHA-256 here,
+// deliberately: a C++ copy would be a THIRD implementation, and the property
+// under test is that the bytes the BROWSER runs are a correct SHA-256.
+TEST(WebPageFind, ThePagesEmbeddedSha256IsARealSha256) {
+    const WebAsset *asset = WebPageFind("/");
+    ASSERT_NE(asset, nullptr);
+    const std::string page(asset->body, asset->len);
+
+    // The function's source, from the page itself.
+    const std::string marker = "function swcSha256(bytes) {";
+    const size_t start = page.find(marker);
+    ASSERT_NE(start, std::string::npos)
+        << "the page no longer defines swcSha256; the upload path has no digest";
+    const size_t end = page.find("\n  }", start);
+    ASSERT_NE(end, std::string::npos) << "could not find the end of swcSha256";
+    const std::string fn = page.substr(start, end - start + 4);
+
+    // `node` is how the page's own language is executed. Skipped when absent
+    // rather than failed: a host without node cannot run a browser's JS, and
+    // that is an environment fact rather than a defect in the page. The CI
+    // workflow installs it, so the check does run where it matters.
+    const bool have_node = (std::system("command -v node > /dev/null 2>&1") == 0);
+    if (!have_node) {
+        GTEST_SKIP() << "no node on this host; the JS vector check is covered in CI";
+    }
+
+    std::string script = fn + R"JS(
+const enc = (s) => new TextEncoder().encode(s);
+const vectors = [
+  ["", "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"],
+  ["abc", "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"],
+  ["abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq",
+   "248d6a61d20638b8e5c026930c3e6039a33ce45964ff2167f6ecedd419db06c1"],
+];
+for (const [inp, want] of vectors) {
+  if (swcSha256(enc(inp)) !== want) { process.exit(1); }
+}
+process.exit(0);
+)JS";
+
+    const std::string tmpl = "/tmp/swc_page_sha_XXXXXX.js";
+    std::vector<char> path(tmpl.begin(), tmpl.end());
+    path.push_back('\0');
+    const int fd = mkstemps(path.data(), 3);
+    ASSERT_GE(fd, 0) << "could not create a temp file";
+    const ssize_t written = write(fd, script.data(), script.size());
+    ASSERT_EQ(written, static_cast<ssize_t>(script.size()));
+    close(fd);
+
+    const std::string cmd = std::string("node ") + path.data();
+    const int rc = std::system(cmd.c_str());
+    std::remove(path.data());
+
+    EXPECT_EQ(rc, 0)
+        << "the page's swcSha256 disagrees with the published SHA-256 vectors, so "
+           "every valid firmware upload would be rejected as a digest mismatch";
 }

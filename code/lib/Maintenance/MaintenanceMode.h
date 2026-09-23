@@ -73,14 +73,16 @@ public:
      * Bumps the activity clock, so a user actively working in the web UI or
      * typing a PoP is not kicked out mid-task.
      *
-     * **Nothing calls this in the current build, so the window is a fixed
-     * deadline from `Enter` rather than the "5 minutes of inactivity" spec 8.2 and
-     * FR-38 describe.** The activity source is an HTTP request or a PoP entry, and
-     * the web server and radio that would produce one do not exist yet (N-15). The
-     * direction is safe -- a window that closes early serves a press again sooner,
-     * which is what FR-38 wants -- but it is a gap, not the intended behaviour, and
-     * it is recorded as N-35 rather than left for a reader to infer from a call
-     * site that is not there. See `SystemOrchestrator::Tick`.
+     * **The window is measured from the last activity, not from `Enter`** (N-35,
+     * resolved with the radio): the maintenance HTTP server counts the requests it
+     * serves and `main.cpp`'s poll loop wrappers this call on every change, so the
+     * close is the "5 minutes of inactivity" spec 8.2 and FR-38 describe. The
+     * wrapper is `SystemOrchestratorNoteMaintenanceActivity`; the source is
+     * `MaintenanceRadioRequestCount`.
+     *
+     * This file stays free of that wiring on purpose -- the HTTP server is
+     * device-only and this class is host-tested, so naming it here would cost this
+     * state machine its tests.
      */
     void NoteActivity(uint64_t now_ms);
 

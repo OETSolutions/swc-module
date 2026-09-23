@@ -199,6 +199,17 @@ jobs:
         working-directory: code
         run: python3 tools/check_task_ownership.py
 
+      # MaintenanceRadio.cpp is the THIRD device-only TU, so nothing that runs in
+      # this job compiles it. The properties it holds are the ones that only
+      # surface on a board inside a car: FR-32's teardown pairing (a leaked radio
+      # stack), a reply that sets no status line (so a 401 reads as success on the
+      # page), and the window-scoped failure count (which the app branches on
+      # FIRST, so a sticky value makes every later window claim its radio is
+      # down). Each was a real shape before this gate existed.
+      - name: The maintenance radio's window-scoped invariants hold
+        working-directory: code
+        run: python3 tools/check_maintenance_radio.py
+
       # A missing Kconfig key is neither a compile error nor a test failure --
       # it is simply an unset symbol until the exact path that depends on it
       # runs. FR-37's rollback shipped dead that way: the A/B partitions and the

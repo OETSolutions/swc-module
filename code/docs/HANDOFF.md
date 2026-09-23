@@ -86,15 +86,15 @@ python3 tools/check_hal_contracts.py
 python3 tools/check_frame_handlers.py
 python3 tools/check_app_limits.py
 python3 tools/check_task_ownership.py
+python3 tools/check_maintenance_radio.py
 python3 tools/check_sdkconfig_keys.py
 python3 tools/check_spec_example.py
 python3 tools/check_stack_usage.py
 bash   tools/crosscheck_config.sh
 ```
 
-Last verified: **503/503 native tests green, zero sanitizer reports**; device
-build succeeds; `firmware.bin` **387,120 bytes = 19.7 %** of the 1,966,080-byte
-app slot.
+Last verified: **585/585 native tests green, zero sanitizer reports**; device
+build succeeds at 74.5 % of the app slot; 39 Python gates green.
 
 **Always use isolated build dirs.** Peer sessions share `code/.pio/build/` and
 will race you (`PLATFORMIO_BUILD_DIR=…` per the commands above).
@@ -173,14 +173,15 @@ one more `dev_usb_reset.py` run re-enumerates it.
 ## 4. Static gates
 
 All in `code/tools/`; the repo-root `.github/workflows/firmware.yml` invokes
-them by name and CI runs from `code/`. Two notes worth having up front:
+them by name and CI runs from `code/`. Every gate and its `test_check_*.py`
+self-test is committed as of `38f579c`, and CI runs each one; a gate added later
+must be added to the workflow by name as well as to the verify loop in §2.
 
-- **Most gates are currently UNTRACKED** (`??` in git): `check_app_limits.py`,
-  `check_frame_handlers.py`, `check_hal_contracts.py`, `check_sdkconfig_keys.py`,
-  `check_stack_usage.py`, `check_task_ownership.py`, and the matching
-  `test_check_*.py`. They are NOT gitignored, so they will be committed with an
-  explicit `git add` (see §5). **Do that before any push**, or CI fails on a
-  clean checkout.
+- `check_maintenance_radio.py` (added with N-15) pins the maintenance radio's
+  window-scoped invariants — FR-32's teardown pairing, every reply setting its
+  status line, and the failure count being window-scoped and assigned rather than
+  accumulated. `MaintenanceRadio.cpp` is device-only, so nothing else in the
+  suite can see any of them.
 - `check_stack_usage.py` reads `sizeof(Config)` from the `static_assert` in
   `lib/Config/ConfigModel.h` (added this session) rather than carrying its own
   copy; deleting that assertion fails the gate loudly instead of silently
@@ -222,10 +223,10 @@ detail is in the auto-memory index (`MEMORY.md`) under the N-numbers.
 
 | Item | What's missing |
 | --- | --- |
-| **OTA — USB path** | ✅ **WIRED 2026-09-24 (N-14).** The router dispatches `ota_begin`/`ota_chunk`/`ota_end` to `OtaUsb`, `hello` advertises `"ota"`, the app's Update screen pushes a picked file with a progress bar. **Still board-gated:** the `esp_ota_*` flash write itself — verify on hardware with a deliberately CORRUPT image first. |
-| **OTA — WiFi path** | `OtaWifi` exists and shares the gate, but its caller is the maintenance page's `/api/ota/upload`, which needs the radio (below). |
-| **Maintenance radio** | `BleProvisioning`, `WebPage`, `WebPageAssets` are implemented, tested, and **never started**. FR-32's whole point is the radio exists only inside the maintenance window. A user entering maintenance today gets a window with no radio behind it. |
-| **Release check** | ✅ **DONE 2026-09-24 (N-12).** The APP performs the full spec §9.5 path: `update/ReleaseManifest.kt` (a faithful mirror of the firmware's `ReleaseCheck` + `SemverCompare`, differential-verified identical on 19 version pairs), `update/ManifestFetcher.kt` (HTTPS manifest fetch + image download, `INTERNET` now declared), and `AppViewModel`'s check → decide → download → verify `sha256`/`size` → push-over-USB flow. The firmware's own `ReleaseCheck` still has no production caller — its WiFi path needs the radio (below). |
+| **OTA — USB path** | ✅ **WIRED 2026-09-24 (N-14).** The router dispatches `ota_begin`/`ota_chunk`/`ota_end` to `OtaUsb`, `hello` advertises `"ota"`, the app's Update screen pushes a picked file with a progress bar. **Still board-gated:** the `esp_ota_*` flash write itself — verify on hardware with a deliberately CORRUPT image first. ✅ **VERIFIED 2026-09-24** by `tools/bench_ota_corrupt.py`: a real 398,592-byte image with ONE payload byte flipped at offset 199,296 was pushed with the TRUE size and TRUE sha256 (so the refusal can only come from OUR stream digest, not a header/magic test); `ota_end` returned **`nack: verify_failed`**, `uptime_ms` kept CLIMBING across the push (215,463 → 415,503 ms, i.e. no reboot), `heap_free` and `config_state` were unchanged, and the device still acked a command afterwards. The corrupt image was refused and the running slot was left untouched. |
+| **OTA — WiFi path** | ✅ **WIRED 2026-09-24 (N-15).** `OtaWifiCheck`/`OtaWifiInstall` are now reached from the maintenance page's `POST /api/ota/check` and `POST /api/ota/pull`. **Still board-gated:** the end-to-end `esp_https_ota` fetch needs a real network + a published release; the refusal/corruption behaviour is already pinned by `tools/bench_ota_corrupt.py` on the USB path, which shares the same gate. |
+| **Maintenance radio** | ✅ **DONE 2026-09-24 (N-15).** The window now has a radio behind it. `lib/Maintenance/MaintenanceRadio.cpp` (device-only TU, third host-excluded file) brings up `esp_netif` + `esp_event` + `esp_wifi` (APSTA) + NimBLE `wifi_provisioning` (BLE transport, Sec1 with the MAC-derived PoP) + `esp_http_server`, on the OFF→ON transition of `SystemOrchestratorIsMaintenanceActive` in `src/main.cpp`, and `TearDown()` frees exactly what each per-resource flag says exists, in reverse — so FR-32's "no radio outside the window" holds. The PoP, web token, setup URL and BLE name reach the app over the already-trusted USB link as a new `maintenance` frame (emitted only on change; forced on connect so a late-joining app learns an already-open window). The security decision — the token gate, the route table, the upload metadata check — lives in the host-tested `MaintenanceHttp` (17 tests), not in the untestable `esp_http_server` handler. **Still board-gated:** the real BLE provisioning round-trip against the Espressif app, and the AP/HTTP bring-up itself — none of it can run on the native host. |
+| **Release check** | ✅ **DONE 2026-09-24 (N-12).** The APP performs the full spec §9.5 path: `update/ReleaseManifest.kt` (a faithful mirror of the firmware's `ReleaseCheck` + `SemverCompare`, differential-verified identical on 19 version pairs), `update/ManifestFetcher.kt` (HTTPS manifest fetch + image download, `INTERNET` now declared), and `AppViewModel`'s check → decide → download → verify `sha256`/`size` → push-over-USB flow. ✅ **The firmware's own `ReleaseCheck` now has a production caller too (N-15):** the maintenance page's `/api/ota/check` reaches it through `OtaWifiCheck`. |
 | **DAC fault path** | ✅ **DONE 2026-09-24 (N-21).** FR-13's read-back (`IHAL::dac_read_code` → `DacFrame::DecodeReadCode`, compared per channel at boot); §6.8's retry-with-backoff (`DacRetry.h`, 3 attempts 1/2 ms) on both DAC writes; the latch (HAL `dac_faulted` + the orchestrator's `dac_verify_failed_` for a wrong-VALUE read); and `FAULT_DAC` now has a caller (`ReportDacFault`, an edge). **Board-gated:** the actual MCP4728 read needs the real part to confirm the 24-byte response. |
 | **NTC temperature** | ✅ **DONE 2026-09-24 (N-67).** `NtcConvert.h` (divider inversion + B3380 model, integer maths) + `SampleNtcTenthsC`; both learn paths record it in `temp_c_at_learn`. **One bring-up validation left:** read a room temperature and compare. |
 | **AUX bindings are inert** | ✅ **DONE 2026-09-24 (N-26).** `ServiceAux` services AUX2/AUX3 as real gesture inputs (`BindingResolveAux`), and AUX1 is refused a binding by `ConfigValidate` (it carries the programming/maintenance holds). Pinned by `AnAux2PressDrivesKeyChannelZeroAndIsReportedAsItsOwnInput` and siblings. |
@@ -265,6 +266,20 @@ Host-invisible: it needs the analog loop closed by a real sense node. Fixed by
 `SystemOrchestrator::HeadUnitGone` (a driven line is judged only on a deep sag;
 a released line's verdict must persist 250 ms). Native suite 503 → 504; device
 build clean. Details in `code/docs/bring-up-log.md` and spec §12.1 (N-79).
+
+**This session's software work (2026-09-24)** closed **N-15**, the last
+genuinely-missing feature: the maintenance window had no radio behind it. Two
+new modules now carry it — `lib/Maintenance/MaintenanceRadio.{h,cpp}`
+(device-only; the third host-excluded TU alongside `EspHal.cpp` and
+`UsbLink.cpp`) and `lib/Maintenance/MaintenanceHttp.{h,cpp}` (host-tested; the
+token gate, route table and upload metadata check). The split is deliberate:
+the security decision is tested on the host, only the IDF calls are not. The
+window's PoP/token/URL/BLE name reach the app as a new `maintenance` frame.
+Also fixed on the way: `UploadRefused`-style `strtoul` size parsing accepted a
+**negative** declared size (`-5` → `ULONG_MAX−4`, past a `> 0` check → the gate
+sees a ~4-exabyte image); the parse is now digit-only and pinned by tests over
+`-5`, ` 100`, `+100`, `1e6`, `1000x`, empty. Native suite 504 → 585; Android
+197; 39 Python gates; device build 74.5% of the app slot.
 
 
 ## 8. Environment notes

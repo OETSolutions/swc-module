@@ -34,13 +34,56 @@ data class LinkUiState(
     /**
      * Whether the device is in a maintenance window, as far as the app knows.
      *
-     * Only the app's OWN requests move this: the firmware sends no frame when the
-     * window opens or closes, so a window opened by an AUX1 hold is invisible
-     * here. It is deliberately not derived from anything else -- the app's
-     * maintenance requests are the only ones it can observe, and guessing at the
-     * rest would show a state the app has no evidence for.
+     * **The device's `maintenance` frame is the authority** (spec 4.3). It is
+     * emitted on connect and on every window transition, so a window opened by an
+     * AUX1 hold -- which the app's own requests cannot see -- IS visible here. The
+     * app's own enter/exit request still sets it optimistically, so the button
+     * reflects the press before the frame comes back; the frame then corrects it
+     * if the device disagreed.
+     *
+     * It used to be moved ONLY by the app's own requests, on the reasoning that
+     * the firmware sent no frame. That stopped being true when the radio made the
+     * window's state something the app must display: the PoP and the page URL are
+     * only useful if the app knows the window is open, and a user who held AUX1
+     * saw a card that said nothing was happening.
      */
     val maintenanceOpen: Boolean = false,
+    /**
+     * The BLE Proof-of-Possession the device is advertising for its current
+     * maintenance window (spec 8.3 option 1), or empty.
+     *
+     * Derived per device from its MAC and carried to the app over the trusted USB
+     * link, because the board has no display and no printed label to show it. The
+     * user types this into the Espressif provisioning app. Empty when the window
+     * is closed or the session is Sec0 (which has no PoP).
+     */
+    val maintenancePop: String = "",
+    /**
+     * The web page's `X-SWC-Token` (spec 8.4), or empty. The user needs it (or the
+     * `pageUrl`, which carries it) to open the device's setup page.
+     */
+    val maintenanceToken: String = "",
+    /** The setup page's URL, WITH the token in its query string, or empty. */
+    val maintenancePageUrl: String = "",
+    /** The BLE name to look for in the Espressif app's scan list, or empty. */
+    val maintenanceBleName: String = "",
+    /**
+     * Whether THIS window's radio bring-up failed (spec 4.3's `ble_failures`):
+     * 0 means the radio is up, nonzero means it is not.
+     *
+     * The window and the radio are separate: the orchestrator can open the window
+     * while the radio fails to come up (no heap, a driver error). Without this the
+     * app would show a setup page that does not exist -- the N-76 shape, a screen
+     * promising a capability the device does not have -- so a nonzero value is
+     * what lets the card say the radio is not up instead.
+     *
+     * **It describes the current window, not a running total.** The device clears
+     * it when a window closes (N-81), which is what makes it safe to branch on
+     * FIRST in the card: a sticky count would make every window after a single
+     * failure claim its radio was down, while the same frame carried a live
+     * `pageUrl`. Treat any nonzero value as "this window's radio is not up".
+     */
+    val maintenanceBleFailures: Int = 0,
     /**
      * How long the device's maintenance window lasts, from the config's own
      * `maintenance_timeout_ms` (spec 8.2 bounds it to `(0, K_MAINTENANCE_TIMEOUT_MAX_MS]`).
@@ -164,14 +207,15 @@ data class LinkUiState(
 /**
  * The maintenance window's length, in words.
  *
- * **It says how long the window lasts, NOT "of inactivity", and that distinction
- * is the whole point.** Spec 8.2 and FR-38 both describe the close as "5 minutes
- * of INACTIVITY", but the firmware closes on a FIXED deadline from entry: nothing
- * calls `NoteActivity`, so no user action extends the window (spec open item
- * N-35). Copy promising that "activity" keeps it open told the user a behaviour
- * the device does not have — and this card is where they would notice, since a
- * user typing a password is exactly the person N-35 says gets closed out. The
- * wording is derived from what the firmware does, not from the spec's intent.
+ * **It deliberately says how long the window lasts rather than spelling out the
+ * close policy.** Spec 8.2 and FR-38 describe the close as "5 minutes of
+ * INACTIVITY", and the device now implements exactly that (N-35, resolved with
+ * the radio: the maintenance HTTP server's requests are the activity, and the
+ * window is measured from the last one) — but the user-facing sentence is the
+ * same either way, because "the mode returns to normal by itself after N
+ * minutes" is true of both readings and is not a promise about what extends it.
+ * An earlier revision of this comment described a fixed-deadline firmware; that
+ * was accurate when it was written and is not any more.
  *
  * **Rounded UP, never down.** Telling a user the window is shorter than it is
  * makes them rush; telling them it is longer is how they get cut off mid-task. A
@@ -183,6 +227,23 @@ internal fun describeTimeout(timeoutMs: Long): String {
     if (timeoutMs < 60_000L) return "after under a minute"
     val minutes = (timeoutMs + 59_999L) / 60_000L
     return if (minutes == 1L) "after 1 minute" else "after $minutes minutes"
+}
+
+/**
+ * One per-device secret, labelled, for the maintenance card (spec 8.3 option 1).
+ *
+ * A small helper rather than two inline `Text`s because the pair must render
+ * IDENTICALLY -- a user reads one off the screen and types it into the Espressif
+ * app, and a differently-styled second row is where a copy-paste error starts.
+ * The value is monospace-free and on its own line so it is selectable and
+ * unmistakable against the surrounding prose.
+ */
+@Composable
+private fun SecretRow(label: String, value: String) {
+    Column {
+        Text(label, style = MaterialTheme.typography.labelSmall)
+        Text(value, style = MaterialTheme.typography.titleMedium)
+    }
 }
 
 /**
@@ -389,32 +450,57 @@ fun LinkScreen(
                 Text("Maintenance mode", style = MaterialTheme.typography.titleMedium)
                 Text(
                     if (state.maintenanceOpen) {
-                        // **It must NOT claim the radio is up.** The device acks
-                        // `maintenance_enter` and enters the mode -- it records the
-                        // trigger, lights `LED_STAT` and runs the window's clock --
-                        // but nothing brings up NimBLE, `wifi_provisioning` or the
-                        // web server: `MaintenanceMode` is pure state and the
-                        // plan's `MaintenanceStartRadio()` does not exist (spec open
-                        // item N-15). So "the WiFi is on, connect to its setup page"
-                        // was the N-39 shape one layer out -- the N-35/N-39 repairs
-                        // corrected this same card's TIMEOUT wording on the rule that
-                        // it must describe what the device does, and left this
-                        // sentence asserting a radio that never comes up. A user
-                        // hunting for an access point that does not exist is the
-                        // concrete harm; saying the mode is open and the network is
-                        // not yet available is the truthful version.
-                        "The device is in maintenance mode. Its WiFi setup page is " +
-                            "not available yet -- this build does not start the " +
-                            "device's radio. The mode returns to normal by itself " +
-                            "${describeTimeout(state.maintenanceTimeoutMs)}."
+                        // **It must describe the radio the DEVICE reports, not the
+                        // one we hope for.** The window and the radio are separate
+                        // states: the orchestrator opens the window and the device
+                        // then brings up NimBLE + the page. `ble_failures` is how
+                        // the app learns the second half did not happen, and this
+                        // is the branch that must not promise a setup page that is
+                        // not there (the N-76 shape: a user-facing surface
+                        // asserting a capability the device does not have).
+                        when {
+                            state.maintenanceBleFailures > 0 ->
+                                "The device is in maintenance mode, but its radio did " +
+                                    "not come up, so there is no setup page to open " +
+                                    "yet. The mode returns to normal by itself " +
+                                    "${describeTimeout(state.maintenanceTimeoutMs)}."
+                            state.maintenancePageUrl.isNotEmpty() ->
+                                "The device's setup page is at ${state.maintenancePageUrl}. " +
+                                    "Its radio is up: join the \"SWC-…\" network it is " +
+                                    "broadcasting with the Espressif provisioning app, " +
+                                    "or open the page in a browser. The mode returns to " +
+                                    "normal by itself " +
+                                    "${describeTimeout(state.maintenanceTimeoutMs)}."
+                            else ->
+                                // The window is open and the radio has neither
+                                // succeeded nor failed yet -- the frame arrives a
+                                // moment before the bring-up finishes. Saying
+                                // nothing about the page yet is the honest answer.
+                                "The device is in maintenance mode and is bringing " +
+                                    "its radio up. The mode returns to normal by " +
+                                    "itself ${describeTimeout(state.maintenanceTimeoutMs)}."
+                        }
                     } else {
-                        "Put the device into maintenance mode. This build does not " +
-                            "start the device's radio yet, so it does not bring up a " +
-                            "WiFi setup page; the mode is the state the provisioning " +
-                            "and network-update paths will use once the radio is wired."
+                        "Put the device into maintenance mode to set up the device's " +
+                            "WiFi and update its firmware over the network. Holding " +
+                            "AUX1 for 3 seconds does the same from the device itself, " +
+                            "with no app."
                     },
                     style = MaterialTheme.typography.bodyMedium,
                 )
+                // The two per-device secrets, shown over this already-trusted link
+                // because the board has no display (spec 8.3 option 1). They are
+                // rendered only when the device says the radio is actually up, so
+                // a user is never handed a credential for a session that is not
+                // listening.
+                if (state.maintenanceOpen && state.maintenanceBleFailures == 0) {
+                    if (state.maintenancePop.isNotEmpty()) {
+                        SecretRow("BLE passcode", state.maintenancePop)
+                    }
+                    if (state.maintenanceBleName.isNotEmpty()) {
+                        SecretRow("Bluetooth name", "SWC-${state.maintenanceBleName}")
+                    }
+                }
                 Button(
                     onClick = if (state.maintenanceOpen) onExitMaintenance else onEnterMaintenance,
                     enabled = !state.maintenanceBusy &&

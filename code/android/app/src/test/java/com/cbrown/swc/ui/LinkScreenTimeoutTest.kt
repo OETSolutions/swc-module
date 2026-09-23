@@ -52,6 +52,9 @@ class LinkScreenTimeoutTest {
 
     @Test
     fun `the open card names the configured timeout and not the inactivity story`() {
+        // The window is open and the radio has neither come up nor failed yet --
+        // the frame that says so arrives a moment before the bring-up finishes, so
+        // the card must not promise a page it does not yet have.
         composeRule.setContent {
             LinkScreen(
                 state = LinkUiState(
@@ -63,26 +66,101 @@ class LinkScreenTimeoutTest {
                 onExitMaintenance = {},
             )
         }
-        // The device's OWN value, not the 5-minute default.
         composeRule
             .onNodeWithText(
-                "The device is in maintenance mode. Its WiFi setup page is " +
-                    "not available yet -- this build does not start the " +
-                    "device's radio. The mode returns to normal by itself " +
-                    "after 20 minutes.",
+                "The device is in maintenance mode and is bringing its radio up. " +
+                    "The mode returns to normal by itself after 20 minutes.",
             )
             .assertIsDisplayed()
     }
 
     @Test
+    fun `a radio failure is stated rather than a setup page promised`() {
+        // The window and the radio are separate states: the device opens the window
+        // and only THEN brings the radio up, and that bring-up can fail. The frame
+        // reports the failure count, and this card is where a user would otherwise
+        // be sent hunting for an access point that does not exist -- the N-76 shape
+        // (a user-facing surface asserting a capability the device does not have).
+        composeRule.setContent {
+            LinkScreen(
+                state = LinkUiState(
+                    maintenanceOpen = true,
+                    maintenanceBleFailures = 1,
+                    // Even WITH a URL present the failure wins: a page address from
+                    // a radio that failed is not a page to send a user to.
+                    maintenancePageUrl = "http://192.168.4.1/?token=ABCDEF123456",
+                ),
+                onRetry = {},
+                onEnterMaintenance = {},
+                onExitMaintenance = {},
+            )
+        }
+        composeRule
+            .onNodeWithText("its radio did not come up", substring = true)
+            .assertIsDisplayed()
+        composeRule
+            .onNodeWithText("http://192.168.4.1/?token=ABCDEF123456", substring = true)
+            .assertDoesNotExist()
+    }
+
+    @Test
+    fun `an open window with a live radio shows the page url and the ble secrets`() {
+        // Spec 8.3 option 1: the board has no display, so the Proof-of-Possession
+        // and the page token reach the user THROUGH THIS SCREEN or not at all. A
+        // frame that arrives and is never rendered is the "produced, consumed by
+        // nobody" shape (N-22/N-24/N-45) with the user unable to provision.
+        composeRule.setContent {
+            LinkScreen(
+                state = LinkUiState(
+                    maintenanceOpen = true,
+                    maintenancePop = "A1B2C3",
+                    maintenanceToken = "ABCDEF123456",
+                    maintenancePageUrl = "http://192.168.4.1/?token=ABCDEF123456",
+                    maintenanceBleName = "A1B2",
+                ),
+                onRetry = {},
+                onEnterMaintenance = {},
+                onExitMaintenance = {},
+            )
+        }
+        composeRule.onNodeWithText("A1B2C3").assertIsDisplayed()
+        composeRule.onNodeWithText("SWC-A1B2").assertIsDisplayed()
+        composeRule
+            .onNodeWithText("http://192.168.4.1/?token=ABCDEF123456", substring = true)
+            .assertIsDisplayed()
+    }
+
+    @Test
+    fun `no secret is shown for a window whose radio is not up`() {
+        // A credential rendered for a session that is not listening is worse than
+        // no credential: the user types it into the Espressif app and gets a
+        // timeout that looks like a bug in the app.
+        composeRule.setContent {
+            LinkScreen(
+                state = LinkUiState(
+                    maintenanceOpen = true,
+                    maintenanceBleFailures = 2,
+                    maintenancePop = "A1B2C3",
+                    maintenanceBleName = "A1B2",
+                ),
+                onRetry = {},
+                onEnterMaintenance = {},
+                onExitMaintenance = {},
+            )
+        }
+        composeRule.onNodeWithText("A1B2C3").assertDoesNotExist()
+        composeRule.onNodeWithText("SWC-A1B2").assertDoesNotExist()
+    }
+
+    @Test
     fun `the maintenance card does not claim the device's radio is up`() {
-        // The device acks `maintenance_enter` and enters the mode, but nothing
-        // brings up NimBLE, `wifi_provisioning` or the web server (`MaintenanceMode`
-        // is pure state; spec open item N-15). The card used to read "The device's
-        // WiFi is on. Connect to its setup page…" and "Turn the device's WiFi on"
-        // -- both asserting a radio no code starts, which is the N-35/N-39 shape:
-        // user-facing copy promising a behaviour the device does not have. A user
-        // hunting for an access point that does not exist is the concrete harm.
+        // The CLOSED branch must not promise a radio, and neither may the OPEN one
+        // when the device has not reported it up. The card used to read "The
+        // device's WiFi is on. Connect to its setup page…" in the open state and
+        // "Turn the device's WiFi on" when closed -- both asserting a radio no code
+        // started, which is the N-35/N-39 shape: user-facing copy promising a
+        // behaviour the device does not have. The strings themselves stay banned;
+        // what the card may now say is the device's OWN report (see the tests above).
         composeRule.setContent {
             LinkScreen(
                 state = LinkUiState(maintenanceOpen = true),
@@ -114,6 +192,40 @@ class LinkScreenTimeoutTest {
             .assertDoesNotExist()
         composeRule.onNodeWithText("Turn the device's WiFi on", substring = true)
             .assertDoesNotExist()
+    }
+
+    @Test
+    fun `a failed earlier window does not make a later working one claim its radio is down`() {
+        // N-81, the app-visible half. The card branches on `ble_failures > 0` FIRST,
+        // so a count that outlived its window made EVERY later window say "its radio
+        // did not come up, so there is no setup page to open" -- while the same frame
+        // carried a live `page_url` and the working PoP. The device now clears the
+        // count when a window closes (MaintenanceRadioStop); this asserts the card is
+        // correct for the state that produces: radio up, count zero, secrets present.
+        //
+        // A count of 0 with a page_url MUST render the URL. If the device ever
+        // regresses to a sticky count, this is the frame it would send for a working
+        // window after any earlier failure, and it would fail here.
+        composeRule.setContent {
+            LinkScreen(
+                state = LinkUiState(
+                    maintenanceOpen = true,
+                    maintenanceBleFailures = 0,
+                    maintenancePageUrl = "http://192.168.4.1/?token=ABCDEF123456",
+                    maintenancePop = "A1B2C3",
+                    maintenanceBleName = "A1B2",
+                ),
+                onRetry = {},
+                onEnterMaintenance = {},
+                onExitMaintenance = {},
+            )
+        }
+        composeRule
+            .onNodeWithText("http://192.168.4.1/?token=ABCDEF123456", substring = true)
+            .assertIsDisplayed()
+        composeRule.onNodeWithText("its radio did not come up", substring = true)
+            .assertDoesNotExist()
+        composeRule.onNodeWithText("A1B2C3").assertIsDisplayed()
     }
 
     @Test

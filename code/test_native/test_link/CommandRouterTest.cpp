@@ -149,6 +149,180 @@ TEST(CommandRouter, ConnectBeginsTheConfigRunSoTheAppCanRenderImmediately) {
     for (const auto &l : cap.lines) EXPECT_LT(l.size(), kNdjsonMaxFrame) << l;
 }
 
+// --- spec 4.3's `maintenance`: the delivery path for the two per-device secrets
+// (spec 8.3 option 1). The board has no display, so the PoP and the page token
+// reach the user OVER this link or not at all -- so what the router writes here
+// IS the feature.
+
+namespace {
+MaintenanceInfo OpenWindow(const char *pop, const char *token) {
+    MaintenanceInfo info;
+    info.active = true;
+    std::snprintf(info.pop, sizeof(info.pop), "%s", pop);
+    std::snprintf(info.token, sizeof(info.token), "%s", token);
+    std::snprintf(info.page_url, sizeof(info.page_url), "http://192.168.4.1/?token=%s", token);
+    std::snprintf(info.ble_name, sizeof(info.ble_name), "%s", "A1B2");
+    return info;
+}
+
+// The line carrying the `maintenance` frame, or "" when none was emitted.
+std::string MaintenanceFrame(const Capture &cap) {
+    for (const auto &l : cap.lines) {
+        if (l.find("\"type\":\"maintenance\"") != std::string::npos) return l;
+    }
+    return "";
+}
+}  // namespace
+
+// The secrets reach the app with their values, so a user can type the PoP and
+// open the page. A frame that carried the fields but not the values would satisfy
+// the contract's field list and deliver nothing.
+TEST(CommandRouter, TheOpenWindowsSecretsAndPageUrlReachTheApp) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    const MaintenanceInfo info = OpenWindow("A1B2C3", "ABCDEF123456");
+    r.SetMaintenanceInfo(info, 0);
+
+    const std::string f = MaintenanceFrame(cap);
+    ASSERT_FALSE(f.empty()) << "the window opened and no maintenance frame went out";
+    EXPECT_NE(f.find("\"active\":true"), std::string::npos) << f;
+    EXPECT_NE(f.find("\"pop\":\"A1B2C3\""), std::string::npos) << f;
+    EXPECT_NE(f.find("\"token\":\"ABCDEF123456\""), std::string::npos) << f;
+    EXPECT_NE(f.find("\"page_url\":\"http://192.168.4.1/?token=ABCDEF123456\""), std::string::npos)
+        << f;
+    EXPECT_NE(f.find("\"ble_name\":\"A1B2\""), std::string::npos) << f;
+    EXPECT_NE(f.find("\"ble_failures\":0"), std::string::npos) << f;
+}
+
+// A CLOSED window must carry no secret. This is the property that stops a stale
+// PoP being read off a window that has already shut -- and the radio's own
+// teardown clears the struct, so an all-empty frame alongside `active:false` is
+// the honest report rather than an omission.
+TEST(CommandRouter, AClosedWindowCarriesNoSecret) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    // Open, then close.
+    r.SetMaintenanceInfo(OpenWindow("A1B2C3", "ABCDEF123456"), 0);
+    cap.lines.clear();
+    MaintenanceInfo closed;   // active=false, every string empty
+    r.SetMaintenanceInfo(closed, 0);
+
+    const std::string f = MaintenanceFrame(cap);
+    ASSERT_FALSE(f.empty()) << "a closing window must be reported, or the app shows it open forever";
+    EXPECT_NE(f.find("\"active\":false"), std::string::npos) << f;
+    EXPECT_NE(f.find("\"pop\":\"\""), std::string::npos) << f;
+    EXPECT_NE(f.find("\"token\":\"\""), std::string::npos) << f;
+}
+
+// The frame is emitted on CHANGE and not every tick. `SetMaintenanceInfo` runs
+// from the poll loop, so an unconditional emit would flood the link at 100 Hz
+// with a frame whose content never changes -- filling the TX buffer that a real
+// reply then cannot use.
+TEST(CommandRouter, AnUnchangedWindowIsNotReEmitted) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    const MaintenanceInfo info = OpenWindow("A1B2C3", "ABCDEF123456");
+    r.SetMaintenanceInfo(info, 0);
+    const size_t after_first = cap.lines.size();
+    ASSERT_NE(MaintenanceFrame(cap), "");
+
+    for (int i = 0; i < 20; ++i) r.SetMaintenanceInfo(info, 0);
+    EXPECT_EQ(cap.lines.size(), after_first)
+        << "an unchanged window re-emitted " << (cap.lines.size() - after_first)
+        << " frames; the poll loop calls this every tick";
+}
+
+// A radio that FAILED to come up must be distinguishable from one that came up,
+// or the app cannot tell the user their setup page is not there (the N-76 shape:
+// a user-facing surface promising a capability the device does not have). The
+// count is the signal, so a change in it must emit.
+TEST(CommandRouter, ARadioFailureIsReportedEvenWhenTheWindowIsUnchanged) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    // The window is open but the radio never came up: no secrets, a failure count.
+    MaintenanceInfo failed;
+    failed.active = true;
+    r.SetMaintenanceInfo(failed, 0);
+    cap.lines.clear();
+    r.SetMaintenanceInfo(failed, 1);
+
+    const std::string f = MaintenanceFrame(cap);
+    ASSERT_FALSE(f.empty()) << "the failure count changed and nothing went out";
+    EXPECT_NE(f.find("\"active\":true"), std::string::npos) << f;
+    EXPECT_NE(f.find("\"ble_failures\":1"), std::string::npos) << f;
+}
+
+// An app that connects into an ALREADY-open window must learn the state without
+// asking. `hello` carries no maintenance fields (spec 4.3), so the frame has to
+// be sent on connect as well -- otherwise a user who opened the window before
+// plugging the app in sees nothing.
+TEST(CommandRouter, ConnectReportsAnAlreadyOpenWindow) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    // The window opened while the app was away, so the first frame was emitted
+    // with no sink attached.
+    r.SetMaintenanceInfo(OpenWindow("A1B2C3", "ABCDEF123456"), 0);
+    cap.lines.clear();
+
+    r.OnConnected();
+    const std::string f = MaintenanceFrame(cap);
+    ASSERT_FALSE(f.empty()) << "a connecting app was not told the window is open";
+    EXPECT_NE(f.find("\"pop\":\"A1B2C3\""), std::string::npos) << f;
+}
+
+// A window that OPENS after a previous window's radio FAILED must report itself
+// as healthy. This is the wire half of N-81: the device used to keep a running
+// failure total that no window reset, so the frame for a perfectly good later
+// window carried `ble_failures: 1` -- and the app branches on that FIRST, so the
+// user was told "its radio did not come up, so there is no setup page to open"
+// while `page_url` in the same frame pointed at the page.
+//
+// The router carries whatever the device hands it, so what this pins is the two
+// facts arriving TOGETHER and consistently: a window with a page_url and a PoP
+// is healthy, and a healthy window says so.
+TEST(CommandRouter, AWindowAfterAFailedOneReportsItselfAsHealthy) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+
+    // The first window: the radio failed, so no secrets and a failure count.
+    MaintenanceInfo failed;
+    failed.active = true;
+    r.SetMaintenanceInfo(failed, 1);
+    ASSERT_NE(MaintenanceFrame(cap).find("\"ble_failures\":1"), std::string::npos);
+    cap.lines.clear();
+
+    // It closes. The device clears its failure state with the window
+    // (`MaintenanceRadioStop`), so the closing frame is clean...
+    MaintenanceInfo closed;
+    r.SetMaintenanceInfo(closed, 0);
+    const std::string closing = MaintenanceFrame(cap);
+    ASSERT_FALSE(closing.empty()) << "a closing window must be reported";
+    EXPECT_NE(closing.find("\"ble_failures\":0"), std::string::npos) << closing;
+    cap.lines.clear();
+
+    // ...and the NEXT window opens with a working radio, so its frame must carry
+    // the page and the secrets and no failure. A sticky count would fail here.
+    const MaintenanceInfo good = OpenWindow("A1B2C3", "ABCDEF123456");
+    r.SetMaintenanceInfo(good, 0);
+    const std::string f = MaintenanceFrame(cap);
+    ASSERT_FALSE(f.empty()) << "the second window opened and nothing went out";
+    EXPECT_NE(f.find("\"ble_failures\":0"), std::string::npos) << f;
+    EXPECT_NE(f.find("\"page_url\":\"http://192.168.4.1/?token=ABCDEF123456\""), std::string::npos)
+        << f;
+    EXPECT_NE(f.find("\"pop\":\"A1B2C3\""), std::string::npos) << f;
+}
+
 TEST(CommandRouter, AConfigGetRepliesWithAWholeChunkedRunThatRoundTrips) {
     MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
     CommandRouter r(&hal.InterfaceRef(), nullptr, &store);

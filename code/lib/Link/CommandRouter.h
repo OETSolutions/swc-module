@@ -10,6 +10,7 @@
 #include "HAL/IHAL.h"
 #include "Learning/LearnSession.h"
 #include "Link/Ndjson.h"
+#include "Maintenance/MaintenanceInfo.h"
 #include "System/SystemOrchestrator.h"
 
 /*
@@ -39,6 +40,26 @@ public:
     CommandRouter(IHAL *hal, SystemOrchestrator *sys, ConfigStore *store);
 
     void SetSink(FrameSink sink, void *ctx);
+
+    /*
+     * Publish the maintenance window's facts to the app (spec 8.3 option 1).
+     *
+     * Called by the poll loop with what the device-only radio module reports. The
+     * router emits a `maintenance` frame whenever the state CHANGES -- including
+     * the first time, and including a change back to closed -- so the app sees the
+     * window open and close without polling. A no-op when nothing changed, because
+     * this is called every tick.
+     *
+     * **Why the router and not the radio module.** The radio module is device-only
+     * and cannot emit a frame; the frame path and the sink live here, and this file
+     * is host-tested, so the emission (the value the app actually receives) is
+     * covered rather than merely wired.
+     */
+    void SetMaintenanceInfo(const MaintenanceInfo &info, uint32_t failures);
+
+    // The window's facts as last published, so a caller can assert them and so a
+    // connecting app can be sent the current state.
+    const MaintenanceInfo &MaintenanceState() const { return maintenance_info_; }
 
     /*
      * A synchronous TX flush, for the one reply that must leave BEFORE the device
@@ -227,6 +248,30 @@ private:
     void              *tx_flush_ctx_ = nullptr;
 
     uint32_t seq_sent_ = 0;
+
+    // The maintenance window's facts as last PUBLISHED (spec 8.3 option 1), and
+    // whether anything has been published yet. The first publish always emits, so
+    // an app connecting into an already-open window learns the state without
+    // asking; after that only a CHANGE emits, because `SetMaintenanceInfo` runs
+    // every poll tick.
+    //
+    // Held by value rather than as a pointer into the radio module: the radio is
+    // device-only and its state is not visible to this host-testable file, so the
+    // router stores what it was told. A test sets it directly.
+    MaintenanceInfo maintenance_info_{};
+    uint32_t        maintenance_failures_ = 0;
+    bool            maintenance_published_ = false;
+    // The last values actually EMITTED, compared against on every call. Kept
+    // separately from `maintenance_info_` because the two differ exactly between a
+    // call that changed the state and the emit that follows it -- and on a link
+    // that is down, `Emit` writes nothing, so the snapshot must advance only when
+    // a frame really went out.
+    MaintenanceInfo published_info_{};
+    uint32_t        published_failures_ = 0;
+    // Emits the frame if anything changed (or nothing has been sent yet). One
+    // home, so `SetMaintenanceInfo` and `OnConnected` cannot disagree about the
+    // wire shape.
+    void PublishMaintenanceIfChanged();
     // The next `seq` we expect from the peer. Per-sender monotonic (spec 4.2),
     // so a gap means a dropped frame and is surfaced as an `event`.
     uint32_t expected_seq_ = 1;

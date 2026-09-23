@@ -68,6 +68,7 @@ object Frames {
     const val EVENT = "event"
     const val STATUS = "status"
     const val LADDER_SAMPLE = "ladder_sample"
+    const val MAINTENANCE = "maintenance"
     const val ACK = "ack"
     const val NACK = "nack"
     const val LOG = "log"

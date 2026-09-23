@@ -296,3 +296,11 @@ void UsbLinkService()
     }
     g_cdc.ServiceTx();
 }
+
+void UsbLinkPublishMaintenance(const MaintenanceInfo &info, uint32_t failures)
+{
+    // Before Start, or after a failed install, there is no router to tell -- and
+    // that is correct rather than a gap: with no host there is nobody to show the
+    // secrets to (spec 6.6 keeps the device fully functional with no app).
+    if (g_router != nullptr) g_router->SetMaintenanceInfo(info, failures);
+}

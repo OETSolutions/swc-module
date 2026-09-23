@@ -269,8 +269,37 @@ EOF
     # a BOOT-pressed device, so seeking it here could report the wrong board. The
     # shell loop below still accepts either; this seek is only a "has it come up
     # yet" gate, and the unambiguous PID is the right thing to gate on.
+    #
+    # **Exit 2 is fatal and must not be swallowed.** The helper polls for the
+    # loader first and only bus-resets as a fallback; a *failed* bus reset means
+    # the control transfer collided with the stub's enumeration and the device may
+    # be off the bus. Continuing to flash a device that is not enumerated just
+    # buries the real failure -- and a retry or a hub power-cycle is the same race
+    # again. This killed the DUT once (2026-09-23); stop here instead.
+    #
+    # **Exit 1 (no loader yet) IS recoverable**: the awk loop below re-checks for
+    # longer, and a BOOT-pressed device shows `303A:1001`, which this seek
+    # deliberately does not match.
+    #
+    # `--settle 5` gives the ROM stub generous room to enumerate on its own; the
+    # reset only fires if it has not, and the reset is the one step that can wedge
+    # the bus.
+    set +e
     "$(py_bin)" "$REPO_ROOT/tools/dev_usb_reset.py" --vid-pid "$APP_VID_PID" \
-        --seek 303A:0009 --seek-timeout 20 || true
+        --seek 303A:0009 --seek-timeout 20 --settle 5
+    reset_rc=$?
+    set -e
+    if [[ "$reset_rc" -eq 2 ]]; then
+        cat >&2 <<EOF
+ERROR: the USB bus reset failed -- the device may be off the bus.
+
+This is NOT retryable: the reset collided with the ROM stub's own enumeration,
+which wedges its USB peripheral. DO NOT re-run this and DO NOT power-cycle a hub
+port. Reset the board by hand, then use the OTA route (it cannot wedge the bus):
+  tools/dev_flash.sh
+EOF
+        exit 1
+    fi
 
     # --- 4. wait for the ROM loader port ------------------------------------
 

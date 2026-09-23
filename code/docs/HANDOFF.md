@@ -170,12 +170,27 @@ Two routes, and they are not interchangeable:
 
 ### The three non-obvious things, all found on the bench
 
-1. **A USB bus reset is required after the frame.** macOS keeps the stale TinyUSB
-   node (`303A:4001`) bound to the port, so the ROM interface never appears in
-   `/dev` and the device looks *wedged* — enumerated, silent, unreachable. The
-   script's `tools/dev_usb_reset.py` issues `Device.reset()` through pyusb, after
-   which the loader shows up as `303A:0009` (PID = the S3 chip id, 9). If you ever
-   see the wedged state by hand, that reset is the fix — the device is fine.
+1. **A USB bus reset is required after the frame — but resetting is a FALLBACK,
+   and it can WEDGE the device.** macOS keeps the stale TinyUSB node (`303A:4001`)
+   bound to the port, so the ROM interface never appears in `/dev` and the device
+   looks *wedged* — enumerated, silent, unreachable. The script's
+   `tools/dev_usb_reset.py` issues `Device.reset()` through pyusb, after which the
+   loader shows up as `303A:0009` (PID = the S3 chip id, 9). If you ever see the
+   wedged state by hand, that reset is the fix — the device is fine.
+
+   **The trap (this killed the DUT once, 2026-09-23): the reset is only safe once
+   the stub has FINISHED enumerating.** A bus reset that lands while the ROM
+   download stub is still bringing its USB peripheral up collides with that
+   bring-up — the control transfer never completes (`[Errno 60] Operation timed
+   out`) and the stub's USB peripheral wedges such that it never enumerates
+   again. The board then vanishes from the bus entirely, and no host action
+   recovers it (esptool in every `--before` mode, repeated pyusb resets, and
+   `uhubctl` hub power cycles all failed; only a manual reset brought it back).
+   The helper now **polls for the loader first and resets only if it does not
+   come up on its own** — the loader usually does, so the bus is untouched on the
+   happy path. A *failed* reset is a hard, non-retryable error (exit 2), never
+   the old reassuring "device re-enumerated; continuing". **If you see it: stop,
+   do not retry, do not power-cycle a hub port, reset by hand, and use `--ota`.**
 2. **The loader identity is `303A:0009`, not `303A:1001`.** `303A:1001` is the ROM
    USB-Serial-JTAG a BOOT-press gives, and the **rig driver enumerates as it too**
    — so never auto-select `303A:1001` without excluding pre-existing ports, or you

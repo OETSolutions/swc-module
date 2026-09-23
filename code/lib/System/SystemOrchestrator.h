@@ -122,6 +122,26 @@ public:
      */
     void SetStore(ConfigStore *store) { store_ = store; }
 
+    /*
+     * Test-only: turn FR-19's trim loop on for the channels built after this call.
+     *
+     * The shipped posture is DISABLED (spec 6.5), and the bring-up switch is a
+     * compile-time define (`SWC_BENCH_TRIM_LOOP`) so a shipped device cannot run a
+     * loop tuned against a guess. That makes the loop's ORCHESTRATION -- that
+     * `ServiceTrim` trims the DRIVEN line and nothing trims at command time --
+     * unreachable from a host test without a seam. This is it, and it exists only
+     * so `TheTrimLoopTrimsTheDrivenLineNotTheCommandTimeReading` can pin the
+     * defect the FR-19 bench found.
+     */
+    void SetTrimEnabledForTest(bool enabled)
+    {
+        for (uint8_t i = 0; i < kMaxChannels; ++i) {
+            ServoConfig c = channels_[i].servo.Config();
+            c.enabled = enabled;
+            channels_[i].servo.SetConfig(c);
+        }
+    }
+
     // True while the headless learn wizard is running (FR-31). The caller uses it
     // to keep the normal feedback grammars from fighting the wizard's prompts.
     bool LearnActive() const { return wizard_.Active(); }
@@ -609,6 +629,11 @@ private:
         ServoLoop           servo{ServoConfigDefault()};
         bool                key_driven = false;    // a pulse is currently on the line
         uint64_t            key_released_at_ms = 0;
+        // FR-19's trim clock. The loop measures the DRIVEN line, so it cannot run
+        // at command time (that reading is the idle level, and trimming it applied
+        // a full wrong-direction step every press -- the FR-19 bench finding).
+        // `ServiceTrim` runs it from `Tick`, first after the servo settles.
+        uint64_t            trim_next_ms = 0;
         // FR-25: pass-through has no gesture machine to latch a press, and its
         // pulse self-releases after `send_duration_ms`, so it needs its own
         // edge detector -- otherwise a held button re-arms the pulse every tick
@@ -702,6 +727,16 @@ private:
     bool SeedChannelState();
     void ServiceChannel(uint8_t index, uint64_t now_ms);
     /*
+     * FR-19's periodic trim. It runs the `ServoLoop` against the DRIVEN line --
+     * never at command time, where the only sense reading available is the line's
+     * idle level. With the loop enabled and fed that reading, every press applied
+     * one full wrong-direction step (measured: +11.7 mV of static error, exactly
+     * one `max_step` at gain 1.82); serviced here, it trims toward the code it
+     * actually wrote. A no-op while the loop is disabled (the shipped posture) or
+     * the line is released.
+     */
+    void ServiceTrim(uint8_t index, uint64_t now_ms);
+    /*
      * Service the AUX inputs that act as gesture sources (spec 3.1/3.5).
      *
      * **AUX2 and AUX3 are bindable inputs; AUX1 is not.** AUX1 carries the
@@ -739,7 +774,7 @@ private:
      * rest (above which the servo can only turn `Q4` OFF -- the release
      * behaviour, not a command), the second is FR-18's gain-mode envelope.
      */
-    bool DriveBoundLevelMv(uint8_t index, int key_mv, int sense_mv, uint64_t now_ms);
+    bool DriveBoundLevelMv(uint8_t index, int key_mv, uint64_t now_ms);
     /*
      * Execute a resolved binding's WHOLE ordered action list (spec 3.5).
      *
@@ -753,7 +788,7 @@ private:
      * OUT_VOLTAGE]` drive its key, which the single-`actions[0]` version did not.
      */
     void RunBindingActions(uint8_t index, const ResolvedBinding &resolved,
-                           int sense_mv, uint64_t now_ms);
+                           uint64_t now_ms);
     /*
      * Write a channel's signal DAC code, and in TRACKING mode mirror the SAME
      * code onto its V_ADJ channel.
@@ -780,8 +815,7 @@ private:
      * so the caller must RELEASE rather than drive a guess -- the same direction
      * FR-12 takes for an unrecognised level.
      */
-    bool PresentLevel(uint8_t index, int level_mv, int wheel_idle_mv, int sense_mv,
-                      uint64_t now_ms);
+    bool PresentLevel(uint8_t index, int level_mv, int wheel_idle_mv, uint64_t now_ms);
     void ApplyLearnedProfile(int channel, const LadderProfile &profile);
     // Spec 4.3's `event`. Called at the moment of recognition, from inside
     // ServiceChannel's resolution branch, because a gesture can complete on any

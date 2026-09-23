@@ -833,6 +833,10 @@ void SystemOrchestrator::Tick(uint64_t now_ms) {
     }
     for (uint8_t i = 0; i < channel_count_; ++i) {
         ServiceChannel(i, now_ms);
+        // FR-19's trim, AFTER the channel so it sees this tick's drive state. It
+        // is a no-op unless the loop is enabled AND a pulse is on the line AND the
+        // servo has settled (see `ServiceTrim`).
+        ServiceTrim(i, now_ms);
     }
     // The AUX gesture inputs, after the wheel channels so a shared resolve cannot
     // reorder what the head unit sees from a single tick's presses.
@@ -1268,8 +1272,7 @@ void SystemOrchestrator::ServiceAux(uint64_t now_ms) {
             // AUX actions drive KEY channel 0: the spec gives an AUX input no
             // output line of its own, and the primary head-unit input is the
             // choice that needs no new config field.
-            RunBindingActions(0, resolved, hal_->adc_read_mv(hal_->ctx, ADC_CH_KEY_SENSE1),
-                              now_ms);
+            RunBindingActions(0, resolved, now_ms);
         } else {
             // Recognised but unbound: spec 6.6 rule 4's pass-through is a property
             // of the WHEEL's own level, and an AUX switch has no ladder level to
@@ -1295,15 +1298,18 @@ bool SystemOrchestrator::TestDriveKeyMv(uint8_t channel_index, int key_mv, uint3
     // Shares the servo with the action path, so what the bench measures is what
     // a real press produces -- a direct dac_set_code would bypass the trim loop
     // and measure a different thing.
+    //
+    // The sense read is deliberately NOT fed to `Update()` here: it precedes the
+    // write, so it is the line's idle level. `ServiceTrim()` trims the driven
+    // line after it settles -- see `DriveBoundLevelMv` for the measurement that
+    // found this.
     cs.servo.Target(gain_mode_[channel_index], key_mv);
-    cs.servo.Update(hal_->adc_read_mv(hal_->ctx,
-                                      (channel_index == 0) ? ADC_CH_KEY_SENSE1
-                                                           : ADC_CH_KEY_SENSE2));
     DriveKeyCode(channel_index, cs.servo.Code());
     cs.key_driven = true;
     // A test command has no gesture to resolve, so it drives immediately and
     // releases on the caller's hold time.
     cs.key_released_at_ms = now_ms + (hold_ms ? hold_ms : 1);
+    cs.trim_next_ms = now_ms + kServoTrimSettleMs;
     return true;
 }
 
@@ -1438,6 +1444,40 @@ void SystemOrchestrator::ReleaseKey(uint8_t index) {
     cs.key_driven = false;
 }
 
+/*
+ * FR-19's trim, serviced from `Tick` rather than at command time.
+ *
+ * **Why not at command time: measured, and it was wrong.** The sense reading
+ * available in `DriveBoundLevelMv`/`TestDriveKeyMv` is taken BEFORE the command is
+ * written, so it is the line's idle level. Feeding that to `ServoLoop::Update`
+ * made the enabled loop apply one full `max_step` in the wrong direction on every
+ * press: measured on the FR-19 bench, the static error was +11.7 mV with the loop
+ * enabled versus disabled -- exactly one 8-code step at gain 1.82 -- with no added
+ * noise. The loop can only trim toward the code it drove if it measures that code's
+ * RESULT, which means running after the servo has settled.
+ *
+ * A no-op unless the loop is enabled (the shipped posture is disabled) and a pulse
+ * is actually on the line: trimming a released line would move the IDLE code,
+ * which is a held-key hazard, not a trim.
+ */
+void SystemOrchestrator::ServiceTrim(uint8_t index, uint64_t now_ms) {
+    ChannelState &cs = channels_[index];
+    if (!cs.key_driven) return;
+    // The unsigned compare is the same clock-rewind guard the NTC cadence uses: a
+    // `now_ms` earlier than the last update must not run the trim every tick.
+    if (now_ms < cs.trim_next_ms) return;
+    cs.trim_next_ms = now_ms + kServoTrimIntervalMs;
+
+    const int sense_mv = hal_->adc_read_mv(hal_->ctx,
+                                           (index == 0) ? ADC_CH_KEY_SENSE1 : ADC_CH_KEY_SENSE2);
+    // A -1 is a FAILED conversion, not a measurement (N-43's rule): hold rather
+    // than trim toward a sentinel.
+    if (sense_mv < 0) return;
+
+    cs.servo.Update(sense_mv);
+    DriveKeyCode(index, cs.servo.Code());
+}
+
 void SystemOrchestrator::DriveKeyCode(uint8_t index, uint16_t code) {
     const DacChannel key_ch = (index == 0) ? DAC_CH_KEY1 : DAC_CH_KEY2;
     hal_->dac_set_code(hal_->ctx, key_ch, code);
@@ -1469,7 +1509,7 @@ void SystemOrchestrator::DriveKeyCode(uint8_t index, uint16_t code) {
 // level is below its rest. There is no command to make then, and the caller
 // reports the press as un-acknowledged rather than quietly releasing it, which is
 // the same direction FR-12 takes for a level matching no window.
-bool SystemOrchestrator::DriveBoundLevelMv(uint8_t index, int key_mv, int sense_mv,
+bool SystemOrchestrator::DriveBoundLevelMv(uint8_t index, int key_mv,
                                            uint64_t now_ms) {
     ChannelState &cs = channels_[index];
     bool band_clamped = false;
@@ -1498,17 +1538,27 @@ bool SystemOrchestrator::DriveBoundLevelMv(uint8_t index, int key_mv, int sense_
     }
     // One bounded pulse, held for the recognition time, then released: the head
     // unit sees a single key event, not a held line.
+    //
+    // **The trim is NOT applied here.** `sense_mv` was read BEFORE this command
+    // was written, so it is the line's IDLE level, not the result of the code
+    // about to be driven -- feeding it to `Update()` made the loop apply one full
+    // `max_step` in the wrong direction every press (measured on the FR-19 bench:
+    // +11.7 mV of static error with the loop ENABLED versus DISABLED, which is
+    // exactly one 8-code step at gain 1.82). The loop is serviced instead by
+    // `ServiceTrim()`, once the driven line has settled, so it trims toward the
+    // code it actually wrote.
     cs.servo.Target(gain_mode_[index], target_key_mv);
-    cs.servo.Update(sense_mv);
     DriveKeyCode(index, cs.servo.Code());
     cs.key_driven = true;
     cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
+    // Arm the trim clock: the first update waits for the servo to settle.
+    cs.trim_next_ms = now_ms + kServoTrimSettleMs;
     return true;
 }
 
 void SystemOrchestrator::RunBindingActions(uint8_t index,
                                            const ResolvedBinding &resolved,
-                                           int sense_mv, uint64_t now_ms) {
+                                           uint64_t now_ms) {
     // The tail's default acknowledgement is KEY_ACCEPTED for every action that
     // produced a key. The one case that must not be acknowledged is an OUT_VOLTAGE
     // whose command band is EMPTY: nothing was driven, so the press is reported as
@@ -1522,7 +1572,7 @@ void SystemOrchestrator::RunBindingActions(uint8_t index,
         const Action &a = resolved.actions[i];
         switch (a.kind) {
             case ActionKind::kOutVoltage:
-                if (!DriveBoundLevelMv(index, a.key_mv, sense_mv, now_ms)) {
+                if (!DriveBoundLevelMv(index, a.key_mv, now_ms)) {
                     // The empty command band: nothing was driven, so the press must
                     // not be acknowledged as if it had. Report it and suppress the
                     // tail's default -- the same direction the unrecognised-level
@@ -1573,7 +1623,7 @@ void SystemOrchestrator::RunBindingActions(uint8_t index,
 }
 
 bool SystemOrchestrator::PresentLevel(uint8_t index, int level_mv, int wheel_idle_mv,
-                                      int sense_mv, uint64_t now_ms) {
+                                      uint64_t now_ms) {
     ChannelState &cs = channels_[index];
     // This channel's own head-unit idle. With none there is nothing to map the
     // ratio ONTO, and a fabricated denominator would land every press on a key
@@ -1619,13 +1669,14 @@ bool SystemOrchestrator::PresentLevel(uint8_t index, int level_mv, int wheel_idl
     if (banded == 0) return false;
 
     cs.servo.Target(gain_mode_[index], banded);
-    cs.servo.Update(sense_mv);
     DriveKeyCode(index, cs.servo.Code());
     cs.key_driven = true;
     // Held for the recognition time, then released: the head unit must see ONE
     // key event, not a line held down (spec 6.6 -- it is gesture-blind, so a held
     // line is a different thing to it).
     cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
+    // The trim is serviced by `ServiceTrim()`, not here: see `DriveBoundLevelMv`.
+    cs.trim_next_ms = now_ms + kServoTrimSettleMs;
     return true;
 }
 
@@ -1859,7 +1910,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                 // safe-idle code instead would scale against 5200 mV and push low
                 // buttons into the clamp, which is the wrong key rather than a
                 // quieter one.
-                PresentLevel(index, level_mv, idle, sense_mv, now_ms);
+                PresentLevel(index, level_mv, idle, now_ms);
             } else if (falling_edge) {
                 ReleaseKey(index);
             }
@@ -1928,7 +1979,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             // of the key path.
             ReportGesture(index, ev, level_mv);
             if (resolved.found) {
-                RunBindingActions(index, resolved, sense_mv, now_ms);
+                RunBindingActions(index, resolved, now_ms);
             } else {
                 // The button was RECOGNISED but its gesture is not bound, so there
                 // is no action to run. The device then behaves as a STOCK WHEEL:
@@ -1954,7 +2005,7 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
                 const LadderProfile &ladder = config_.channels[index].ladder;
                 if (bi < ladder.count &&
                     PresentLevel(index, ladder.buttons[bi].mv_center, ladder.learned_idle_mv,
-                                 sense_mv, now_ms)) {
+                                 now_ms)) {
                     buzzer_.Play(BuzzerPattern::kKeyAccepted);
                 } else {
                     // No usable head-unit idle (or no such button): there is nothing

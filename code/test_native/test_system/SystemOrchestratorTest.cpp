@@ -786,8 +786,47 @@ TEST(SystemOrchestrator, ATestKeyPulseOnAPassThroughDeviceSurvivesItsHold) {
         << "the hold still ends in a release";
 }
 
-TEST(SystemOrchestrator, AConfiguredDeviceDoesNotUsePassThrough) {
-    // The inverse, and the more dangerous direction: a CONFIGURED device must
+TEST(SystemOrchestrator, TheTrimLoopTrimsTheDrivenLineNotTheCommandTimeReading) {
+    // FR-19's defect, found on the bench 2026-09-24: with the trim loop ENABLED,
+    // `DriveBoundLevelMv`/`TestDriveKeyMv` fed `ServoLoop::Update` the sense
+    // reading taken BEFORE the command was written -- i.e. the line's IDLE level.
+    // The loop therefore saw a huge error in one direction and applied its full
+    // `max_step` every press, moving the output AWAY from the target. Measured:
+    // +11.7 mV of static error with the loop enabled versus disabled -- exactly one
+    // 8-code step at gain 1.82 -- with no added noise.
+    //
+    // The fix services the loop from `ServiceTrim` AFTER the servo has settled, so
+    // it measures the code it actually drove. This test pins both halves: the
+    // command-time write is the OPEN-LOOP code (same as the disabled build), and
+    // the trim then CONVERGES toward the target rather than stepping away.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+
+    // What a DISABLED build writes for this command: the open-loop code.
+    const uint16_t open_loop =
+        GainPolicyCodeForTarget(GainMode::kAmplified, 2400).dac_code;
+
+    o.SetTrimEnabledForTest(true);
+    ASSERT_TRUE(o.TestDriveKeyMv(0, 2400, 5000, hal.NowMs()));
+    // The command-time write must be the open-loop code, NOT a trimmed-away one.
+    EXPECT_EQ(hal.LastDacCode(DAC_CH_KEY1), open_loop)
+        << "the trim must not run at command time: the sense reading there is the "
+           "line's IDLE, not the code just written";
+
+    // The sense shows the line sitting ABOVE the target/2 = 1200 mV, i.e. the
+    // servo reads high, so the correct trim moves the code DOWN. (Sense 1300 is
+    // 100 mV past the target, outside the 20 mV deadband.)
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, 1300);
+    PollFor(o, hal, 400);   // past kServoTrimSettleMs (60), through a trim tick
+
+    EXPECT_LT(hal.LastDacCode(DAC_CH_KEY1), open_loop)
+        << "with the line reading high, the trim must move the code DOWN toward "
+           "the target -- the old pre-drive reading moved it the wrong way";
+}
+
+TEST(SystemOrchestrator, AConfiguredDeviceDoesNotUsePassThrough) {    // The inverse, and the more dangerous direction: a CONFIGURED device must
     // classify against its learned windows. If pass-through were ever left on, a
     // configured device would silently ignore every binding it has -- the wheel
     // would "work" while doing the wrong thing.

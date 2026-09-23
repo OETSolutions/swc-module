@@ -19,12 +19,52 @@ struct ServoConfig {
 };
 
 inline ServoConfig ServoConfigDefault() {
+    // FR-19 / spec 6.5: DISABLED in the shipped build. The spec's posture is
+    // "open-loop command with the trim loop present but disabled by default until
+    // its gain is measured on hardware", and FR-19's test row states the
+    // consequence exactly -- the unit tests "prove the implementation and not the
+    // running system".
+    //
+    // `SWC_BENCH_TRIM_LOOP` is the bring-up switch that performs the measurement:
+    // a bench build defines it, drives the output, and checks that the trim
+    // CONVERGES the line (smaller static error) without INJECTING noise (no
+    // jitter/oscillation). It is a compile-time flag, not a runtime config field,
+    // because enabling the loop is a hardware-characterisation decision -- there
+    // is no user-facing reason to turn it on, and a config field would be one more
+    // way for a shipped device to end up running a loop tuned against a guess.
+    const bool enabled =
+#ifdef SWC_BENCH_TRIM_LOOP
+        true;
+#else
+        false;
+#endif
     return ServoConfig{/*max_step_codes=*/8,
                        /*deadband_mv=*/20,
                        /*max_total_codes=*/120,
                        /*samples_to_settle=*/4,
-                       /*enabled=*/false};
+                       enabled};
 }
+
+/*
+ * When the trim is serviced. **Both constants exist because the loop must
+ * measure the RESULT of its own action, and the bounded pulse means it can only
+ * do that a little after the drive settles.**
+ *
+ * `kServoTrimSettleMs` is the wait after a command is written before the first
+ * trim update: the op-amp integrator (§6.5, ~10 ms) needs several time constants
+ * to reach the commanded level, and trimming an unsettled line measures the
+ * servo's ramp, not its static error. `kServoTrimIntervalMs` is the update
+ * cadence once settled.
+ *
+ * **The cadence is a measured-plant retune, not the spec's 1-2 Hz.** §6.5's rate
+ * was written for a continuously-commanded servo; this device commands a
+ * BOUNDED pulse (`send_duration_ms`, default 200 ms), so a 1-2 Hz trim would get
+ * at most one update per press and could never null a static error. The interval
+ * is well below the 16 Hz analog loop (5x), which is the stability property the
+ * spec's rate protects -- the bench (FR-19) is what confirms it does not ring.
+ */
+inline constexpr uint32_t kServoTrimSettleMs = 60;
+inline constexpr uint32_t kServoTrimIntervalMs = 200;
 
 /*
  * A deliberately small, bounded correction on top of the open-loop code.
@@ -47,6 +87,11 @@ public:
 
     uint16_t Code() const { return code_; }
     bool     Settled() const { return settled_samples_ >= cfg_.samples_to_settle; }
+    // The config, for a test seam that flips `enabled` (the orchestrator's
+    // `SetTrimEnabledForTest`). The shipped switch is compile-time, so this is the
+    // only way a host test can reach the loop's orchestration.
+    const ServoConfig &Config() const { return cfg_; }
+    void SetConfig(const ServoConfig &cfg) { cfg_ = cfg; }
     void     Reset();
 
 private:

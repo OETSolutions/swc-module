@@ -233,6 +233,13 @@ one more `dev_usb_reset.py` run re-enumerates it.
 # status 0) with the RIGHT PoP and that a WRONG PoP is refused. Needs `bleak` and
 # `protobuf` in the penv python; the WiFi JOIN is FR-35's dependency, not FR-34's.
 ~/.platformio/penv/bin/python tools/bench_prov.py --port /dev/cu.usbmodem1234561
+
+# the output line on the rig (FR-16/39/40): drives a key via `test_key` and
+# watches the DUT's own KEY output through the loopback, proving release is
+# high-Z (FR-16), a reset never leaves the line driving (FR-39), and safe idle is
+# re-established before a key after a reset (FR-40). Needs --dut AND --rig.
+~/.platformio/penv/bin/python tools/bench_output.py \
+    --dut /dev/cu.usbmodem1234561 --rig /dev/cu.usbmodem1121101
 ```
 
 **Two bench traps `bench_ladder.py` documents, because both look like firmware
@@ -251,6 +258,16 @@ bugs and neither is:**
    the previous float; a `set_level` loop that reads without draining the rig's
    reply queue parses a stale level and never converges. `drive_now()` re-drives
    and waits the ramp out.
+
+3. **The loopback (DUT KEY out → driver SWC in) is a WIRE PER CHANNEL, and both
+   boards are identical, so each has its own pull-up.** An absent loopback wire
+   reads the released level and looks *identical* to a released DUT — the only way
+   to tell is to DRIVE the channel and see whether the observer moves.
+   `bench_output.py` probes this and reports which channels are observable rather
+   than failing on a half-wired rig. On the 2026-09-24 bench only **channel 1**'s
+   KEY output was wired to the loopback; channel 2's drive is verified instead by
+   the boot read-back (`VerifySafeIdleIdleCodes` reads channel C's DAC), which is
+   per-channel and is the same check FR-37's board proof exercises.
 
 ## 4. Static gates
 

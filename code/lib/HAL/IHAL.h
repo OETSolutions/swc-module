@@ -123,7 +123,20 @@ typedef struct IHAL {
     uint32_t (*heap_free)(void *ctx);
     int      (*nvs_get)(void *ctx, const char *key, void *out, size_t len);
     int      (*nvs_set)(void *ctx, const char *key, const void *in, size_t len);
+    // Restart into the application (spec 4.3's `boot_target: "app"`).
     void     (*reboot)(void *ctx);
+    // Restart into the ROM USB download bootloader (spec 4.3's
+    // `boot_target: "bootloader"`), so a peer can flash the device without a
+    // physical BOOT press. On the ESP32-S3 this is not a power-on-only event as
+    // spec 3.2 once assumed: the ROM checks `RTC_CNTL_FORCE_DOWNLOAD_BOOT`
+    // (`RTC_CNTL_OPTION1_REG` bit 0) on every reset, that bit lives in the RTC
+    // domain so it survives `esp_restart()` but not a power cycle, and IDF's own
+    // `esp_usb_console_before_restart` sets exactly this bit for its
+    // `REBOOT_BOOTLOADER`. Separate from `reboot` rather than a parameter because
+    // the two are different hardware actions, and a caller that wanted the app and
+    // silently got the download stub is the "wrong destination, reported as
+    // success" defect the frame's `bad_target` refusal was written to avoid.
+    void     (*reboot_to_download)(void *ctx);
     void      *ctx;
 } IHAL;
 

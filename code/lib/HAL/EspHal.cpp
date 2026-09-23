@@ -32,6 +32,11 @@
 #include "esp_timer.h"
 #include "nvs.h"
 #include "nvs_flash.h"
+// `RTC_CNTL_OPTION1_REG` / `RTC_CNTL_FORCE_DOWNLOAD_BOOT` for the software
+// download-boot request (spec 4.3's `boot_target: "bootloader"`). The register
+// header is per-target (`soc/esp32s3/register/soc/rtc_cntl_reg.h`, reached
+// through `soc/rtc_cntl_reg.h`), and it pulls in `soc/soc.h` for `REG_SET_BIT`.
+#include "soc/rtc_cntl_reg.h"
 
 static const char *TAG = "esp_hal";
 
@@ -374,6 +379,30 @@ static void HalReboot(void *ctx)
     esp_restart();
 }
 
+// Restart into the ROM USB download bootloader (spec 4.3's `boot_target:
+// "bootloader"`). The ESP32-S3 ROM re-checks `RTC_CNTL_FORCE_DOWNLOAD_BOOT`
+// (`RTC_CNTL_OPTION1_REG` bit 0) on EVERY reset, and that register is in the RTC
+// domain, so it survives `esp_restart()` (a software reset) but not a power
+// cycle -- which is exactly the lifetime a developer affordance wants: ask, and
+// the next boot is the download stub; unplug, and the device is normal again.
+//
+// **This is IDF's own idiom, not a trick.** `esp_usb_console_before_restart`
+// (components/esp_system/port/usb_console.c) writes this same register for its
+// `REBOOT_BOOTLOADER` path, and esptool's `ESP32S3ROM.hard_reset` CLEARS the same
+// bit before it resets -- so a flashing tool already knows to clear it, and a
+// device asked to enter download mode is not trapped there afterwards.
+//
+// Written with the struct-typed register rather than a raw address so the field
+// and the bit position come from the SOC headers for this exact target; a
+// hard-coded address is the kind of second source of truth that goes stale
+// silently on a part change.
+static void HalRebootToDownload(void *ctx)
+{
+    (void)ctx;
+    REG_SET_BIT(RTC_CNTL_OPTION1_REG, RTC_CNTL_FORCE_DOWNLOAD_BOOT);
+    esp_restart();
+}
+
 // ---------------------------------------------------------------------------
 // Init
 // ---------------------------------------------------------------------------
@@ -587,6 +616,7 @@ IHAL *EspHalInit(void)
     iface.nvs_get        = HalNvsGet;
     iface.nvs_set        = HalNvsSet;
     iface.reboot         = HalReboot;
+    iface.reboot_to_download = HalRebootToDownload;
     iface.ctx            = &g_state;
     return &iface;
 }

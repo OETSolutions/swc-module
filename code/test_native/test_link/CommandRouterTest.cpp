@@ -2799,13 +2799,20 @@ TEST(CommandRouter, AConfigRunRefusesAFractionalLengthOrOffset) {
     EXPECT_NE(cap.lines.back().find("bad_frame"), std::string::npos);
 }
 
-TEST(CommandRouter, RebootRefusesAnUnimplementableBootloaderTarget) {
-    // The frame once declared `boot_target: app/bootloader`, but nothing downstream
-    // could act on the difference -- the HAL's reboot is a bare `esp_restart()`,
-    // and entering the ROM download loader is a power-on/BOOT-pin event, not a
-    // software call. A target the device cannot honour is an accepted field whose
-    // value changes nothing, reported as success (the "accepted field that is
-    // ignored" class); it is refused by name instead.
+TEST(CommandRouter, RebootSelectsTheDestinationNamedAndRefusesAnyOther) {
+    // Both declared targets are honoured and each reaches a DIFFERENT HAL action.
+    // The frame once refused `bootloader` outright, on the belief that entering
+    // the ROM download loader was a power-on/BOOT-pin event with no software path;
+    // on the S3 the ROM re-checks `RTC_CNTL_FORCE_DOWNLOAD_BOOT` on every reset,
+    // so the download stub IS reachable in software. This test pins the routing
+    // AND the refusal, because the dangerous half is not "refused" but "acked and
+    // went to the wrong destination" -- a peer that asked for a loader and got the
+    // application port has been told something false.
+    //
+    // What this test CANNOT see, and must not be read as covering: that
+    // `reboot_to_download` actually sets the force-download bit on the S3. That is
+    // `EspHal`, excluded from the host build (see `check_hal_contracts.py`), and is
+    // verified on hardware by `tools/dev_flash.sh`.
     MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
     CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
     cap.Attach(r);
@@ -2813,18 +2820,34 @@ TEST(CommandRouter, RebootRefusesAnUnimplementableBootloaderTarget) {
     DrainReplies(r);
     cap.lines.clear();
 
+    // `bootloader` is acked AND routed to the download action, not the app one.
     const std::string bl =
         "{\"v\":1,\"seq\":1,\"type\":\"reboot\",\"boot_target\":\"bootloader\"}";
     r.OnLine(bl.c_str(), bl.size());
-    ASSERT_TRUE(HasType(cap, "nack")) << "bootloader must be refused, not acked";
-    EXPECT_FALSE(HasType(cap, "ack"));
-    EXPECT_NE(cap.lines.back().find("bad_target"), std::string::npos);
+    EXPECT_TRUE(HasType(cap, "ack")) << "the bootloader target must be acked";
+    EXPECT_EQ(hal.RebootToDownloadCount(), 1) << "bootloader must reach the download action";
+    EXPECT_EQ(hal.RebootCount(), 0) << "bootloader must NOT be an ordinary restart";
 
-    // `app` is the honoured target and is still acked.
+    // `app` is the other honoured target, and reaches the ORDINARY restart.
     cap.lines.clear();
     const std::string ap = "{\"v\":1,\"seq\":2,\"type\":\"reboot\",\"boot_target\":\"app\"}";
     r.OnLine(ap.c_str(), ap.size());
-    EXPECT_TRUE(HasType(cap, "ack")) << "the app target must still reboot";
+    EXPECT_TRUE(HasType(cap, "ack")) << "the app target must reboot";
+    EXPECT_EQ(hal.RebootCount(), 1) << "app must reach the ordinary restart";
+    EXPECT_EQ(hal.RebootToDownloadCount(), 1)
+        << "app must NOT be routed to the download stub -- the destinations are the point";
+
+    // A target that names neither destination is still refused by name -- the
+    // "accepted field that changes nothing" shape the routing exists to prevent.
+    cap.lines.clear();
+    const std::string no =
+        "{\"v\":1,\"seq\":3,\"type\":\"reboot\",\"boot_target\":\"recovery\"}";
+    r.OnLine(no.c_str(), no.size());
+    ASSERT_TRUE(HasType(cap, "nack")) << "an unknown target must be refused";
+    EXPECT_FALSE(HasType(cap, "ack"));
+    EXPECT_NE(cap.lines.back().find("bad_target"), std::string::npos);
+    EXPECT_EQ(hal.RebootCount(), 1) << "an unknown target must not restart anything";
+    EXPECT_EQ(hal.RebootToDownloadCount(), 1) << "an unknown target must not reboot at all";
 }
 
 TEST(CommandRouter, ANumericFieldOverflowingToInfinityIsRefusedNotCast) {

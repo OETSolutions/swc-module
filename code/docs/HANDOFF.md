@@ -123,6 +123,53 @@ When you flash, watch specifically for:
   crashes the parser, and the stack gate is recursion-blind (N-71). The only
   valid test uses BALANCED brackets.
 
+## 3a. Flashing the DUT without a BOOT press (added 2026-09-24, N-80)
+
+**Do not reach for the recessed BOOT pin first.** The firmware accepts
+`{"type":"reboot","boot_target":"bootloader"}`, which restarts the device into
+the ROM download loader, so a full flash runs over the device's own USB cable.
+
+```bash
+cd code
+tools/dev_flash.sh                 # build, then push over USB OTA (the default)
+tools/dev_flash.sh --loader        # build, then raw esptool write via the loader
+tools/dev_flash.sh --no-build      # skip the build
+tools/dev_flash.sh --loader --rom-port /dev/cu.usbmodem113101   # device already in a loader
+```
+
+Two routes, and they are not interchangeable:
+
+- **`--ota` (default)** — pushes the image over the app link (`ota_begin` /
+  `ota_chunk` / `ota_end`, spec 9.3), commits it, reboots. No loader, no esptool.
+  Slow (~3 min; the wire chunk is 512 B) but it cannot leave the device
+  unreachable, and it is the one to prefer. It manages the two app slots properly.
+- **`--loader`** — sends the `bootloader` frame, waits for the ROM interface, and
+  runs esptool. Fast (~10 s) and works even when the running app is too broken to
+  answer frames. **It writes BOTH app slots**, because `otadata` names whichever
+  slot the last OTA wrote and a single-slot write can reboot a stale image.
+
+### The three non-obvious things, all found on the bench
+
+1. **A USB bus reset is required after the frame.** macOS keeps the stale TinyUSB
+   node (`303A:4001`) bound to the port, so the ROM interface never appears in
+   `/dev` and the device looks *wedged* — enumerated, silent, unreachable. The
+   script's `tools/dev_usb_reset.py` issues `Device.reset()` through pyusb, after
+   which the loader shows up as `303A:0009` (PID = the S3 chip id, 9). If you ever
+   see the wedged state by hand, that reset is the fix — the device is fine.
+2. **The loader identity is `303A:0009`, not `303A:1001`.** `303A:1001` is the ROM
+   USB-Serial-JTAG a BOOT-press gives, and the **rig driver enumerates as it too**
+   — so never auto-select `303A:1001` without excluding pre-existing ports, or you
+   will flash the driver board.
+3. **Bootstrap needs one BOOT press, and only once.** A blank board, or firmware
+   predating N-80 (it refuses `bootloader` with `bad_target`), has no software way
+   in; `dev_flash.sh` reports this rather than hiding it. After that first flash,
+   every later one uses the tools above.
+
+`--after watchdog-reset` is what boots the device back into the app after an
+esptool write. `--after hard-reset` does not work here (this board has no
+auto-reset wiring), and if the app node does not reappear within a few seconds,
+one more `dev_usb_reset.py` run re-enumerates it.
+
 ## 4. Static gates
 
 All in `code/tools/`; the repo-root `.github/workflows/firmware.yml` invokes

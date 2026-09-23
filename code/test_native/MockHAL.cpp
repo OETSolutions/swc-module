@@ -79,6 +79,7 @@ MockHal::MockHal() {
     iface_.nvs_get        = &MockHal::NvsGetThunk;
     iface_.nvs_set        = &MockHal::NvsSetThunk;
     iface_.reboot         = &MockHal::RebootThunk;
+    iface_.reboot_to_download = &MockHal::RebootToDownloadThunk;
     iface_.ctx            = this;
 }
 
@@ -266,3 +267,6 @@ int MockHal::NvsSetThunk(void *ctx, const char *key, const void *in, size_t len)
     return static_cast<MockHal *>(ctx)->NvsSet(key, in, len);
 }
 void MockHal::RebootThunk(void *ctx) { ++static_cast<MockHal *>(ctx)->reboot_count_; }
+void MockHal::RebootToDownloadThunk(void *ctx) {
+    ++static_cast<MockHal *>(ctx)->reboot_to_download_count_;
+}

@@ -34,6 +34,13 @@ of the shapes that let that happen, since a behavioral test cannot reach EspHal:
      must CALL `nvs_flash_init()`. It was called nowhere, so on a real device every
      nvs_open returned ESP_ERR_NVS_NOT_INITIALIZED and all persistence silently
      failed while the host suite (MockHal, which has no mount step) passed.
+  6. Every `IHAL` member assigned in one implementation must be assigned in the
+     other. A member wired in `EspHal` but forgotten in `MockHal` (or the
+     reverse) is a NULL function pointer at a call site -- a crash or a silent
+     no-op on whichever side was missed, and neither the host suite nor this
+     file's other checks would look. Found 2026-09-24 while adding
+     `reboot_to_download`: the two assignment blocks are hand-maintained mirror
+     lists with nothing tying them together.
 
 Exit codes: 0 clean, 1 a violation, 2 a file could not be found.
 """
@@ -44,6 +51,7 @@ import sys
 
 REPO = pathlib.Path(__file__).resolve().parent.parent
 ESP_HAL = REPO / "lib" / "HAL" / "EspHal.cpp"
+MOCK_HAL = REPO / "test_native" / "MockHAL.cpp"
 CONFIG_STORE = REPO / "lib" / "Config" / "ConfigStore.cpp"
 
 
@@ -86,7 +94,6 @@ def main() -> int:
         return 2
 
     problems = []
-
     # 1. HalNvsSet returns 0 on success, never a byte count. Any `return`
     #    statement that mentions `len` is the byte-count shape (the correct form
     #    returns a literal 0 / -1 and never names the parameter).
@@ -175,6 +182,37 @@ def main() -> int:
             "the host suite cannot see it)."
         )
 
+    # 6. Every IHAL member assigned in ONE implementation must be assigned in the
+    #    other. `iface.<member> = <fn>;` / `iface_.<member> = ...` are the two
+    #    hand-written mirror lists; nothing else ties them together.
+    mock = _read(MOCK_HAL)
+    if mock is not None:
+        def assigned(src: str):
+            return set(re.findall(r"\biface_?\.\s*([A-Za-z_][A-Za-z0-9_]*)\s*=", src))
+
+        esp_members = assigned(_strip_comments(esp))
+        mock_members = assigned(_strip_comments(mock))
+        # `ctx` is assigned by both but is not a function pointer; keeping it in
+        # the comparison is harmless (both set it) and simpler than special-casing.
+        only_esp = esp_members - mock_members
+        only_mock = mock_members - esp_members
+        if only_esp:
+            problems.append(
+                "IHAL members set in EspHal but NOT in MockHal: "
+                + ", ".join(sorted(only_esp))
+                + " -- a host test would call a NULL pointer (or a mock would never "
+                  "exercise the member), and neither implementation's suite would "
+                  "notice, since one only compiles on the target and the other only "
+                  "on the host."
+            )
+        if only_mock:
+            problems.append(
+                "IHAL members set in MockHal but NOT in EspHal: "
+                + ", ".join(sorted(only_mock))
+                + " -- the device build would leave the member NULL while every host "
+                  "test passes against the mock."
+            )
+
     if problems:
         print("HAL NVS contract guard FAILED:", file=sys.stderr)
         for p in problems:
@@ -184,6 +222,7 @@ def main() -> int:
     print("HAL NVS contract guard: OK")
     print("  EspHal::HalNvsSet  -> 0 on success; HalNvsGet -> byte count, no clamp")
     print("  ConfigStore::ReadSlot reads chunk 0 at full width from the caller's buffer")
+    print("  EspHal/MockHal IHAL member lists agree")
     print(f"  NVS mounted by: {', '.join(str(m) for m in mounts)}")
     return 0
 

@@ -1584,15 +1584,45 @@ void CommandRouter::HandleReboot(const cJSON *root, uint32_t for_seq) {
     // Ack BEFORE rebooting, or the ack is lost with the reset and the app cannot
     // tell a successful reboot from a dropped link.
     const char *t = (target != nullptr) ? target->valuestring : "app";
-    // **`bootloader` is REFUSED, not accepted-and-ignored** (spec 4.3, N-48). The
-    // frame once declared both targets, but a reboot into the bootloader has no
-    // implementation: the HAL's `reboot` is a bare `esp_restart()` and entering the
-    // ROM download loader is a power-on/BOOT-pin event (§3.2), not a software call.
-    // A target the device cannot honour is an accepted field whose value changes
-    // nothing, reported as success -- the peer then expects a bootloader and talks
-    // to the application port. Refusing by name is the honest answer.
-    if (strcmp(t, "app") != 0) {
+    // **BOTH declared targets are honoured, and each selects a different HAL
+    // action** (spec 4.3). This was refused `bad_target` for a revision on the
+    // belief that entering the ROM download loader was a power-on/BOOT-pin event
+    // with no software path (§3.2). That belief was wrong for this part: the
+    // ESP32-S3 ROM re-checks `RTC_CNTL_FORCE_DOWNLOAD_BOOT` on every reset, the
+    // bit is in the RTC domain (survives `esp_restart()`, not a power cycle), and
+    // IDF's own `esp_usb_console_before_restart` writes it for its
+    // `REBOOT_BOOTLOADER`. `IHAL::reboot_to_download` is that path.
+    //
+    // **Why this matters enough to be a frame and not a build option.** A
+    // developer affordance gated behind a special build is a trap: flashing a
+    // normal image would remove the very capability needed to flash the next one,
+    // and the fallback is opening the enclosure and poking a recessed BOOT pin.
+    // The ROM loader's port (`303A:1001`, the same VID/PID family as an ESP32-S3
+    // ROM interface with no CDC descriptor) is the one esptool can reach while the
+    // app firmware -- which hands the USB PHY to TinyUSB and disables
+    // USB-Serial-JTAG -- is running. So `bootloader` is what makes the device
+    // flashable over its own cable.
+    //
+    // **Still refused by name for anything else.** An unknown target is the
+    // "accepted field that changes nothing, reported as success" shape: the peer
+    // then expects a destination the device did not go to.
+    void (*action)(void *) = nullptr;
+    const char *chosen = nullptr;
+    if (strcmp(t, "app") == 0) {
+        action = hal_->reboot;
+        chosen = "app";
+    } else if (strcmp(t, "bootloader") == 0) {
+        action = hal_->reboot_to_download;
+        chosen = "bootloader";
+    } else {
         Nack(for_seq, "bad_target", t);
+        return;
+    }
+    // A HAL that cannot reach the requested destination must SAY so rather than
+    // fall back to the other one -- "wrong destination, reported as success" is
+    // the exact failure this frame's target field exists to prevent.
+    if (action == nullptr) {
+        Nack(for_seq, "bad_target", chosen);
         return;
     }
     char body[64];
@@ -1600,11 +1630,9 @@ void CommandRouter::HandleReboot(const cJSON *root, uint32_t for_seq) {
     Emit("ack", body);
     // FLUSH IT. `Emit` only queues into the transport; the poll loop's
     // `ServiceTx` is what writes to the USB FIFO, and it never runs again before
-    // `reboot()` below. Without this the ack is lost with the reset -- the app
+    // the reset below. Without this the ack is lost with the reset -- the app
     // cannot tell a successful reboot from a dropped link, which is precisely
     // what the ack-before-reset ordering exists to avoid.
     if (tx_flush_ != nullptr) tx_flush_(tx_flush_ctx_);
-    // The one honoured target. The HAL's reboot is `esp_restart()`; see the guard
-    // above for why there is no second one.
-    hal_->reboot(hal_->ctx);
+    action(hal_->ctx);
 }

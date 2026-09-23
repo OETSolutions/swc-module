@@ -134,6 +134,10 @@ public:
     // trusting the header's length over the chunks it actually read.
     void ClearNvsKey(const char *key) { nvs_.erase(key); }
     int RebootCount() const { return reboot_count_; }
+    // Restarts into the ROM download stub. Counted separately from
+    // `reboot_count_` so a test can tell WHICH destination the router chose --
+    // the whole point of `boot_target` is that the two are not interchangeable.
+    int RebootToDownloadCount() const { return reboot_to_download_count_; }
 
     // Advance the clock and hand it to the interface (for poll loops).
     void Tick(uint64_t ms) { AdvanceMs(ms); }
@@ -154,6 +158,7 @@ private:
     static int  NvsGetThunk(void *ctx, const char *key, void *out, size_t len);
     static int  NvsSetThunk(void *ctx, const char *key, const void *in, size_t len);
     static void RebootThunk(void *ctx);
+    static void RebootToDownloadThunk(void *ctx);
 
     IHAL iface_{};
     uint64_t now_ms_ = 0;
@@ -187,6 +192,7 @@ private:
     std::string truncate_key_;          // empty = no key-targeted truncation armed
     size_t truncate_key_at_ = 0;
     int reboot_count_ = 0;
+    int reboot_to_download_count_ = 0;
 };
 
 /*

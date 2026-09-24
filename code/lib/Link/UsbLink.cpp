@@ -131,7 +131,6 @@ void ServiceLineState()
     g_host_open = open;
 
     if (open) {
-        g_cdc.NoteConnected();
         // `hello` first (spec 4.5), then the config reply run so the app can
         // render without having to ask for anything.
         if (g_router != nullptr) g_router->OnConnected();
@@ -140,7 +139,7 @@ void ServiceLineState()
         if (g_sys != nullptr) g_sys->SetUsbConnected(true);
         ESP_LOGI(TAG, "host opened the app port");
     } else {
-        g_cdc.NoteDisconnected();
+        g_cdc.ResetSession();
         // Discards any half-received config run: an interrupted transfer must
         // never be applied (spec 4.2).
         if (g_router != nullptr) g_router->OnDisconnected();
@@ -258,7 +257,7 @@ void UsbLinkStart(IHAL *hal, SystemOrchestrator *sys)
     }
 
     g_started = true;
-    // NOT NoteConnected() here: the driver is up, but no host has opened the
+    // NOT a session reset here: the driver is up, but no host has opened the
     // port, so `hello` waits for the DTR callback. Sending now would put the
     // opening frame into a FIFO nobody is draining.
     ESP_LOGI(TAG, "app link initialised on TinyUSB CDC; console stays on USB-Serial-JTAG");

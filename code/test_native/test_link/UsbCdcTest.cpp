@@ -189,14 +189,12 @@ TEST(UsbCdc, DisconnectResetsTheAssemblerSoAHalfFrameCannotLeakIntoTheNextSessio
     // to the first frame after re-enumeration, producing one garbage command.
     Fifo f; Sink s; UsbCdc u;
     u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
-    u.NoteConnected();
     const std::string half = "{\"v\":1,\"seq\":1,";
     u.FeedBytes(reinterpret_cast<const uint8_t *>(half.data()), half.size());
     u.DrainRx();
     EXPECT_TRUE(s.lines.empty());
 
-    u.NoteDisconnected();
-    EXPECT_FALSE(u.IsConnected());
+    u.ResetSession();
     const std::string whole = "{\"v\":1,\"seq\":2,\"type\":\"ping\"}\n";
     u.FeedBytes(reinterpret_cast<const uint8_t *>(whole.data()), whole.size());
     u.DrainRx();
@@ -306,12 +304,11 @@ TEST(UsbCdc, DisconnectDropsStagedBytesSoTheyCannotLeakIntoTheNextSession) {
     // the session that just ended must not be parsed as if the new session sent it.
     Fifo f; Sink s; UsbCdc u;
     u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
-    u.NoteConnected();
     const std::string cmd = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}\n";
     u.FeedBytes(reinterpret_cast<const uint8_t *>(cmd.data()), cmd.size());
     ASSERT_EQ(u.PendingRx(), cmd.size());
 
-    u.NoteDisconnected();
+    u.ResetSession();
     EXPECT_EQ(u.PendingRx(), 0u) << "the staged bytes belong to the ended session";
     EXPECT_EQ(u.DrainRx(), 0u) << "and must not be delivered on the next drain";
     EXPECT_TRUE(s.lines.empty());
@@ -324,7 +321,7 @@ namespace {
 struct DisconnectAtPublish {
     UsbCdc *u = nullptr;
     static void Fire(void *ctx) {
-        static_cast<DisconnectAtPublish *>(ctx)->u->NoteDisconnected();
+        static_cast<DisconnectAtPublish *>(ctx)->u->ResetSession();
     }
 };
 }  // namespace
@@ -342,7 +339,6 @@ TEST(UsbCdc, ABytesInFlightAcrossADisconnectAreDiscardedNotDelivered) {
     // still pass with the epoch check deleted.
     Fifo f; Sink s; UsbCdc u;
     u.Init(&Fifo::Write, &f, &Sink::OnLine, &s);
-    u.NoteConnected();
     DisconnectAtPublish hook{&u};
     u.SetRxInterleaveHookForTest(&DisconnectAtPublish::Fire, &hook);
 

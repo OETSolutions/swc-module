@@ -23,7 +23,7 @@ undo by "simplifying" a callback:
   1. `CdcRxCallback` must NOT parse: it must not call `UsbCdc::DrainRx`, and it
      must not reach the sink. It stages bytes and returns.
   2. `CdcLineStateCallback` must NOT call into the router or the orchestrator:
-     no `OnConnected`/`OnDisconnected`, no `SetUsbConnected`, no `NoteConnected`.
+     no `OnConnected`/`OnDisconnected`, no `SetUsbConnected`, no `ResetSession`.
      It publishes a pending transition that `UsbLinkService` applies.
   2b. `CdcLineStateCallback` must NOT read the APPLIED state (`g_host_open`). An
      edge published against the applied state loses a transition: if the host
@@ -126,6 +126,10 @@ def main() -> int:
              "drops the run state the poll task reads"),
             ("SetUsbConnected",
              "mutates the orchestrator, which Tick is using"),
+            ("ResetSession",
+             "resets the transport's reader and TX, which DrainRx also owns -- the "
+             "session reset must run on the poll task so it cannot land inside a "
+             "producer call"),
         ):
             if forbidden in body:
                 problems.append(

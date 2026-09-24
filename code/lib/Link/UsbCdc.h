@@ -112,16 +112,17 @@ public:
         rx_interleave_ctx_ = ctx;
     }
 
+    // Ends the current session: drops the pending TX bytes, the RX assembler and
+    // the staged RX bytes (spec 4.4 -- reconnect is stateless). Runs on the poll
+    // task only; the name says `ResetSession`, not `NoteDisconnected`, because
+    // that is ALL it does -- it records no state, and there is deliberately no
+    // `connected_` flag or `IsConnected()` reader, because the only latch that
+    // matters lives in the consumer (`SystemOrchestrator::usb_connected_`) and a
+    // second one here would just be a thing to keep in sync.
+    void ResetSession();
+
     size_t PendingTx() const { return tx_len_; }
     size_t PendingRx() const;
-    // The session flag is the CONSUMER's (the poll task sets it from the DTR
-    // transition), so it is a plain bool by design: the producer never reads it.
-    // Gating `FeedBytes` on it would drop the app's first frame when that frame
-    // arrives in the same poll tick as the DTR assertion -- the router treats a
-    // frame as proof of a peer for exactly that reason.
-    bool IsConnected() const { return connected_; }
-    void NoteConnected() { connected_ = true; }
-    void NoteDisconnected();
 
     // Frames dropped because the buffer was full. Exposed because a silent drop
     // is the failure this class exists to prevent, so it must be observable.
@@ -148,14 +149,14 @@ private:
     std::atomic<size_t> rx_head_{0};   // producer: next write position
     std::atomic<size_t> rx_tail_{0};   // consumer: next read position
     // Bumped by the consumer on a session reset (disconnect). It exists because
-    // `NoteDisconnected` -- which moves only the consumer-owned tail -- cannot by
+    // `ResetSession` -- which moves only the consumer-owned tail -- cannot by
     // itself discard bytes a producer is ALREADY in flight on: those bytes are
     // published after the reset, so the ring looks non-empty again and a command
     // the app sent before it closed (a `config_patch`, a `test_key`) is parsed as
     // if the new session had sent it. The producer publishes its head and THEN
     // verifies this counter, pulling the head back to the tail if it moved; the
     // consumer bumps it BEFORE reading the head. That order is what makes the race
-    // impossible rather than merely unlikely -- see FeedBytes and NoteDisconnected.
+    // impossible rather than merely unlikely -- see FeedBytes and ResetSession.
     std::atomic<uint32_t> rx_epoch_{0};
     uint32_t rx_overflows_ = 0;
     // Null on device. See SetRxInterleaveHookForTest.
@@ -164,6 +165,5 @@ private:
 
     // Owned by the poll task alone, because it is only ever touched in `DrainRx`.
     NdjsonReader reader_;
-    bool         connected_ = false;
     uint32_t     dropped_ = 0;
 };

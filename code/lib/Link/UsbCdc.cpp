@@ -120,7 +120,7 @@ void UsbCdc::FeedBytes(const uint8_t *data, size_t len) {
     // head it can see before the payload it points at.
     rx_head_.store(head, std::memory_order_release);
 
-    // **The lost-disconnect close.** `NoteDisconnected` can run between the head
+    // **The lost-disconnect close.** `ResetSession` can run between the head
     // read above and this store -- it is the other task, and the write above is
     // not atomic with respect to it. Its tail reset would then be overwritten by
     // this head, the ring would look non-empty, and a command the app sent in the
@@ -179,8 +179,7 @@ size_t UsbCdc::PendingRx() const {
     return (head >= tail) ? (head - tail) : (kRxCapacity - tail + head);
 }
 
-void UsbCdc::NoteDisconnected() {
-    connected_ = false;
+void UsbCdc::ResetSession() {
     // Drop BOTH the pending TX bytes and the RX assembler. Spec 4.4 makes
     // reconnect stateless: nothing is replayed and nothing carries over. The TX
     // bytes must go because a frame half-written when the host unplugged is

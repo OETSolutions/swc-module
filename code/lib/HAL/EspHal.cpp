@@ -347,6 +347,14 @@ static int HalResetReason(void *ctx)
     return static_cast<int>(esp_reset_reason());
 }
 
+static bool HalCalibrationDegraded(void *ctx)
+{
+    (void)ctx;
+    // Spec 3.2's "fall back AND report that it did" (spec 4.3's
+    // `status.calibration_degraded`). False means the eFuse curve is in use.
+    return g_state.cali_degraded;
+}
+
 static int HalNvsGet(void *ctx, const char *key, void *out, size_t len)
 {
     (void)ctx;
@@ -625,6 +633,7 @@ IHAL *EspHalInit(void)
     iface.now_us         = HalNowUs;
     iface.heap_free      = HalHeapFree;
     iface.reset_reason   = HalResetReason;
+    iface.calibration_degraded = HalCalibrationDegraded;
     iface.nvs_get        = HalNvsGet;
     iface.nvs_set        = HalNvsSet;
     iface.reboot         = HalReboot;

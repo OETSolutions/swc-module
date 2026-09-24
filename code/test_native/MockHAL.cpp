@@ -77,6 +77,7 @@ MockHal::MockHal() {
     iface_.now_us         = &MockHal::NowUsThunk;
     iface_.heap_free      = &MockHal::HeapFreeThunk;
     iface_.reset_reason   = &MockHal::ResetReasonThunk;
+    iface_.calibration_degraded = &MockHal::CalibrationDegradedThunk;
     iface_.nvs_get        = &MockHal::NvsGetThunk;
     iface_.nvs_set        = &MockHal::NvsSetThunk;
     iface_.reboot         = &MockHal::RebootThunk;
@@ -262,6 +263,7 @@ uint64_t MockHal::NowMsThunk(void *ctx) { return static_cast<MockHal *>(ctx)->No
 uint64_t MockHal::NowUsThunk(void *ctx) { return static_cast<MockHal *>(ctx)->NowUs(); }
 uint32_t MockHal::HeapFreeThunk(void *ctx) { return static_cast<MockHal *>(ctx)->HeapFree(); }
 int MockHal::ResetReasonThunk(void *ctx) { return static_cast<MockHal *>(ctx)->ResetReason(); }
+bool MockHal::CalibrationDegradedThunk(void *ctx) { return static_cast<MockHal *>(ctx)->CalibrationDegraded(); }
 int MockHal::NvsGetThunk(void *ctx, const char *key, void *out, size_t len) {
     return static_cast<MockHal *>(ctx)->NvsGet(key, out, len);
 }

@@ -430,12 +430,17 @@ void CommandRouter::EmitStatusBody(bool with_for_seq, uint32_t for_seq) {
     // writing to once TinyUSB owns the PHY). 0 = "unknown", matching `heap_free`.
     const int reset_reason = (hal_ != nullptr && hal_->reset_reason != nullptr)
                                  ? hal_->reset_reason(hal_->ctx) : 0;
-    char body[384];
+    // Spec 3.2's "fall back AND report that it did": whether the ADC is on its
+    // linear approximation instead of the eFuse curve. Surfaced so a blank part is
+    // visible to the app and to FR-2's "the calibrated path is applied" check.
+    const bool cal_degraded = (hal_ != nullptr && hal_->calibration_degraded != nullptr)
+                                  && hal_->calibration_degraded(hal_->ctx);
+    char body[416];
     snprintf(body, sizeof(body),
              "%s\"vbus_present\":%s,\"gain_mode\":\"%s\",\"uptime_ms\":%llu,"
              "\"config_state\":\"%s\",\"output_safe\":%s,"
              "\"tx_dropped\":%u,\"rx_overflows\":%u,\"temp_c\":%s,\"heap_free\":%u,"
-             "\"reset_reason\":%d",
+             "\"reset_reason\":%d,\"calibration_degraded\":%s",
              reply_field, vbus ? "true" : "false",
              (sys_ != nullptr) ? (sys_->ChannelGainMode(0) == GainMode::kAmplified ? "amplified"
                                                                                   : "tracking")
@@ -444,7 +449,8 @@ void CommandRouter::EmitStatusBody(bool with_for_seq, uint32_t for_seq) {
              cfg,
              ((sys_ != nullptr) && sys_->SafeIdleEstablished()) ? "true" : "false",
              static_cast<unsigned>(tx_dropped), static_cast<unsigned>(rx_overflows),
-             temp_field, static_cast<unsigned>(heap_free), reset_reason);
+             temp_field, static_cast<unsigned>(heap_free), reset_reason,
+             cal_degraded ? "true" : "false");
     Emit("status", body);
 }
 

@@ -129,6 +129,13 @@ typedef struct IHAL {
     // `heap_free` uses. A host `MockHal` returns a settable value so a test can
     // assert the field is carried.
     int      (*reset_reason)(void *ctx);
+    // Whether the ADC fell back to its linear approximation because the eFuse
+    // calibration could not be used (a blank/unsupported part). Reported in
+    // `status.calibration_degraded` so a bring-up or the app can see it, and so
+    // FR-2's "the calibrated path is applied on silicon" is checkable from the
+    // host (spec §3.2's "fall back AND report that it did"). False = the eFuse
+    // curve is in use. Returns 0 ("not degraded") when the platform cannot answer.
+    bool     (*calibration_degraded)(void *ctx);
     int      (*nvs_get)(void *ctx, const char *key, void *out, size_t len);
     int      (*nvs_set)(void *ctx, const char *key, const void *in, size_t len);
     // Restart into the application (spec 4.3's `boot_target: "app"`).

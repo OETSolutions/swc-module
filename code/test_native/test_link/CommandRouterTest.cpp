@@ -2008,22 +2008,25 @@ TEST(CommandRouter, StatusGainModeReflectsTheOrchestratorsResolvedMode) {
     const std::string p = "{\"v\":1,\"seq\":1,\"type\":\"ping\"}";
     r.OnLine(p.c_str(), p.size());
     ASSERT_TRUE(HasType(cap, "status"));
-    EXPECT_NE(cap.lines.back().find("\"gain_mode\":\"tracking\""), std::string::npos)
+    EXPECT_NE(cap.lines.back().find("\"gain_mode_0\":\"tracking\""), std::string::npos)
         << "the frame must report the mode the device actually resolved; got: "
+        << cap.lines.back();
+    // A one-channel device reports no mode for a channel that is not there.
+    EXPECT_NE(cap.lines.back().find("\"gain_mode_1\":null"), std::string::npos)
+        << "with one channel the second gain field must be null, not a value; got: "
         << cap.lines.back();
 }
 
-TEST(CommandRouter, StatusGainModeIsChannelZeroOnlyAndTheFrameSaysSo) {
-    // The status frame carries ONE `gain_mode` for the whole device, taken from
-    // channel 0 (`ChannelGainMode(0)`), but the mode is PER CHANNEL -- FR-14
-    // selects it per channel from `gain_policy`, and the two head-unit inputs are
-    // independent (spec 6.2 samples `/SENSEn` per channel), so a 3 V channel and a
-    // 5 V channel on the same device legitimately resolve to 1.00 and 1.82 at
-    // once. The field name and spec 4.3 ("`gain_mode` is the mode the device
-    // actually resolved") both read as a device-wide fact, which the wire cannot
-    // carry. Nothing on the app side reads the field, so no user is misled today;
-    // this test exists so the limitation is asserted rather than latent, and so a
-    // future reader adding a consumer sees it.
+TEST(CommandRouter, StatusGainModeIsReportedPerChannelNotAsOneDeviceWideScalar) {
+    // The mode is PER CHANNEL -- FR-14 selects it per channel from `gain_policy`,
+    // and the two head-unit inputs are independent (spec 6.2 samples `/SENSEn` per
+    // channel), so a 3 V channel and a 5 V channel on the same device legitimately
+    // resolve to 1.00 and 1.82 at once. The frame used to carry ONE `gain_mode`
+    // built from channel 0 while the name and spec 4.3 ("`gain_mode` is the mode
+    // the device actually resolved") read as a device-wide fact (spec N-60). It is
+    // now indexed: `gain_mode_0` and `gain_mode_1`, with the second null when there
+    // is no second channel. This test drives OPPOSITE modes so a regression to a
+    // single scalar -- or to channel 1 -- fails.
     MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
     MockHal::Defaults d;
     d.config.channel_count = 2;
@@ -2050,15 +2053,14 @@ TEST(CommandRouter, StatusGainModeIsChannelZeroOnlyAndTheFrameSaysSo) {
     r.OnLine(p.c_str(), p.size());
     ASSERT_TRUE(HasType(cap, "status"));
     const std::string &s = cap.lines.back();
-    // Channel 0's mode, and only one gain_mode field -- the two channels cannot
-    // both be described by this frame.
-    EXPECT_NE(s.find("\"gain_mode\":\"tracking\""), std::string::npos)
-        << "the frame reports channel 0's resolved mode; got: " << s;
-    const size_t first = s.find("\"gain_mode\"");
-    ASSERT_NE(first, std::string::npos);
-    EXPECT_EQ(s.find("\"gain_mode\"", first + 1), std::string::npos)
-        << "exactly one gain_mode field is emitted, so it cannot describe both "
-           "channels; got: " << s;
+    // Each channel gets its OWN field. This is the repair of N-60: the frame
+    // previously carried one `gain_mode` built from channel 0, which read as a
+    // device-wide fact while the mode is per channel.
+    EXPECT_NE(s.find("\"gain_mode_0\":\"tracking\""), std::string::npos)
+        << "channel 0's resolved mode; got: " << s;
+    EXPECT_NE(s.find("\"gain_mode_1\":\"amplified\""), std::string::npos)
+        << "channel 1's OWN resolved mode, which is the opposite of channel 0's -- "
+           "a single scalar could not carry both; got: " << s;
 }
 
 TEST(CommandRouter, StatusReportsTheTransportsLossCounters) {

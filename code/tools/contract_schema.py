@@ -101,7 +101,11 @@ FRAMES = [
     # so a peer can see a watchdog/brownout reset (otherwise unobservable: the
     # console is on the ROM USB-Serial-JTAG the firmware stops writing to once
     # TinyUSB owns the PHY). 0 = "unknown", matching `heap_free`'s convention.
-    Frame("status",        "fw2app", "vbus_present,gain_mode,uptime_ms,config_state,output_safe,tx_dropped,rx_overflows,temp_c,heap_free,reset_reason,calibration_degraded"),
+        # `gain_mode` is PER CHANNEL (FR-14, spec N-60), so the field is named by
+    # index and a second one appears only when a second channel exists. A single
+    # device-wide `gain_mode` could only report one channel's mode while reading
+    # as a fact about the whole device.
+    Frame("status",        "fw2app", "vbus_present,gain_mode_0,gain_mode_1,uptime_ms,config_state,output_safe,tx_dropped,rx_overflows,temp_c,heap_free,reset_reason,calibration_degraded"),
     Frame("ladder_sample", "fw2app", "channel,level_mv,n"),
     # Spec 8.3 option 1: the BLE Proof-of-Possession and the web token are derived
     # per device and shown to the user OVER USB, because the board has no display

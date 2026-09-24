@@ -383,6 +383,11 @@ public:
         return (channel_index < kMaxChannels) ? gain_mode_[channel_index] : GainMode::kAmplified;
     }
 
+    // How many channels the RUNNING config carries. A consumer that reports a
+    // per-channel quantity to the app needs this: `status` names its gain-mode
+    // fields by index, so an emitter must know whether channel 1 exists (spec N-60).
+    uint8_t ChannelCount() const { return channel_count_; }
+
     /*
      * Spec 4.3's `event`: one recognized gesture, reported to the link.
      *

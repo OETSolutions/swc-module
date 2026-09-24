@@ -435,16 +435,33 @@ void CommandRouter::EmitStatusBody(bool with_for_seq, uint32_t for_seq) {
     // visible to the app and to FR-2's "the calibrated path is applied" check.
     const bool cal_degraded = (hal_ != nullptr && hal_->calibration_degraded != nullptr)
                                   && hal_->calibration_degraded(hal_->ctx);
-    char body[416];
+    // Gain mode is PER CHANNEL (FR-14 selects it per channel; spec 6.2 samples
+    // `/SENSEn` per channel), so a 3 V channel and a 5 V channel on the same device
+    // legitimately resolve to 1.00 and 1.82 at once and one scalar cannot describe
+    // both. Spec N-60. The fields are therefore named by INDEX: `gain_mode_0`, and
+    // `gain_mode_1` which is JSON `null` when the running config carries no second
+    // channel (the same "null rather than a fabricated value" convention `temp_c`
+    // uses), so the frame never claims a mode for a channel that is not there.
+    const char *gain0 = (sys_ != nullptr)
+                            ? (sys_->ChannelGainMode(0) == GainMode::kAmplified ? "amplified"
+                                                                               : "tracking")
+                            : "unknown";
+    char gain1[16];
+    if (sys_ != nullptr && sys_->ChannelCount() > 1) {
+        snprintf(gain1, sizeof(gain1), "\"%s\"",
+                 sys_->ChannelGainMode(1) == GainMode::kAmplified ? "amplified" : "tracking");
+    } else {
+        snprintf(gain1, sizeof(gain1), "null");
+    }
+    char body[448];
     snprintf(body, sizeof(body),
-             "%s\"vbus_present\":%s,\"gain_mode\":\"%s\",\"uptime_ms\":%llu,"
+             "%s\"vbus_present\":%s,\"gain_mode_0\":\"%s\",\"gain_mode_1\":%s,"
+             "\"uptime_ms\":%llu,"
              "\"config_state\":\"%s\",\"output_safe\":%s,"
              "\"tx_dropped\":%u,\"rx_overflows\":%u,\"temp_c\":%s,\"heap_free\":%u,"
              "\"reset_reason\":%d,\"calibration_degraded\":%s",
              reply_field, vbus ? "true" : "false",
-             (sys_ != nullptr) ? (sys_->ChannelGainMode(0) == GainMode::kAmplified ? "amplified"
-                                                                                  : "tracking")
-                               : "unknown",
+             gain0, gain1,
              static_cast<unsigned long long>(hal_ ? hal_->now_ms(hal_->ctx) : 0ULL),
              cfg,
              ((sys_ != nullptr) && sys_->SafeIdleEstablished()) ? "true" : "false",

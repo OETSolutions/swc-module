@@ -94,11 +94,21 @@ public:
     /*
      * False while the last burst was a mixture of old and new levels -- i.e. the
      * input was still moving during the window, so its median is a value the input
-     * never held. A caller that classifies before this is reading a settling
-     * filter.
+     * never held.
      *
-     * It also goes false on a failed read, because a caller that classifies on a
-     * stale value is in exactly the position FR-3 warns about.
+     * **The CLASSIFIER deliberately does not gate on this** (N-18). The one
+     * production reader is `ServiceChannel`'s idle-reference re-adoption, which
+     * uses it to avoid adopting a moving value as the idle; classification runs on
+     * `Value()` unconditionally, and that is safe because a single settling tick
+     * cannot latch a button -- `PressClassifier`'s `debounce_ms` requires its
+     * candidate to PERSIST, so one intermediate median is absorbed. Gating
+     * classification on `Settled()` was considered and rejected: a genuinely noisy
+     * rail could leave it false indefinitely, which would stall all classification
+     * rather than degrade it. The reasoning is pinned by
+     * `PressClassifier.A_SingleSettlingTickIsAbsorbedByTheDebounce`.
+     *
+     * It also goes false on a failed read, because a caller that adopts or
+     * classifies on a stale value is in exactly the position FR-3 warns about.
      */
     bool Settled() const { return settled_; }
 

@@ -12,6 +12,29 @@ LadderProfile Profile() {
 }
 }  // namespace
 
+TEST(PressClassifier, A_SingleSettlingTickIsAbsorbedByTheDebounce) {
+    // FR-3/N-18: the classifier reads `Value()` unconditionally rather than
+    // gating on `AdcReader::Settled()`. That is safe because the ONLY effect of an
+    // unsettled burst is one intermediate median (the mixed window's upper-middle
+    // sample), and the classifier's `debounce_ms` (25 ms) requires the candidate to
+    // PERSIST before it latches -- so a single such tick cannot fire a button.
+    //
+    // This pins that reasoning so the claim is not merely "expected to be
+    // harmless": one settling tick between two real-level ticks must not produce a
+    // press, and the press must still latch once the level holds.
+    PressClassifier c(Profile(), GestureTimingsDefault());
+    uint64_t t = 1000;
+    // A mixed first window's median would land ~mid-swing, e.g. 2130 mV (751‰) --
+    // between VOL_UP's window and idle, so it classifies kUnknown, not kButton.
+    EXPECT_EQ(c.Update(2130, 2835, t), ChannelLevel::kIdle) << "one settling tick is not a press";
+    t += 10;
+    // The next window is fully the pressed level; the press latches after debounce.
+    ChannelLevel level = ChannelLevel::kIdle;
+    for (int i = 0; i < 5; ++i) { level = c.Update(1430, 2835, t); t += 10; }
+    EXPECT_EQ(level, ChannelLevel::kPressed);
+    EXPECT_EQ(c.ButtonIndex(), 0) << "the settling tick must not shift which button latches";
+}
+
 TEST(PressClassifier, ByteNoiseBelowTheDebounceWindowIsNotAPress) {
     PressClassifier c(Profile(), GestureTimingsDefault());
     // One 10ms sample dips into the window: not a press.

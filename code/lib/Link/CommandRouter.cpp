@@ -1148,8 +1148,13 @@ void CommandRouter::HandleOtaBegin(const cJSON *root, uint32_t for_seq) {
         Nack(for_seq, OtaErrWord(r), "the image was refused");
         return;
     }
-    // An ack carries the run's progress so the app can show real progress and
-    // resume a partial transfer (spec 9.3), rather than having to track it.
+    // The ack confirms the run is OPEN. It deliberately carries no progress: the
+    // APP tracks `sent` itself from the chunks it has already acked (see
+    // `SwcClient.pushFirmware`'s `onProgress`), so a device-side byte count here
+    // would be a second home for a number the app already has -- and one that
+    // `ImageVerifyBytesSoFar()` would have had to be wired up to produce (spec
+    // N-72). A partial transfer is resumed by the app re-beginning, not by the
+    // device reporting where it got to.
     char body[64];
     snprintf(body, sizeof(body), "\"for_seq\":%u,\"ok\":true", static_cast<unsigned>(for_seq));
     Emit("ack", body);

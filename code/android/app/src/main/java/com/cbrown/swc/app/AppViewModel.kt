@@ -127,6 +127,22 @@ class AppViewModel(
      * test, a preview — and the install path is a no-op rather than a crash.
      */
     private val downloadImage: ImageDownloader? = null,
+
+    /**
+     * The wall clock, in milliseconds since the epoch, for stamping `updated_at_ms`
+     * on a config the user edits (spec N-28).
+     *
+     * **The app is the only side that CAN stamp it.** The firmware has no RTC — its
+     * own clock is `now_ms`, an uptime — so a device-authored stamp would be a boot
+     * counter, not a time. Android has a real wall clock, so the app is the one
+     * writer that can give the field the meaning its name promises. The field was
+     * declared, decoded and re-encoded while nothing ever assigned it, so a config
+     * edited many times still reported the timestamp it arrived with, or `0`.
+     *
+     * Injected so a JVM test can assert the stamp without depending on the real
+     * clock. The default is the production one.
+     */
+    private val nowMs: () -> Long = { System.currentTimeMillis() },
 ) {
 
     private val _actionOutcomes = MutableStateFlow<List<String>>(emptyList())
@@ -919,7 +935,13 @@ class AppViewModel(
                 return@launch
             }
             val ok = try {
-                saveConfig(merged)
+                // Stamp the edit time (spec N-28): the app is the only side with a
+                // real wall clock, so it is the one writer that can make
+                // `updated_at_ms` mean what its name says. Stamped BEFORE the save
+                // so the value that reaches the device is the one the user's edit
+                // produced; a config the app never edits keeps whatever stamp it
+                // arrived with.
+                saveConfig(merged.copy(updatedAtMs = nowMs()))
             } catch (e: Exception) {
                 false
             }

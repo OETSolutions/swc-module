@@ -558,6 +558,34 @@ class AppViewModelTest {
     }
 
     @Test
+    fun `a save stamps updated_at_ms with the app's own wall clock`() = runTest {
+        // Spec N-28: `updated_at_ms` was declared, decoded and re-encoded while
+        // nothing ever assigned it, so an edited config still reported the timestamp
+        // it arrived with (or 0). The firmware cannot stamp it -- it has no RTC --
+        // so the app is the only writer that can make the field mean what its name
+        // promises. This pins that a save the user makes carries the app's clock.
+        val t = FakeTransport()
+        var saved: com.oetsolutions.swc.model.Config? = null
+        val vm = AppViewModel(
+            SwcClient(t),
+            scope = vmScope(),
+            saveConfig = { c -> saved = c; true },
+            nowMs = { 1_700_000_000_000L },
+        )
+        started(vm)
+        val c = sampleConfig()
+        configRun(c).forEach { t.emit(it) }
+        advanceUntilIdle()
+
+        val cell = vm.bindings.value.cells.first { it.buttonId == "next" && it.gesture == "SINGLE" }
+        vm.editBinding(cell, com.oetsolutions.swc.model.Action(ActionKind.OUT_VOLTAGE, keyMv = 2000))
+        vm.save()
+        advanceUntilIdle()
+
+        assertEquals(1_700_000_000_000L, saved!!.updatedAtMs)
+    }
+
+    @Test
     fun `an edit is held locally and only sent on save`() = runTest {
         val t = FakeTransport()
         var saved: com.oetsolutions.swc.model.Config? = null

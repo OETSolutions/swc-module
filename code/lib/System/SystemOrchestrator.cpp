@@ -11,6 +11,13 @@
 #include "Config/ConfigStore.h"
 #include "Output/GainPolicy.h"
 
+// FR-33's no-config maintenance trigger (spec 8.2, "Reset-reason + no-config")
+// keys on the reset reason being a POWER-ON, via `SWC_RST_POWERON` (defined in
+// `HAL/IHAL.h`, because this file is HOST-compiled and cannot see the platform's
+// `esp_system.h`). `SWC_RST_POWERON` mirrors IDF's `ESP_RST_POWERON`; `EspHal.cpp`
+// static_asserts the mirror, and `IHAL.h` documents the conservative rule -- 0
+// ("unknown") is NOT treated as a cold boot.
+
 namespace {
 
 // The sense divider is an exact divide-by-2 (spec 2.3), so the KEY line is twice
@@ -613,7 +620,7 @@ void SystemOrchestrator::Boot() {
     // 3b. FR-33's next-boot maintenance trigger (spec 8.2, "config flag on next
     //     boot"). This is the third of §8.2's four entry triggers and the only
     //     one that is a stored setting; the other three are a live USB command,
-    //     a live AUX1 hold, and the reset-reason case N-13 leaves blocked.
+    //     a live AUX1 hold, and the reset-reason case wired in step 3c below.
     //
     //     **CONSUMED HERE, and the consume is PERSISTED.** Spec 8.2 scopes this
     //     trigger to the NEXT boot, and nothing on the exit path can clear a
@@ -657,6 +664,30 @@ void SystemOrchestrator::Boot() {
         }
 
         maintenance_.Enter(MaintenanceTrigger::kConfigFlag, hal_->now_ms(hal_->ctx));
+    }
+
+    // 3c. §8.2's fourth entry trigger: "Reset-reason + no-config — first-ever boot
+    //     with no config offers provisioning." This was the last unreachable
+    //     trigger (N-13); the earlier note that it was "redundant" was WRONG on two
+    //     counts. First, it predated `IHAL::reset_reason` (N-58), so the reason
+    //     simply could not be read when that decision was written. Second, it
+    //     conflated two different things: FR-25's pass-through (the device keeps
+    //     SERVING the ladder with no config) is not the same as OFFERING the
+    //     provisioning window a first-time user needs. A fresh board with no config
+    //     is exactly the device that most needs a way in, and a user with no app and
+    //     no wheel attached has no other trigger.
+    //
+    //     **Why it is keyed on a POWER-ON rather than on "no config" alone.** A
+    //     software reboot (`reboot` command, an OTA, the 10 s WDT) must NOT re-open
+    //     the window on a still-unconfigured device -- that is FR-38's unbounded
+    //     window, one reboot away. Only a cold start (a fresh board being brought up)
+    //     qualifies. `kNone` covers FR-33's "first-ever boot" case and also a device
+    //     whose config partition was erased; a `kDefaults`/`kRecovered` boot has a
+    //     config and does not want this. Ordered after 3b, so the stored-flag
+    //     trigger is the more specific one when both could apply.
+    if (config_state_ == BootConfigState::kNone &&
+        hal_->reset_reason(hal_->ctx) == SWC_RST_POWERON) {
+        maintenance_.Enter(MaintenanceTrigger::kNoConfigAtBoot, hal_->now_ms(hal_->ctx));
     }
 
     // 4. Feedback for the load result. A recovered backup is degraded (the user

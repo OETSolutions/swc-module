@@ -29,12 +29,15 @@
 /*
  * Why the window opened, for a caller that wants to say so.
  *
- * **The triggers are now distinguishable (N-61, resolved 2026-09-24).** Three have
- * sources: the USB command, the 3 s AUX1 hold, and — since N-83 — spec 8.2's
- * "config flag on next boot" (`settings.maintenance_on_boot`, consumed by
- * `SystemOrchestrator::Boot`). `kNoConfigAtBoot` is the one with no emitter, and
- * that is a DECISION rather than a gap: a device with no config already reaches
- * pass-through (FR-25), so a reset-reason path would be redundant (N-13).
+ * **All four triggers now have sources (N-13 closed 2026-09-25).** The USB
+ * command, the 3 s AUX1 hold, spec 8.2's "config flag on next boot"
+ * (`settings.maintenance_on_boot`, consumed by `SystemOrchestrator::Boot`), and
+ * `kNoConfigAtBoot` (a power-on with no config, keyed on `IHAL::reset_reason`).
+ * The earlier note that `kNoConfigAtBoot` was "redundant" because "a device with
+ * no config already reaches pass-through (FR-25)" was WRONG: pass-through means
+ * the device keeps SERVING presses, which is not the same as OFFERING the
+ * provisioning window a first-time user needs — and it predated `reset_reason`
+ * existing at all.
  *
  * The distinction now has consequences, which is what it lacked before: the AUX1
  * hold plays `PROGRAM_ENTER` (the no-app user's only channel), and the

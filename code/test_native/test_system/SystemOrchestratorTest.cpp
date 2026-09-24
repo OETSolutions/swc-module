@@ -1862,6 +1862,65 @@ TEST(SystemOrchestrator, AConfigWithoutTheFlagDoesNotOpenAWindow) {
     EXPECT_FALSE(o.MaintenanceActive());
 }
 
+TEST(SystemOrchestrator, APowerOnWithNoConfigOpensMaintenanceForProvisioning) {
+    // Spec 8.2's fourth trigger, and the LAST one to get a producer (N-13): a
+    // first-ever boot with no config offers provisioning. The earlier "redundant"
+    // decision was wrong twice over -- it predated `IHAL::reset_reason` (N-58), and
+    // it conflated FR-25's pass-through (the device keeps SERVING with no config)
+    // with OFFERING the window a first-time user needs. This is the device that
+    // most needs a way in, and with no app and no wheel attached there is no other
+    // trigger.
+    MockHal hal;
+    MockHal::Defaults d;
+    ConfigStore store(&hal.InterfaceRef());
+    // Deliberately do NOT save: the load returns kNoConfig.
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetResetReason(SWC_RST_POWERON);
+
+    ASSERT_FALSE(o.MaintenanceActive()) << "constructed, not yet booted";
+    o.Boot();
+
+    EXPECT_TRUE(o.MaintenanceActive())
+        << "a cold boot with no config must offer provisioning";
+    EXPECT_EQ(o.MaintenanceTriggeredBy(), MaintenanceTrigger::kNoConfigAtBoot);
+}
+
+TEST(SystemOrchestrator, ASoftwareRebootWithNoConfigDoesNotReopenTheWindow) {
+    // The condition the trigger keys on. A software reboot (`reboot` command, an
+    // OTA, the 10 s WDT) must NOT re-open the window on a still-unconfigured
+    // device: that is FR-38's unbounded window, one reboot away, and it would also
+    // stop the device serving presses. Only a cold start qualifies.
+    MockHal hal;
+    MockHal::Defaults d;
+    ConfigStore store(&hal.InterfaceRef());
+    SystemOrchestrator o(&hal.InterfaceRef(), d.config, d.timings);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetResetReason(SWC_RST_SW);   // a software reset, not a cold boot
+    o.Boot();
+    EXPECT_FALSE(o.MaintenanceActive())
+        << "only a POWER-ON opens the no-config window; a software reboot must not";
+}
+
+TEST(SystemOrchestrator, APowerOnWithADurableConfigDoesNotOpenTheNoConfigWindow) {
+    // "No config" is load-bearing: a configured device that happens to power on
+    // must not be dragged into maintenance (which would stop it serving presses).
+    // `MakeOrch` stores a config, so this boot is `kOk`.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
+    hal.SetResetReason(SWC_RST_POWERON);
+    o.Boot();
+    EXPECT_FALSE(o.MaintenanceActive())
+        << "a power-on with a durable config is an ordinary boot";
+}
+
 TEST(SystemOrchestrator, TheConfigFlagIsSpentOnceAndDoesNotReopenOnTheNextBoot) {
     // Spec 8.2 scopes this trigger to the NEXT boot, and the device's exit path
     // cannot clear a stored field (only a whole-config commit rewrites `settings`).
@@ -1932,10 +1991,9 @@ TEST(SystemOrchestrator, AConfigFlagWithNoDurableConfigOpensOnceButPersistsNothi
 TEST(SystemOrchestrator, TheMaintenanceTriggerIsRecordedAndTheAuxHoldIsAcknowledged) {
     // `MaintenanceTrigger` documents itself as existing because "the caller's
     // shutdown path differs": a USB command should be acknowledged, an AUX1 hold
-    // gets a buzzer, and a no-config boot "must explain itself on the LED". The
-    // first two are now implemented (N-61); `kNoConfigAtBoot` still has NO emitter
-    // anywhere (N-13's other half -- a device with no config already reaches
-    // pass-through, so the path is redundant).
+    // gets a buzzer, and a no-config boot "must explain itself on the LED". All
+    // three of §8.2's distinguishable triggers now have producers (N-61 for the
+    // first two, N-13 for `kNoConfigAtBoot` last -- see the two tests below).
     //
     // **The AUX1 ack is the one that matters most, because it is the no-app path.**
     // A user who holds AUX1 for 3 s gets LED_STAT's double-flash -- and so does a

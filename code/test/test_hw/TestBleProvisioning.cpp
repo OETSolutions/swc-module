@@ -7,8 +7,12 @@
 // gate -- is covered by the host suite in test_native/test_maintenance, so
 // nothing here re-tests that.
 //
-// BLOCKED until the board exists, like the rest of test_hw. The plan says to
-// report that as blocked, not green.
+// RUNS ON THE DUT (2026-09-25, N-87). This file used to say "BLOCKED until the
+// board exists". It does, and the suite now passes 22/22 on it -- including this
+// file's MAC test, which was failing on a NON-IDEMPOTENT `EspHalInit` (the
+// per-test setup called it again, the second `adc_oneshot_new_unit` failed with
+// "adc1 is already in use", and the HAL came back NULL; `EspHalInit` now returns
+// the SAME interface on a repeat call). See spec N-87 and docs/bring-up-log.md.
 //
 // The test-definition macro takes an UNQUOTED identifier and stringifies it
 // inside the macro (see test/unity_config.h); Unity 2.6.1 defines no `TEST`, and

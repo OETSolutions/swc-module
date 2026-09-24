@@ -56,6 +56,22 @@ struct EspHalState {
 
 static EspHalState g_state;
 
+// The interface struct and the one-shot latch. `EspHalInit` is called ONCE on the
+// device (src/main.cpp), but the on-device Unity suite calls it from every test
+// file's per-test setup, and a REPEAT call is not harmless: the `memset` below
+// zeroes live driver handles, and a second `adc_oneshot_new_unit` fails with
+// "adc1 is already in use" (ESP_ERR_NOT_FOUND), so `EspHalInit` returned NULL and
+// every test after the first file saw a NULL HAL. The device-only suite could
+// therefore never pass -- the failure looked like a firmware fault
+// (DeviceMacIsReadableAndNotAllZeroes: "Expected Non-NULL") but was re-init.
+//
+// Returning the SAME interface on a repeat call is also the correct runtime
+// behaviour: a second `EspHalInit` at runtime would otherwise wipe `g_state.i2c_bus`
+// and `g_state.dac`, leaving a HAL that reports success while every I2C write goes
+// to a stale handle.
+static IHAL    g_iface;
+static bool    g_inited = false;
+
 // ---------------------------------------------------------------------------
 // ADC channel mapping
 //
@@ -343,6 +359,17 @@ static int HalResetReason(void *ctx)
     // recovery is observable this way from the host: the console is on the ROM
     // USB-Serial-JTAG, which the firmware stops emitting to once TinyUSB takes the
     // PHY, so the reset reason is the only reset source a peer can confirm.
+    //
+    // This file is the ONE place that sees both `IHAL.h`'s `SWC_RST_POWERON` and
+    // the platform's `ESP_RST_POWERON`, so it is where the mirror is pinned: if a
+    // future IDF renumbered the enum, the no-config maintenance trigger (which
+    // compares against the mirror, spec 8.2/N-13) would silently stop firing.
+    static_assert(SWC_RST_POWERON == ESP_RST_POWERON,
+                  "SWC_RST_POWERON (IHAL.h) must mirror IDF's ESP_RST_POWERON; "
+                  "SystemOrchestrator's no-config boot trigger compares against it");
+    static_assert(SWC_RST_SW == ESP_RST_SW,
+                  "SWC_RST_SW (IHAL.h) must mirror IDF's ESP_RST_SW; the host test "
+                  "that a software reboot does not open the no-config window uses it");
     return static_cast<int>(esp_reset_reason());
 }
 
@@ -532,13 +559,29 @@ static void InitGpio(void)
 {
     gpio_config_t out_cfg = {};
     out_cfg.pin_bit_mask = (1ULL << (int)SWC_PIN_BUZZ) | (1ULL << (int)SWC_PIN_LED2) |
-                           (1ULL << (int)SWC_PIN_LED_STAT) |
-                           (1ULL << (int)SWC_PIN_DAC_LDAC_B);
+                           (1ULL << (int)SWC_PIN_LED_STAT);
     out_cfg.mode         = GPIO_MODE_OUTPUT;
     out_cfg.pull_up_en   = GPIO_PULLUP_DISABLE;
     out_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
     out_cfg.intr_type    = GPIO_INTR_DISABLE;
     gpio_config(&out_cfg);
+
+    // ~LDAC is an output too, but driven as INPUT_OUTPUT so its DRIVEN level can be
+    // read back. `gpio_get_level` returns 0 for a pad that is not configured for
+    // input -- IDF's own docs, driver/gpio.h: "If the pad is not configured for
+    // input (or input and output) the returned value is always 0" -- so the
+    // device test that checks ~LDAC idles HIGH (the property R13's 10 k pulldown
+    // makes safety-critical, spec 2.2) could never pass against a plain output and
+    // read 0 no matter what the firmware drove. Enabling the input buffer changes
+    // nothing about the drive (still push-pull, still never floating); it only
+    // makes the pin's state observable to the suite and to a future bring-up.
+    gpio_config_t ldac_cfg = {};
+    ldac_cfg.pin_bit_mask = (1ULL << (int)SWC_PIN_DAC_LDAC_B);
+    ldac_cfg.mode         = GPIO_MODE_INPUT_OUTPUT;
+    ldac_cfg.pull_up_en   = GPIO_PULLUP_DISABLE;
+    ldac_cfg.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    ldac_cfg.intr_type    = GPIO_INTR_DISABLE;
+    gpio_config(&ldac_cfg);
 
     // Only two GPIO inputs exist (spec 2.2). SENSE1/SENSE2 are ADC channels, NOT
     // GPIO -- configuring them here would take the pins away from the ADC and
@@ -565,6 +608,11 @@ static void InitGpio(void)
 
 IHAL *EspHalInit(void)
 {
+    // Idempotent: see the note on `g_iface`. The first call does the real bring-up
+    // and builds the interface; every later call hands back the SAME one rather
+    // than re-initialising the ADC (which fails) and wiping live driver handles.
+    if (g_inited) return &g_iface;
+
     memset(&g_state, 0, sizeof(g_state));
 
     if (InitAdc() != ESP_OK) return NULL;
@@ -619,7 +667,7 @@ IHAL *EspHalInit(void)
                  SWC_NVS_NAMESPACE);
     }
 
-    static IHAL iface;
+    IHAL &iface = g_iface;
     memset(&iface, 0, sizeof(iface));
     iface.adc_read_mv    = HalAdcReadMv;
     iface.dac_set_code   = HalDacSetCode;
@@ -640,6 +688,7 @@ IHAL *EspHalInit(void)
     iface.reboot         = HalReboot;
     iface.reboot_to_download = HalRebootToDownload;
     iface.ctx            = &g_state;
+    g_inited = true;
     return &iface;
 }
 

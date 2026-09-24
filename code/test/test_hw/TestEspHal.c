@@ -21,6 +21,7 @@
 #include "HAL/PinMap.h"
 
 #include "driver/gpio.h"
+#include "esp_heap_caps.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 
@@ -77,9 +78,16 @@ TEST(esp_hal_dac_write_reaches_the_sense_divider, "[hw]")
     vTaskDelay(pdMS_TO_TICKS(20));
     const int high = hal->adc_read_mv(hal->ctx, ADC_CH_KEY_SENSE1);
 
-    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(low, -1, "sense read failed");
-    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(high, -1, "sense read failed");
-    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(high, low + 200,
+    // NOTE the argument order: `TEST_ASSERT_GREATER_THAN_INT_MESSAGE(threshold,
+    // actual, msg)` asserts `actual > threshold`. Written the other way round
+    // (the reading first) these three were comparing the CONSTANT against the
+    // reading, so a valid measurement was reported as `Expected <constant> to be
+    // greater than <reading>` -- e.g. "Expected -1 to be greater than 505", with
+    // 505 mV a perfectly good driven level. Every assertion here was backwards
+    // and the test could only ever fail.
+    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(-1, low, "sense read failed");
+    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(-1, high, "sense read failed");
+    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(low + 200, high,
         "a full-scale code must move the KEY line measurably");
 }
 
@@ -198,6 +206,37 @@ TEST(esp_hal_sense_pins_read_as_analog_not_driven, "[hw]")
     hal->dac_set_code(hal->ctx, DAC_CH_KEY1, 2048);   // mid-scale
     vTaskDelay(pdMS_TO_TICKS(20));
     const int mid = hal->adc_read_mv(hal->ctx, ADC_CH_KEY_SENSE1);
-    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(mid, 100, "sense pin reads as a driven rail");
-    TEST_ASSERT_LESS_THAN_INT_MESSAGE(mid, 2900, "sense pin reads as a driven rail");
+    // `(threshold, actual)` -- see the note in `esp_hal_dac_write_reaches_the_
+    // sense_divider`. These two were ALSO reversed, so the lower bound was
+    // compared as `100 > mid` and failed for every real reading above 100 mV.
+    TEST_ASSERT_GREATER_THAN_INT_MESSAGE(100, mid, "sense pin reads as a driven rail");
+    TEST_ASSERT_LESS_THAN_INT_MESSAGE(2900, mid, "sense pin reads as a driven rail");
+}
+
+// Spec 10.5's free-heap gate: ">= 20% free at worst-case steady state".
+//
+// **This gate did not exist until 2026-09-25.** 10.5 listed it with the command
+// "runtime assertion in the device test", and no device test asserted it -- the
+// N-33 shape (a gate reported as covered by nothing that runs it). It is
+// implemented here because that is where the spec put it, and the RATIO is
+// computed at runtime from the device's OWN figures rather than a magic constant:
+// a hardcoded threshold would pass a future build whose heap grew.
+//
+// **What this does and does not establish.** It measures the DEVICE-TEST image,
+// which does not boot the orchestrator, the TinyUSB link or the radio -- so its
+// free heap is HIGHER than the production image's, and the test is therefore a
+// LOWER BOUND, not the production figure. The production image's real number is
+// peer-visible in `status.heap_free` (the IHAL::heap_free producer), and the
+// maintenance window's depth is measured in FR-32's row. Stated here rather than
+// left implicit, because a gate that silently measures the wrong image is exactly
+// the size-gate defect (10.5's own note) one resource over.
+TEST(esp_hal_free_heap_headroom_meets_the_gate, "[hw]")
+{
+    const size_t total = heap_caps_get_total_size(MALLOC_CAP_DEFAULT);
+    const size_t freeb = heap_caps_get_free_size(MALLOC_CAP_DEFAULT);
+    TEST_ASSERT_GREATER_THAN_UINT32_MESSAGE(0, total,
+        "no default heap region was registered -- the ratio would be meaningless");
+    // >= 20% free (spec 10.5). Integer math, no float: 5*free >= 1*total.
+    TEST_ASSERT_TRUE_MESSAGE(freeb * 5 >= total,
+        "free heap is below 20% of the default heap region (spec 10.5 gate)");
 }

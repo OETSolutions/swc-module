@@ -19,6 +19,23 @@ typedef uint16_t MilliVolt;    /* 0-2900 at the pin, after calibration (spec 3.2
 typedef uint16_t AdcRaw;       /* 0-4095, 12-bit at 12 dB atten (spec 3.2) */
 typedef uint32_t TimestampMs;  /* monotonic ms since boot (spec 3.2) */
 
+/*
+ * `IHAL::reset_reason`'s power-on value, spelled here rather than left as a
+ * literal because `SystemOrchestrator.cpp` (which keys FR-33's no-config
+ * trigger on it) is HOST-compiled and cannot include the platform's
+ * `esp_system.h`. This mirrors IDF's `ESP_RST_POWERON` = 1 (`esp_system.h`);
+ * `EspHal.cpp` -- the one file that DOES see the real header -- carries a
+ * `static_assert` pinning the two together, so the mirror cannot drift silently.
+ * 0 stays the "unknown" reading (`IHAL::reset_reason`'s contract), which the
+ * trigger deliberately does NOT treat as a cold boot.
+ */
+#define SWC_RST_POWERON 1
+
+// IDF's `ESP_RST_SW` = 3 (`esp_system.h`), for the same host-visibility reason:
+// a test asserts that a SOFTWARE reboot does NOT open the no-config window, and
+// it cannot name the platform enum. Pinned by the same `static_assert` as above.
+#define SWC_RST_SW 3
+
 typedef enum {
     ADC_CH_SWC1 = 0, ADC_CH_SWC2, ADC_CH_TEMP,
     ADC_CH_AUX1, ADC_CH_AUX2, ADC_CH_AUX3,

@@ -602,11 +602,152 @@ def check_fr42_usb_down(dut, rig, results):
                     f"device serves its link without a host; uptime {up0} ms"))
 
 
+def check_stress_repeatability(dut, rig, results, presses=100):
+    """Spec 10.4 Level 4: every learned button, pressed many times, ZERO
+    misclassifications -- the end-to-end property the whole product exists for.
+
+    **What this check covers and what it does NOT.** §10.4's row reads "every
+    learned button, pressed 100 times each, at three +3V3 rail voltages (3.14,
+    3.30, 3.47 V)". The RAIL-voltage sweep needs the ladder's +3V3 supply varied,
+    which the two-board rig cannot do -- the rail is the DUT's own regulator, driven
+    by nothing the rig can command, so that third leg needs a bench supply wired to
+    the +3V3 net and is listed as bench-gated rather than faked here. What this DOES
+    prove is the repeatability half on the rail the device actually has: each learned
+    button's own centre is presented `presses` times and must resolve to THAT button
+    every single time -- a spread/hysteresis/edge-timing defect that fires 1 in 50
+    shows up here and nowhere else, because a host test drives MockHal with a value
+    it picked and never sees a real analog ramp.
+
+    A press is "drive the centre, then return to the wheel-like idle" (never a
+    RELEASE -- the released node floats above the ADC ceiling, see the module
+    docstring). One press per double-press window, so the DUT emits SINGLE.
+    """
+    cfg = dut.config()
+    if cfg is None:
+        results.append(("STRESS", False, "could not read the config"))
+        return
+    learned = buttons(cfg)
+    if not learned:
+        results.append(("STRESS", False, "no learned buttons to stress (run fr31 first)"))
+        return
+
+    # The live idle the press returns to (sub-ceiling). Read from the DUT, not
+    # assumed, so this works on a board whose idle differs from the bench default.
+    idle = None
+    for _ in range(8):
+        rig.set_level(IDLE_CMD_MV)
+        rig.drive_now()
+        time.sleep(0.3)
+        dut.collect(0.2)
+        dut._write(type="learn_start", channel=0)
+        frames = dut.collect(0.5)
+        dut._write(type="learn_stop", channel=0)
+        lv = [f.get("level_mv") for f in frames
+              if f.get("type") == "ladder_sample" and f.get("level_mv")]
+        if lv:
+            idle = max(set(lv), key=lv.count)
+            if 0 < idle < 2900:
+                break
+    if not idle or idle >= 2900:
+        results.append(("STRESS", False, f"could not establish a sub-ceiling idle (read {idle})"))
+        return
+
+    mis = 0
+    errors = []
+    rig_misses = 0
+    for btn_id, center, tol in learned:
+        if not center:
+            continue
+        # Settle on the held idle and drain any frames left from the last press so a
+        # press's collect() cannot pick up the PREVIOUS press's (already emitted) event.
+        rig.set_level(idle)
+        rig.drive_now()
+        time.sleep(0.3)
+        dut.collect(0.3)
+        for i in range(presses):
+            # A press is a settle into the centre, then a return to the wheel idle.
+            # Consecutive presses must be separated by MORE than the firmware's
+            # double-press window, or two presses merge into a DOUBLE on the DUT --
+            # that is a cadence artifact, not a misclassification. The held-idle
+            # drain below plus the collect loop (which stops at the first event,
+            # i.e. once SINGLE has resolved) keeps one press per window.
+            #
+            # `set_level` returns the level it CONVERGED to, or None if the rig's
+            # +/-nudge loop never reached the target within its iteration cap. A None
+            # means the DUT was never presented the centre, so a missing event is the
+            # RIG's miss, not a firmware misclassification -- attributed separately so
+            # a flaky rig cannot masquerade as a classifier defect (the whole reason
+            # this check exists). The `set_level`/`drive_now` path itself reads the
+            # rig's status, which RELEASES its DAC and re-ramps (~1 s) on the next
+            # drive, so this convergence return is the one honest signal of what the
+            # DUT actually received.
+            conv = rig.set_level(center)
+            rig.drive_now(settle_s=1.4)
+            rig.set_level(idle)
+            rig.drive_now(settle_s=1.4)
+            # Collect until the press's event lands (SINGLE resolves after the
+            # double-press window) or a deadline passes with none.
+            evs = []
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                evs += [f for f in dut.collect(0.3) if f.get("type") == "event"]
+                if evs:
+                    break
+            got = [e.get("button") for e in evs if e.get("button")]
+            if got == [btn_id]:
+                if (i + 1) % 25 == 0:
+                    print(f"    {btn_id}: {i + 1}/{presses} ({mis} mis, {rig_misses} rig-miss)")
+                continue
+            # A miss. Attribute it BEFORE counting it as a firmware defect: if the
+            # rig never converged to the centre, the DUT cannot have seen the press.
+            if conv is None:
+                rig_misses += 1
+                if len(errors) < 6:
+                    errors.append(f"{btn_id} press {i+1}: rig did not converge to "
+                                  f"{center} mV (DUT never saw the centre)")
+                if (i + 1) % 25 == 0:
+                    print(f"    {btn_id}: {i + 1}/{presses} ({mis} mis, {rig_misses} rig-miss)")
+                continue
+            # The rig DID drive the centre, so a missing/wrong event is a candidate
+            # firmware miss -- but re-present the SAME centre once to separate a
+            # one-off (a merged double-press window, a frame lost on the wire) from a
+            # repeatable classification failure at a level the classifier should know.
+            rig.set_level(center)
+            rig.drive_now(settle_s=1.4)
+            rig.set_level(idle)
+            rig.drive_now(settle_s=1.4)
+            retry = []
+            deadline = time.time() + 3.0
+            while time.time() < deadline:
+                retry += [f for f in dut.collect(0.3) if f.get("type") == "event"]
+                if retry:
+                    break
+            retry_got = [e.get("button") for e in retry if e.get("button")]
+            mis += 1
+            if len(errors) < 6:
+                errors.append(
+                    f"{btn_id} press {i+1}: got {got or 'no event'} at level "
+                    f"{[e.get('level_mv') for e in evs]}; rig converged to {conv} mV; "
+                    f"same-centre retry -> {retry_got or 'no event'}")
+            if (i + 1) % 25 == 0:
+                print(f"    {btn_id}: {i + 1}/{presses} ({mis} mis, {rig_misses} rig-miss)")
+        # Return to the held idle between buttons.
+        rig.set_level(idle)
+        rig.drive_now()
+
+    detail = (f"{mis} misclassification(s) across {len(learned)} button(s) x {presses} "
+              f"presses at the board's own rail"
+              + (f" (+{rig_misses} rig non-convergence(s), excluded)" if rig_misses else "")
+              + (f"; first: {errors}" if errors else ""))
+    results.append(("STRESS", mis == 0, detail))
+
+
 CHECKS = {
     "fr12": check_fr12_unlearned_press,
     "fr9": check_fr9_dual_channel,
     "fr31": check_fr31_headless_learn,
     "fr42": check_fr42_usb_down,
+    "stress": check_stress_repeatability,
 }
 
 
@@ -615,7 +756,9 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dut", required=True, help="the DUT app port (303A:4001)")
     ap.add_argument("--rig", required=True, help="the rig driver port (303A:1001)")
-    ap.add_argument("--only", default=None, help="comma list of checks (fr9,fr12,fr31,fr42)")
+    ap.add_argument("--only", default=None, help="comma list of checks (fr9,fr12,fr31,fr42,stress)")
+    ap.add_argument("--presses", type=int, default=100,
+                    help="presses per learned button for the stress check (default 100)")
     args = ap.parse_args()
 
     try:
@@ -636,7 +779,10 @@ def main() -> int:
             print(f"== {name} ...", flush=True)
             try:
                 rig.reset()
-                fn(dut, rig, results)
+                if name == "stress":
+                    fn(dut, rig, results, presses=args.presses)
+                else:
+                    fn(dut, rig, results)
             except Exception as e:  # a check must not abort the run
                 results.append((name.upper(), False, f"error: {e}"))
     finally:

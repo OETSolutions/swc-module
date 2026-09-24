@@ -56,18 +56,10 @@ REQUIRED = [
     ("CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE", "y",
      "FR-37 A/B rollback: without it a freshly-updated app that crash-loops "
      "is never reverted, and main.cpp's mark-valid call is a no-op"),
-    ("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", "y",
-     "spec 9.5's TLS trust anchor: IDF gates esp_crt_bundle.c AND its include "
-     "path on this symbol, so with it unset OtaWifi.cpp stops compiling and the "
-     "error names neither the key nor the requirement. Defaults y, so it was "
-     "inert-but-working -- pinned because the value lived only in the "
-     "gitignored generated sdkconfig"),
-    ("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL", "y",
-     "which roots are in the bundle above. The choice is what decides that a "
-     "trust anchor EXISTS at all: DEFAULT_NONE selects the symbol's y while "
-     "leaving the bundle with no roots, so a connection that should verify "
-     "would fail rather than silently accept -- but the failure would look like "
-     "a network error"),
+    ("CONFIG_MBEDTLS_CERTIFICATE_BUNDLE", "n",
+     "the stock Mozilla cert BUNDLE is NOT used: the WiFi OTA trust anchor is a "
+     "PINNED CA (lib/Update/ReleaseCa.h, N-62 fixed), so the ~200-root bundle is "
+     "disabled and its flash is reclaimed"),
 ]
 
 FORBIDDEN = [

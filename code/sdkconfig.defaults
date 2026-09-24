@@ -56,23 +56,13 @@ CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_MBEDTLS_HARDWARE_AES=n
 CONFIG_MBEDTLS_SSL_PROTO_TLS1_2=y
 
-# The trust anchor for the WiFi OTA path (spec 9.5). `OtaWifi` attaches
-# `esp_crt_bundle_attach`, and IDF's mbedtls component gates BOTH
-# `esp_crt_bundle.c` and its include path on CONFIG_MBEDTLS_CERTIFICATE_BUNDLE
-# (components/mbedtls/CMakeLists.txt:117) -- so with the symbol unset, OtaWifi.cpp
-# stops compiling and the failure names neither the key nor spec 9.5.
-#
-# It defaults `y`, which is why this worked before and why nothing caught it: the
-# value lived only in the gitignored generated `sdkconfig.esp32s3`, so a clean
-# build under a changed default (or a future IDF) would silently drop it. Pinned
-# here for the same reason CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE is: `defaults` is
-# the only tracked, authoritative file.
-#
-# NOTE this is the DEFAULT bundle, not a pinned CA -- it authenticates the channel
-# but any of the ~200 stock roots can vouch for the image. Pinning a CA is open
-# item N-62.
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=y
-CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_DEFAULT_FULL=y
+# The WiFi OTA trust anchor is now a PINNED CA (`lib/Update/ReleaseCa.h`, N-62
+# fixed), set via `cfg.cert_pem`, so the stock Mozilla cert BUNDLE is no longer
+# used and is DISABLED -- that is a few hundred KB of flash back on a 4 MB/no-PSRAM
+# part. (`esp_crt_bundle` is no longer included anywhere; `grep esp_crt_bundle`
+# returns only comments.) N-62 records the fix; `tools/check_release_ca.py` guards
+# the pin's single-cert shape and expiry.
+CONFIG_MBEDTLS_CERTIFICATE_BUNDLE=n
 
 # --- ADC -------------------------------------------------------------------
 # NOTE: there is deliberately NO ADC calibration key here, because on this

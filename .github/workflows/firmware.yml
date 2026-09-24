@@ -221,3 +221,13 @@ jobs:
       - name: Every requirement-bearing Kconfig key is present and correct
         working-directory: code
         run: python3 tools/check_sdkconfig_keys.py
+
+      # N-62: the Release fetch pins a single CA, and a pin does NOT self-update.
+      # This guards both halves of that: the header is one certificate (not a
+      # bundle again) and OtaWifi actually uses it, and the pin is not near
+      # expiry -- a pinned CA that lapses breaks the fetch at TLS with nothing
+      # else to notice it.
+      - name: The release CA is a single pinned cert, used, and not near expiry
+        working-directory: code
+        run: python3 tools/check_release_ca.py
+

@@ -3,11 +3,30 @@
 #include <string.h>
 
 #ifdef ESP_PLATFORM
-#include "esp_crt_bundle.h"
 #include "esp_http_client.h"
 #include "esp_https_ota.h"
 #include "esp_log.h"
 #endif
+
+/*
+ * The trust anchor for the release fetch is the PINNED CA (N-62, spec 9.5's
+ * "pinned CA certificate, not `setInsecure()`") -- `kReleaseCaPem`, the root that
+ * signs GitHub Releases. A BENCH build substitutes a different pinned root with
+ * `-D SWC_BENCH_RELEASE_CA`, which selects a generated `Update/BenchReleaseCa.h`
+ * (written by `tools/bench_ota_release.py` from a bring-up host's chain). This
+ * keeps the pin REAL on the bench too -- it is another single CA, not a bundle and
+ * not `setInsecure` -- so the ACCEPT/REJECT behaviour is exercised against an
+ * actual pin without a release. A SHIPPED build never sets the define, so it can
+ * only ever trust the release root. Both headers define the same symbol, so
+ * exactly one is included.
+ */
+#ifdef ESP_PLATFORM
+#ifdef SWC_BENCH_RELEASE_CA
+#include "Update/BenchReleaseCa.h"
+#else
+#include "Update/ReleaseCa.h"
+#endif
+#endif  // ESP_PLATFORM
 
 namespace {
 
@@ -57,14 +76,15 @@ esp_err_t ImageHttpEvent(esp_http_client_event_t *e) {
 }  // namespace
 
 const char *OtaWifiCaBundleAttach() {
-    // A NAME, not a mode. The whole point of returning a string is that a test or
-    // a log can record which verification path was used, so "we use the bundle"
-    // is a checkable fact rather than a comment someone may have deleted.
+    // A NAME, not a mode. The purpose is that a test or a log can record which
+    // verification path was used, so the choice is a checkable fact rather than a
+    // comment someone may have deleted.
     //
-    // **It names the default bundle, which is NOT a pinned CA.** See the header
-    // and N-62 for what that does and does not buy; do not read this string as
-    // "the trust anchor is pinned".
-    return "esp_crt_bundle";
+    // **It now names a PINNED CA (N-62 resolved): the release fetch sets a
+    // `cert_pem` trust anchor, so exactly one root is trusted -- not IDF's ~200-root
+    // default bundle. The old return value `"esp_crt_bundle"` described the weaker
+    // anchor this function used to stand beside.**
+    return "pinned_ca";
 }
 
 ReleaseCheckResult OtaWifiCheck(const char *manifest_url, const char *current_version,
@@ -85,11 +105,9 @@ ReleaseCheckResult OtaWifiCheck(const char *manifest_url, const char *current_ve
     esp_http_client_config_t cfg = {};
     cfg.url = manifest_url;
     cfg.event_handler = ManifestHttpEvent;
-    // VERIFIED TLS, but see the header: this is IDF's DEFAULT bundle, not a pinned
-    // CA. Not `setInsecure` -- see spec 9.5, which records the reference project's
-    // disabled validation as a gap SWC must not repeat -- but the anchor is the
-    // ~200 stock Mozilla roots, and pinning one is open item N-62.
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    // PINNED CA (N-62), not the ~200-root default bundle: the device trusts only
+    // the root that signs the release host. Not `setInsecure` either.
+    cfg.cert_pem = kReleaseCaPem;
     cfg.timeout_ms = 10000;
 
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
@@ -136,9 +154,8 @@ OtaResult OtaWifiInstall(const ReleaseInfo &info, size_t max_size,
     esp_http_client_config_t cfg = {};
     cfg.url = info.url;
     cfg.event_handler = ImageHttpEvent;
-    // Verified against the default bundle -- see the header and N-62. Still not
-    // `setInsecure`, and still not a pinned CA.
-    cfg.crt_bundle_attach = esp_crt_bundle_attach;
+    // PINNED CA (N-62), not the default bundle. Still not `setInsecure`.
+    cfg.cert_pem = kReleaseCaPem;
     cfg.timeout_ms = 15000;
     // The image is up to ~1.5 MB; the default buffer is fine because the event
     // handler consumes each chunk as it arrives rather than buffering the image.

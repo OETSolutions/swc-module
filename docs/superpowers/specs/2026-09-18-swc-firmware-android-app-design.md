@@ -192,7 +192,9 @@ steering-pad ladder (series chain, common tied to GND)
 **The ladder is a resistor chain with its common tied to ground, and a button
 shorts the node it sits at to the chain's common — so pressing a button pulls the
 input *down*, not up.** (Reference: `Tundra_SWC_steeringpadswitch.bmp` in the
-Android_Stereo_Apps working notes; verified with the board's owner, 2026-09-18.)
+Android_Stereo_Apps working notes, and the resistor-value table supplied as
+`Likely Tundra Steering Wheel Switch Resistor Values.png` — both verified with
+the board's owner, 2026-09-18; the table is transcribed in §2.4 below.)
 This is the single most important correction in this section:
 
 - **Idle (no button) is the *high* state:** the ladder's full series resistance
@@ -218,6 +220,40 @@ This is the single most important correction in this section:
 
 `AUX1`–`AUX3` on `J5` are electrically identical but use a **1 kΩ** series
 resistor (`R23`–`R25`) and the same pull-up/clamp/filter, on IO4/IO5/IO6.
+
+**The vehicle's ladder values are now KNOWN (N-2, resolved 2026-09-24).** The
+open item asked for the head unit's actual resistor values; they are the Toyota
+Tundra's steering-pad ladder, supplied as a reference table and reproduced here
+because §2.4's consequence 3 makes them load-bearing — the pull-up value and the
+button separation both depend on them:
+
+| KEY line | Button | R to ground | V_KEY (calc) |
+| --- | --- | --- | --- |
+| KEY 1 | SEEK+ | 0 Ω | 0.000 V |
+| | SEEK− | 330 Ω | 0.105 V |
+| | VOL+ | 1.00 kΩ | 0.300 V |
+| | VOL− | 3.11 kΩ | 0.788 V |
+| KEY 2 | MODE | 0 Ω | 0.000 V |
+| | ON HOOK | 330 Ω | 0.105 V |
+| | OFF HOOK | 1.00 kΩ | 0.300 V |
+| | VOICE / PTT | 3.11 kΩ | 0.788 V |
+
+Two facts fall out of the table and both were the reason the item was open:
+
+- **The head unit's divider is a 10 kΩ pull-up to +3.3 V, the same topology as
+  §2.4** — `V_KEY = 3.3 · R_switch / (10000 + R_switch)`, which is exactly §2.4's
+  `V_pin` with the head unit's own 10 kΩ in the `R_pullup` slot. So the sense
+  side and the drive side share a transfer function, and the adapter's DAC (which
+  presents a *voltage*, §6.7) reproduces `V_KEY` directly.
+- **The four levels per line are 0, 0.105, 0.300 and 0.788 V, and the worst-case
+  separation is 0.105 V ≈ 105 mV** (SEEK+/SEEK−). That is comfortably inside the
+  ADC's ~43 mV error (§FR-2) but it is the reason `mv_tolerance` is derived from
+  the *measured* gap rather than a fixed width (§3.4): a 105 mV gap at the bottom
+  of the range, where §2.4's consequence 2 says sensitivity is *highest*, is the
+  easy case; the adapter's own ladder (measured at bring-up) is the one that can
+  be tight. Both ladders' worst gaps are now bounded, so the "are the buttons
+  resolvable" question has an answer for the head unit and a measurement for the
+  adapter.
 
 ### 2.5 Power, feedback, and the one user-visible button
 
@@ -3006,7 +3042,7 @@ reset-source cases. §12 carries the critical path.
 | # | Item | Needed by | Blocking? |
 | --- | --- | --- | --- |
 | N-1 | **The exact DOIT ESPS3-32-N4 flash/RAM configuration** — confirm 4 MB flash, no PSRAM, and the USB-Serial-JTAG pin map, then fix the board JSON | Immediately | **Yes** — every build depends on it |
-| N-2 | **The head unit's actual ladder resistor values.** The *input* side is now settled (§2.4/§6.3: series chain, common to GND, pulled up to +3V3 by `R15`/`R16`, no 12 V term), but the **actual resistance values are vehicle-specific and unmeasured**, so how well the buttons spread across the ADC range is unknown. If the spread is poor — most likely for the idle-adjacent buttons (§6.3 consequence 2) — the fix is to change `R15`/`R16` | Before bench tests | Yes, for **input** calibration; also gates §6.2's output envelope indirectly |
+| N-2 | **The head unit's actual ladder resistor values.** The *input* side is now settled (§2.4/§6.3: series chain, common to GND, pulled up to +3V3 by `R15`/`R16`, no 12 V term), but the **actual resistance values are vehicle-specific and unmeasured**, so how well the buttons spread across the ADC range is unknown. If the spread is poor — most likely for the idle-adjacent buttons (§6.3 consequence 2) — the fix is to change `R15`/`R16` **RESOLVED 2026-09-24.** The values are the Toyota Tundra steering-pad ladder, supplied as a reference table and transcribed into §2.4: KEY1 = SEEK+ 0 Ω / SEEK− 330 Ω / VOL+ 1.00 kΩ / VOL− 3.11 kΩ, and KEY2 = MODE 0 Ω / ON-HOOK 330 Ω / OFF-HOOK 1.00 kΩ / VOICE 3.11 kΩ, giving V_KEY levels 0 / 0.105 / 0.300 / 0.788 V against the head unit's own 10 kΩ pull-up to +3.3 V. So the head unit's divider is the SAME topology as §2.4's, which is what lets the adapter's DAC reproduce `V_KEY` directly. The worst-case separation is 105 mV, comfortably resolvable within the ADC error; `mv_tolerance` still derives from the measured gap (§3.4) rather than this table, because the adapter's own ladder is what can be tight | Resolved 2026-09-24 | No — the adapter never assumed these values (it measures its own ladder); the item was that they were unknown, and they are now recorded |
 | N-3 | **App-fits-in-1920 KB** — unresolved until the first full BLE build with NimBLE. The §9.6 fallback is the answer if it does not **RESOLVED 2026-09-24.** The firmware builds and fits with headroom: the size gate reports `firmware.bin` at 1,398,176 bytes against the 1,966,080-byte slot — **71.1%**, roughly 568 KB spare — so the §9.6 fallback is not needed. This is the FULL build (NimBLE, WiFi, the maintenance radio, the OTA paths all linked), which is what the item was waiting on. The gate runs in CI on every build, so a future growth that would breach the slot fails the build rather than the OTA | Resolved 2026-09-24 | No — it fits with ~568 KB headroom, and `check_size.py` fails the build before the slot is breached |
 | N-4 | **The real MCP4728 I²C address strap** on this board — read from the schematic/silkscreen, not assumed **RESOLVED 2026-09-24 (by bench evidence).** The address is confirmed WITHOUT a bus scan, because the firmware's boot-time verify already exercises it: `app_main` marks the image valid only when `OutputVerified()` is true, which requires `SystemOrchestrator::VerifySafeIdleIdleCodes` to have READ each channel's code back from the real MCP4728 over I2C (N-21). The DUT reports `output_safe: true` (read live, `uptime_ms` > 1.05 M), so a real transaction to `SWC_MCP4728_ADDR` (0x60) received 24 valid bytes — the all-low strap default. `PinMap.h`'s comment is updated from "a bring-up measurement" to "confirmed on the board"; the value is unchanged, and the read-back is the ongoing proof, so a mis-strapped respin would fail `output_safe` rather than silently address nothing | Resolved 2026-09-24 | No — the read-back proves the address, so bring-up cannot be mis-addressed without `output_safe` going false |
 | N-5 | **Whether the integrator's measured plant matches the modelled one.** §6.5's servo constants are a model until step 5 of bring-up | Bring-up | No, but constants change |

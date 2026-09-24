@@ -424,11 +424,18 @@ void CommandRouter::EmitStatusBody(bool with_for_seq, uint32_t for_seq) {
     }
     const uint32_t heap_free = (hal_ != nullptr && hal_->heap_free != nullptr)
                                    ? hal_->heap_free(hal_->ctx) : 0u;
-    char body[352];
+    // Why the chip last started, from the HAL (spec 4.3). Reported so a peer can
+    // see a watchdog/brownout reset, which is otherwise unobservable on this
+    // board (the console is on the ROM USB-Serial-JTAG, which the firmware stops
+    // writing to once TinyUSB owns the PHY). 0 = "unknown", matching `heap_free`.
+    const int reset_reason = (hal_ != nullptr && hal_->reset_reason != nullptr)
+                                 ? hal_->reset_reason(hal_->ctx) : 0;
+    char body[384];
     snprintf(body, sizeof(body),
              "%s\"vbus_present\":%s,\"gain_mode\":\"%s\",\"uptime_ms\":%llu,"
              "\"config_state\":\"%s\",\"output_safe\":%s,"
-             "\"tx_dropped\":%u,\"rx_overflows\":%u,\"temp_c\":%s,\"heap_free\":%u",
+             "\"tx_dropped\":%u,\"rx_overflows\":%u,\"temp_c\":%s,\"heap_free\":%u,"
+             "\"reset_reason\":%d",
              reply_field, vbus ? "true" : "false",
              (sys_ != nullptr) ? (sys_->ChannelGainMode(0) == GainMode::kAmplified ? "amplified"
                                                                                   : "tracking")
@@ -437,7 +444,7 @@ void CommandRouter::EmitStatusBody(bool with_for_seq, uint32_t for_seq) {
              cfg,
              ((sys_ != nullptr) && sys_->SafeIdleEstablished()) ? "true" : "false",
              static_cast<unsigned>(tx_dropped), static_cast<unsigned>(rx_overflows),
-             temp_field, static_cast<unsigned>(heap_free));
+             temp_field, static_cast<unsigned>(heap_free), reset_reason);
     Emit("status", body);
 }
 

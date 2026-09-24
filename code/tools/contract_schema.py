@@ -97,7 +97,11 @@ FRAMES = [
     # measured), and `heap_free` is the HAL's free-heap figure at emit time. All
     # are declared because the app reads them; the router's emit site is asserted
     # against this row in both directions by test_frame_field_lists_match_the_router.
-    Frame("status",        "fw2app", "vbus_present,gain_mode,uptime_ms,config_state,output_safe,tx_dropped,rx_overflows,temp_c,heap_free"),
+    # `reset_reason` is the HAL's `esp_reset_reason()` enum value for THIS boot,
+    # so a peer can see a watchdog/brownout reset (otherwise unobservable: the
+    # console is on the ROM USB-Serial-JTAG the firmware stops writing to once
+    # TinyUSB owns the PHY). 0 = "unknown", matching `heap_free`'s convention.
+    Frame("status",        "fw2app", "vbus_present,gain_mode,uptime_ms,config_state,output_safe,tx_dropped,rx_overflows,temp_c,heap_free,reset_reason"),
     Frame("ladder_sample", "fw2app", "channel,level_mv,n"),
     # Spec 8.3 option 1: the BLE Proof-of-Possession and the web token are derived
     # per device and shown to the user OVER USB, because the board has no display

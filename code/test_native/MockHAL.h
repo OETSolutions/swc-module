@@ -47,6 +47,11 @@ public:
     void SetHeapFree(uint32_t bytes) { heap_free_ = bytes; }
     uint32_t HeapFree() { return heap_free_; }
 
+    // Spec 4.3's `status.reset_reason`. Settable so a test asserts the frame
+    // carries the platform's value rather than a literal.
+    void SetResetReason(int reason) { reset_reason_ = reason; }
+    int ResetReason() { return reset_reason_; }
+
     // --- analog ------------------------------------------------------------
     void SetAdcMilliVolts(AdcChannel ch, int mv) { adc_mv_[static_cast<int>(ch)] = mv; }
     void ReleaseInputs();
@@ -155,6 +160,7 @@ private:
     static uint64_t NowMsThunk(void *ctx);
     static uint64_t NowUsThunk(void *ctx);
     static uint32_t HeapFreeThunk(void *ctx);
+    static int  ResetReasonThunk(void *ctx);
     static int  NvsGetThunk(void *ctx, const char *key, void *out, size_t len);
     static int  NvsSetThunk(void *ctx, const char *key, const void *in, size_t len);
     static void RebootThunk(void *ctx);
@@ -176,6 +182,7 @@ private:
     bool ldac_asserted_ = false;
     bool dac_failed_ = false;
     uint32_t heap_free_ = 0;
+    int reset_reason_ = 0;
     bool fail_next_dac_write_ = false;
     bool fail_dac_read_ = false;
     int  read_back_bias_ = 0;      // added to the stored code on a read-back

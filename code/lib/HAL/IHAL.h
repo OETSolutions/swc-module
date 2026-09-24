@@ -121,6 +121,14 @@ typedef struct IHAL {
     // the platform cannot answer, which the status body reports as 0 -- an
     // honest "unknown" for a diagnostic field, never a fabricated size.
     uint32_t (*heap_free)(void *ctx);
+    // The reason the chip last started, as IDF's `esp_reset_reason()` enum value
+    // (spec 4.3's `status.reset_reason`, open item N-58). A function for the same
+    // reason as `heap_free`: the value is read at emit time, not stored, so a
+    // frame reports THIS boot's reason rather than a stale one. Returns 0
+    // ("unknown") when the platform cannot answer -- the same honest-unknown rule
+    // `heap_free` uses. A host `MockHal` returns a settable value so a test can
+    // assert the field is carried.
+    int      (*reset_reason)(void *ctx);
     int      (*nvs_get)(void *ctx, const char *key, void *out, size_t len);
     int      (*nvs_set)(void *ctx, const char *key, const void *in, size_t len);
     // Restart into the application (spec 4.3's `boot_target: "app"`).

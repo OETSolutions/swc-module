@@ -1,5 +1,6 @@
 #include <stdio.h>
 
+#include "esp_attr.h"
 #include "esp_chip_info.h"
 #include "esp_flash.h"
 #include "esp_log.h"
@@ -147,6 +148,44 @@ extern "C" void app_main(void)
             ESP_LOGI(TAG, "image confirmed valid; rollback cancelled");
         }
     }
+
+#ifdef SWC_BENCH_WDT_RESET
+    /*
+     * FR-40's WATCHDOG reset source, forced on the bench. The shipped build never
+     * sets this define (like the other `SWC_BENCH_*` switches).
+     *
+     * Spec §10.4 wants the WDT reset proven, but this build cannot get one:
+     * `CONFIG_ESP_TASK_WDT_PANIC` is UNSET, so a TASK-watchdog timeout only prints
+     * a backtrace and never resets, and the board's 12 V supply cannot be cut from
+     * software for a brownout. The **interrupt** watchdog, however, DOES panic and
+     * reboot by default (`CONFIG_ESP_SYSTEM_PANIC_PRINT_REBOOT`), and it is easy to
+     * trigger: its timeout only fires from the FreeRTOS tick, so a task that
+     * disables interrupts and spins never feeds it and the WDT reboots the chip.
+     *
+     * The hook is SELF-LIMITING, keyed on the reset reason: on any boot that is NOT
+     * already a watchdog reset it stalls (forcing the WDT), and on a watchdog-reset
+     * boot it falls through to normal operation. So one flash produces exactly the
+     * sequence the requirement describes -- a boot that watchdog-resets, then a
+     * boot that comes up safely -- and a re-run repeats it without a reflash or a
+     * power cycle. `tools/bench_wdt_reset.py` observes the recovery over USB.
+     */
+    {
+        const esp_reset_reason_t why = esp_reset_reason();
+        if (why == ESP_RST_INT_WDT || why == ESP_RST_TASK_WDT || why == ESP_RST_WDT) {
+            ESP_LOGW(TAG, "SWC_BENCH_WDT_RESET: recovered from a watchdog reset "
+                          "(reason=%d); safe idle established before this point",
+                     static_cast<int>(why));
+        } else {
+            ESP_LOGW(TAG, "SWC_BENCH_WDT_RESET: forcing a watchdog reset now "
+                          "(reset reason was %d)", static_cast<int>(why));
+            portDISABLE_INTERRUPTS();
+            for (;;) {
+                // Spin with interrupts off: the tick never runs, so the interrupt
+                // watchdog is never fed and reboots the device.
+            }
+        }
+    }
+#endif
 
     // The USB link belongs here and not earlier: everything above has already
     // made the output safe, so the device serves presses with no app, no host and

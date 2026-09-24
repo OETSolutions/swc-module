@@ -336,6 +336,17 @@ static uint32_t HalHeapFree(void *ctx)
     return static_cast<uint32_t>(esp_get_free_heap_size());
 }
 
+static int HalResetReason(void *ctx)
+{
+    (void)ctx;
+    // IDF's reset-reason enum, exposed so the app can show WHY the device last
+    // started (spec 4.3's `status.reset_reason`). Notably, FR-40's watchdog
+    // recovery is observable this way from the host: the console is on the ROM
+    // USB-Serial-JTAG, which the firmware stops emitting to once TinyUSB takes the
+    // PHY, so the reset reason is the only reset source a peer can confirm.
+    return static_cast<int>(esp_reset_reason());
+}
+
 static int HalNvsGet(void *ctx, const char *key, void *out, size_t len)
 {
     (void)ctx;
@@ -613,6 +624,7 @@ IHAL *EspHalInit(void)
     iface.now_ms         = HalNowMs;
     iface.now_us         = HalNowUs;
     iface.heap_free      = HalHeapFree;
+    iface.reset_reason   = HalResetReason;
     iface.nvs_get        = HalNvsGet;
     iface.nvs_set        = HalNvsSet;
     iface.reboot         = HalReboot;

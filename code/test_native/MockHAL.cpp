@@ -76,6 +76,7 @@ MockHal::MockHal() {
     iface_.now_ms         = &MockHal::NowMsThunk;
     iface_.now_us         = &MockHal::NowUsThunk;
     iface_.heap_free      = &MockHal::HeapFreeThunk;
+    iface_.reset_reason   = &MockHal::ResetReasonThunk;
     iface_.nvs_get        = &MockHal::NvsGetThunk;
     iface_.nvs_set        = &MockHal::NvsSetThunk;
     iface_.reboot         = &MockHal::RebootThunk;
@@ -260,6 +261,7 @@ bool MockHal::GpioReadThunk(void *ctx, GpioPin pin) {
 uint64_t MockHal::NowMsThunk(void *ctx) { return static_cast<MockHal *>(ctx)->NowMs(); }
 uint64_t MockHal::NowUsThunk(void *ctx) { return static_cast<MockHal *>(ctx)->NowUs(); }
 uint32_t MockHal::HeapFreeThunk(void *ctx) { return static_cast<MockHal *>(ctx)->HeapFree(); }
+int MockHal::ResetReasonThunk(void *ctx) { return static_cast<MockHal *>(ctx)->ResetReason(); }
 int MockHal::NvsGetThunk(void *ctx, const char *key, void *out, size_t len) {
     return static_cast<MockHal *>(ctx)->NvsGet(key, out, len);
 }

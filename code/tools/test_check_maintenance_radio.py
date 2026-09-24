@@ -59,7 +59,8 @@ def test_a_teardown_with_no_flags_is_caught():
     # The flat "free everything" shape: no per-resource flags at all. Every
     # `<flag> = false;` in the file goes, so the teardown names nothing.
     mutated = REAL
-    for flag in ("g_netif_inited", "g_event_loop", "g_wifi_inited", "g_prov_inited"):
+    for flag in ("g_netif_inited", "g_event_loop", "g_wifi_inited", "g_prov_inited",
+                 "g_time_started"):
         mutated = mutated.replace(f"{flag} = false;", "(void)0;")
     problems = cmr.check_teardown_pairs_the_bringup(mutated)
     assert any("no resource flag" in p for p in problems), problems

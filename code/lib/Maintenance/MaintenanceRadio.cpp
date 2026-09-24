@@ -10,6 +10,7 @@
 #include "esp_log.h"
 #include "esp_mac.h"
 #include "esp_netif.h"
+#include "esp_sntp.h"
 #include "esp_timer.h"
 #include "esp_wifi.h"
 #include "esp_wifi_default.h"
@@ -60,6 +61,7 @@ bool           g_netif_inited = false;
 bool           g_event_loop = false;
 bool           g_wifi_inited = false;
 bool           g_prov_inited = false;
+bool           g_time_started = false;
 esp_netif_t   *g_sta_netif = nullptr;
 esp_netif_t   *g_ap_netif = nullptr;
 httpd_handle_t g_server = nullptr;
@@ -92,10 +94,54 @@ char g_body[512];
 
 namespace {
 
+/*
+ * Start SNTP so the wall clock becomes VALID once the station joins a network.
+ *
+ * **Why this is required for the OTA fetch, not a nicety.** `OtaWifiCheck` and
+ * `OtaWifiInstall` use VERIFIED TLS (spec 9.5, and `OtaWifi.h`'s "never
+ * `setInsecure`"). mbedTLS validates the server certificate's validity window,
+ * and this device has NO RTC: a fresh boot's clock is the epoch (1970), so the
+ * modern server cert reads as "not yet valid" and the handshake fails -- with
+ * `OtaWifiCheck` mapping that to `kMalformed` ("the release manifest could not be
+ * read"), which points nowhere near the clock. SNTP fixes the clock the moment
+ * an IP is obtained, which is the first instant the fetch is even possible.
+ *
+ * **It is started on `IP_EVENT_STA_GOT_IP`, not at bring-up**, because before the
+ * station has an IP there is nothing to sync against; the DHCP-assigned DNS
+ * server comes with that event, so the hostnames resolve. This costs one event
+ * handler for the window's lifetime and is stopped in `TearDown`.
+ */
+void StartSntp()
+{
+    if (g_time_started) return;
+    // Pool addresses cover the common "first NTP blocked, second works" case.
+    esp_sntp_setoperatingmode(ESP_SNTP_OPMODE_POLL);
+    esp_sntp_setservername(0, "pool.ntp.org");
+    esp_sntp_setservername(1, "time.google.com");
+    esp_sntp_init();
+    g_time_started = true;
+    ESP_LOGI(TAG, "SNTP started; the clock is set once the station resolves a server");
+}
+
+// Handler for `IP_EVENT_STA_GOT_IP` (the station obtained an address).
+void OnAnyEvent(void *, esp_event_base_t base, int32_t id, void *)
+{
+    if (base == IP_EVENT && id == IP_EVENT_STA_GOT_IP) {
+        StartSntp();
+    }
+}
+
 // Undo whatever the bring-up managed to create, in reverse order. Safe to call
 // with every flag clear.
 void TearDown()
 {
+    if (g_time_started) {
+        // Stop SNTP BEFORE the network goes away, so no timer fires against a
+        // torn-down netif. `sntp_stop` is safe to call once `sntp_init` returned.
+        esp_sntp_stop();
+        g_time_started = false;
+    }
+
     if (g_server != nullptr) {
         // Stops the server task and closes the sockets. Before `wifi_stop`,
         // because a socket outliving its netif is how the next start fails with a
@@ -131,6 +177,10 @@ void TearDown()
     }
 
     if (g_event_loop) {
+        // Unregister this module's handler before the loop it lives on is gone.
+        // `esp_event_handler_unregister` is safe even if the register failed (it
+        // just returns ESP_ERR_NOT_FOUND), so no extra flag is needed.
+        esp_event_handler_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, &OnAnyEvent);
         // Deleted only if THIS module created it, which is why the flag exists:
         // the device may one day have a default loop for another purpose, and
         // deleting someone else's loop is a use-after-free waiting to happen.
@@ -470,6 +520,29 @@ constexpr const char *kReleaseManifestUrl =
     "https://github.com/oetsolutions/swc-module/releases/latest/download/version_manifest.json";
 
 /*
+ * The manifest URL used by `HandleOtaCheck`/`HandleOtaPull`. Normally the release
+ * constant above; a BENCH build can override it with `-D
+ * SWC_BENCH_MANIFEST_URL=\"https://...\"` to exercise the fetch against a
+ * bring-up server (a Cloudflare quick tunnel serving a manifest + image) without
+ * publishing a release. The override is behind its own define, so a SHIPPED build
+ * cannot be repointed at a server that is not the release channel -- the same
+ * guard the other `SWC_BENCH_*` switches use. The value must be a `https://` URL
+ * (a bench cannot exercise the verified-TLS path over plain http, and `OtaWifiCheck`
+ * refuses one anyway).
+ */
+const char *ManifestUrl() {
+#ifdef SWC_BENCH_MANIFEST_URL
+    // Referenced so the compiled-in release URL stays a live symbol even when the
+    // bench override is in use (a namespace-scope constant referenced by nothing
+    // trips `-Wunused-const-variable` under this project's `-Werror`).
+    (void)kReleaseManifestUrl;
+    return SWC_BENCH_MANIFEST_URL;
+#else
+    return kReleaseManifestUrl;
+#endif
+}
+
+/*
  * `POST /api/ota/check`: fetch the manifest and decide (spec 9.5).
  *
  * The manifest is fetched over VERIFIED TLS (`OtaWifiCheck` refuses a plain-http
@@ -480,7 +553,7 @@ constexpr const char *kReleaseManifestUrl =
 esp_err_t HandleOtaCheck(httpd_req_t *req)
 {
     ReleaseInfo info{};
-    const ReleaseCheckResult r = OtaWifiCheck(kReleaseManifestUrl, FwVersionString(), &info);
+    const ReleaseCheckResult r = OtaWifiCheck(ManifestUrl(), FwVersionString(), &info);
 
     const char *word = nullptr;
     switch (r) {
@@ -523,7 +596,7 @@ esp_err_t HandleOtaCheck(httpd_req_t *req)
 esp_err_t HandleOtaPull(httpd_req_t *req)
 {
     ReleaseInfo info{};
-    const ReleaseCheckResult r = OtaWifiCheck(kReleaseManifestUrl, FwVersionString(), &info);
+    const ReleaseCheckResult r = OtaWifiCheck(ManifestUrl(), FwVersionString(), &info);
     if (r != ReleaseCheckResult::kNewer) {
         const char *why = (r == ReleaseCheckResult::kUpToDate)
                               ? "the device is already up to date"
@@ -750,6 +823,15 @@ bool BringUpStacks()
             return false;
         }
         g_event_loop = true;
+    }
+
+    // Start the clock once the station gets an address (see `StartSntp`). Without
+    // it the verified-TLS OTA fetch fails against a modern server cert because the
+    // RTC-less clock reads 1970. Unregistered in `TearDown` before the loop goes.
+    if (esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &OnAnyEvent,
+                                   nullptr) != ESP_OK) {
+        ESP_LOGW(TAG, "could not register the time-sync handler; the OTA over WiFi "
+                      "may fail TLS certificate validation");
     }
 
     g_sta_netif = esp_netif_create_default_wifi_sta();

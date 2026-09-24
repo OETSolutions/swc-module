@@ -95,8 +95,17 @@ ReleaseCheckResult OtaWifiCheck(const char *manifest_url, const char *current_ve
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
     if (client == nullptr) return ReleaseCheckResult::kMalformed;
     const esp_err_t err = esp_http_client_perform(client);
+    const int status = esp_http_client_get_status_code(client);
     esp_http_client_cleanup(client);
-    if (err != ESP_OK) return ReleaseCheckResult::kMalformed;
+    if (err != ESP_OK) {
+        // Name the transport cause: the returned result is only `kMalformed`, and
+        // the common cause here is TLS cert validation -- which for this RTC-less
+        // device means an unset clock (see the SNTP note in MaintenanceRadio.cpp),
+        // not a bad URL.
+        ESP_LOGE("swc-ota", "manifest fetch failed: %s (http status %d)",
+                 esp_err_to_name(err), status);
+        return ReleaseCheckResult::kMalformed;
+    }
     if (manifest_overflow_ || manifest_len_ == 0) return ReleaseCheckResult::kMalformed;
 
     manifest_buf_[manifest_len_] = '\0';

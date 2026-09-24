@@ -1156,6 +1156,13 @@ name it is unreadable in production anyway (N-16: TinyUSB moves the shared USB P
 and the console goes dark), so the buzzer is the only signal a user at the bench
 actually hears.
 
+> **N-16 corrected 2026-09-25 — the console is no longer dark.** The paragraph
+> above is right about the buzzer being the bench signal, but the console claim is
+> now obsolete: the console PRIMARY was moved to UART0 (the fabricated board already
+> pads it out at TP7/TP8), which is OFF the USB PHY, so `ESP_LOG*` survives TinyUSB
+> taking the PHY. The `BOOT_DEGRADED` beep is still worth playing — it is what a user
+> with no console hears — but the log is now readable too. See the N-16 entry below.
+
 The plan's own step for this (`EspHal.c`) specified **two** mechanisms — "a `log`
 frame (§4.3) at init, and a `BOOT_DEGRADED` boot (§7.2)". Neither was reachable:
 the `log` frame cannot exist because the log sink is registered by `UsbLinkStart`,
@@ -1336,3 +1343,152 @@ non-install outcome stating that the device kept its old image, which is the
 screen's core promise (spec 9). Six client tests and eight screen/view-model tests.
 Android 120 → 133; native 504 → 514.
 
+
+## The console was dark in production — and it needed no respin to fix (N-16)
+
+Spec §4.1 has long said the ESP32-S3's ONE internal USB PHY is shared by
+USB-Serial-JTAG and USB-OTG, and that `UsbLinkStart` installing TinyUSB moves the
+PHY to USB-OTG — so a console left on USB-Serial-JTAG goes dark the moment the app
+link comes up. That part is correct and was verified against Espressif's docs. What
+was never true is the REMEDY the spec recorded:
+
+> The console can be restored with a UART0 console on unused GPIO43/44 (needs header
+> pins or test pads **on a respin**), or an external PHY (≥6 GPIOs).
+
+**The fabricated board already pads out that UART.** `SWC.kicad_pcb` routes the
+module's `/TXD0` and `/RXD0` — GPIO43/44, the S3's `U0TXD`/`U0RXD` (SOC
+`uart_channel.h`: `UART_NUM_0_TXD_DIRECT_GPIO_NUM 43`, `U0RXD_GPIO_NUM 44`) — to
+test pads **TP7** and **TP8**, bare THT pads with nothing else on those nets
+(verified against the PCB netlist 2026-09-25). So "needs a respin" was false, and
+the decision N-16 asked to make "before the board is finalised" was already made in
+copper: keep `TP7`/`TP8`, they are the console.
+
+The consequence of not noticing was concrete. Every `ESP_LOG*` line the firmware
+emits after the link comes up was unreadable — including `UsbLinkStart`'s OWN
+`"tinyusb driver install failed"`, the one message that reports the link failing.
+A dark console is why FR-40's `status.reset_reason` field exists at all (there was
+no other way for a peer to see a watchdog reset) and why the blank-eFuse
+`BOOT_DEGRADED` path leaned entirely on the buzzer.
+
+**Fixed** in `sdkconfig.defaults`:
+
+- `CONFIG_ESP_CONSOLE_UART_DEFAULT=y` — console PRIMARY on UART0, which is **off
+  the USB PHY**, so it survives TinyUSB taking the PHY.
+- `CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y` — output is DUPLICATED to the
+  USB port (the S3 sets `ESP_ROM_CONSOLE_OUTPUT_SECONDARY = 1`, so both get every
+  byte), so `pio test -e esp32s3` and a serial monitor still read the log off USB
+  until TinyUSB installs; the durable copy is on the pads.
+- `CONFIG_ESP_CONSOLE_USB_CDC` stays forbidden — a console on the TinyUSB CDC port
+  would let a debug `printf` be parsed as a protocol frame (spec 4.1's HARD
+  requirement, unchanged).
+
+The old `sdkconfig.defaults` comment asserted the OPPOSITE — "Both can be up at
+once on the S3 because USB-Serial-JTAG is a ROM peripheral independent of the OTG
+controller TinyUSB drives" — which is the exact false claim N-16 exists to refute;
+it is corrected in place.
+
+**Gated, not merely changed.** `tools/check_sdkconfig_keys.py` now REQUIRES
+`CONFIG_ESP_CONSOLE_UART_DEFAULT` + the secondary and FORBIDS
+`CONFIG_ESP_CONSOLE_USB_CDC`, so a later "simplify the console" edit cannot
+silently reintroduce the dark-console defect; the on-device assertion
+`TestUsbCdc.cpp::TheConsoleIsNotConfiguredOntoTheCdcPort` checks the same two facts
+(it used to assert `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG`, the safe-but-dark primary).
+Device build clean (RAM 53.4%, Flash 71.7%); native suite unaffected. A CP2102 UART
+bridge is on the bench, so the restored console is directly verifiable on TP7/TP8.
+
+**N-16 is fully resolved:** the download-mode half by N-80 (a reset enters the ROM
+USB loader with no BOOT press), the console half here.
+
+## The on-device suite ran on silicon for the first time: 6 failures of 22 (N-87)
+
+`test/test_hw` had never executed on hardware. It was written "BLOCKED until the
+board exists" (plan Tasks 14c/23), and CI's own comment says it is "NEVER run in
+CI — it needs the device"; the green build step only proves it *compiles*
+(`pio test -e esp32s3 --without-uploading --without-testing`). So the first real
+run, on the DUT, reported **22 Tests / 6 Failures** — six latent defects, five in
+the tests and one in the firmware.
+
+**Five were tests that could not pass or could not mean anything.**
+
+- **Reversed Unity arguments** (`esp_hal_dac_write_reaches_the_sense_divider`,
+  `esp_hal_sense_pins_read_as_analog_not_driven`). `TEST_ASSERT_GREATER_THAN_INT_MESSAGE(threshold,
+  actual, msg)` asserts `actual > threshold`, but both tests passed `(reading, bound)`.
+  The readings were fine (505 mV, 1625 mV — valid driven levels); the CONSTANT was
+  being compared as the actual, so the report read "Expected -1 to be greater than
+  505" and "Expected 100 to be greater than 1625". Every assertion in both tests was
+  backwards and could only ever fail.
+- **`PendingTx() == 0` with no host** (`ATransportAcceptsAMaximumFrameWithNoHostAttached`,
+  `ShortWritesAgainstTheRealFifoStillSendTheWholeFrame`). The suite deliberately
+  does not install TinyUSB — that is what keeps the console readable over USB
+  (spec 4.1 / N-16) — so `tinyusb_cdcacm_write_queue` returns 0 for every call and
+  the TX buffer can never drain: "Expected 0 Was 1500 / 2046". Even *with* a host,
+  two maximum frames (2046 B) cannot drain into a 512-byte FIFO nobody reads, so the
+  no-host claim was self-contradictory. Reworked to assert what is true and
+  valuable on device (the pair is buffered whole and never dropped; the real
+  function returns bytes-ACCEPTED-not-requested, 0 with the link down), leaving the
+  partial-acceptance retry path to the host suite's FIFO double.
+- **`EspHalInit` was not idempotent** (`DeviceMacIsReadableAndNotAllZeroes`). Every
+  test file's per-test `setup` calls `EspHalInit()`; the second call's
+  `adc_oneshot_new_unit` fails with "adc1 is already in use" (`ESP_ERR_NOT_FOUND`),
+  so `EspHalInit` returned NULL and every test after the first file reported
+  "Expected Non-NULL". The same call also `memset`s `g_state`, wiping live I2C/ADC
+  handles — a real hazard, not just a test artifact. Fixed with an idempotent latch
+  that returns the SAME interface on a repeat call.
+
+**One was a real firmware defect.**
+
+- **`esp_hal_ldac_idles_high_so_the_pulldown_cannot_latch` read back 0.** IDF says
+  it outright (driver/gpio.h:146): "If the pad is not configured for input (or input
+  and output) the returned value is always 0." `InitGpio` configured
+  `SWC_PIN_DAC_LDAC_B` as `GPIO_MODE_OUTPUT`, so the pin R13's 10 k pulldown makes
+  safety-critical — ~LDAC, active LOW, which must *idle HIGH* — could never be read
+  back as high. Fixed by configuring it `GPIO_MODE_INPUT_OUTPUT`: the drive is
+  unchanged (push-pull, never floating), but its driven level is now observable.
+  The pin's *behaviour* was always correct; only its observability was wrong, so no
+  key ever mis-fired.
+
+**Verified on the DUT 2026-09-25: 22 Tests 0 Failures 0 Ignored, OK.** Host suite
+unaffected (597/597), tools 53/53, all 10 static gates green. The production image
+was restored to BOTH app slots afterwards (`output_safe: true`, `config_state: ok`,
+`heap_free: 139136`).
+
+**A bench note, because it cost a cycle.** `tools/dev_flash.sh --loader` ends with
+`--after watchdog_reset`, and on the S3 that does NOT clear
+`RTC_CNTL_FORCE_DOWNLOAD_BOOT` — only esptool's `hard_reset` path does
+(`esptool/targets/esp32s3.py:345`). So a device flashed through the download-mode
+frame boots straight back into the ROM loader, looking wedged (`303A:0009`, silent,
+esptool "No serial data received"). `esptool ... --after hard-reset` clears the bit
+and boots the app. The script's OTA route (the default) does not hit this.
+
+## §10.4 Level-4 repeatability: 200 presses each, zero misclassifications (2026-09-25)
+
+The §10.4 stress battery's repeatability half is now EXECUTED on the two-board
+rig: `tools/bench_ladder.py --only stress --presses 100` presents each learned
+button's own centre 100 times and requires the DUT to resolve THAT button every
+time. Two instrumented runs: **0 misclassifications across 2 buttons × 100
+presses, twice** (400 consecutive clean presses at the board's own rail).
+
+The check now **attributes a miss before counting it**, because the first version
+of this check reported phantom failures that were entirely the rig's:
+
+- **A press cycle whose settle is shorter than the rig's DAC ramp misses the
+  press.** `set_level` reads the rig's status, which releases its DAC
+  (`KeyLine::FloatMv` → `Dac::Release`); the next `drive_now()` then RAMPS for
+  ~1 s. A cycle that drove the centre with a 0.4 s settle presented the *previous*
+  level, so the DUT saw no press and the check reported "got no event" — 6 of 6
+  presses, which reads exactly like a broken classifier. Driving with
+  `settle_s=1.4` (and `drive_now`'s own default is 1.6) fixed it.
+- **A miss is attributed: `set_level` returns `None` when the rig never converged
+  to the centre**, so a `None` is a rig non-convergence, counted separately and
+  excluded. A genuine miss (rig DID converge) is re-presented once at the same
+  centre to separate a one-off from a repeatable failure; the retry outcome is in
+  the error string.
+
+Across the two instrumented runs there were also **0 rig non-convergences** — so
+on a 1.4 s cadence the rig's +/-nudge loop reached the centre every single time.
+
+**What this does NOT cover.** The rail-voltage sweep (3.14/3.30/3.47 V) needs the
++3V3 net driven by a bench supply, which the two-board rig cannot command — the
+rail is the DUT's own regulator — so that leg is bench-gated and is not claimed
+here. The 72-hour soak and the DAC 4096-code monotonicity sweep (which needs the
+KEY-out loopback wire, absent on this bench) are likewise not run here.

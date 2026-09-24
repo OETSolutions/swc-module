@@ -65,10 +65,9 @@ import bench_prov                                 # noqa: E402
 
 ENV_PATH = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                         ".env")
-# The DHCP-assigned address seen on this bench. Overridable; the tool verifies it
-# against the device's station MAC (derived from the BLE short id) before trusting
-# it, so a moved lease is caught rather than silently hitting another host.
-DEFAULT_LAN_IP = "<device-lan-ip>"
+# No default LAN IP: the address is DHCP-assigned and site-specific, so it is
+# discovered from the ARP table by the device's station MAC, or passed with
+# `--ip`. Nothing here is site-specific.
 
 
 def env_value(key):
@@ -96,7 +95,7 @@ def station_mac(ble_name):
 
 def arp_ip_for_mac(mac):
     """Find the IP currently leased to `mac` from the ARP table. macOS prints the
-    MAC with leading zeros stripped (`fc:1:2c:c0:92:d4`), so compare per-octet."""
+    MAC with leading zeros stripped (`fc:1:2c:c0:a1:b2`), so compare per-octet."""
     if not mac:
         return None
     want = [int(x, 16) for x in mac.split(":")]
@@ -151,8 +150,8 @@ def main() -> int:
     ap.add_argument("--passphrase", default=None,
                     help="LAN passphrase (default: WIFI_PASSWORD from code/.env)")
     ap.add_argument("--ip", default=None,
-                    help="device LAN IP (default: discovered by ARP, else "
-                         f"{DEFAULT_LAN_IP})")
+                    help="device LAN IP (default: discovered from the ARP table "
+                         "by the device's station MAC)")
     ap.add_argument("--install", action="store_true",
                     help="ALSO upload the good image and reboot into it (step 4)")
     args = ap.parse_args()
@@ -225,7 +224,9 @@ def main() -> int:
         deadline = time.time() + 40
         chosen = None
         while time.time() < deadline:
-            cand = ip or arp_ip_for_mac(mac) or DEFAULT_LAN_IP
+            cand = ip or arp_ip_for_mac(mac)
+            if not cand:
+                break
             st, _ = http(cand, "GET", "/", timeout=3)
             if st is not None:
                 chosen = cand
@@ -233,7 +234,8 @@ def main() -> int:
             time.sleep(1)
         if not chosen:
             print(f"ERROR: device not reachable on the LAN (tried "
-                  f"{ip or mac or DEFAULT_LAN_IP}).", file=sys.stderr)
+                  f"{ip or mac or 'no candidate'}). Pass --ip if ARP has no "
+                  f"entry for the device's MAC.", file=sys.stderr)
             return 1
         print(f"device on the LAN at {chosen} (sta mac {mac or 'unknown'})")
 

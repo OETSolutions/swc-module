@@ -22,10 +22,34 @@ Geometry rules, all verified against real renders (see docs in the repo):
 
 Usage: fieldplace.py SCH [--dry]
 """
+import glob
+import os
 import sys
 import math
 
-sys.path.insert(0, '<uv-cache>/mcp_server_kicad')
+
+def _find_mcp_server_kicad():
+    """Locate the `mcp_server_kicad` package (it is not on the default path).
+
+    The kicad MCP server is normally run via `uvx`, which unpacks it into an
+    anonymous `~/.cache/uv/archive-v0/<hash>/` directory -- a path that differs
+    per machine and per uv cache generation, so it must not be hardcoded. Look in
+    `SWC_MCP_SERVER_KICAD` first (a CI or pinned checkout sets it to the directory
+    that CONTAINS `mcp_server_kicad/`), then glob the uv cache for the package.
+    Returns the parent dir to put on `sys.path`, or None if the import should just
+    be attempted as-is.
+    """
+    env = os.environ.get("SWC_MCP_SERVER_KICAD")
+    if env:
+        return os.path.abspath(env)
+    for d in glob.glob(os.path.expanduser("~/.cache/uv/archive-v0/*/mcp_server_kicad")):
+        return os.path.dirname(d)
+    return None
+
+
+_p = _find_mcp_server_kicad()
+if _p:
+    sys.path.insert(0, _p)
 from mcp_server_kicad import _cst                                   # noqa: E402
 
 CHAR_W = 1.30          # mm advance per char at 1.27mm text (PDF-measured 1.08-1.33)

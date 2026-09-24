@@ -1083,14 +1083,16 @@ class AppViewModel(
      *
      * Spec §9.5 says the app "should also be able to perform the check over its own
      * internet connection" and push the result over USB, precisely because the
-     * ESP32 may have no WiFi in the car. That is not implemented — it needs a
-     * pinned-CA TLS client and the INTERNET permission — and it is recorded as open
-     * item N-12. Until then the truthful report is that this build cannot check,
-     * rather than a green "up to date" that would stop a user looking for an update
-     * that does exist.
+     * ESP32 may have no WiFi in the car. **That is implemented (N-12 resolved
+     * 2026-09-24):** [fetchManifest] is a [ManifestFetcher] (a pinned-CA TLS client
+     * over `HttpURLConnection`, `INTERNET` declared), and [checkForUpdates] below
+     * fetches, decides with [ReleaseManifest]'s Kotlin semver, and maps the outcome
+     * to the screen. The `fetcher == null` branch is not the normal path — it is the
+     * case where a caller constructed this without a fetcher (as a unit test does),
+     * and it refuses truthfully rather than showing a green "up to date".
      *
-     * The firmware CAN check, over WiFi in maintenance mode, which is what the next
-     * line points at.
+     * The firmware CAN also check, over WiFi in maintenance mode, which is what the
+     * "could not reach the release server" message points at.
      */
     fun checkForUpdates() {
         scope.launch {

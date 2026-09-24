@@ -9,6 +9,7 @@ filler to drop exactly those, which is what a plane wants; 1 keeps them.
 
 Usage: zoneisland.py PCB [--remove] [--apply]
 """
+import os
 import sys
 
 sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
@@ -30,7 +31,8 @@ def layername(z):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
-    pcb = args[0] if args else '<repo-root>/SWC.kicad_pcb'
+    default_pcb = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), 'SWC.kicad_pcb')
+    pcb = args[0] if args else default_pcb
     apply_ = '--apply' in sys.argv
     remove = '--remove' in sys.argv
 

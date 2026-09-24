@@ -25,10 +25,11 @@ Checks
 Obstacles are read from the live board with the same transform the MCP server
 uses: board = origin + R(rot) . local   (see tools/README.md).
 """
-import argparse, json, math, re, sys
+import argparse, json, math, os, re, sys
 from collections import defaultdict
 
-PCB = "<repo-root>/SWC2.kicad_pcb"
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PCB = os.path.join(ROOT, "SWC2.kicad_pcb")
 
 # ---- board design rules (read from SWC2.kicad_pcb setup block) -------------
 MIN_CLEAR = 0.15

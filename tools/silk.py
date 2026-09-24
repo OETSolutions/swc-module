@@ -26,14 +26,16 @@ Read-only unless --fix is given.  Goes through the MCP server's CST parser.
 Usage: silk.py PCB [--fields REF ...] [--pads] [--json OUT]
 """
 import math
+import os
 import sys
 
 sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
 import fieldplace as F                                    # noqa: E402
 from mcp_server_kicad import _cst as C                    # noqa: E402
 
-PCB = ('<repo-root>'
-       '/SWC.kicad_pcb')
+# Repo root is two levels up from this file (tools/ lives at the root).
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PCB = os.path.join(ROOT, 'SWC.kicad_pcb')
 
 # Stroke-font advance, as a fraction of the requested text width.  KiCad's
 # Hershey-derived font averages a little under one width per glyph; 1.0

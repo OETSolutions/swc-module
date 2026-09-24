@@ -22,10 +22,11 @@ multiples), vias/holes are circles, tracks are segments with width.  Distances
 are exact for segment/segment, point/segment, point/rect, circle/rect, and are
 treated as capsule-vs-primitive, i.e. track half-width subtracted at the end.
 """
-import re, math, sys
+import os, re, math, sys
 from dataclasses import dataclass
 
-PCB   = '<repo-root>/SWC2.kicad_pcb'
+ROOT  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PCB   = os.path.join(ROOT, 'SWC2.kicad_pcb')
 CLR      = 0.150
 HOLE_CLR = 0.200
 EDGE_CLR = 0.500

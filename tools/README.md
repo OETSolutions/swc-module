@@ -86,12 +86,16 @@ The board path is usually the argument (some take further flags; run with no
 arguments or read the docstring for usage):
 
 ```
-PYTHONPATH=<uv-cache>/mcp_server_kicad \
-  python3 tools/addmodels.py SWC.kicad_pcb
+python3 tools/addmodels.py SWC.kicad_pcb
 ```
 
-`PYTHONPATH` is needed because the writers use the MCP server's own s-expression
-parser (`mcp_server_kicad._cst`) so their output matches KiCad's byte for byte.
+The writers use the MCP server's own s-expression parser
+(`mcp_server_kicad._cst`) so their output matches KiCad's byte for byte.
+`fieldplace` (imported by all of them) puts that package on `sys.path` itself,
+resolving it from `SWC_MCP_SERVER_KICAD` if set or otherwise from the `uvx`
+cache (`~/.cache/uv/archive-v0/*/mcp_server_kicad`) — set `SWC_MCP_SERVER_KICAD`
+to the directory that contains `mcp_server_kicad/` to pin it explicitly, e.g. in
+CI or a checkout where the module is vendored elsewhere.
 `addmodels.py`, `pcbfields.py` and friends are idempotent — running one twice
 changes nothing the second time.
 

@@ -80,16 +80,17 @@ measured off a render instead (see below):
 
 Usage: addmodels.py PCB
 """
+import os
 import sys
 
 sys.path.insert(0, __import__('os').path.dirname(__import__('os').path.abspath(__file__)))
 import fieldplace as F                                    # noqa: E402
 from mcp_server_kicad import _cst as C                    # noqa: E402
 
-PCB = ('<repo-root>'
-       '/SWC.kicad_pcb')
-MODELS = ('<repo-root>'
-          '/3dmodels')
+# Repo root is two levels up from this file (tools/ lives at the root).
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PCB = os.path.join(ROOT, 'SWC.kicad_pcb')
+MODELS = os.path.join(ROOT, '3dmodels')
 
 TB2 = 'TerminalBlock_CUI_TB007-508-02_1x02_P5.08mm_Horizontal'
 TB3 = 'TerminalBlock_CUI_TB007-508-03_1x03_P5.08mm_Horizontal'

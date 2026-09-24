@@ -17,7 +17,7 @@ unchanged — the `iface='hci0'` argument is unused by the bleak backend.
 
   1. The BLE service advertises and is discoverable as `SWC-<short-id>`.
   2. A Sec1 session establishes ONLY with the correct PoP — the derived
-     `<PoP>`-style secret the app shows over USB — and a WRONG PoP is refused
+     a `<PoP>`-style secret the app shows over USB — and a WRONG PoP is refused
      (the security property: an unauthenticated provisioning window would be a
      radio-range takeover).
   3. `CmdSetConfig` returns status 0 (credentials accepted).

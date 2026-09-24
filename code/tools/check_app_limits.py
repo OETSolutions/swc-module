@@ -36,6 +36,8 @@ NDJSON_H = REPO / "lib" / "Link" / "Ndjson.h"
 CONFIG_KT = REPO / "android" / "app" / "src" / "main" / "java" / "com" / "oetsolutions" / "swc" / "model" / "Config.kt"
 SWC_CLIENT_KT = REPO / "android" / "app" / "src" / "main" / "java" / "com" / "oetsolutions" / "swc" / "link" / "SwcClient.kt"
 MANIFEST_FETCHER_KT = REPO / "android" / "app" / "src" / "main" / "java" / "com" / "oetsolutions" / "swc" / "update" / "ManifestFetcher.kt"
+LADDER_SCREEN_KT = REPO / "android" / "app" / "src" / "main" / "java" / "com" / "oetsolutions" / "swc" / "ui" / "LadderScreen.kt"
+LADDER_DECODE_CPP = REPO / "lib" / "Analog" / "LadderDecode.cpp"
 
 # (label, C++ constant, Kotlin constant, C++ header). The header is explicit because
 # not every width the app mirrors lives in ConfigModel.h: `LadderButton.id` is
@@ -109,6 +111,12 @@ PAIRS = [
     ("device-id width",      "kDeviceIdLen",          "K_DEVICE_ID_LEN",         CONFIG_MODEL),
     ("adc ceiling",          "kAdcFullScaleMv12dB",   "K_ADC_CEILING_MV",        CALIBRATION_H),
     ("ladder button max",    "kLadderMaxButtons",     "K_LADDER_MAX_BUTTONS",    LADDER_DECODE),
+    # FR-30's rail-health floor. The app now MIRRORS the firmware's sag test so its
+    # ladder screen can say "rail fault" (open item N-77), which makes this a
+    # threshold with two homes: a re-tune on one side would let the screen report
+    # "healthy" while the device is faulting, or the reverse. The C++ side is a
+    # `constexpr` in the .cpp (not the header), so the pair reads the .cpp.
+    ("rail-health floor",    "kRailHealthFloorPermille", "kRailHealthFloorPermille", LADDER_DECODE_CPP),
 ]
 
 
@@ -146,8 +154,9 @@ def _kt_constant(text, name):
 
 
 def main() -> int:
-    for p in (CONFIG_MODEL, LADDER_DECODE, BASE64_H, CONFIG_CODEC_H, NDJSON_H,
-              OTA_USB_H, CALIBRATION_H, CONFIG_KT, SWC_CLIENT_KT, MANIFEST_FETCHER_KT):
+    for p in (CONFIG_MODEL, LADDER_DECODE, LADDER_DECODE_CPP, BASE64_H, CONFIG_CODEC_H,
+              NDJSON_H, OTA_USB_H, CALIBRATION_H, CONFIG_KT, SWC_CLIENT_KT,
+              MANIFEST_FETCHER_KT, LADDER_SCREEN_KT):
         if not p.is_file():
             print(f"FAIL: {p} not found", file=sys.stderr)
             return 2
@@ -160,11 +169,13 @@ def main() -> int:
         NDJSON_H: NDJSON_H.read_text(),
         OTA_USB_H: OTA_USB_H.read_text(),
         CALIBRATION_H: CALIBRATION_H.read_text(),
+        LADDER_DECODE_CPP: LADDER_DECODE_CPP.read_text(),
     }
     kt_by_file = {
         CONFIG_KT: CONFIG_KT.read_text(),
         SWC_CLIENT_KT: SWC_CLIENT_KT.read_text(),
         MANIFEST_FETCHER_KT: MANIFEST_FETCHER_KT.read_text(),
+        LADDER_SCREEN_KT: LADDER_SCREEN_KT.read_text(),
     }
 
     def kt_find(name):

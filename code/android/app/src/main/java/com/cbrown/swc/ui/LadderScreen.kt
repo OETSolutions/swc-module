@@ -40,6 +40,13 @@ data class LearnedButton(
     val name: String,
     val mvCenter: Int,
     val mvTolerance: Int,
+    /**
+     * The +3V3 rail the button was LEARNED at (spec 3.4 `learned_at_rail_mv`), in
+     * millivolts. Shown because FR-30 promises the app can "display absolute
+     * millivolts" -- a reading is only interpretable against the rail it was taken
+     * on, and a user comparing two learns needs to know the rail did not move.
+     */
+    val learnedAtRailMv: Int = 3300,
 )
 
 data class LadderUiState(
@@ -136,7 +143,42 @@ data class LadderUiState(
     /** The firmware's own rounding: `(mv * 1000 + idle/2) / idle` (`LadderRatioPermille`). */
     private fun ratioOf(mv: Int, idle: Int): Int =
         if (idle <= 0) 0 else ((mv.toLong() * 1000 + idle / 2) / idle).toInt()
+
+    /**
+     * FR-30's sag detection: true when the LIVE idle has collapsed toward zero
+     * relative to the learned one -- a regulator fault, not a press.
+     *
+     * **The threshold is the firmware's, not a new one.** `LadderClassify`
+     * (`LadderDecode.cpp`) rejects a profile whose `idle_mv` falls below
+     * `learned_idle_mv * [kRailHealthFloorPermille]/1000` and raises `kFault`. The
+     * app mirrors that test so the screen and the device agree about what a
+     * collapsed rail is; a second, independently-chosen threshold would let the UI
+     * say "healthy" while the device is faulting, which is the exact
+     * disagreement N-77 exists to remove. The floor is a PERMILLE figure applied to
+     * the idle, not the 20 % of the reading the earlier spec prose (wrongly) named.
+     *
+     * Null when there is nothing to compare -- no live idle yet, an unlearned
+     * channel, or a frame whose denom is the AUX nominal rather than a real wheel
+     * idle -- so the screen shows nothing rather than a false alarm.
+     */
+    fun railSagging(): Boolean? {
+        val live = liveIdleMv ?: return null
+        if (idleMv <= 0 || live <= 0) return null
+        return live < (idleMv.toLong() * kRailHealthFloorPermille / 1000).toInt()
+    }
 }
+
+/**
+ * FR-30's rail-health floor, in permille of the learned idle.
+ *
+ * One home, and it mirrors `kRailHealthFloorPermille` in
+ * `lib/Analog/LadderDecode.cpp` (200, i.e. a collapse to <=20 %). Kept as a named
+ * app constant rather than inlined so the gate that pins the app's numbers against
+ * the firmware's can find it -- `tools/check_app_limits.py` reads the firmware's
+ * limits, and this is the same "the app must not invent its own threshold" rule the
+ * config limits follow.
+ */
+internal const val kRailHealthFloorPermille = 200
 
 /**
  * The live ladder: the diagnostic that separates an adapter fault from a head-unit
@@ -171,6 +213,15 @@ fun LadderScreen(state: LadderUiState, modifier: Modifier = Modifier) {
                     style = MaterialTheme.typography.titleMedium,
                 )
                 Text("Rail (idle): ${state.idleMv} mV", style = MaterialTheme.typography.bodyMedium)
+                // FR-30's display clause: the +3V3 rail each button was LEARNED at.
+                // Shown per-button because a re-learn can move it, and a user with
+                // two buttons learned on different rails needs to see that.
+                state.buttons.map { it.learnedAtRailMv }.distinct().forEach { rail ->
+                    Text(
+                        "Learned at +3V3 rail: $rail mV",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
                 Text(
                     state.liveMv?.let { "Reading: $it mV" } ?: "Reading: —",
                     style = MaterialTheme.typography.headlineSmall,
@@ -179,6 +230,21 @@ fun LadderScreen(state: LadderUiState, modifier: Modifier = Modifier) {
                     matched?.let { "Classified as: ${it.name}" } ?: "Classified as: nothing",
                     style = MaterialTheme.typography.bodyLarge,
                 )
+                // FR-30's detectability clause: a live idle collapsed toward zero is
+                // a regulator fault, and saying so is the difference between "your
+                // adapter is broken" and "your car's 3V3 is failing".
+                if (state.railSagging() == true) {
+                    Text(
+                        "Rail fault: the +3V3 supply has sagged to ${state.liveIdleMv} mV " +
+                            "(was ${state.idleMv} mV at learn). This is a regulator fault, " +
+                            "not a button press.",
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = Color(0xFFD32F2F),
+                        modifier = Modifier.semantics {
+                            contentDescription = "rail fault, +3V3 sagged"
+                        }.testTag("rail-fault"),
+                    )
+                }
                 // The gesture the DEVICE reported, which is not derivable from the
                 // reading: the classifier answers "which window", and the gesture
                 // machine answers "single, double or long". Showing both is what

@@ -149,6 +149,50 @@ class LadderScreenTest {
             "This channel has no learned rail yet. Learn a button first."
         ).assertIsDisplayed()
     }
+
+    @Test
+    fun `the learned rail is displayed per FR-30's display clause`() {
+        // FR-30: `learned_at_rail_mv` exists "so the app can display absolute
+        // millivolts". Before N-77 nothing rendered it, so the field round-tripped
+        // and was read by no screen.
+        composeRule.setContent { LadderScreen(state = state(liveMv = 1430)) }
+        composeRule.onNodeWithText("Learned at +3V3 rail: 3300 mV").assertIsDisplayed()
+    }
+
+    @Test
+    fun `a sagged rail is reported as a fault, not as a press`() {
+        // FR-30's detectability clause: a live idle collapsed to <=20 % of the
+        // learned one is a regulator fault. The threshold is the firmware's own
+        // `kRailHealthFloorPermille`, so the app and the device agree.
+        composeRule.setContent {
+            LadderScreen(
+                state = state(liveMv = 400).copy(liveIdleMv = 500),  // 500 < 2835*0.2 = 567
+            )
+        }
+        composeRule.onNodeWithContentDescription("rail fault, +3V3 sagged").assertExists()
+    }
+
+    @Test
+    fun `a rail within its tolerance is not reported as a fault`() {
+        // The failure this prevents is a false alarm: a healthy rail that has
+        // drifted inside the regulator's +/-5 % must read as healthy, or the screen
+        // is noise a user learns to ignore.
+        composeRule.setContent {
+            LadderScreen(
+                state = state(liveMv = 1430).copy(liveIdleMv = 2830),
+            )
+        }
+        composeRule.onNodeWithTag("rail-fault").assertDoesNotExist()
+    }
+
+    @Test
+    fun `with no live idle there is nothing to compare so no fault is claimed`() {
+        // A frame carrying no idle, or an unlearned channel, must not produce a
+        // false "rail fault": the screen shows nothing rather than a wrong answer.
+        assertEquals(null, state(liveMv = 1430).railSagging())
+        assertEquals(false, state(liveMv = 1430).copy(liveIdleMv = 2820).railSagging())
+        assertEquals(true, state(liveMv = 1430).copy(liveIdleMv = 500).railSagging())
+    }
 }
 
 @RunWith(RobolectricTestRunner::class)

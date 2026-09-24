@@ -594,7 +594,8 @@ class AppViewModel(
             channelName = chosen.name.ifEmpty { "SWC${at + 1}" },
             buttons = chosen.ladder.buttons.map { b: LadderButton ->
                 LearnedButton(id = b.id, name = b.name.ifEmpty { b.id },
-                    mvCenter = b.mvCenter, mvTolerance = b.mvTolerance)
+                    mvCenter = b.mvCenter, mvTolerance = b.mvTolerance,
+                    learnedAtRailMv = b.learnedAtRailMv)
             },
         )
     }

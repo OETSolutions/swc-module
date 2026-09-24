@@ -17,20 +17,12 @@ constexpr int kAdcFullScaleMv12dB = 2900;
 // firmware to fall back to a documented linear approximation *and report that
 // it did*, rather than silently mis-scaling every reading.
 //
-// **The production report does NOT go through `source` below, and an earlier
-// comment here claimed it did** ("Carrying the source on the struct is what makes
-// 'report' possible; a caller that never checks it is the silent-fallback fault
-// the spec names"). That sentence was false: the reported flag is EspHal's own
-// `g_state.cali_degraded`, set from the same `supported` local in `InitCalibration`
-// and surfaced through `EspHalCalibrationIsDegraded` to the boot path. The
-// `source` field has ONE reader in the whole tree, `CalibrationCurveTest`, so it is
-// informational rather than load-bearing.
-//
-// That leaves TWO homes for one fact (this field and EspHal's flag), which is the
-// duplicate-home shape this project keeps re-finding. Today they cannot disagree --
-// both are derived from the same `supported` value on adjacent lines -- but a
-// re-tune of one would be silent. Recorded as spec open item N-64; the durable fix
-// is for EspHal to report `g_state.curve.source` and drop its parallel bool.
+// **`source` is now the SINGLE home for which curve is in use (N-64 resolved).**
+// EspHal reports `g_state.curve.source` in `HalCalibrationDegraded` /
+// `EspHalCalibrationIsDegraded` and its parallel `cali_degraded` bool is gone, so
+// there is one derivation of "the calibrated curve or the fallback", not two that
+// could drift. (An earlier comment here wrongly claimed the report went through
+// this field while it did not; that duplication was N-64.)
 enum class CalibrationSource { kEFuseCurveFit, kLinearFallback };
 
 // Two-point calibration, which is the shape the ESP-IDF curve-fit calibration

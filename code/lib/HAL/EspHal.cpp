@@ -48,7 +48,6 @@ struct EspHalState {
     // The two-point curve the logic uses (Task 4). Derived from the eFuse
     // scheme when available, else the documented linear approximation.
     AdcCalibration            curve;
-    bool                      cali_degraded;
     i2c_master_bus_handle_t   i2c_bus;
     i2c_master_dev_handle_t   dac;
     // Latched by any failed DAC write. See HalDacSetCode and IHAL::dac_faulted.
@@ -351,8 +350,11 @@ static bool HalCalibrationDegraded(void *ctx)
 {
     (void)ctx;
     // Spec 3.2's "fall back AND report that it did" (spec 4.3's
-    // `status.calibration_degraded`). False means the eFuse curve is in use.
-    return g_state.cali_degraded;
+    // `status.calibration_degraded`). **Read from the CURVE's own `source`**, so
+    // the struct field that carries the choice is the single home for it -- the
+    // parallel `cali_degraded` bool N-64 recorded is gone, and the two can no
+    // longer drift.
+    return g_state.curve.source == CalibrationSource::kLinearFallback;
 }
 
 static int HalNvsGet(void *ctx, const char *key, void *out, size_t len)
@@ -478,7 +480,6 @@ static void InitCalibration(void)
 
     const bool supported = (err == ESP_OK);
     g_state.curve = AdcCalibrationSelect(supported);
-    g_state.cali_degraded = !supported;
 
     if (!supported) {
         // Reported, not silent (spec 3.2): a log at init here, and BOOT_DEGRADED
@@ -644,5 +645,6 @@ IHAL *EspHalInit(void)
 
 bool EspHalCalibrationIsDegraded(void)
 {
-    return g_state.cali_degraded;
+    // The same single home as `HalCalibrationDegraded`: the curve's `source`.
+    return g_state.curve.source == CalibrationSource::kLinearFallback;
 }

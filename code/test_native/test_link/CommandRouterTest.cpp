@@ -494,6 +494,23 @@ TEST(CommandRouter, ASequenceNumberIsAssignedMonotonicallyPerDirection) {
     EXPECT_GT(r.LastSeenSeqSent(), first);
 }
 
+TEST(CommandRouter, LastSeenSeqReceivedIsZeroBeforeAnyFrameArrives) {
+    // N-65: the accessor is `expected_seq_ - 1`, and `expected_seq_` starts at 1, so
+    // before the first frame it would report "seq 0 was received" when nothing had
+    // been. The `seen_any_` guard is the fix; this pins it so a future consumer does
+    // not read a false value in the exact case it is most likely to ask.
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    CommandRouter r(&hal.InterfaceRef(), nullptr, &store);
+    cap.Attach(r);
+    r.OnConnected();
+    EXPECT_EQ(r.LastSeenSeqReceived(), 0u)
+        << "no frame has arrived, so nothing has been received";
+
+    const std::string p = "{\"v\":1,\"seq\":7,\"type\":\"ping\"}";
+    r.OnLine(p.c_str(), p.size());
+    EXPECT_EQ(r.LastSeenSeqReceived(), 7u) << "the seq of the one frame that arrived";
+}
+
 TEST(CommandRouter, PingIsAnsweredWithStatusCarryingForSeq) {
     // Spec 4.3: `ping` is "Liveness; FW answers `status`". There is no `pong`
     // frame type, and the reply does NOT echo the peer's `seq` -- `seq` is each

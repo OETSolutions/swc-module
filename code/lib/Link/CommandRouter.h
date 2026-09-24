@@ -142,7 +142,18 @@ public:
     static constexpr uint32_t kTestKeyMaxHoldMs = 1000;
 
     uint32_t LastSeenSeqSent() const { return seq_sent_; }
-    uint32_t LastSeenSeqReceived() const { return expected_seq_ - 1; }
+
+    /*
+     * The highest seq RECEIVED from the peer, or 0 when none has been.
+     *
+     * **The `seen_any_` guard is the fix (N-65).** The field is `expected_seq_ - 1`,
+     * and `expected_seq_` starts at 1, so before the first frame this would have
+     * reported "seq 0 was received" when nothing had been. No caller read it, so no
+     * wrong behaviour shipped -- but a link-diagnostics view is the obvious future
+     * consumer, and it would have read a value false exactly in the case it is most
+     * likely to be asked ("has anything arrived yet?").
+     */
+    uint32_t LastSeenSeqReceived() const { return seen_any_ ? expected_seq_ - 1 : 0; }
 
     /*
      * The two link-loss counters, reported in the `status` body.

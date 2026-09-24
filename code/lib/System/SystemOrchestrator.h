@@ -525,14 +525,14 @@ public:
         // window's double-flash, and the fault indication is the one that must
         // never be hidden.
         RestatLeds();
-        // **No buzzer, deliberately.** Spec 7.2's fault patterns each name a
-        // SUBSYSTEM -- `FAULT_DAC` is the I2C/DAC path, `FAULT_CONFIG` is a
-        // corrupt config -- and a collapsed rail or an open ladder input is
-        // neither. Playing `FAULT_DAC` here would tell the user to look at the
-        // wrong part of the board, which is worse than saying nothing, and the
-        // spec defines no pattern for a wiring fault. Spec 7.3 makes the LED the
-        // continuously-readable fault channel, and this indication latches, so it
-        // is still blinking whenever anyone looks. See open item N-10.
+        // **No buzzer HERE -- but the caller plays one.** This method is the LED
+        // half, and it stays silent by design: spec 7.2's fault patterns each name
+        // a SUBSYSTEM, and playing `FAULT_DAC` from here would tell the user to
+        // look at the wrong part of the board. A ladder/rail wiring fault is
+        // neither, so `ServiceChannel` plays `FAULT_INPUT` (spec 7.2, N-10) on its
+        // own transition into the fault, where the CAUSE is known. Spec 7.3 makes
+        // the LED the continuously-readable fault channel, and this indication
+        // latches, so it is still blinking whenever anyone looks.
     }
 
     // Either fault kind: the lamp is the single fault channel (spec 7.3), so a

@@ -36,6 +36,10 @@ Step StepsFor(BuzzerPattern p) {
         case BuzzerPattern::kLearnReject:   return {300, 80, 2};
         case BuzzerPattern::kFaultDac:      return {500, 300, 3};
         case BuzzerPattern::kFaultConfig:   return {500, 300, 4};
+        // Spec 7.2's INPUT fault (N-10): a ladder/rail wiring fault. 3 reps like
+        // FAULT_DAC -- a distinct, insistent rhythm -- so a user with led_level 0
+        // still hears that the device is faulted and needs attention.
+        case BuzzerPattern::kFaultInput:    return {500, 300, 3};
         case BuzzerPattern::kFactoryReset:  return {800, 200, 3};
         // Spec 7.2's OTA row has no 2022 numbers and its prose says "rising
         // double", which a fixed-tone gated buzzer cannot produce. Encoded as
@@ -60,7 +64,7 @@ BuzzerGrammar::BuzzerGrammar(IHAL *hal, uint8_t level) : hal_(hal), level_(level
 
 bool BuzzerGrammar::IsFatal(BuzzerPattern p) {
     return p == BuzzerPattern::kBootError || p == BuzzerPattern::kFaultDac ||
-           p == BuzzerPattern::kFaultConfig;
+           p == BuzzerPattern::kFaultConfig || p == BuzzerPattern::kFaultInput;
 }
 
 void BuzzerGrammar::Play(BuzzerPattern p) {
@@ -162,6 +166,7 @@ BuzzerPattern BuzzerPatternFromName(const char *name) {
         {"LearnReject", BuzzerPattern::kLearnReject},
         {"FaultDac", BuzzerPattern::kFaultDac},
         {"FaultConfig", BuzzerPattern::kFaultConfig},
+        {"FaultInput", BuzzerPattern::kFaultInput},
         {"FactoryReset", BuzzerPattern::kFactoryReset},
         {"OtaStart", BuzzerPattern::kOtaStart},
         {"OtaOk", BuzzerPattern::kOtaOk},

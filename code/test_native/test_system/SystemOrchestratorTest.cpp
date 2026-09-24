@@ -2273,6 +2273,34 @@ TEST(SystemOrchestrator, AnOutOfRangeChannelBlinksTheFaultLamp) {
     // (one edge) or breathing (a slow pair), so the count distinguishes them.
     EXPECT_GT(CountStatEdges(hal, o, 1000), 4)
         << "the fault indication must be a blink, not the normal solid/breathe";
+    // N-10: the AUDIBLE half. Spec 7.2 had no pattern for a wiring fault, so a
+    // user with `led_level` 0 got no fault indication at all; `FAULT_INPUT` now
+    // plays on the transition into the fault.
+    EXPECT_GT(hal.BuzzerOnCount(), 0)
+        << "a ladder fault must be audible, or a user with led_level 0 hears nothing";
+}
+
+TEST(SystemOrchestrator, ALadderFaultSoundsOnceOnTheEdgeNotEveryTick) {
+    // The buzzer grammar REPLACES on Play, so a per-tick re-arm would restart the
+    // pattern every 10 ms and it would never finish -- the user would hear a
+    // stutter, not a FAULT_INPUT. The play is guarded on the transition into the
+    // fault, so holding the fault for a second adds no further drives beyond the
+    // pattern's own.
+    MockHal hal;
+    auto o = MakeOrch(hal);
+    hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
+    o.Boot();
+
+    hal.SetAdcMilliVolts(ADC_CH_SWC1, 3000);
+    PollFor(o, hal, 100);            // latch the fault
+    ASSERT_TRUE(o.Faulted());
+    const int after_latch = hal.BuzzerOnCount();
+    // Hold the fault well past FAULT_INPUT's ~2.1 s total. Without the edge guard
+    // the count would climb by one per tick (~100/s); with it, only the pattern's
+    // own 3 pulses add drives.
+    PollFor(o, hal, 1200);
+    EXPECT_LT(hal.BuzzerOnCount() - after_latch, 20)
+        << "the fault pattern must not be re-armed every tick";
 }
 
 TEST(SystemOrchestrator, AFaultDoesNotClearItselfWhenTheLevelReturnsToIdle) {

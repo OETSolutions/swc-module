@@ -131,7 +131,8 @@ TEST(BuzzerGrammar, EverySpecPatternCompletesAndReleasesTheLine) {
         BuzzerPattern::kProgramSaved, BuzzerPattern::kProgramExit,
         BuzzerPattern::kProgramCancel,
         BuzzerPattern::kLearnPrompt, BuzzerPattern::kLearnOk, BuzzerPattern::kLearnReject,
-        BuzzerPattern::kFaultDac, BuzzerPattern::kFaultConfig, BuzzerPattern::kFactoryReset,
+        BuzzerPattern::kFaultDac, BuzzerPattern::kFaultConfig, BuzzerPattern::kFaultInput,
+        BuzzerPattern::kFactoryReset,
         BuzzerPattern::kOtaStart, BuzzerPattern::kOtaOk, BuzzerPattern::kOtaFail,
     };
     for (BuzzerPattern p : all) {

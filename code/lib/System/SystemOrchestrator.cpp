@@ -342,9 +342,9 @@ void SystemOrchestrator::ReportDacFault() {
     // so it latches exactly as FR-4's wiring fault does.
     ReportFault();
     // **§7.2's `FAULT_DAC` finally has a caller.** The pattern's meaning is
-    // "I2C/DAC fault", which is precisely this condition -- unlike the ladder and
-    // rail faults, which ReportFault deliberately leaves silent because no
-    // pattern names them (N-10). Playing it is the audible half the row asks for
+    // "I2C/DAC fault", which is precisely this condition -- distinct from the
+    // ladder/rail faults, which play their own `FAULT_INPUT` (N-10) rather than
+    // this one: playing FAULT_DAC for a wiring fault would name the wrong part. Playing it is the audible half the row asks for
     // ("report a fault"), and the buzzer's OFF level cannot suppress a FAULT_*
     // pattern (spec 7.2).
     buzzer_.Play(BuzzerPattern::kFaultDac);
@@ -2056,7 +2056,21 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             // safety half; this is the half the user can act on. The indication
             // latches (see ReportFault): a wiring fault does not clear itself, and
             // an indication that faded would be a lie.
+            //
+            // The buzzer is the audible half (N-10). Spec 7.2 had no pattern for a
+            // wiring fault -- the FAULT_* patterns named subsystems, and a collapsed
+            // rail or an open ladder input is neither -- so a user with `led_level`
+            // 0 got NO fault indication at all. `FAULT_INPUT` closes that.
+            //
+            // Guarded on the ONCE-ONLY edge: `hw_faulted_` is the latch, so the
+            // pattern is armed only on the transition into the fault. `ReportFault`
+            // sets it, so checking `!hw_faulted_` first is the edge detector, and a
+            // fault that persists for many ticks does not re-Play (which with a
+            // one-buzzer replace-not-queue grammar would restart the pattern every
+            // tick and never let it finish).
+            const bool first = !Faulted();
             ReportFault();
+            if (first) buzzer_.Play(BuzzerPattern::kFaultInput);
         }
         return;
     }

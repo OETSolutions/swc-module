@@ -104,6 +104,7 @@ TEST(ActionLibrary, ThePatternNamesTheBuzzerTableUsesParseBack) {
     EXPECT_EQ(BuzzerPatternFromName("KeyUnknown"), BuzzerPattern::kKeyUnknown);
     EXPECT_EQ(BuzzerPatternFromName("LearnOk"), BuzzerPattern::kLearnOk);
     EXPECT_EQ(BuzzerPatternFromName("FaultConfig"), BuzzerPattern::kFaultConfig);
+    EXPECT_EQ(BuzzerPatternFromName("FaultInput"), BuzzerPattern::kFaultInput);
     EXPECT_EQ(BuzzerPatternFromName("OtaFail"), BuzzerPattern::kOtaFail);
     EXPECT_EQ(BuzzerPatternFromName("BootOk"), BuzzerPattern::kBootOk);
     EXPECT_EQ(BuzzerPatternFromName("FactoryReset"), BuzzerPattern::kFactoryReset);

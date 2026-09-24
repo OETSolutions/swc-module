@@ -16,7 +16,7 @@ enum class BuzzerPattern {
     kKeyAccepted, kKeyUnknown,
     kProgramEnter, kProgramStep, kProgramSaved, kProgramExit, kProgramCancel,
     kLearnPrompt, kLearnOk, kLearnReject,
-    kFaultDac, kFaultConfig, kFactoryReset,
+    kFaultDac, kFaultConfig, kFaultInput, kFactoryReset,
     kOtaStart, kOtaOk, kOtaFail,
 };
 

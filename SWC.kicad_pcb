@@ -10,7 +10,7 @@
 	(title_block
 		(title "Steering Wheel Controls Adapter")
 		(date "2026-09-10")
-		(rev "A")
+		(rev "B")
 		(company "OETSolutions, Inc.")
 	)
 	(layers
@@ -24015,33 +24015,27 @@
 		(path "/abe83ff1-8845-4961-bb4f-8cce4e5f7299")
 		(sheetname "/")
 		(sheetfile "SWC.kicad_sch")
-		(units
-			(unit
-				(name "A")
-				(pins "1" "2")
-			)
-		)
 		(attr through_hole)
 		(duplicate_pad_numbers_are_jumpers no)
 		(fp_line
-			(start 8.81126 0)
-			(end 10.81024 0)
-			(stroke
-				(width 0.12)
-				(type solid)
-			)
-			(layer "F.SilkS")
-			(uuid "8d6e0b9a-b8a9-4a02-8f46-a6be2967d52c")
-		)
-		(fp_line
-			(start 9.80948 -1.00076)
-			(end 9.80948 1.00076)
+			(start -3 -1)
+			(end -1.00102 -1)
 			(stroke
 				(width 0.12)
 				(type solid)
 			)
 			(layer "F.SilkS")
 			(uuid "2d202e74-9824-45d8-8596-a150ef4138fb")
+		)
+		(fp_line
+			(start -2.00178 -2.00076)
+			(end -2.00178 0.00076)
+			(stroke
+				(width 0.12)
+				(type solid)
+			)
+			(layer "F.SilkS")
+			(uuid "8d6e0b9a-b8a9-4a02-8f46-a6be2967d52c")
 		)
 		(fp_circle
 			(center 3.81 0)
@@ -28533,18 +28527,6 @@
 				(thickness 0.12)
 			)
 			(justify mirror)
-		)
-	)
-	(gr_text "JLCJLCJLCJLC"
-		(at 50.5 71 90)
-		(layer "B.SilkS")
-		(uuid "452513cd-1d79-4de9-9229-da442d31a38c")
-		(effects
-			(font
-				(size 0.8 0.8)
-				(thickness 0.12)
-			)
-			(justify left bottom mirror)
 		)
 	)
 	(gr_text "12V DC IN"

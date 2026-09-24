@@ -68,11 +68,14 @@ except ImportError:  # pragma: no cover
           file=sys.stderr)
     sys.exit(2)
 
-# IDF's `esp_reset_reason_t`. `INT_WDT` is the interrupt watchdog -- the one this
-# build can fire (the task WDT does not panic here, and brownout needs a power cut).
-ESP_RST_INT_WDT = 3
-ESP_RST_TASK_WDT = 4
-ESP_RST_WDT = 5
+# IDF's `esp_reset_reason_t` (values are positional, from `esp_system.h`):
+#   0 UNKNOWN, 1 POWERON, 2 EXT, 3 SW, 4 PANIC, 5 INT_WDT, 6 TASK_WDT, 7 WDT, ...
+# INT_WDT is the interrupt watchdog -- the one this build fires (the task WDT does
+# not panic here, and brownout needs a power cut). A software `reboot` reports 3.
+ESP_RST_SW = 3
+ESP_RST_INT_WDT = 5
+ESP_RST_TASK_WDT = 6
+ESP_RST_WDT = 7
 WDT_REASONS = (ESP_RST_INT_WDT, ESP_RST_TASK_WDT, ESP_RST_WDT)
 # A normal reboot on this bench re-enumerates and answers within ~1.5 s; the
 # stall + interrupt-WDT timeout adds several seconds. Used as corroboration only.

@@ -1929,53 +1929,52 @@ TEST(SystemOrchestrator, AConfigFlagWithNoDurableConfigOpensOnceButPersistsNothi
         << "a non-durable boot must not persist anything into NVS";
 }
 
-TEST(SystemOrchestrator, TheMaintenanceTriggerIsRecordedAndNothingInProductionBranchesOnIt) {
+TEST(SystemOrchestrator, TheMaintenanceTriggerIsRecordedAndTheAuxHoldIsAcknowledged) {
     // `MaintenanceTrigger` documents itself as existing because "the caller's
     // shutdown path differs": a USB command should be acknowledged, an AUX1 hold
-    // gets a buzzer, and a no-config boot "must explain itself on the LED". None of
-    // that exists. `kNoConfigAtBoot` still has NO emitter anywhere, and no
-    // production code branches on the trigger at all -- the only reader in the tree
-    // is the accessor `MaintenanceTriggeredBy()`, whose sole caller is a test. So a
-    // device in maintenance mode is INDISTINGUISHABLE, on the wire and to the user,
-    // from one whose window opened for any other reason.
+    // gets a buzzer, and a no-config boot "must explain itself on the LED". The
+    // first two are now implemented (N-61); `kNoConfigAtBoot` still has NO emitter
+    // anywhere (N-13's other half -- a device with no config already reaches
+    // pass-through, so the path is redundant).
     //
-    // (`kConfigFlag` used to be in that list too and is NOT any more: FR-33's
-    // next-boot trigger is now wired -- `settings.maintenance_on_boot`, consumed
-    // and persisted by `Boot` -- so three of the four §8.2 triggers have emitters.
-    // The one still missing is the reset-reason case, N-13's other half.)
-    //
-    // **That matters most for the AUX1 path, which is the no-app path.** A user who
-    // holds AUX1 for 3 s gets LED_STAT's double-flash -- and so does a user whose
-    // window opened from the app, or from a config flag. The LED is the only
-    // evidence a no-app user has, and it cannot say which. The buzzer the enum
-    // promises for an AUX1 hold is never played.
-    //
-    // This test records the state rather than fixing it: making the triggers
-    // distinct is a feature (a per-trigger acknowledgement plus a wire field),
-    // not a repair, and the recorded finding is N-61.
+    // **The AUX1 ack is the one that matters most, because it is the no-app path.**
+    // A user who holds AUX1 for 3 s gets LED_STAT's double-flash -- and so does a
+    // user whose window opened from the app, or from a config flag. Before this
+    // fix the LED was the only evidence a no-app user had, and it could not say
+    // which path they took. `PROGRAM_ENTER` (spec 7.2, and the row §7.5's flow
+    // already names for this exact step) now plays on the enter edge.
     MockHal hal;
     auto o = MakeOrch(hal);
     hal.SetAdcMilliVolts(ADC_CH_KEY_SENSE1, kSenseFor5vHeadUnit);
     hal.SetAdcMilliVolts(ADC_CH_AUX1, kAuxReleasedMv);
     hal.SetAdcMilliVolts(ADC_CH_SWC1, 2835);
     o.Boot();
+    // Let the boot pattern finish before counting, or its remaining line writes
+    // land inside the "no buzzer for USB" window and the equality sees them.
+    PollFor(o, hal, 400);
 
-    // The USB path records kUsbCommand...
+    // The USB path records kUsbCommand and does NOT sound the buzzer -- the app
+    // that opened the window is looking at the screen, and a beep there would be
+    // unexplained. (The router owns that path's acknowledgement; see the frame.)
+    const int before_usb = hal.BuzzerOnCount();
     o.EnterMaintenance(MaintenanceTrigger::kUsbCommand, hal.NowMs());
     ASSERT_TRUE(o.MaintenanceActive());
-    EXPECT_EQ(o.MaintenanceTriggeredBy(), MaintenanceTrigger::kUsbCommand)
-        << "the trigger is recorded faithfully -- this is not the defect";
+    EXPECT_EQ(o.MaintenanceTriggeredBy(), MaintenanceTrigger::kUsbCommand);
+    PollFor(o, hal, 200);
+    EXPECT_EQ(hal.BuzzerOnCount(), before_usb)
+        << "the USB path is not the no-app path: no buzzer for an app-opened window";
     o.ExitMaintenance();
+    PollFor(o, hal, 400);
 
-    // ...and the AUX1 path records kAux1Hold. The two ARE distinguished in the
-    // stored value; what is missing is any consequence of the difference.
+    // The AUX1 path records kAux1Hold AND sounds it, so a user holding the button
+    // at the car hears that their hold took effect.
+    const int before_aux = hal.BuzzerOnCount();
     HoldAuxFor(o, hal, SystemOrchestrator::kMaintenanceHoldMs + 150);
     ASSERT_TRUE(o.MaintenanceActive());
     EXPECT_EQ(o.MaintenanceTriggeredBy(), MaintenanceTrigger::kAux1Hold);
+    EXPECT_GT(hal.BuzzerOnCount(), before_aux)
+        << "the AUX1 hold must be audible: it is the only channel a no-app user has";
 
-    // The observable consequence that IS missing: an AUX1 hold plays no
-    // acknowledgement. Nothing in this build plays a maintenance-entered pattern
-    // for either trigger, so the two are indistinguishable to the user.
     EXPECT_FALSE(o.LearnActive()) << "escalation still leaves no learn behind it";
 }
 

@@ -900,6 +900,13 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
                 wizard_.Abandon(now_ms);
             }
             maintenance_.Enter(MaintenanceTrigger::kAux1Hold, now_ms);
+            // N-61: say WHY on the buzzer, which the app-opened path cannot. A
+            // user holding AUX1 at the car has no phone in hand, so the one
+            // channel they have is sound -- and without this the AUX1 hold is
+            // indistinguishable from the app opening the window, which the enum's
+            // own doc-comment claimed the buzzer existed to distinguish. Played
+            // on the ENTER edge (the latch above), not per tick.
+            buzzer_.Play(BuzzerPattern::kProgramEnter);
         } else if ((now_ms - aux_hold_ms_) >= LearnWizard::kEnterHoldMs && !aux_hold_latch_) {
             // The hold has armed the wizard. The LATCH, not this flag, prevents a
             // second arm: the flag is cleared so the next release re-arms.

@@ -1,5 +1,16 @@
 #include "Maintenance/MaintenanceMode.h"
 
+const char *MaintenanceTriggerName(MaintenanceTrigger t) {
+    switch (t) {
+        case MaintenanceTrigger::kUsbCommand:    return "usb_command";
+        case MaintenanceTrigger::kConfigFlag:    return "config_flag";
+        case MaintenanceTrigger::kAux1Hold:      return "aux1_hold";
+        case MaintenanceTrigger::kNoConfigAtBoot: return "no_config_at_boot";
+        case MaintenanceTrigger::kNone:          break;
+    }
+    return "none";
+}
+
 MaintenanceMode::MaintenanceMode(IHAL *hal, uint32_t timeout_ms)
     : hal_(hal), timeout_ms_(timeout_ms) {}
 

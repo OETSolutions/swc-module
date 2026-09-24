@@ -509,6 +509,8 @@ class AppViewModel(
                     maintenanceToken = frame.fields["token"]?.jsonPrimitive?.content.orEmpty(),
                     maintenancePageUrl = frame.fields["page_url"]?.jsonPrimitive?.content.orEmpty(),
                     maintenanceBleName = frame.fields["ble_name"]?.jsonPrimitive?.content.orEmpty(),
+                    maintenanceTrigger =
+                        frame.fields["trigger"]?.jsonPrimitive?.content.orEmpty(),
                     maintenanceBleFailures =
                         frame.fields["ble_failures"]?.jsonPrimitive?.intOrNull ?: 0,
                     // A frame that reports the window closed clears any stale

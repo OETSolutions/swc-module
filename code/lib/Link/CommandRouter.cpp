@@ -498,11 +498,20 @@ void CommandRouter::PublishMaintenanceIfChanged() {
     char body[512];
     snprintf(body, sizeof(body),
              "\"active\":%s,\"pop\":\"%s\",\"token\":\"%s\",\"page_url\":\"%s\","
-             "\"ble_name\":\"%s\",\"ble_failures\":%u",
+             "\"ble_name\":\"%s\",\"ble_failures\":%u,\"trigger\":\"%s\"",
              maintenance_info_.active ? "true" : "false",
              maintenance_info_.pop, maintenance_info_.token,
              maintenance_info_.page_url, maintenance_info_.ble_name,
-             static_cast<unsigned>(maintenance_failures_));
+             static_cast<unsigned>(maintenance_failures_),
+             // WHY the window opened (spec N-61). Read from the orchestrator rather
+             // than carried on `MaintenanceInfo`, so there is one home for the value
+             // (`MaintenanceMode`) instead of a copy a caller must remember to fill
+             // -- the N-61 shape, where a recorded value reached nobody. The `active`
+             // gate is what keeps the field honest: a closed window reports "none",
+             // so a trigger from the previous window cannot be read as this one's.
+             (sys_ != nullptr && sys_->MaintenanceActive())
+                 ? MaintenanceTriggerName(sys_->MaintenanceTriggeredBy())
+                 : "none");
     Emit("maintenance", body);
 
     published_info_ = maintenance_info_;

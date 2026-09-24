@@ -117,7 +117,12 @@ FRAMES = [
     # late-joining app sees the state without asking. All fields are empty when
     # `active` is false, which is what stops a stale secret being read off a
     # closed window.
-    Frame("maintenance",   "fw2app", "active,pop,token,page_url,ble_name,ble_failures"),
+        # `trigger` is WHY the window opened (spec N-61): one of `usb_command`,
+    # `config_flag`, `aux1_hold`, `no_config_at_boot`, or `none` when closed. It
+    # exists because a user holding AUX1 at the car saw exactly what the app
+    # saw -- the same double-flash -- so the device could not say which path
+    # opened the window, and the app can now name it.
+    Frame("maintenance",   "fw2app", "active,pop,token,page_url,ble_name,ble_failures,trigger"),
     # `ack` carries `for_seq` and `ok` -- and `mv_center`/`mv_tolerance` on the
     # ONE ack that has them, `learn_commit`'s (CommandRouter::HandleLearnCommit),
     # where the derived window is the answer the learn screen exists to read. It

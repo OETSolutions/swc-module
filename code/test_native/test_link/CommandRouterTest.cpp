@@ -172,7 +172,51 @@ std::string MaintenanceFrame(const Capture &cap) {
     }
     return "";
 }
+
+// The LAST `maintenance` line, for a test that opens then closes: the frame is
+// emitted on change, so both states are in the capture and only the newest answers
+// "what does the app see now".
+std::string LastMaintenanceFrame(const Capture &cap) {
+    std::string last;
+    for (const auto &l : cap.lines) {
+        if (l.find("\"type\":\"maintenance\"") != std::string::npos) last = l;
+    }
+    return last;
+}
 }  // namespace
+
+// The frame NAMES why the window opened (spec N-61). Without this the app could
+// show a maintenance card that did not say which path opened it, so a user who
+// held AUX1 and a user who tapped the button saw the same thing -- which is the
+// finding N-61 records.
+TEST(CommandRouter, TheMaintenanceFrameNamesWhyTheWindowOpened) {
+    MockHal hal; Capture cap; ConfigStore store(&hal.InterfaceRef());
+    MockHal::Defaults d;
+    SystemOrchestrator sys(&hal.InterfaceRef(), d.config, d.timings);
+    sys.Boot();
+    CommandRouter r(&hal.InterfaceRef(), &sys, &store);
+    cap.Attach(r);
+
+    // The AUX1 path, which is the no-app path and the one a user cannot otherwise
+    // identify.
+    sys.EnterMaintenance(MaintenanceTrigger::kAux1Hold, hal.NowMs());
+    r.SetMaintenanceInfo(OpenWindow("A1B2C3", "ABCDEF123456"), 0);
+
+    const std::string f = MaintenanceFrame(cap);
+    ASSERT_FALSE(f.empty()) << "the window opened and no maintenance frame went out";
+    EXPECT_NE(f.find("\"trigger\":\"aux1_hold\""), std::string::npos)
+        << "the frame must name the AUX1 hold; got: " << f;
+
+    // A closed window reports `none`, so a trigger from the previous window can
+    // never be read as this one's.
+    sys.ExitMaintenance();
+    MaintenanceInfo closed;   // active=false
+    r.SetMaintenanceInfo(closed, 0);
+    const std::string c = LastMaintenanceFrame(cap);
+    EXPECT_NE(c.find("\"active\":false"), std::string::npos) << c;
+    EXPECT_NE(c.find("\"trigger\":\"none\""), std::string::npos)
+        << "a closed window must not carry the last trigger; got: " << c;
+}
 
 // The secrets reach the app with their values, so a user can type the PoP and
 // open the page. A frame that carried the fields but not the values would satisfy

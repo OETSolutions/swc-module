@@ -51,6 +51,55 @@ class LinkScreenTimeoutTest {
     }
 
     @Test
+    fun `the open card names WHY the window opened`() {
+        // N-61: the device records the trigger, and until the field was carried to
+        // this card a user holding AUX1 at the car saw exactly what a user who
+        // tapped "Enter maintenance mode" saw -- the same double-flash. The card is
+        // the only place a user can learn which path they took.
+        composeRule.setContent {
+            LinkScreen(
+                state = LinkUiState(
+                    maintenanceOpen = true,
+                    maintenanceTrigger = "aux1_hold",
+                ),
+                onRetry = {},
+                onEnterMaintenance = {},
+                onExitMaintenance = {},
+            )
+        }
+        composeRule
+            .onNodeWithText(
+                "Opened by: holding AUX1 on the device (no app needed)",
+            )
+            .assertIsDisplayed()
+    }
+
+    @Test
+    fun `no trigger line is shown while the window is closed`() {
+        // The field means nothing on a closed window, and a line reading "Opened
+        // by: …" under a "not in maintenance mode" card would be the exact confusion
+        // the trigger exists to remove.
+        composeRule.setContent {
+            LinkScreen(
+                state = LinkUiState(maintenanceOpen = false, maintenanceTrigger = "none"),
+                onRetry = {},
+                onEnterMaintenance = {},
+                onExitMaintenance = {},
+            )
+        }
+        composeRule.onNodeWithText("Opened by:", substring = true).assertDoesNotExist()
+    }
+
+    @Test
+    fun `a trigger word this build does not know is shown verbatim`() {
+        // A firmware that adds a trigger must not have its word silently mapped to
+        // a wrong phrase; the unknown word is surfaced so the app is not lying.
+        assertEquals("the app, over USB", describeTrigger("usb_command"))
+        assertEquals("holding AUX1 on the device (no app needed)", describeTrigger("aux1_hold"))
+        assertEquals("a_new_trigger", describeTrigger("a_new_trigger"))
+    }
+
+    @Test
     fun `the open card names the configured timeout and not the inactivity story`() {
         // The window is open and the radio has neither come up nor failed yet --
         // the frame that says so arrives a moment before the bring-up finishes, so

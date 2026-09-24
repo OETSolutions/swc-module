@@ -29,21 +29,18 @@
 /*
  * Why the window opened, for a caller that wants to say so.
  *
- * **No production code branches on this, and one value still has no source.**
- * The USB command, the 3 s AUX1 hold and — since N-83 — spec 8.2's "config flag
- * on next boot" (`settings.maintenance_on_boot`, consumed by
- * `SystemOrchestrator::Boot`) are wired. `kNoConfigAtBoot` needs a reset-reason
- * source `IHAL` does not expose, so it is the one still unreachable (N-13's
- * remaining half; that path is also redundant, since a device with no config
- * already reaches pass-through). The only reader in the tree is `Trigger()` below,
- * whose caller is a test. An earlier version of this comment claimed the values
- * were distinct "because the caller's shutdown path differs: a USB command should
- * get an acknowledgement, an AUX1 hold gets a buzzer, and booting with no config
- * is the one case that must explain itself on the LED" -- none of which is
- * implemented, and none of which spec 8.2 requires: the window opens on
- * `LED_STAT`'s double-flash for every trigger, identical to the app-opened case
- * (N-61). The distinction is available for the per-trigger feedback the spec does
- * not yet ask for; it is not a promise that the feedback exists.
+ * **The triggers are now distinguishable (N-61, resolved 2026-09-24).** Three have
+ * sources: the USB command, the 3 s AUX1 hold, and — since N-83 — spec 8.2's
+ * "config flag on next boot" (`settings.maintenance_on_boot`, consumed by
+ * `SystemOrchestrator::Boot`). `kNoConfigAtBoot` is the one with no emitter, and
+ * that is a DECISION rather than a gap: a device with no config already reaches
+ * pass-through (FR-25), so a reset-reason path would be redundant (N-13).
+ *
+ * The distinction now has consequences, which is what it lacked before: the AUX1
+ * hold plays `PROGRAM_ENTER` (the no-app user's only channel), and the
+ * `maintenance` frame carries `trigger` so the app can say "Opened by: …" —
+ * before this, a user holding AUX1 and a user tapping a button saw identical
+ * feedback and nothing could tell them apart.
  */
 enum class MaintenanceTrigger {
     kNone = 0,
@@ -52,6 +49,17 @@ enum class MaintenanceTrigger {
     kAux1Hold,
     kNoConfigAtBoot,   // FR-25's pass-through device offers provisioning at boot
 };
+
+/*
+ * The trigger's wire name for the `maintenance` frame.
+ *
+ * One home for the spelling, shared by the emitter and its test, so a renamed
+ * enumerator cannot silently change the word the app is branching on. `kNone` maps
+ * to "none" rather than an empty string: the app distinguishes "the window opened
+ * for no recorded reason" from "the window is closed" by `active`, not by this
+ * field, and an empty value would read as a missing field.
+ */
+const char *MaintenanceTriggerName(MaintenanceTrigger t);
 
 class MaintenanceMode {
 public:

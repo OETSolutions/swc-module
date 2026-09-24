@@ -85,6 +85,17 @@ data class LinkUiState(
      */
     val maintenanceBleFailures: Int = 0,
     /**
+     * WHY the maintenance window is open (spec 4.3's `trigger`, spec N-61): one of
+     * `usb_command`, `config_flag`, `aux1_hold`, `no_config_at_boot`, or `none`.
+     *
+     * The device records the trigger, but until N-61 nothing carried it to a
+     * user, so a user holding AUX1 at the car saw the same double-flash as a user
+     * who opened the window from this app and could not tell which had happened.
+     * The card names it, which is the one thing a user standing at the car with no
+     * phone needs to know.
+     */
+    val maintenanceTrigger: String = "",
+    /**
      * How long the device's maintenance window lasts, from the config's own
      * `maintenance_timeout_ms` (spec 8.2 bounds it to `(0, K_MAINTENANCE_TIMEOUT_MAX_MS]`).
      *
@@ -227,6 +238,24 @@ internal fun describeTimeout(timeoutMs: Long): String {
     if (timeoutMs < 60_000L) return "after under a minute"
     val minutes = (timeoutMs + 59_999L) / 60_000L
     return if (minutes == 1L) "after 1 minute" else "after $minutes minutes"
+}
+
+/**
+ * A maintenance trigger's wire word as a phrase a user can act on (spec N-61).
+ *
+ * The point is to distinguish the paths a user cannot otherwise tell apart -- the
+ * AUX1 hold from the app, especially. An unrecognised word is shown verbatim
+ * rather than mapped to "unknown": a firmware that adds a trigger should have its
+ * word visible so the app is not silently lying about it, the same rule the config
+ * decoder follows for unknown enum names.
+ */
+internal fun describeTrigger(trigger: String): String = when (trigger) {
+    "usb_command" -> "the app, over USB"
+    "config_flag" -> "the config's maintenance-on-boot flag"
+    "aux1_hold" -> "holding AUX1 on the device (no app needed)"
+    "no_config_at_boot" -> "booting with no saved config"
+    "none" -> "an unrecorded reason"
+    else -> trigger
 }
 
 /**
@@ -488,6 +517,16 @@ fun LinkScreen(
                     },
                     style = MaterialTheme.typography.bodyMedium,
                 )
+                // WHY the window opened (spec N-61). Rendered only while it IS open:
+                // a line reading "Opened by: …" under a "not in maintenance mode"
+                // card would be the confusion the field exists to remove.
+                if (state.maintenanceOpen && state.maintenanceTrigger.isNotEmpty() &&
+                    state.maintenanceTrigger != "none") {
+                    Text(
+                        "Opened by: ${describeTrigger(state.maintenanceTrigger)}",
+                        style = MaterialTheme.typography.bodySmall,
+                    )
+                }
                 // The two per-device secrets, shown over this already-trusted link
                 // because the board has no display (spec 8.3 option 1). They are
                 // rendered only when the device says the radio is actually up, so

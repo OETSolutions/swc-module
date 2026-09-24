@@ -271,6 +271,10 @@ each carries an M5 mounting hole whose courtyard is a 5.55 mm radius circle.
 - **Buttons:** `SW1` (BOOT → module strapping pin) and `SW2` (RESET → EN).
 - **Test points:** `TP1`–`TP6` on module I/O, plus `TP7`/`TP8` on the UART
   `TXD0`/`RXD0`. All eight are bare through-hole pads with no purchased part.
+  `TP7`/`TP8` are **the console**: the production console is on UART0 (GPIO43/44,
+  off the USB PHY), so it stays readable after TinyUSB takes the PHY for the app
+  link (N-16, fixed 2026-09-25) — clip a UART adapter (`115200 8N1`) between them
+  and a ground pad.
 
 ### 4.11 Interfaces
 

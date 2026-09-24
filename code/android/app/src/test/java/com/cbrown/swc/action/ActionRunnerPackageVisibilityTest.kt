@@ -185,4 +185,65 @@ class ActionRunnerPackageVisibilityTest {
             namesLauncher,
         )
     }
+
+    // --- N-11: the four kinds that were blanket-"NotImplemented" --------------
+
+    @Test
+    fun `VOLUME adjusts the named stream and refuses an unknown one`() {
+        // Spec 3.6's VOLUME is the app's kind, and it needs no privilege: an
+        // ordinary app may adjust streams via AudioManager. Reporting it "not
+        // implemented" told the user their runnable binding was wrong (N-11).
+        val ctx = RuntimeEnvironment.getApplication()
+        val runner = ActionRunner(ctx)
+        assertEquals(ActionOutcome.Ran, runner.run("VOLUME", "media"))
+        // An unknown stream is refused rather than defaulting to media -- acting
+        // on the wrong stream is worse than acting on none.
+        assertTrue(runner.run("VOLUME", "not-a-stream") is ActionOutcome.NoHandler)
+    }
+
+    @Test
+    fun `MEDIA dispatches a media key and refuses an unknown command`() {
+        val runner = ActionRunner(RuntimeEnvironment.getApplication())
+        for (cmd in listOf("play", "pause", "next", "prev", "stop")) {
+            assertEquals("MEDIA $cmd", ActionOutcome.Ran, runner.run("MEDIA", cmd))
+        }
+        assertTrue(runner.run("MEDIA", "rewind-faster") is ActionOutcome.NoHandler)
+    }
+
+    @Test
+    fun `the four kinds run rather than reporting a blanket not-implemented`() {
+        // The regression this guards: `KEYCODE`, `MEDIA`, `VOLUME` and `SYSTEM` were
+        // one block that refused every one of them, so a user binding MEDIA got
+        // "this build does not implement it" for a command an ordinary app can run.
+        // Each of the unprivileged commands now returns `Ran`.
+        val runner = ActionRunner(RuntimeEnvironment.getApplication())
+        assertEquals(ActionOutcome.Ran, runner.run("MEDIA", "next"))
+        assertEquals(ActionOutcome.Ran, runner.run("KEYCODE", "KEYCODE_MEDIA_NEXT"))
+        assertEquals(ActionOutcome.Ran, runner.run("VOLUME", "media"))
+        assertEquals(ActionOutcome.Ran, runner.run("SYSTEM", "open_settings"))
+    }
+
+    @Test
+    fun `SYSTEM open_settings runs and the privileged commands say so`() {
+        val runner = ActionRunner(RuntimeEnvironment.getApplication())
+        // `open_settings` is an ordinary ACTION_SETTINGS intent, so it runs.
+        assertEquals(ActionOutcome.Ran, runner.run("SYSTEM", "open_settings"))
+        // The other three need a device-owner / root API; the honest report is the
+        // privilege requirement, not a false success and not "not implemented".
+        for (cmd in listOf("screen_off", "night_mode", "screenshot")) {
+            assertTrue("SYSTEM $cmd", runner.run("SYSTEM", cmd) is ActionOutcome.Privileged)
+        }
+        assertTrue(runner.run("SYSTEM", "nonsense") is ActionOutcome.NoHandler)
+    }
+
+    @Test
+    fun `an injectable KEYCODE runs and a privileged one says so`() {
+        val runner = ActionRunner(RuntimeEnvironment.getApplication())
+        // The media transport keys are dispatchable by an ordinary app.
+        assertEquals(ActionOutcome.Ran, runner.run("KEYCODE", "KEYCODE_MEDIA_PLAY_PAUSE"))
+        assertEquals(ActionOutcome.Ran, runner.run("KEYCODE", "KEYCODE_VOLUME_UP"))
+        // Anything else needs INJECT_EVENTS, a signature permission.
+        assertTrue(runner.run("KEYCODE", "KEYCODE_HOME") is ActionOutcome.Privileged)
+        assertTrue(runner.run("KEYCODE", "KEYCODE_BACK") is ActionOutcome.Privileged)
+    }
 }

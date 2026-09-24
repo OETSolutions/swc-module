@@ -712,8 +712,9 @@ class AppViewModel(
             is ActionOutcome.NoHandler -> "nothing on this phone handles ${outcome.action}"
             is ActionOutcome.Blocked -> outcome.reason
             is ActionOutcome.NotAppSide -> "${outcome.kind} is not an app-side action"
-            is ActionOutcome.NotImplemented ->
-                "${outcome.kind} is the app's to run, but this build does not implement it yet"
+            is ActionOutcome.Privileged ->
+                "${outcome.command} needs root, an accessibility service, or a system-app " +
+                    "install on this head unit"
         }
     }
 

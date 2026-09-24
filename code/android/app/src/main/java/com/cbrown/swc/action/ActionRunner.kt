@@ -35,35 +35,73 @@ sealed interface ActionOutcome {
     data class NotAppSide(val kind: String) : ActionOutcome
 
     /**
-     * The kind IS app-side per spec §3.6, but this build does not implement it.
+     * The kind IS app-side and this build would run it, but the specific command
+     * needs a privilege an ordinary app does not have (root, an accessibility
+     * service, a device-owner / system-app install — spec N-6).
      *
-     * **Distinct from [NotAppSide] on purpose.** `KEYCODE`, `MEDIA`, `VOLUME` and
-     * `SYSTEM` are all the app's to execute, so reporting them as "not an app-side
-     * action" contradicts the spec and sends the user to change a binding that is
-     * correctly configured. Saying "not implemented in this build" is the honest
-     * version, and it is the difference between "your binding is wrong" and "this
-     * app cannot do that yet".
+     * **Distinct from [NotAppSide].** `NotAppSide` says "the firmware owns this
+     * kind"; this one says "the KIND works, but THIS command needs elevated
+     * access" — the honest report for `SYSTEM{night_mode}` or an arbitrary
+     * `KEYCODE`, where the user's fix is to grant the role, not to change the
+     * binding. (An earlier `NotImplemented` variant carried this job for the whole
+     * four-kind block; it is gone now that the unprivileged subset runs.)
      */
-    data class NotImplemented(val kind: String) : ActionOutcome
+    data class Privileged(val command: String) : ActionOutcome
 }
 
+/** A `VOLUME` target name -> its `AudioManager` stream (spec 3.6). */
+private val STREAMS = mapOf(
+    "media" to android.media.AudioManager.STREAM_MUSIC,
+    "call" to android.media.AudioManager.STREAM_VOICE_CALL,
+    "ring" to android.media.AudioManager.STREAM_RING,
+    "alarm" to android.media.AudioManager.STREAM_ALARM,
+)
+
+/** A `MEDIA` command -> its keycode (spec 3.6). */
+private val MEDIA_KEYS = mapOf(
+    "play" to android.view.KeyEvent.KEYCODE_MEDIA_PLAY,
+    "pause" to android.view.KeyEvent.KEYCODE_MEDIA_PAUSE,
+    "next" to android.view.KeyEvent.KEYCODE_MEDIA_NEXT,
+    "prev" to android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+    "stop" to android.view.KeyEvent.KEYCODE_MEDIA_STOP,
+)
+
 /**
- * Runs the app-side action kinds this build implements: `APP_LAUNCH`, `APP_INTENT`
- * and the escape hatch `APP_RAW`.
+ * The keycodes an ordinary app may inject, via the media dispatch — the media
+ * transport and volume keys. Anything else needs `INJECT_EVENTS` (signature-level),
+ * so it is reported as [ActionOutcome.Privileged] rather than attempted.
+ */
+private val KEYCODE_KEYS = mapOf(
+    "KEYCODE_MEDIA_PLAY" to android.view.KeyEvent.KEYCODE_MEDIA_PLAY,
+    "KEYCODE_MEDIA_PAUSE" to android.view.KeyEvent.KEYCODE_MEDIA_PAUSE,
+    "KEYCODE_MEDIA_PLAY_PAUSE" to android.view.KeyEvent.KEYCODE_MEDIA_PLAY_PAUSE,
+    "KEYCODE_MEDIA_NEXT" to android.view.KeyEvent.KEYCODE_MEDIA_NEXT,
+    "KEYCODE_MEDIA_PREVIOUS" to android.view.KeyEvent.KEYCODE_MEDIA_PREVIOUS,
+    "KEYCODE_MEDIA_STOP" to android.view.KeyEvent.KEYCODE_MEDIA_STOP,
+    "KEYCODE_VOLUME_UP" to android.view.KeyEvent.KEYCODE_VOLUME_UP,
+    "KEYCODE_VOLUME_DOWN" to android.view.KeyEvent.KEYCODE_VOLUME_DOWN,
+    "KEYCODE_VOLUME_MUTE" to android.view.KeyEvent.KEYCODE_VOLUME_MUTE,
+)
+
+/**
+ * Runs the app-side action kinds this build implements.
  *
- * **Spec §3.6 gives the app FOUR more — `KEYCODE`, `MEDIA`, `VOLUME` and `SYSTEM` —
- * and this class does not implement them.** An earlier version of this comment
- * claimed it ran `KEYCODE`, which it never did: the `when` below had no branch for
- * it, so binding a button to a keycode produced `NotAppSide` and the user was told
- * their (valid) binding was not an app-side action. The claim is removed and the
- * gap is now reported as [ActionOutcome.NotImplemented].
+ * **Spec 3.6 gives the app seven kinds, and this class runs all but one now** (N-11).
+ * `APP_LAUNCH`, `APP_INTENT`, `APP_RAW`, `VOLUME`, `MEDIA`, `SYSTEM` (its
+ * `open_settings` command) and the unprivileged `KEYCODE` set are implemented; the
+ * only kind still refused is a `KEYCODE` outside the small set an ordinary app may
+ * inject (see [KEYCODE_REQUIRES_PRIVILEGE]), which needs root, an accessibility
+ * service or a system-app install (spec N-6).
  *
- * The bindings screen offers every kind in the generated `ActionKind` enum, so all
- * seven are selectable today. A user can therefore bind one that will not run, and
- * will see the "not implemented" message rather than silence. Implementing the rest
- * is gated on the target head unit's privileges — see the spec's open item on the
- * Android environment — because key injection and screen control need root, an
- * accessibility service or a system-app install.
+ * **The four "unimplemented" kinds were not all privileged, and treating them as
+ * one block was the defect.** An earlier version reported `KEYCODE`, `MEDIA`,
+ * `VOLUME` and `SYSTEM` as one "not implemented" set and justified it
+ * with "key injection and screen control need root". That is true of arbitrary
+ * keycodes and false of the rest: `Volume` is `AudioManager`, `MEDIA`'s transport
+ * is `dispatchMediaKeyEvent`, and `SYSTEM`'s `open_settings` is a plain
+ * `ACTION_SETTINGS` intent -- all available to an ordinary app. So the block told
+ * users their (runnable) bindings could not run, which is the same "your binding
+ * is wrong" misdirection the outcome split exists to avoid.
  *
  * **This is the module Android 15's background-activity-launch (BAL) hardening
  * applies to** (spec 3.6): since the app must launch activities from a background
@@ -77,8 +115,7 @@ sealed interface ActionOutcome {
 class ActionRunner(private val context: Context) {
 
     /**
-     * Run [target] as `APP_LAUNCH` (a package) or `APP_INTENT` (an action, optionally
-     * with a data payload).
+     * Run [target] as the action kind's own meaning (spec 3.6).
      *
      * `kind` is the wire name from the generated contract, so the caller cannot pass
      * a kind this class does not implement without it being visible here.
@@ -88,9 +125,16 @@ class ActionRunner(private val context: Context) {
             "APP_LAUNCH" -> launchPackage(target)
             "APP_INTENT" -> sendIntent(target, payload)
             "APP_RAW" -> sendIntent(target, payload)
-            // App-side per spec 3.6, not implemented here. Named individually so the
-            // intent is visible: these are not "unknown", they are "not yet".
-            "KEYCODE", "MEDIA", "VOLUME", "SYSTEM" -> ActionOutcome.NotImplemented(kind)
+            "VOLUME" -> setVolume(target)
+            "MEDIA" -> sendMediaCommand(target)
+            // SYSTEM covers four commands; only `open_settings` maps to an
+            // unprivileged intent. The other three (`screen_off`, `night_mode`,
+            // `screenshot`) need a device-owner or root API, so they report the
+            // privilege requirement rather than pretending.
+            "SYSTEM" -> runSystemCommand(target)
+            // KEYCODE splits: the media-transport keycodes are dispatchable by an
+            // ordinary app, everything else needs privilege.
+            "KEYCODE" -> sendKeycode(target)
             // The firmware's half (OUT_*, NONE, BUZZ). Reaching here means the caller
             // dispatched an action it should have skipped.
             else -> ActionOutcome.NotAppSide(kind)
@@ -135,6 +179,98 @@ class ActionRunner(private val context: Context) {
                     "\"display over other apps\" or \"start activities from " +
                     "background\" permission for SWC, then retry."
             )
+        } catch (e: Exception) {
+            ActionOutcome.Blocked(e.message ?: e::class.java.simpleName)
+        }
+    }
+
+    /**
+     * `VOLUME` (spec 3.6): adjust a stream's volume. `target` names the stream
+     * (`media`/`call`/`ring`/`alarm`); the action raises it one step.
+     *
+     * **`adjustStreamVolume`, not `setStreamVolume`.** Spec 3.6 notes the value of
+     * `VOLUME` over a stock SWC is the *absolute* set, but an absolute value needs a
+     * second parameter this kind does not carry (spec 3.6's two-string budget: the
+     * one slot is the stream NAME). A relative step is what the one parameter can
+     * express, it works for every stream, and it needs no `MODIFY_AUDIO_SETTINGS`
+     * beyond the default a foreground app already has for its own streams. An
+     * unknown stream name is refused rather than silently defaulting to media --
+     * acting on the wrong stream is worse than acting on none.
+     */
+    private fun setVolume(streamName: String): ActionOutcome {
+        val stream = STREAMS[streamName.lowercase()]
+            ?: return ActionOutcome.NoHandler(streamName)
+        return try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            am.adjustStreamVolume(stream, android.media.AudioManager.ADJUST_RAISE, 0)
+            ActionOutcome.Ran
+        } catch (e: SecurityException) {
+            ActionOutcome.Blocked(
+                "Android refused to change the $streamName volume. Grant SWC the " +
+                    "\"modify audio settings\" permission, then retry."
+            )
+        } catch (e: Exception) {
+            ActionOutcome.Blocked(e.message ?: e::class.java.simpleName)
+        }
+    }
+
+    /**
+     * `MEDIA` (spec 3.6): transport control via the media-session dispatch, which is
+     * `AudioManager.dispatchMediaKeyEvent`. This reaches whatever holds the active
+     * media session, so it works on any player rather than a named one.
+     *
+     * Key DOWN then UP, because a media session acts on the pair -- sending only a
+     * DOWN leaves the command half-issued on some players.
+     */
+    private fun sendMediaCommand(command: String): ActionOutcome {
+        val key = MEDIA_KEYS[command.lowercase()] ?: return ActionOutcome.NoHandler(command)
+        return try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            am.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, key))
+            am.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, key))
+            ActionOutcome.Ran
+        } catch (e: Exception) {
+            ActionOutcome.Blocked(e.message ?: e::class.java.simpleName)
+        }
+    }
+
+    /**
+     * `SYSTEM` (spec 3.6): one of four housekeeping commands.
+     *
+     * Only `open_settings` is reachable without privilege, and it is an ordinary
+     * `ACTION_SETTINGS` intent. The other three (`screen_off`, `night_mode`,
+     * `screenshot`) are device-owner / root APIs -- `DevicePolicyManager` for the
+     * first two, a privileged screenshot API for the third -- so they report the
+     * privilege requirement (spec N-6) instead of silently doing nothing.
+     */
+    private fun runSystemCommand(command: String): ActionOutcome = when (command.lowercase()) {
+        "open_settings" -> {
+            // Reuse the intent path: ACTION_SETTINGS needs no data and no package.
+            sendIntent(android.provider.Settings.ACTION_SETTINGS, "")
+        }
+        "screen_off", "night_mode", "screenshot" ->
+            ActionOutcome.Privileged(command)
+        else -> ActionOutcome.NoHandler(command)
+    }
+
+    /**
+     * `KEYCODE` (spec 3.6): inject a key event.
+     *
+     * **Only the media/volume keycodes are injectable by an ordinary app**, and via
+     * the media dispatch rather than `InputManager.injectInputEvent` (which needs
+     * `INJECT_EVENTS`, a signature permission). A named keycode outside that set --
+     * `KEYCODE_HOME`, `KEYCODE_BACK`, an arbitrary letter -- reports the privilege
+     * requirement rather than a false `Ran`. The set is deliberately the media
+     * transport keys, which is what the spec's own example
+     * (`KEYCODE_MEDIA_NEXT`) is.
+     */
+    private fun sendKeycode(name: String): ActionOutcome {
+        val key = KEYCODE_KEYS[name.uppercase()] ?: return ActionOutcome.Privileged(name)
+        return try {
+            val am = context.getSystemService(Context.AUDIO_SERVICE) as android.media.AudioManager
+            am.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_DOWN, key))
+            am.dispatchMediaKeyEvent(android.view.KeyEvent(android.view.KeyEvent.ACTION_UP, key))
+            ActionOutcome.Ran
         } catch (e: Exception) {
             ActionOutcome.Blocked(e.message ?: e::class.java.simpleName)
         }

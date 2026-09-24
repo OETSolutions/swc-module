@@ -1529,20 +1529,21 @@ class AppViewModelTest {
     }
 
     @Test
-    fun `an app-side kind this build cannot run is reported as unimplemented, not as a bad binding`() =
+    fun `a privileged app-side command is reported as needing a role, not as a bad binding`() =
         runTest {
-            // KEYCODE, MEDIA, VOLUME and SYSTEM are the APP's to execute per spec
-            // 3.6, and ActionRunner implements none of them. The bindings screen
-            // offers every kind in the generated enum, so a user can bind one and
-            // will see nothing happen. The message matters: "not an app-side action"
-            // would tell them to go fix a binding that is already correct, whereas
-            // "not implemented yet" is the true reason.
+            // N-11: some app-side commands need a role an ordinary app lacks (a
+            // non-media KEYCODE needs INJECT_EVENTS; `SYSTEM{night_mode}` needs a
+            // device-owner API). The message matters: "not an app-side action" would
+            // tell the user to fix a binding that is already correct, and a silent
+            // no-op would look like a broken button. `ActionOutcome.Privileged` is
+            // the honest report, and it must be RENDERED -- N-45 records outcomes
+            // that were produced and read by no screen.
             val t = FakeTransport()
             val ran = mutableListOf<String>()
             val vm = AppViewModel(
                 SwcClient(t),
                 scope = vmScope(),
-                runAppAction = { kind, _, _ -> ran += kind; ActionOutcome.NotImplemented(kind) },
+                runAppAction = { kind, target, _ -> ran += "$kind:$target"; ActionOutcome.Privileged(target) },
             )
             started(vm)
 
@@ -1551,7 +1552,7 @@ class AppViewModelTest {
                     "b9", com.oetsolutions.swc.model.BindingChannel.SWC1, "next",
                     com.oetsolutions.swc.model.Gesture.SINGLE, true,
                     listOf(com.oetsolutions.swc.model.Action(
-                        com.oetsolutions.swc.contract.ActionKind.KEYCODE, "KEYCODE_MEDIA_NEXT", "")),
+                        com.oetsolutions.swc.contract.ActionKind.KEYCODE, "KEYCODE_HOME", "")),
                 ))
             }
             configRun(c).forEach { t.emit(it) }
@@ -1561,10 +1562,10 @@ class AppViewModelTest {
                 "gesture" to "\"SINGLE\"", "t_ms" to "10", "level_mv" to "2145"))
             advanceUntilIdle()
 
-            assertEquals("the app must attempt it, not skip it", listOf("KEYCODE"), ran)
+            assertEquals("the app must attempt it, not skip it", listOf("KEYCODE:KEYCODE_HOME"), ran)
             val msg = vm.actionOutcomes.value.single()
-            assertTrue("the message must say it is unimplemented, not mis-bound: $msg",
-                msg.contains("not implement"))
+            assertTrue("the message must name the privilege requirement: $msg",
+                msg.contains("root") || msg.contains("system-app"))
             assertFalse("and must NOT claim the binding is not app-side: $msg",
                 msg.contains("not an app-side action"))
         }

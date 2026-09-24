@@ -34,11 +34,13 @@
 // address correction would have landed on one and been silently overridden by
 // the other.
 //
-// SPEC ITEM N-4: this value is a bring-up MEASUREMENT, not a datasheet fact --
-// the strap is set by how the board ties those pins, and the spec lists it as
-// open (section 12.1). 0x60 is the all-low default, which is what a board with
-// the strap pins grounded produces. The bring-up log's step 2 records the
-// address read off the bus; if it differs, change it HERE and nowhere else.
+// CONFIRMED ON THE BOARD 2026-09-24 (spec item N-4, closed). No bus scan was
+// needed: the firmware's boot-time verify reads each channel's code back from
+// the MCP4728 (N-21), and the DUT reports `output_safe: true`, which is only set
+// when that real I2C transaction to THIS address returns valid bytes -- so 0x60
+// is the strap this board actually has. A mis-strapped respin would fail
+// `output_safe` rather than silently address nothing. Change it HERE and nowhere
+// else if a future board differs.
 //
 // The Multi-Write *frame bytes* are NOT here. They are built by
 // DacFrame::EncodeSet in DacFrame.h, which is host-testable -- EspHal.cpp is

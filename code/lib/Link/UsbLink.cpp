@@ -260,7 +260,9 @@ void UsbLinkStart(IHAL *hal, SystemOrchestrator *sys)
     // NOT a session reset here: the driver is up, but no host has opened the
     // port, so `hello` waits for the DTR callback. Sending now would put the
     // opening frame into a FIFO nobody is draining.
-    ESP_LOGI(TAG, "app link initialised on TinyUSB CDC; console stays on USB-Serial-JTAG");
+    // The console is on UART0 (TP7/TP8), NOT on this port (spec 4.1, N-16), so
+    // these `ESP_LOG*` lines stay readable after TinyUSB takes the USB PHY.
+    ESP_LOGI(TAG, "app link initialised on TinyUSB CDC; console is on UART0 (TP7/TP8)");
 }
 
 void UsbLinkService()

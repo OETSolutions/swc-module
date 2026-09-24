@@ -5,13 +5,16 @@
 # ## The problem this exists for
 #
 # The product firmware hands the ESP32-S3's USB PHY to TinyUSB (the Android app
-# link, `CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y` puts the ROM console on
-# USB-Serial-JTAG but the app link reconfigures the peripheral). While the app
-# firmware is running, the ROM USB-Serial-JTAG peripheral esptool needs is NOT
-# present on that port, so `esptool` / `pio run -t upload` fail with "No serial
-# data received" and the only documented way in was a physical BOOT press
-# (spec 3.2). On a sealed enclosure that means opening the case and poking a
-# recessed pin -- on every flash.
+# link). While the app firmware is running, the ROM USB-Serial-JTAG peripheral
+# esptool needs is NOT present on that port, so `esptool` / `pio run -t upload`
+# fail with "No serial data received" and the only documented way in was a
+# physical BOOT press (spec 3.2). On a sealed enclosure that means opening the
+# case and poking a recessed pin -- on every flash.
+#
+# (The console itself is no longer lost to this: N-16 moved the console PRIMARY
+# to UART0 -- TP7/TP8 -- which is off the USB PHY, so `ESP_LOG*` stays readable
+# even after TinyUSB takes the PHY. The USB-Serial-JTAG output is kept as the
+# console SECONDARY, so it also appears on the app port until TinyUSB installs.)
 #
 # The firmware accepts `{"type":"reboot","boot_target":"bootloader"}`
 # (spec 4.3, N-80), which sets `RTC_CNTL_FORCE_DOWNLOAD_BOOT` and restarts. The

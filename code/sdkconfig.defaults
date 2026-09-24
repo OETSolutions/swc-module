@@ -9,13 +9,37 @@
 CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
 
 # --- Console and USB -------------------------------------------------------
-# Console on the ROM USB-Serial-JTAG peripheral; the app link is TinyUSB CDC on
-# the same physical port but a SEPARATE USB controller (spec 4.1). Keeping them
-# distinct is deliberate: the console must not corrupt app frames. Both can be
-# up at once on the S3 because USB-Serial-JTAG is a ROM peripheral independent
-# of the OTG controller TinyUSB drives.
-CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG=y
-CONFIG_ESP_CONSOLE_UART_DEFAULT=n
+# Console on **UART0** (TP7 `/TXD0`, TP8 `/RXD0` on this board), never on the
+# TinyUSB CDC app link, and NEVER on USB-Serial-JTAG (N-16, fixed 2026-09-25).
+#
+# **Why not USB-Serial-JTAG.** The ESP32-S3 has ONE internal USB PHY shared by
+# USB-Serial-JTAG and USB-OTG; installing TinyUSB at boot (`UsbLinkStart` ->
+# `tinyusb_driver_install`) moves the PHY to USB-OTG, so a console left on
+# USB-Serial-JTAG goes DARK the moment the app link comes up. Every `ESP_LOG*`
+# line after that point was unreadable -- including `UsbLinkStart`'s OWN
+# "tinyusb driver install failed", the message that reports the link failing.
+# An earlier revision of this file claimed "Both can be up at once on the S3
+# because USB-Serial-JTAG is a ROM peripheral independent of the OTG
+# controller"; that is FALSE for this part (Espressif: "both controllers share
+# a single internal PHY, allowing only one to operate at a time"; spec 4.1) and
+# is precisely the claim N-16 exists to refute.
+#
+# **Why this needs no respin** (what N-16 asked to decide "before the board is
+# finalised"): UART0 is independent of the USB PHY, so its console survives
+# TinyUSB taking the PHY -- and the fabricated board ALREADY breaks UART0 out to
+# test pads TP7/TP8 (bare THT pads on nets /TXD0 and /RXD0, nothing else on
+# them). The spec's line "needs header pins or test pads on a respin" is wrong
+# for this board.
+#
+# USB-Serial-JTAG is kept as the SECONDARY console so its output is duplicated
+# there (non-blocking) -- `pio test -e esp32s3` and a plain serial monitor on the
+# USB port still see the boot log until TinyUSB installs, while the durable
+# console lives on the UART pads. Neither channel is the TinyUSB CDC port, so a
+# debug byte can still never be parsed as a protocol frame (the HARD requirement
+# of spec 4.1, asserted on-device by TestUsbCdc.cpp).
+CONFIG_ESP_CONSOLE_UART_DEFAULT=y
+CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG=y
+CONFIG_ESP_CONSOLE_UART_BAUDRATE=115200
 
 # TinyUSB is the MANAGED component `espressif/esp_tinyusb`, fetched by
 # src/idf_component.yml -- IDF 5.5.5 ships no components/tinyusb of its own.

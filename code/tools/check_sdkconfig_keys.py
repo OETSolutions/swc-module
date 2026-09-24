@@ -40,8 +40,14 @@ GENERATED = REPO / "sdkconfig.esp32s3"
 REQUIRED = [
     ("CONFIG_ESPTOOLPY_FLASHSIZE_4MB", "y",
      "4 MB flash, in choice form (the string form is silently ignored)"),
-    ("CONFIG_ESP_CONSOLE_USB_SERIAL_JTAG", "y",
-     "console on the ROM USB-JTAG peripheral (spec 10.3)"),
+    ("CONFIG_ESP_CONSOLE_UART_DEFAULT", "y",
+     "console PRIMARY on UART0 (TP7/TP8 on this board), NOT USB-Serial-JTAG: "
+     "installing TinyUSB moves the S3's single internal USB PHY to USB-OTG and a "
+     "console left on Serial-JTAG goes dark at runtime (N-16, spec 4.1/10.3)"),
+    ("CONFIG_ESP_CONSOLE_SECONDARY_USB_SERIAL_JTAG", "y",
+     "the console is DUPLICATED to USB-Serial-JTAG so `pio test -e esp32s3` and a "
+     "plain serial monitor still read the log off the USB port until TinyUSB takes "
+     "the PHY (the durable copy is the UART pads)"),
     ("CONFIG_TINYUSB_CDC_ENABLED", "y",
      "the app link; without it tinyusb_cdc_acm.h refuses to compile"),
     ("CONFIG_TINYUSB_CDC_RX_BUFSIZE", "1024",
@@ -65,6 +71,9 @@ REQUIRED = [
 FORBIDDEN = [
     ("CONFIG_BT_BLUEDROID_ENABLED", "y",
      "Bluedroid does not fit 4 MB/no-PSRAM beside WiFi + OTA (spec 9.2)"),
+    ("CONFIG_ESP_CONSOLE_USB_CDC", "y",
+     "spec 4.1's HARD requirement: a console on the TinyUSB CDC port would let a "
+     "debug printf be parsed as a protocol frame by the app"),
 ]
 
 

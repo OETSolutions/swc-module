@@ -1647,3 +1647,28 @@ ordered list and the any-position refusal. Mutation-tested twice: collapsing the
 runner loop to one action and turning the app-kind skip back into a `ReleaseKey`
 each fail the suite.
 
+
+## Committed HEAD re-verified on the bench (2026-09-25, post-CI-fix)
+
+After the CI-fix and doc-consolidation commits, the committed tip was re-verified
+against the live DUT (`/dev/cu.usbmodem1234561`) with the two-board rig
+(`/dev/cu.usbmodem1121101`). The firmware BINARY is unchanged from the earlier
+bench runs (only `.github/workflows/` and docs moved since), so these re-run the
+same proofs against the current tree; all pass:
+
+- **FR-2** (`bench_cal.py`): the eFuse curve is applied on silicon
+  (`calibration_degraded=False`, so the N-17 linear-fallback defect is absent);
+  the ADC tracks the rig's injected 1900–2835 mV with worst error 41 mV
+  (tolerance 60) and a least-squares slope of 1.024.
+- **FR-16 / FR-39 / FR-40** (`bench_output.py`): a driven channel reaches its
+  target and releases back to the pull-up level (the FET is off, the line is
+  high-Z, not held down); a reboot leaves the line idle (`output_safe=True`) and
+  safe idle is re-established before the next key.
+- **FR-9 / FR-12 / FR-31 / FR-31b / FR-42** (`bench_ladder.py --only
+  fr9,fr12,fr31,fr42`): ch0 classifies the rig-presented button while ch1
+  correctly emits nothing; an out-of-band level yields `event{button:null}`;
+  three learned buttons all class-match on replay, including a freshly taught
+  one; the device serves its link with no host attached.
+
+DUT on entry: `fw_version` `dev`, `hw_id` `SWC-S3`, `protocol_v` 1, caps
+`["config","learn","ota"]`, `config_state` ok, `output_safe` true.

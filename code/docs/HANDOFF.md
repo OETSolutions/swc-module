@@ -229,8 +229,12 @@ one more `dev_usb_reset.py` run re-enumerates it.
 # device comes back on the old image. ~7 min for the push.
 ~/.platformio/penv/bin/python tools/bench_rollback.py --port /dev/cu.usbmodem1234561
 
-# the ladder cluster on the two-board rig (FR-9/12/31/31b/42): the rig driver
-# presents a synthetic wheel, the DUT classifies it. Needs --dut AND --rig.
+# the ladder cluster on the two-board rig (FR-9/12/30/31/31b/42 + the stress
+# sweep): the rig driver presents a synthetic wheel, the DUT classifies it. Needs
+# --dut AND --rig. `--only fr30` is the +3V3 rail sweep (FR-30), reached by
+# scaling the presented pin voltages; `--only stress --presses 100` is the
+# repeatability run. See N-88 for why the rail sweep is reachable without a
+# bench supply.
 ~/.platformio/penv/bin/python tools/bench_ladder.py \
     --dut /dev/cu.usbmodem1234561 --rig /dev/cu.usbmodem1121101
 

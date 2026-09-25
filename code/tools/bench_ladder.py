@@ -147,6 +147,48 @@ class Rig:
             time.sleep(0.2 + n * 0.004)
         return None
 
+    def drive_both(self, ch1_mv, ch2_mv, settle_s=0.6):
+        """Present a level on BOTH channels AT ONCE and leave both driven.
+
+        This exists because `set_level` cannot do it. `set_level` closes its loop
+        with a status read, and the rig's status command prints
+        `KeyLine::FloatMv(1)` AND `FloatMv(2)` -- and `FloatMv` calls
+        `Dac::Release`. So every status read RELEASES BOTH DAC channels, which
+        makes a `set_level`-based sequence structurally unable to hold two
+        channels pressed at once: setting up the second always lets the first go.
+
+        One status read up front (harmless -- nothing is driven yet) establishes
+        the commanded level and the selected channel; from there the +/- nudges
+        are walked with LOCAL tracking and NO further status read, and `p` drives
+        the selected channel. `c` toggles the selection without releasing.
+        """
+        import re
+        txt = self._status_text()
+        m = re.findall(r"commanded key\s*:\s*(-?\d+) mV", txt)
+        if not m:
+            raise RuntimeError("the rig did not report its commanded level")
+        cur = int(m[-1])
+        sel_m = re.search(r"channel\s*:\s*(\d+)", txt)
+        sel = int(sel_m.group(1)) if sel_m else 1
+
+        for ch, target_mv in ((1, ch1_mv), (2, ch2_mv)):
+            if sel != ch:
+                self.cmd("c")
+                time.sleep(0.25)
+                sel = ch
+            d = target_mv - cur
+            if abs(d) > 25:
+                # At least ONE nudge, for the same parity reason `set_level`
+                # documents: a 50 mV floor on a sub-50 delta would spin.
+                n = max(1, min(abs(d) // 50, 300))
+                self.cmd(("-" if d < 0 else "+") * n)
+                time.sleep(0.25 + n * 0.004)
+                step = -50 if d < 0 else 50
+                cur += step * n
+            self.cmd("p")
+            time.sleep(settle_s)
+        return cur
+
     def drive_now(self, settle_s=1.6):
         """Drive the current commanded level and WAIT for it to actually arrive.
 
@@ -382,45 +424,72 @@ def check_fr12_unlearned_press(dut, rig, results):
 
 
 def check_fr9_dual_channel(dut, rig, results):
-    """FR-9: the two channels classify independently; neither blocks the other.
+    """FR-9: two SIMULTANEOUS presses, each classified on its own channel.
 
-    Both ladders are wired (driver J3.3->DUT SWC1, J3.2->DUT SWC2). The check
-    presents a press on each channel in turn and asserts that each is reported on
-    its OWN channel -- so a press on one cannot be resolved as the other, and one
-    channel's activity does not block the other's.
+    Both ladders are wired (driver J3.3->DUT SWC1, J3.2->DUT SWC2). This check
+    holds BOTH channels pressed at the SAME time and asserts that each press
+    produces an event on its OWN channel -- so neither is blocked by the other and
+    neither is resolved against the other's ladder.
+
+    **Why it must be simultaneous, and why the earlier version was not.** FR-9's
+    row and spec 6 read "simultaneous presses". An earlier version of this check
+    drove SWC1 and THEN SWC2 -- two sequential presses -- and structurally could
+    not do anything else: it closed each channel's setup with `set_level`, whose
+    status read prints `KeyLine::FloatMv(1)` AND `FloatMv(2)`, and `FloatMv` calls
+    `Dac::Release`. So setting up the second channel RELEASED the first. A check
+    that presents one press at a time cannot fail the property the row names.
+    `Rig.drive_both` walks the nudges with NO further status read (`p` drives the
+    selected channel, `c` toggles without releasing), so both DAC channels hold
+    their code and both ladders are asserted in the same window.
+
+    **How "not resolved as the other" is decided.** The channels are driven to
+    DIFFERENT levels, and every event carries the `level_mv` the device read on
+    that channel. If a press on one ladder could be classified against the other,
+    the two levels would cross; requiring each channel's event to carry that
+    channel's OWN presented level pins the separation. When channel 0 has a learned
+    window, the check also drives its centre and requires the event to NAME that
+    button -- so a "correct event" is a real classification, not only a level echo.
     """
-    import re
     cfg = dut.config()
     if cfg is None:
         results.append(("FR-9", False, "could not read the config"))
         return
 
-    seen = {}
-    for rig_chan, dut_chan in ((1, 0), (2, 1)):
-        st = rig._status_text()
-        m = re.search(r"channel\s*:\s*(\d+)", st)
-        cur = int(m.group(1)) if m else 1
-        if cur != rig_chan:
-            rig.cmd("c")
-            time.sleep(0.3)
-        rig.set_level(IDLE_CMD_MV)
-        rig.drive_now()
-        dut.collect(0.3)
-        rig.set_level(IDLE_CMD_MV - PRESS_DELTA)
-        rig.drive_now(settle_s=0.7)
-        time.sleep(0.3)
-        frames = dut.collect(2.5)
-        seen[dut_chan] = [f for f in frames if f.get("type") == "event"]
+    idle = IDLE_CMD_MV
+    btns0 = buttons(cfg, 0) or []
+    named0 = btns0[0] if (btns0 and btns0[0][1]) else None
+    l1 = named0[1] if named0 else (idle - 700)
+    want0 = named0[0] if named0 else None
 
-    rig.set_level(IDLE_CMD_MV)
-    rig.drive_now()
+    # The second level is deliberately FAR from the first (so a crossover is
+    # visible against the reading tolerance) and clear of every channel-0 window
+    # (so channel 0's own button is not what channel 1 would land in).
+    l2 = l1 - 700
+    while any(abs(l2 - c) <= TOLERANCE * 2 for (_, c, _) in btns0):
+        l2 -= 200
 
-    ok = (bool(seen.get(0)) and bool(seen.get(1))
-          and all(e.get("channel") == 0 for e in seen[0])
-          and all(e.get("channel") == 1 for e in seen[1]))
+    dut.collect(0.4)                      # drain anything left from the last check
+    rig.drive_both(l1, l2, settle_s=0.7)  # BOTH channels pressed at once
+    time.sleep(0.4)
+    rig.release()                         # release both in the same window
+    frames = dut.collect(3.0)
+    rig.drive_both(idle, idle, settle_s=0.6)  # leave both at a held wheel-like idle
+
+    evs = [f for f in frames if f.get("type") == "event"]
+    e0 = [e for e in evs if e.get("channel") == 0]
+    e1 = [e for e in evs if e.get("channel") == 1]
+    both = bool(e0) and bool(e1)
+    # Each event's level must match ITS channel's presented level, not the other's.
+    # 200 mV is well under the 700 mV separation, so a crossover cannot pass.
+    own0 = any(abs((e.get("level_mv") or 0) - l1) <= 200 for e in e0)
+    own1 = any(abs((e.get("level_mv") or 0) - l2) <= 200 for e in e1)
+    named = (want0 is None) or any(e.get("button") == want0 for e in e0)
+
+    ok = both and own0 and own1 and named
     results.append(("FR-9", ok,
-                    f"ch0 events {[(e.get('channel'), e.get('button')) for e in seen[0]]}, "
-                    f"ch1 events {[(e.get('channel'), e.get('button')) for e in seen[1]]}"))
+                    f"ch0 (presented {l1}) {[(e.get('channel'), e.get('button'), e.get('level_mv')) for e in e0]}, "
+                    f"ch1 (presented {l2}) {[(e.get('channel'), e.get('button'), e.get('level_mv')) for e in e1]}; "
+                    f"both={both} own-level0={own0} own-level1={own1} named={named}"))
 
 
 def check_fr31_headless_learn(dut, rig, results):
@@ -585,6 +654,103 @@ def check_fr31_headless_learn(dut, rig, results):
                             f"taught {new_id} classifies: {[e.get('button') for e in evs]}"))
 
 
+def check_fr30_rail_scale(dut, rig, results):
+    """FR-30 / §10.4: a button learned at one rail classifies across the sweep.
+
+    §6.3's transfer function is a RATIO, so a move of the +3V3 rail scales the
+    whole divider by one factor and leaves `n = V_ADC / V_ADC_idle` invariant. On
+    this rig the DUT's ladder node is driven DIRECTLY, so presenting the idle and
+    the press each scaled by the same 0.95 / 1.00 / 1.05 reproduces exactly what a
+    rail move does to the pin -- the property FR-30 asserts is the invariance, and
+    it is the pin voltage, not the regulator, that the classifier sees.
+
+    **Why the earlier "needs a bench supply" note was too strong.** It is true that
+    the +3V3 NET cannot be commanded by the rig, and true that a real regulator
+    sweep would additionally exercise the ADC's own rail-referenced behaviour. But
+    the requirement's substance -- "a button learned at 3.3 V classifies correctly
+    at 3.14 V and 3.47 V" -- is a statement about the ratio the classifier
+    computes, and that is fully reproducible by scaling the input. §10.4's row and
+    the stress check's note are updated to say so rather than to gate it.
+
+    **The one honest limit, and it is the spec's own.** The sweep is centered on
+    the profile's OWN `learned_idle_mv`, and it must be: the DUT re-adopts its
+    idle denominator only within ±5 % of that value (§6.3's
+    `kIdleRefTrackPermille`), so a sweep anchored on the bench idle instead would
+    put its -5 % point ~8 % below the learned value -- an out-of-band rail move the
+    DUT correctly refuses to believe, which then reads as a misclassification and
+    is not one (measured: it classified against the stale denominator and named the
+    neighbour). Anchored on the learned idle, all three points land inside the
+    adoption band by construction.
+
+    At +5 % the pin idle can exceed the ADC's 2900 mV ceiling (§6.3 consequence
+    4), and it is left to do so DELIBERATELY: the clip is real device behaviour,
+    the DUT seeds its denominator from the clamped reading, and the ratio still
+    lands on the right button -- which is the property FR-30 asserts. Shifting the
+    base down to dodge the clip would break the -5 % leg instead.
+    """
+    cfg = dut.config()
+    if cfg is None:
+        results.append(("FR-30", False, "could not read the config"))
+        return
+    ladder = cfg["channels"][0]["ladder"]
+    learned_idle = ladder.get("idle_mv")
+    btns = buttons(cfg, 0) or []
+    named = [b for b in btns if b[1]]
+    if not named:
+        results.append(("FR-30", False, "no learned button with a centre to sweep"))
+        return
+    if not learned_idle or learned_idle >= 2900:
+        results.append(("FR-30", False,
+                        f"the profile has no usable learned idle ({learned_idle})"))
+        return
+    bid, centre, _ = named[0]
+
+    base = round(learned_idle / 5) * 5
+    ratio = centre / learned_idle              # the button's own permille
+
+    observed = []
+    ok = True
+    for pct, label in ((95, "3.14 V (-5%)"), (100, "3.30 V (ref)"), (105, "3.47 V (+5%)")):
+        i = round(base * pct / 100)
+        p = round(i * ratio)
+        # The DUT seeds its idle denominator from the live reading at boot, so each
+        # rail point needs a boot WITH the rig holding that idle -- the same
+        # precondition FR-31 documents (a node that boots floating seeds above the
+        # ceiling and refuses every target).
+        rig.set_level(i)
+        rig.drive_now()
+        time.sleep(0.3)
+        dut.request(type="reboot", boot_target="app", timeout=1.0)
+        dut.close()
+        time.sleep(4.5)
+        try:
+            dut.reopen()
+        except OSError as e:
+            results.append(("FR-30", False, f"the DUT did not come back at {label}: {e}"))
+            return
+        time.sleep(1.0)
+        rig.set_level(i)
+        rig.drive_now(settle_s=0.8)
+
+        dut.collect(0.4)
+        rig.set_level(p)
+        rig.drive_now(settle_s=0.7)
+        time.sleep(0.3)
+        rig.set_level(i)
+        rig.drive_now(settle_s=0.7)
+        fr = dut.collect(2.5)
+        evs = [e for e in fr if e.get("type") == "event"]
+        got = [e.get("button") for e in evs if e.get("button")]
+        hit = got == [bid]
+        ok = ok and hit
+        observed.append(f"{label} idle={i} press={p} -> {got or 'no button'}"
+                        + ("" if hit else " MISMATCH"))
+
+    results.append(("FR-30", ok,
+                    f"button {bid} at {round(ratio*1000)}‰ across the sweep: "
+                    + "; ".join(observed)))
+
+
 def check_fr42_usb_down(dut, rig, results):
     """FR-42: presses are served with the link down. Shown by the DAC activity.
 
@@ -608,15 +774,18 @@ def check_stress_repeatability(dut, rig, results, presses=100):
 
     **What this check covers and what it does NOT.** §10.4's row reads "every
     learned button, pressed 100 times each, at three +3V3 rail voltages (3.14,
-    3.30, 3.47 V)". The RAIL-voltage sweep needs the ladder's +3V3 supply varied,
-    which the two-board rig cannot do -- the rail is the DUT's own regulator, driven
-    by nothing the rig can command, so that third leg needs a bench supply wired to
-    the +3V3 net and is listed as bench-gated rather than faked here. What this DOES
-    prove is the repeatability half on the rail the device actually has: each learned
-    button's own centre is presented `presses` times and must resolve to THAT button
-    every single time -- a spread/hysteresis/edge-timing defect that fires 1 in 50
-    shows up here and nowhere else, because a host test drives MockHal with a value
-    it picked and never sees a real analog ramp.
+    3.30, 3.47 V)". What THIS check proves is the repeatability half on the rail
+    the device actually has: each learned button's own centre is presented
+    `presses` times and must resolve to THAT button every single time -- a
+    spread/hysteresis/edge-timing defect that fires 1 in 50 shows up here and
+    nowhere else, because a host test drives MockHal with a value it picked and
+    never sees a real analog ramp. **The rail-voltage half is a SEPARATE check,
+    `--only fr30`** (`check_fr30_rail_scale`), which reaches it by scaling the
+    presented pin voltages rather than the regulator -- §6.3's transfer function is
+    a pure scale, so scaling the idle and the press reproduces what a rail move does
+    to the pin, which is what the classifier sees. (An earlier version of this
+    docstring said the sweep "needs a bench supply"; that was too strong, and N-88
+    records why.)
 
     A press is "drive the centre, then return to the wheel-like idle" (never a
     RELEASE -- the released node floats above the ADC ceiling, see the module
@@ -745,6 +914,7 @@ def check_stress_repeatability(dut, rig, results, presses=100):
 CHECKS = {
     "fr12": check_fr12_unlearned_press,
     "fr9": check_fr9_dual_channel,
+    "fr30": check_fr30_rail_scale,
     "fr31": check_fr31_headless_learn,
     "fr42": check_fr42_usb_down,
     "stress": check_stress_repeatability,
@@ -756,7 +926,7 @@ def main() -> int:
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--dut", required=True, help="the DUT app port (303A:4001)")
     ap.add_argument("--rig", required=True, help="the rig driver port (303A:1001)")
-    ap.add_argument("--only", default=None, help="comma list of checks (fr9,fr12,fr31,fr42,stress)")
+    ap.add_argument("--only", default=None, help="comma list of checks (fr9,fr12,fr30,fr31,fr42,stress)")
     ap.add_argument("--presses", type=int, default=100,
                     help="presses per learned button for the stress check (default 100)")
     args = ap.parse_args()

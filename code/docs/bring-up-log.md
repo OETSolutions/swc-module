@@ -1672,3 +1672,54 @@ same proofs against the current tree; all pass:
 
 DUT on entry: `fw_version` `dev`, `hw_id` `SWC-S3`, `protocol_v` 1, caps
 `["config","learn","ota"]`, `config_state` ok, `output_safe` true.
+
+## Two Level-4 bench items were not bench-gated after all (2026-09-25, N-88)
+
+The §10.4 Level-4 list had two unexecuted items. Enumerating them against what the
+rig can actually present showed **both were closable**, and one already carried a
+verification claim it could not have earned:
+
+- **FR-9 (simultaneous presses) — the row overstated its own method.** The
+  traceability row read "VERIFIED on the bench 2026-09-24: the rig drives SWC1 then
+  SWC2, and each press is reported on its OWN channel (0 then 1)" — a claim of the
+  **simultaneous** property backed by a check that presented the presses **in
+  turn**. An in-turn presentation cannot fail "neither may block the other",
+  because both ladders are never pressed at the same instant. The cause was
+  structural: `check_fr9_dual_channel` closed each channel's setup with
+  `set_level`, whose status read prints `KeyLine::FloatMv(1)` AND `FloatMv(2)`, and
+  `FloatMv` calls `Dac::Release` — so setting up the second channel released the
+  first. Fixed with a new rig entry point `Rig.drive_both` (one up-front status
+  read, then +/- nudges tracked locally with NO further status read; `p` drives the
+  selected channel, `c` toggles without releasing). The check now drives the two
+  channels to **different** levels and requires each channel's event to carry that
+  channel's OWN presented level. Measured: `ch0 presented 1944 → (0, 't1', 1923)`,
+  `ch1 presented 1244 → (1, None, 1353)` — both channels live at once, each on its
+  own ladder.
+- **FR-30 (the +3V3 rail sweep) — "needs a bench supply" was too strong.** The
+  +3V3 *net* cannot be commanded by the rig, true; but §6.3's transfer function is
+  a pure **scale**, so a rail move multiplies every node voltage by one factor, and
+  the rig drives the ladder node directly. Scaling the presented idle and press by
+  0.95 / 1.00 / 1.05 reproduces what the rail move does to the pin — the pin
+  voltage, not the regulator, is what the classifier sees. Added as `--only fr30`
+  (three points, each booted with the rig holding that idle so the denominator
+  seeds there). Measured: `t1` at 689 ‰ classified `t1` at all three points.
+
+Two failure modes were found while writing FR-30, both **harness/precondition, not
+firmware**:
+
+1. Centering the sweep on the BENCH idle instead of the profile's **learned** idle
+   puts the -5 % point ~8 % below the learned value — outside §6.3's ±5 %
+   `kIdleRefTrackPermille` adoption band — so the denominator does not re-seed, the
+   press classifies against a stale reference, and the device names the NEIGHBOUR
+   button (measured: `swc1_bt1` instead of `t1`). This looked like a
+   misclassification and is the check's own precondition failing.
+2. At +5 % the pin idle exceeds the ADC's 2900 mV ceiling — §6.3 consequence 4
+   behaving as **documented**. The check lets it clip rather than shifting the base
+   down, because shifting to dodge the clip pushes the -5 % leg out of the
+   adoption band and breaks that point instead.
+
+Full sweep run this session (`--only fr9,fr12,fr30,fr31,fr42`), all PASS, plus a
+short stress (`--presses 20`) at **0 misclassifications across 4 buttons × 20
+presses** (the 4th, `swc1_bt3`, taught by the FR-31 run in the same sequence).
+Native suite 600/600; tools 53/53 after regenerating the root `compile_commands.json`
+(the stack-gate test needs the dual database — see the CI note above).

@@ -14,7 +14,7 @@
 // console and PlatformIO's espidf integration cannot parse it, so it reports "0
 // test cases". Build with `pio test -e esp32s3 --without-uploading
 // --without-testing`, flash, then read the DUT port with a serial capture across
-// a reset. See spec N-87 and docs/bring-up-log.md.
+// a reset. See spec N-87 and code/docs/bring-up-log.md.
 //
 // **A console that is unreadable is the reason this suite is worth more than it
 // looks.** Installing TinyUSB moves the S3's single internal USB PHY from

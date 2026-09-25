@@ -1,32 +1,24 @@
 # SWC firmware + Android app — session handoff
 
-> **STATUS — the tree has been COMMITTED.** The 100+ uncommitted files this
-> document was written around are now commit **`38f579c`** ("Land the
-> host-verified firmware and app, and make CI honest"; 104 files, +10,819/−673)
-> on `feat/swc-firmware-android-app`. **§5 below is now historical** — the
-> hazards it describes (the `.env`, the directory-wide-add trap) still apply to
-> any future commit, but there is no longer a large uncommitted tree to lose.
+> **STATUS — everything is committed and CI is GREEN.** The working tree is
+> clean; `main` and `feat/swc-firmware-android-app` are at the same commit on the
+> private `OETSolutions/swc-module` remote, and both workflows
+> (`.github/workflows/{firmware,android}.yml`) pass on both branches — every job
+> and every step `success`, nothing skipped.
 >
-> What the commit covered: all tracked modifications under `code/`, the
-> repo-root `.github/workflows/` move (N-33 — Actions never read the old path,
-> so no gate had ever run in CI), the six previously-untracked static gates +
-> three gate self-tests, `code/docs/HANDOFF.md` itself, and the spec/plan
-> corrections. The staged set was audited file-by-file before committing.
+> **History note (2026-09-25):** the git history was rewritten (`git filter-repo`)
+> to strip personal identifiers, so **older commit SHAs quoted anywhere in the
+> docs and memory are dead** — the tree content is unchanged (verified
+> byte-identical per tip), only the hashes differ. Do not go looking for a hash
+> you read in an old note.
 >
-> Deliberately **left uncommitted**: `SWC.kicad_pcb` / `SWC.kicad_prl` and
-> `plastic_case/SWC_Enclosure.3mf` (PCB half), plus three pieces of debris that
-> are **not** product source and should not be swept in later by accident:
-> a stray extension-less Kotlin file `code/android/.../swc/module`, a stray
-> 47-line log fragment at **`docs/bring-up-log.md`** (repo root — its content
-> was folded verbatim into `code/docs/bring-up-log.md`, so this copy is now
-> redundant), and the resistor-values PNG.
->
-> **Verified at commit time:** 503/503 native tests under ASan+UBSan, zero
-> sanitizer reports; 120/120 Android unit tests; device build + size gate pass.
-> The Android suite **requires JDK 17** — the machine default is JDK 25, which
-> makes Robolectric fail 25 tests with `IllegalArgumentException at
-> ClassReader.java:200` (an ASM bytecode-version error, NOT a code defect). Run
-> it with `JAVA_HOME=$(/usr/libexec/java_home -v 17)` and `ANDROID_HOME` set.
+> **Verified 2026-09-25:** 600/600 native tests under ASan+UBSan (zero sanitizer
+> reports); 212/212 Android JVM tests; all 10 static gates + their self-tests;
+> device build + size gate (71.7 % of the app slot) + stack gate; CI green both
+> branches. The Android suite **requires JDK 17** — the machine default is JDK 25,
+> which makes Robolectric fail with `IllegalArgumentException at
+> ClassReader.java:200` (an ASM bytecode-version error, NOT a code defect). Run it
+> with `JAVA_HOME=$(/usr/libexec/java_home -v 17)` and `ANDROID_HOME` set.
 
 Written 2026-09-24, at the point the **assembled PCB is in hand and the next
 session is bring-up on real hardware**. This is a starting point for a new
@@ -37,7 +29,7 @@ session: read it top to bottom, then open the two governing documents.
 | Thing | Path |
 | --- | --- |
 | Repo root | `<repo>` (this checkout; `git rev-parse --show-toplevel`) |
-| Branch | `feat/swc-firmware-android-app` (uncommitted, see §5) |
+| Branch | `feat/swc-firmware-android-app` (and `main`) — both committed and CI-green |
 | Software root | `code/` — ESP-IDF firmware (`lib/`, `src/`) + Android app (`code/android/`) |
 | **Spec** (authority) | `docs/superpowers/specs/2026-09-18-swc-firmware-android-app-design.md` |
 | **Plan** (task briefs) | `docs/superpowers/plans/2026-09-18-swc-firmware-android-app.md` |
@@ -70,7 +62,7 @@ Two channels, SWC1 and SWC2. `DacChannel` → A=KEY1, B=ADJ1, C=KEY2, D=ADJ2.
 ```bash
 cd code
 
-# Host suite (591 tests) under ASan+UBSan, in an ISOLATED build dir so a
+# Host suite (600 tests) under ASan+UBSan, in an ISOLATED build dir so a
 # concurrent session cannot clobber it. SWC_FW_VERSION/SHA must be set here too,
 # or PlatformIO auto-cleans .pio/build/ (see the note below the loop):
 SWC_FW_VERSION=dev SWC_GIT_SHA=local \
@@ -95,9 +87,9 @@ python3 tools/check_stack_usage.py
 bash   tools/crosscheck_config.sh
 ```
 
-Last verified: **591/591 native tests green, zero sanitizer reports**; device
-build succeeds at 74.5 % of the app slot; Python gates green (incl. the new
-`check_maintenance_radio.py`, which pins the four maintenance-radio defects).
+Last verified: **600/600 native tests green under ASan+UBSan (zero sanitizer
+reports), 212/212 Android JVM tests, all 10 Python gates green, device build
+succeeds at ~71.7 % of the app slot** (measured 2026-09-25).
 
 **Always use isolated build dirs.** Peer sessions share `code/.pio/build/` and
 will race you (`PLATFORMIO_BUILD_DIR=…` per the commands above).
@@ -348,11 +340,23 @@ must be added to the workflow by name as well as to the verify loop in §2.
   `lib/Config/ConfigModel.h` (added this session) rather than carrying its own
   copy; deleting that assertion fails the gate loudly instead of silently
   reverting to a remembered number.
+  **It needs BOTH compile databases**: `pio run -e esp32s3` refreshes
+  `.pio/build/esp32s3/compile_commands.json`, but the **root**
+  `code/compile_commands.json` is only written by `pio run -e esp32s3 -t
+  compiledb`, and its `main.cpp` entry carries the full `-I` set (the build db's
+  has fewer and dies on `esp_flash.h`). Without the root db the gate cannot
+  recompile `main.cpp` and misreports the boot root as *renamed* ("app_main …
+  absent from the call graph"). `code/compile_commands.json` is gitignored, so a
+  fresh clone MUST run `compiledb` first. The workflow now does this before the
+  gate (fixed 2026-09-25).
 
-## 5. Uncommitted state — READ BEFORE TOUCHING GIT
+## 5. Git state and hard rules — READ BEFORE TOUCHING GIT
 
-**110+ files are modified/untracked on `feat/swc-firmware-android-app`, nothing
-committed.** This is the single biggest hazard for a new session.
+**As of 2026-09-25 the working tree is CLEAN and everything is committed**
+(the long-standing "110+ modified/untracked files" pile was fully worked through;
+`main` and `feat/swc-firmware-android-app` are both at the same commit and CI is
+green on both). The earlier warning about an enormous uncommitted tree no longer
+applies — but the rules below are durable and still apply to any new work.
 
 ### Hard rules (a mistake here loses work or leaks secrets)
 
@@ -360,20 +364,17 @@ committed.** This is the single biggest hazard for a new session.
    API key, a Home Assistant long-lived token, location values) and belongs to a
    **different project**. It must **never be committed**. It is in
    `code/.gitignore` line 14.
-2. **Never `git add code/` or `git add -A`.** Only explicit file lists. The
-   untracked-tools situation (§4) and Drive's `.~*.insyncdl` placeholders inside
-   source dirs make a directory-wide add unsafe.
+2. **Never `git add code/` or `git add -A`.** Only explicit file lists. Drive's
+   `.~*.insyncdl` placeholders inside source dirs make a directory-wide add unsafe.
 3. `code/scratch.txt` (gitignored) and `code/.kilo/` are **not part of this
    project** — never stage.
-4. `plastic_case/SWC_Enclosure.3mf` has a working-tree modification — **do not
-   stage or commit it**.
-5. `SWC.kicad_pcb` is modified in the working tree (PCB half) — leave it alone
-   unless the task is the PCB.
-6. **`git push` needs explicit user confirmation** — shared remote side effect.
+4. `code_board_test/include/Secrets.h` (real WiFi creds) is generated and
+   gitignored — never commit it.
+5. **`git push` needs explicit user confirmation** — shared remote side effect.
 
-Before committing anything, `git status` and read what you staged. The tools
-under `code/tools/` (including the untracked gates) are the first explicit
-`git add` batch to make CI honest.
+Before committing anything, `git status` and read what you staged. All gates under
+`code/tools/` are now tracked, so a new gate must be added to the workflow by name
+as well as to the verify loop in §2.
 
 ## 6. Known-open items (prioritized for a real-board session)
 
@@ -461,11 +462,16 @@ sees a ~4-exabyte image); the parse is now digit-only and pinned by tests over
 
 ## 9. First moves for the new session
 
-1. `git status` and read §5 — protect the uncommitted tree and `.env` first.
+1. `git status` — the tree should be clean; if it is not, read §5 first and
+   protect `.env` before anything else.
 2. Read the spec's bring-up / maintenance sections (§8, §12) and the tail of
    `code/docs/bring-up-log.md`.
-3. Wire **one** device-only path end-to-end against the real board (start with
-   OTA or the maintenance radio — each has a tested seam waiting for a caller)
-   and verify it **on hardware**, not just in the host suite.
-4. Only then decide whether to commit. Explicit file lists; commit the untracked
-   `code/tools/` gates so CI is honest; never the PCB or enclosure 3MF.
+3. **The implementation half is complete and CI is green** (see §3/§4). The only
+   unimplemented requirement is **N-9** (FR-17 temperature compensation), which
+   needs a physical drift measurement no bench run supplies — it is an accepted v1
+   gap, not a task to invent.
+4. The remaining genuinely-open items (§6) are all **external-blocked** (car-side
+   servo plant, the head unit, or a real network/phone). With the board on the
+   bench, the useful work is re-running the existing bench tools if the hardware
+   changed — or a **bounded, single-area** review (per the project's rule: do not
+   restart the unbounded audit loop; see the memory index).

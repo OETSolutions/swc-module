@@ -12,7 +12,7 @@
 // file's MAC test, which was failing on a NON-IDEMPOTENT `EspHalInit` (the
 // per-test setup called it again, the second `adc_oneshot_new_unit` failed with
 // "adc1 is already in use", and the HAL came back NULL; `EspHalInit` now returns
-// the SAME interface on a repeat call). See spec N-87 and docs/bring-up-log.md.
+// the SAME interface on a repeat call). See spec N-87 and code/docs/bring-up-log.md.
 //
 // The test-definition macro takes an UNQUOTED identifier and stringifies it
 // inside the macro (see test/unity_config.h); Unity 2.6.1 defines no `TEST`, and

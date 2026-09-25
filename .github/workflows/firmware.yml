@@ -36,11 +36,21 @@ jobs:
           python-version: "3.11"
       # Pinned, because the native suite's cJSON comes from a git pin and a
       # floating PlatformIO has moved LDF behaviour under this project before.
-      # 6.2.0, not 6.1.18: the pioarduino platform in platformio.ini is
-      # 55.03.311, which declares `>= 6.1.19` and refuses to install under
-      # 6.1.18 ("IncompatiblePlatform ... depends on PlatformIO Core >= 6.1.19"),
-      # so the old pin failed the build job before it compiled anything.
-      - run: pip install "platformio==6.2.0"
+      #
+      # 6.1.19, and NOT 6.2.0, and NOT 6.1.18:
+      #   - 6.1.18 is too old for the platform (55.03.311 declares `>= 6.1.19`;
+      #     under 6.1.18 it refuses to install: "IncompatiblePlatform").
+      #   - 6.2.0 breaks the ESP-IDF build: Core 6.2.0 moved its own SCons
+      #     dependency to tool-scons@~4.41101.0, but this platform's platform.json
+      #     still declares 4.40801.0, so its version check DELETES
+      #     packages/tool-scons mid-build and never reinstalls it -- the link step
+      #     then dies with "ModuleNotFoundError: No module named
+      #     'SCons.Tool.FortranCommon'" (pioarduino/platform-espressif32#529).
+      #   - 6.1.19 pins tool-scons to ~4.40801.0, matching the platform, so no
+      #     mismatch and no deletion. This is the upstream-recommended pin.
+      # Verified end-to-end in a clean ubuntu-24.04 container: with 6.1.19 the
+      # device suite links and the production image builds.
+      - run: pip install "platformio==6.1.19"
       - name: Native unit tests
         working-directory: code
         run: pio test -e native
@@ -139,7 +149,9 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install "platformio==6.2.0"
+      # 6.1.19, not 6.2.0 -- see the pin note in host-tests above for the
+      # tool-scons mismatch that breaks the ESP-IDF link under Core 6.2.0.
+      - run: pip install "platformio==6.1.19"
 
       # The IDF build needs the component manager, which PlatformIO does not
       # install. Without it the build fails before compiling anything, with an
@@ -180,6 +192,26 @@ jobs:
       - name: Size gate (spec 10.5, R-1)
         working-directory: code
         run: python3 tools/check_size.py
+
+      # The stack gate recompiles every TU with -fstack-usage and needs BOTH
+      # compile databases: `.pio/build/esp32s3/compile_commands.json`, which
+      # `pio run` refreshes, AND the root `code/compile_commands.json`, whose
+      # `main.cpp` entry carries the full -I set (the build db's main.cpp entry
+      # has only 143 and dies on esp_flash.h). Only a `compiledb` run writes the
+      # root db, and nothing here ever did -- so on a clean checkout main.cpp
+      # failed to recompile and the gate reported the BOOT ROOT as renamed
+      # ("app_main ... absent from the call graph"), the exact misdiagnosis the
+      # gate's own comments warn about. The gate's design already documents that
+      # neither database alone is sufficient.
+      #
+      # Env is required for the same reason as the build below: the version/SHA
+      # are compiled in and an unset pair fails on -Werror.
+      - name: Emit the root compile database the stack gate needs
+        working-directory: code
+        env:
+          SWC_FW_VERSION: 0.0.0-ci
+          SWC_GIT_SHA: ${{ github.sha }}
+        run: pio run -e esp32s3 -t compiledb
 
       # `sizeof(Config)` is 8,912 B, and several functions held one BY VALUE --
       # which made frames of 9-18 KB on a 3,584-byte main task and a 4,096-byte

@@ -44,7 +44,12 @@ jobs:
         with:
           python-version: "3.11"
 
-      - uses: android-actions/setup-android@v3
+      # v4, not v3: v3's default `packages: 'tools platform-tools'` runs
+      # `sdkmanager tools`, but Google REMOVED the standalone `tools` package
+      # from the SDK repo -- the job dies in the action ("Warning: Failed to
+      # find package 'tools'") before any of our steps run. v4's default is
+      # `platform-tools` only. Pinned to the exact tag, not the floating major.
+      - uses: android-actions/setup-android@v4.0.4
 
       # The app's sources include the GENERATED contract, which is checked in --
       # so this is a staleness check, not a build step. Regenerating here and

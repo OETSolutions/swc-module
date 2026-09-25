@@ -204,7 +204,12 @@ TEST(ConfigStore, AMultiChunkConfigRoundTripsThroughEveryChunkKey) {
     // Every chunk key must exist, not just chunk 0. A store that wrote only the
     // header would still load *something*; this is what makes the gap visible.
     for (int i = 0; i < chunks; ++i) {
-        char key[16];
+        // 32, not the store's own 16: `chunks` is runtime-derived, so GCC's
+        // -Wformat-truncation (in -Wall, and this project builds -Werror) must
+        // assume %d can be 11 digits -> 18 bytes, and rejects 16. The store's
+        // ChunkKey escapes this only because its width is a runtime parameter
+        // the analyzer cannot size.
+        char key[32];
         std::snprintf(key, sizeof(key), "cfg_a_%d", i);
         EXPECT_GE(hal.NvsGet(key, g_scratch, sizeof(g_scratch)), 0)
             << "missing chunk key " << key;

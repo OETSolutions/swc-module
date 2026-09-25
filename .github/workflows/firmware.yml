@@ -36,7 +36,11 @@ jobs:
           python-version: "3.11"
       # Pinned, because the native suite's cJSON comes from a git pin and a
       # floating PlatformIO has moved LDF behaviour under this project before.
-      - run: pip install "platformio==6.1.18"
+      # 6.2.0, not 6.1.18: the pioarduino platform in platformio.ini is
+      # 55.03.311, which declares `>= 6.1.19` and refuses to install under
+      # 6.1.18 ("IncompatiblePlatform ... depends on PlatformIO Core >= 6.1.19"),
+      # so the old pin failed the build job before it compiled anything.
+      - run: pip install "platformio==6.2.0"
       - name: Native unit tests
         working-directory: code
         run: pio test -e native
@@ -135,7 +139,7 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: pip install "platformio==6.1.18"
+      - run: pip install "platformio==6.2.0"
 
       # The IDF build needs the component manager, which PlatformIO does not
       # install. Without it the build fails before compiling anything, with an

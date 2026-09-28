@@ -258,12 +258,20 @@ jobs:
         working-directory: code
         run: python3 tools/check_sdkconfig_keys.py
 
-      # N-62: the Release fetch pins a single CA, and a pin does NOT self-update.
-      # This guards both halves of that: the header is one certificate (not a
-      # bundle again) and OtaWifi actually uses it, and the pin is not near
-      # expiry -- a pinned CA that lapses breaks the fetch at TLS with nothing
+      # N-62/N-92: the Release fetch pins the release chain's roots (github.com +
+      # the CDN it redirects to), and a pin does NOT self-update. This guards the
+      # count and the identities and the expiries -- a pinned CA that lapses, or a
+      # pin missing the redirect hop's root, breaks the fetch at TLS with nothing
       # else to notice it.
-      - name: The release CA is a single pinned cert, used, and not near expiry
+      - name: The release CAs are the pin, used, and not near expiry
         working-directory: code
         run: python3 tools/check_release_ca.py
+
+      # N-92: a GitHub release URL redirects to a CDN whose signed query makes the
+      # request first line ~900 bytes; a config that leaves buffer_size_tx at IDF's
+      # 512-byte default fails on the redirect hop only (so a tunnel bench hides
+      # it). Every HTTP client config must size it.
+      - name: Every OTA HTTP config sizes buffer_size_tx for a release redirect
+        working-directory: code
+        run: python3 tools/check_ota_buffer.py
 

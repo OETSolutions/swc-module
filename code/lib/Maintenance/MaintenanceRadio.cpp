@@ -567,7 +567,7 @@ esp_err_t HandleOtaCheck(httpd_req_t *req)
         case ReleaseCheckResult::kMalformed:         word = "the release manifest could not be read"; break;
     }
 
-    char out[256];
+    char out[320];
     if (r == ReleaseCheckResult::kNewer) {
         // The version and the size are what the page needs to say what it found;
         // the URL is NOT included, because the install path takes it from the
@@ -575,6 +575,24 @@ esp_err_t HandleOtaCheck(httpd_req_t *req)
         // an attacker-supplied download if the token leaked).
         snprintf(out, sizeof(out), "{\"message\":\"an update is available: %s (%u bytes)\"}",
                  info.latest_version, static_cast<unsigned>(info.size_bytes));
+    } else if (r == ReleaseCheckResult::kMalformed) {
+        // Name the CAUSE, not only the symptom (N-85): a TLS failure (an unset
+        // clock), a DNS failure, a non-200 status and an unparseable body all
+        // used to read identically as "could not be read". The detail is copied
+        // with any `"` or `\` replaced by `_`, the same rule `Nack` applies to its
+        // peer-derived strings: an embedded quote would close the JSON string
+        // early and make the whole frame unparseable.
+        const char *why = OtaWifiLastError();
+        char safe[160];
+        size_t n = 0;
+        for (const char *p = (why != nullptr && why[0] != '\0') ? why : "no detail";
+             *p != '\0' && n + 1 < sizeof(safe); ++p) {
+            safe[n++] = (*p == '"' || *p == '\\') ? '_' : *p;
+        }
+        safe[n] = '\0';
+        snprintf(out, sizeof(out),
+                 "{\"message\":\"the release manifest could not be read\",\"detail\":\"%s\"}",
+                 safe);
     } else {
         snprintf(out, sizeof(out), "{\"message\":\"%s\"}", word);
     }

@@ -15,6 +15,39 @@ not just a tag.
 
 ## Software releases
 
+### [1.0.1] — 2026-09-28
+
+**Fix: "check for updates" now works in production.** The WiFi OTA release fetch
+(FR-35) had never succeeded against the real GitHub release host — it was only ever
+proven against a Cloudflare tunnel. Three independent, host-dependent reasons, all
+found and fixed (defect N-92):
+
+- **The release repository was private.** GitHub serves release assets to
+  anonymous clients only on public repos, so the device and the app both received
+  HTTP 404 (neither sends a credential). The repository is now **public**.
+- **The redirect target's CA was not pinned.** A GitHub release URL 302-redirects
+  to `release-assets.githubusercontent.com`, signed by Let's Encrypt (ISRG Root
+  X1) — a different CA than `github.com` (Sectigo E46). The firmware pinned only
+  the latter, and `esp_http_client` reuses its certificate across the redirect, so
+  the fetch died on the redirect hop. `ReleaseCa.h` now pins **both** roots.
+- **The HTTP request buffer was too small.** The redirect URL carries a long
+  signed query string, so the request first line is ~900 bytes — over IDF's
+  512-byte default, which refuses it ("Out of buffer"). The check path set no
+  buffer size; it now matches the install path (`buffer_size_tx = 1024`).
+
+**Diagnostics**: `OtaWifiLastError()` now reports *why* a release check failed
+(the transport error and HTTP status) instead of the single, uninformative "the
+release manifest could not be read" — the ambiguity that hid all three causes.
+
+**Guards** (CI-wired, mutation-tested): `check_release_ca.py` asserts the pin's
+count, both subjects and both expiries; new `check_ota_buffer.py` requires every
+OTA HTTP config to size its TX buffer.
+
+**Verification**: 612/612 native tests; 71 tools tests; all 11 static gates; device
+build 71.9 % of the app slot. **Proven on the DUT** with the production URL
+compiled in (no override): `POST /api/ota/check` → *"an update is available: 1.0.0
+(1410368 bytes)"*, the exact size of the published asset.
+
 ### [1.0.0] — 2026-09-28
 
 The first release with the complete **no-app** feature set: a head unit can be

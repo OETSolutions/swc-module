@@ -766,6 +766,8 @@ private:
     // DAC code would let the next update pull the line back toward the released
     // key's voltage.
     void ReleaseKey(uint8_t index);
+    // Release the line a programming hold is holding, if any (spec §7.5).
+    void ReleaseProgramHold();
     /*
      * Drive a channel's KEY line to a BOUND level (spec 3.6's `OUT_VOLTAGE`).
      *
@@ -993,6 +995,18 @@ private:
      */
     LearnWizard  wizard_;
     ConfigStore *store_ = nullptr;
+    /*
+     * The channel whose line is being HELD for a programming hold (spec §7.5), or
+     * 0xFF when none. While the wizard is active the pressed button's level is held
+     * on this channel for the head unit to capture; when the modifier is released
+     * the line must be let go -- but the wizard has handed back by then, so
+     * `ServiceLearn` needs this to know which channel to release.
+     */
+    uint8_t      program_hold_channel_ = 0xFF;
+    // The gesture slot currently being held on that channel, or -1 when none.
+    // Lets the hold drive the DAC ONCE per gesture and then stay steady, rather
+    // than re-writing every tick (see `ServiceChannel`'s programming-hold branch).
+    int          program_hold_slot_ = -1;
     // The AUX1 level at the last tick, for the hold detector's edge.
     uint64_t     aux_hold_ms_ = 0;
     bool         aux_holding_ = false;

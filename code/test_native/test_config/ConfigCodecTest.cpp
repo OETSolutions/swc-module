@@ -57,6 +57,9 @@ TEST(ConfigCodec, JsonRoundTripsEveryFieldThatWasSet) {
     EXPECT_EQ(out.settings.buzzer_level, 2);
     EXPECT_EQ(out.settings.led_level, 2);
     EXPECT_TRUE(out.settings.temp_comp_enabled);
+    // The per-press click. The fixture sets it TRUE: the shipping default is FALSE,
+    // so a field left at the default would pass whether or not it round-tripped.
+    EXPECT_TRUE(out.settings.key_click_enabled);
     EXPECT_EQ(out.settings.maintenance_timeout_ms, in.settings.maintenance_timeout_ms);
     // FR-33's next-boot trigger. The fixture sets it TRUE precisely so this
     // assertion can fail: an encoder that dropped the field would decode it back

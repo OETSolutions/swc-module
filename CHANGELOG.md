@@ -7,6 +7,54 @@ This is a hardware project, so "version" is the board revision; the project is
 not yet ordered and carries no assigned revision letter (`REV ${REVISION}` on
 the F.Fab block is still an unresolved text variable).
 
+The **firmware and Android app are versioned separately** from the board, and
+their releases are published as GitHub Releases (see "Software releases" below) —
+a release is what the device's OTA check (spec §9.5) and the app fetch from
+`releases/latest/download/version_manifest.json`, so it is a protocol artifact,
+not just a tag.
+
+## Software releases
+
+### [1.0.0] — 2026-09-28
+
+The first release with the complete **no-app** feature set: a head unit can be
+given single, double and long functions on every steering-wheel button with no
+phone attached.
+
+**Firmware** (version reported in `hello` = the release tag):
+
+- **Headless gesture programming — the 2022 Pico flow, restored.** Hold `AUX1`,
+  perform the gesture on a learned wheel button (tap = single, two taps = double,
+  hold = long), and the adapter **holds that gesture's voltage on the KEY line**
+  while the head unit's own "set key function" screen learns it; releasing `AUX1`
+  releases the line. Previously the output was suppressed during the hold, so
+  there was nothing on the line to program — the "it doesn't work" the user
+  reported. (Spec §7.5; defect N-89.)
+- **An unbound gesture now presents its own gesture's voltage**, not the button's
+  single level for all three gestures. This is what makes three head-unit
+  functions per button possible with no app: the head unit is gesture-blind, so
+  it can only tell the gestures apart by a different voltage. The levels come from
+  a predefined ascending table (`Output/GestureLevels`) mapped as a fraction of
+  the output band, so they are correct on both 5 V and 3 V head units. (Spec §6.6
+  rule 4; defect N-89.)
+- **`key_click_enabled` setting** (default **off**): an optional per-press
+  acknowledgement beep, enabling it in the app. Normal switch operation is silent
+  by default. An explicit `BUZZ` action and `KEY_UNKNOWN` still play.
+
+**Android app** (`com.oetsolutions.swc` 1.0.0): a **Key click** switch on the
+Bindings screen for `key_click_enabled`, matching the firmware setting.
+
+**Documentation**: a new end-user **[MANUAL.md](MANUAL.md)** (wiring, the on-device
+learn, programming and binding, the app, firmware updates, feedback reference,
+troubleshooting).
+
+**Verification**: 612/612 native tests; the rig driver's 10/10 host tests; the
+Android JVM suite; the device build at 71.7 % of the app slot; and every static
+gate. The board itself was re-flashed with this image and reports `config_state:
+ok` / `output_safe: true`. The "three distinct levels reach the head unit" half
+is covered by the host suite only — reading a driven level on the bench needs the
+per-channel loopback wire, which is not fitted here (defect N-90).
+
 ## [Unreleased] — 2026-09-11
 
 Full redesign of the 2022 RP2040 reference board. Design complete and routed;

@@ -12,13 +12,20 @@
 > byte-identical per tip), only the hashes differ. Do not go looking for a hash
 > you read in an old note.
 >
-> **Verified 2026-09-25:** 600/600 native tests under ASan+UBSan (zero sanitizer
-> reports); 212/212 Android JVM tests; all 10 static gates + their self-tests;
-> device build + size gate (71.7 % of the app slot) + stack gate; CI green both
-> branches. The Android suite **requires JDK 17** — the machine default is JDK 25,
-> which makes Robolectric fail with `IllegalArgumentException at
-> ClassReader.java:200` (an ASM bytecode-version error, NOT a code defect). Run it
-> with `JAVA_HOME=$(/usr/libexec/java_home -v 17)` and `ANDROID_HOME` set.
+> **Verified 2026-09-28 (firmware 1.0.0 tip):** 612/612 native tests under
+> ASan+UBSan (zero sanitizer reports); 212/212 Android JVM tests;
+> the rig driver's 10/10 host tests; all 10 static gates + their self-tests
+> (60 pytest cases); device build + size gate (71.7 % of the app slot) + stack
+> gate. The DUT on the bench was re-flashed with this image over USB-OTA and
+> reports `config_state: ok` / `output_safe: true` / `fw_version: dev`. The
+> Android suite **requires JDK 17** — the machine default is JDK 25, which makes
+> Robolectric fail with `IllegalArgumentException at ClassReader.java:200` (an ASM
+> bytecode-version error, NOT a code defect). Run it with
+> `JAVA_HOME=$(/usr/libexec/java_home -v 17)` and `ANDROID_HOME` set.
+>
+> **Release note (2026-09-28):** 1.0.0 is published by
+> `.github/workflows/release.yml` on a `v1.0.0` tag (firmware + `version_manifest.json`).
+> See §4 "Software releases".
 
 Written 2026-09-24, at the point the **assembled PCB is in hand and the next
 session is bring-up on real hardware**. This is a starting point for a new
@@ -53,7 +60,10 @@ An Android app (Kotlin/Compose) talks to it over USB serial.
 **The app has NO learning screen. The AUX1 button is the ONLY production learn
 path** — hold AUX1 ~1.5 s to enter the learn wizard; a longer ~3 s hold opens the
 maintenance window. It must work **with no app and no host**. An unbound gesture's
-default is **passed through** to the head unit. Do not add a learning screen.
+default is to present **its own gesture's slot voltage** (§6.6 rule 4), so a head
+unit taught those three voltages gets three functions per button with no app — it
+is NOT the button's single level for all three gestures (defect N-89). Do not add
+a learning screen.
 
 Two channels, SWC1 and SWC2. `DacChannel` → A=KEY1, B=ADJ1, C=KEY2, D=ADJ2.
 
@@ -62,7 +72,7 @@ Two channels, SWC1 and SWC2. `DacChannel` → A=KEY1, B=ADJ1, C=KEY2, D=ADJ2.
 ```bash
 cd code
 
-# Host suite (600 tests) under ASan+UBSan, in an ISOLATED build dir so a
+# Host suite (612 tests) under ASan+UBSan, in an ISOLATED build dir so a
 # concurrent session cannot clobber it. SWC_FW_VERSION/SHA must be set here too,
 # or PlatformIO auto-cleans .pio/build/ (see the note below the loop):
 SWC_FW_VERSION=dev SWC_GIT_SHA=local \
@@ -87,9 +97,9 @@ python3 tools/check_stack_usage.py
 bash   tools/crosscheck_config.sh
 ```
 
-Last verified: **600/600 native tests green under ASan+UBSan (zero sanitizer
+Last verified: **612/612 native tests green under ASan+UBSan (zero sanitizer
 reports), 212/212 Android JVM tests, all 10 Python gates green, device build
-succeeds at ~71.7 % of the app slot** (measured 2026-09-25).
+succeeds at ~71.7 % of the app slot** (measured 2026-09-28, firmware 1.0.0 tip).
 
 **Always use isolated build dirs.** Peer sessions share `code/.pio/build/` and
 will race you (`PLATFORMIO_BUILD_DIR=…` per the commands above).
@@ -334,6 +344,19 @@ them by name and CI runs from `code/`. Every gate and its `test_check_*.py`
 self-test is committed as of `38f579c`, and CI runs each one; a gate added later
 must be added to the workflow by name as well as to the verify loop in §2.
 
+**Software releases (added 2026-09-28).** `.github/workflows/release.yml`
+publishes a GitHub Release on a `vX.Y.Z` tag: it builds the firmware with
+`SWC_FW_VERSION` = the tag (so `hello`'s `fw_version` and the release agree),
+gates the size, and generates `version_manifest.json` from the built binary via
+`code/tools/gen_release_manifest.py` (with its own self-test,
+`test_gen_release_manifest.py`). The manifest is a **protocol artifact**: both the
+device (`ReleaseCheck.cpp`) and the app (`ReleaseManifest.kt`) fetch it from
+`releases/latest/download/version_manifest.json`, so its `firmware.sha256` must
+describe the `firmware.bin` asset beside it — generating both in one job is what
+guarantees that. The **board has not been ordered and carries no revision letter**;
+"software release" is the firmware/app version, deliberately separate from the
+board rev (`CHANGELOG.md` → "Software releases").
+
 - `check_maintenance_radio.py` (added with N-15) pins the maintenance radio's
   window-scoped invariants — FR-32's teardown pairing, every reply setting its
   status line, the failure count being window-scoped and assigned rather than
@@ -437,6 +460,20 @@ Host-invisible: it needs the analog loop closed by a real sense node. Fixed by
 `SystemOrchestrator::HeadUnitGone` (a driven line is judged only on a deep sag;
 a released line's verdict must persist 250 ms). Native suite 503 → 504; device
 build clean. Details in `code/docs/bring-up-log.md` and spec §12.1 (N-79).
+
+**This session's work (2026-09-28)** restored the **no-app gesture programming**
+the user had asked for from the start — the 2022 Pico flow: hold AUX1, perform the
+gesture, and the adapter **holds that gesture's voltage** on the KEY line while the
+head unit learns it. Three coupled changes: a predefined slot table
+(`Output/GestureLevels.{h,cpp}`), §6.6 rule 4 corrected so an unbound gesture
+presents **its own** slot level rather than the button's single level (defect
+N-89), and a new `key_click_enabled` setting (default off). **Bench re-verified on
+the DUT with the 1.0.0 image**: FR-9, FR-12, FR-31, FR-31b, FR-42 all PASS.
+**Two defects found on the bench, both in the HARNESS, not the firmware** — N-90
+(the spec claimed a three-levels measurement the bench cannot take without the
+loopback wire) and N-91 (FR-31b's press used `set_level`, whose status read
+releases the DAC — the same trap N-88 fixed for FR-9; the DUT classified the
+button correctly through `drive_both`). See the spec's N-89/N-90/N-91 rows.
 
 **This session's software work (2026-09-24)** closed **N-15**, the last
 genuinely-missing feature: the maintenance window had no radio behind it. Two

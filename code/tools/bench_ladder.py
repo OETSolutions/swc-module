@@ -638,20 +638,36 @@ def check_fr31_headless_learn(dut, rig, results):
             # A press is "drive the button's level, then return to IDLE" -- and on
             # this rig the return MUST be a driven wheel-like idle, not a RELEASE:
             # a released node floats to ~3173 mV, which the DUT reads as a rail
-            # fault, not as a let-go. ONE press, then wait past the double-press
-            # window so the DUT emits a SINGLE.
-            rig.set_level(idle_seen)
-            rig.drive_now()
-            dut.collect(0.3)
-            rig.set_level(new_center)
-            rig.drive_now(settle_s=0.6)
+            # fault, not as a let-go.
+            #
+            # **The press MUST go through `drive_both`, not `set_level`** -- the
+            # same structural reason N-88 fixed FR-9. `set_level` closes its loop
+            # with a rig STATUS read, and the rig's status handler prints
+            # `KeyLine::FloatMv(1)` AND `FloatMv(2)`, both of which call
+            # `Dac::Release`. So the level `set_level` just set is NOT reliably on
+            # the line when the collect starts, and a press driven that way reads
+            # inconsistently (measured 2026-09-28: the taught button produced NO
+            # event via the `set_level` path and the CORRECT event -- `(ch0,
+            # swc1_bt5, ...)` -- via `drive_both`, on the same device and config).
+            # `drive_both` walks the +/- nudges with NO further status read, so
+            # both channels hold their commanded code for the whole press. SWC1
+            # goes to the button's centre; SWC2 is held at the wheel-like idle.
+            #
+            # The press is held past `long_press_ms`, so the DUT legitimately
+            # resolves it as a LONG; the check only requires the button to be
+            # NAMED (`e["button"] == new_id`), which is the spec 6.6 rule 4 claim
+            # -- that the taught button is recognised headlessly, whatever the
+            # gesture. Use `IDLE_CMD_MV` for the idle (the rig's canonical
+            # wheel-idle command), not the DUT-side `idle_seen`, so the press is
+            # measured against the level the rig actually drives.
+            rig.drive_both(new_center, IDLE_CMD_MV, settle_s=0.8)  # press SWC1, hold
             time.sleep(0.3)
-            rig.set_level(idle_seen)
-            rig.drive_now(settle_s=0.6)
-            frames = dut.collect(3.0)
+            rig.drive_both(IDLE_CMD_MV, IDLE_CMD_MV, settle_s=0.6)  # back to idle
+            frames = dut.collect(3.5)
             evs = [f for f in frames if f.get("type") == "event" and f.get("button")]
             results.append(("FR-31b", any(e.get("button") == new_id for e in evs),
-                            f"taught {new_id} classifies: {[e.get('button') for e in evs]}"))
+                            f"taught {new_id} classifies: "
+                            f"{[(e.get('channel'), e.get('button'), e.get('gesture')) for e in evs]}"))
 
 
 def check_fr30_rail_scale(dut, rig, results):

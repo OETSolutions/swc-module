@@ -170,6 +170,10 @@ object ConfigJson {
                     buzzerLevel = s.int("buzzer_level") ?: 2,
                     ledLevel = s.int("led_level") ?: 2,
                     tempCompEnabled = s.bool("temp_comp_enabled") ?: true,
+                    // The per-press click is OFF by default, matching the firmware
+                    // ("normal switch operation should not cause a beep"). Absent
+                    // means false: a config from an older firmware has no such key.
+                    keyClickEnabled = s.bool("key_click_enabled") ?: false,
                     maintenanceTimeoutMs = s.long("maintenance_timeout_ms") ?: 300_000L,
                     // Absent means false, matching the firmware's optional-field
                     // rule: a config from an older firmware has no such key, and
@@ -263,6 +267,7 @@ object ConfigJson {
         put("buzzer_level", s.buzzerLevel)
         put("led_level", s.ledLevel)
         put("temp_comp_enabled", s.tempCompEnabled)
+        put("key_click_enabled", s.keyClickEnabled)
         put("maintenance_timeout_ms", s.maintenanceTimeoutMs)
         put("maintenance_on_boot", s.maintenanceOnBoot)
     }

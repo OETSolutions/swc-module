@@ -10,6 +10,7 @@
 #include "Config/ConfigDefaults.h"
 #include "Config/ConfigStore.h"
 #include "Output/GainPolicy.h"
+#include "Output/GestureLevels.h"
 
 // FR-33's no-config maintenance trigger (spec 8.2, "Reset-reason + no-config")
 // keys on the reset reason being a POWER-ON, via `SWC_RST_POWERON` (defined in
@@ -134,6 +135,7 @@ GestureBindings SystemOrchestrator::BindingsForButton(uint8_t channel_index,
     const uint8_t as_swc = (channel_index == 0)
                                ? static_cast<uint8_t>(BindingChannel::kSwc1)
                                : static_cast<uint8_t>(BindingChannel::kSwc2);
+    bool any_match = false;
     for (uint8_t i = 0; i < config_.binding_count; ++i) {
         const Binding &b = config_.bindings[i];
         if (!b.enabled) continue;
@@ -141,8 +143,31 @@ GestureBindings SystemOrchestrator::BindingsForButton(uint8_t channel_index,
             continue;
         }
         if (strcmp(b.button, button_id) != 0) continue;
+        any_match = true;
         if (b.gesture == Gesture::kDouble) out.has_double = true;
         if (b.gesture == Gesture::kLong) out.has_long = true;
+    }
+
+    // **A button that binds NOTHING still needs DOUBLE and LONG detected**, because
+    // its gestures are meaningful through the DEFAULT presentation (spec 6.6 rule
+    // 4): an unbound button's single/double/long present three distinct slot levels
+    // so the head unit -- taught them -- can fire three functions. That is the
+    // no-app product. Leaving `has_double`/`has_long` false here (the adaptive
+    // "no ambiguity to resolve" shortcut) made the machine emit SINGLE at the press
+    // and NEVER produce a DOUBLE or LONG at all, so the two extra functions a user
+    // programmed did nothing -- the exact failure this feature exists to fix.
+    //
+    // The latency this adds is inherent, not accidental: you cannot know a tap is
+    // not a double until the double-press window closes, which is what makes three
+    // gestures on one key distinguishable. The 2022 firmware did the same
+    // (`check_is_double_press_key` always returned true).
+    //
+    // A button that DOES bind something keeps the adaptive rule: if it binds only a
+    // SINGLE, its double/long are not the default (the app chose this button's
+    // gestures), so it resolves at the press with no window.
+    if (!any_match) {
+        out.has_double = true;
+        out.has_long = true;
     }
     return out;
 }
@@ -929,6 +954,10 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
             maint_fired_latch_ = true;
             if (wizard_.Active()) {
                 wizard_.Abandon(now_ms);
+                // The abandoned hold may have been holding a programming level on
+                // the line; let it go, or the escalation to maintenance would leave
+                // a key driven (spec 6.7's held-key hazard).
+                ReleaseProgramHold();
             }
             maintenance_.Enter(MaintenanceTrigger::kAux1Hold, now_ms);
             // N-61: say WHY on the buzzer, which the app-opened path cannot. A
@@ -951,6 +980,12 @@ void SystemOrchestrator::ServiceLearn(uint64_t now_ms) {
         if (wizard_.Active() && aux_holding_) {
             wizard_.Release(now_ms);
         }
+        // Spec §7.5: "release the AUX1 line to release the output". The line the
+        // programming hold was HOLDING must be let go now -- the head unit has
+        // captured the level, and leaving it driven is a held key (spec 6.7's
+        // hazard). This runs whether or not the wizard had committed, so a hold
+        // that named no input still releases.
+        ReleaseProgramHold();
         aux_holding_ = false;
         aux_hold_latch_ = false;
         maint_fired_latch_ = false;
@@ -1468,6 +1503,19 @@ void SystemOrchestrator::RestoreLedsAfterIdentify(uint64_t now_ms) {
     if (!wizard_.Active()) RestatLeds();
 }
 
+/*
+ * Let go of a line the programming hold was holding (spec §7.5). Called on the
+ * AUX1 release edge from `ServiceLearn`, which is the one place that sees the
+ * edge AND still knows which channel was being held -- by then the wizard has
+ * already handed back and no longer reports a target.
+ */
+void SystemOrchestrator::ReleaseProgramHold() {
+    if (program_hold_channel_ >= kMaxChannels) return;
+    ReleaseKey(program_hold_channel_);
+    program_hold_channel_ = 0xFF;
+    program_hold_slot_ = -1;
+}
+
 void SystemOrchestrator::ReleaseKey(uint8_t index) {
     ChannelState &cs = channels_[index];
     if (!cs.key_driven) return;
@@ -1658,7 +1706,15 @@ void SystemOrchestrator::RunBindingActions(uint8_t index,
     // second was measured: it is exactly as silent, because KEY_ACCEPTED would be
     // the one replaced.)
     if (play_default_ack) {
-        buzzer_.Play(bound == BuzzerPattern::kNone ? BuzzerPattern::kKeyAccepted : bound);
+        // The DEFAULT acknowledgement is the optional per-press click, OFF unless
+        // the user enabled it ("normal switch operation should not cause a beep").
+        // An EXPLICIT BUZZ action is not gated: the user asked for that pattern by
+        // name, so it always plays.
+        if (bound != BuzzerPattern::kNone) {
+            buzzer_.Play(bound);
+        } else if (config_.settings.key_click_enabled) {
+            buzzer_.Play(BuzzerPattern::kKeyAccepted);
+        }
     }
 }
 
@@ -1725,27 +1781,75 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
     const ChannelConfig &cc = config_.channels[index];
 
     /*
-     * **While the headless learn is armed, no press drives the radio.** The 2022
-     * firmware suppressed output whenever the modifier was held
-     * (`!is_program_button_pressed` guarded every transition to `SEND_KEY_VALUE`),
-     * and the reason is the same here: the user holds AUX1 to program, and any
-     * button they press during that hold is being TAUGHT, not driven. The head
-     * unit must not receive it.
+     * **While the headless learn is armed, a press is being TAUGHT -- but a button
+     * being PROGRAMMED presents a HELD level so the head unit can capture it.**
      *
-     * Without this the button being learned is delivered to the radio on every
-     * press of the learn -- the phantom-key hazard FR-39 exists to prevent,
-     * arriving from the one path whose whole purpose is "nothing is being pressed
-     * for real".
+     * This is the 2022 interaction, restored (spec §7.5). The old firmware reached
+     * `PROGRAM_ALT_KEY` while the modifier was held and held that gesture's pot
+     * value on the output, so the user could teach the head unit "this voltage is
+     * this function"; releasing the modifier released the line. The earlier
+     * behaviour here SUPPRESSED the output entirely during the hold, which is why
+     * the user's Pico flow "didn't work" -- there was nothing on the KEY line to
+     * program.
+     *
+     * The phantom-key hazard the old suppression guarded against is closed a
+     * different way now: the pressed button is delivered only as the level the
+     * user is deliberately programming (its own level, or a chosen gesture's
+     * slot), and only on the channel being programmed -- NOT as whatever action
+     * its bindings would run. `cs.gestures.Reset()` still runs, so a half-
+     * recognised press cannot complete into a binding action after the hold.
      *
      * The SAFETY releases still run (a pulse timeout, a lost head unit), because
      * they are not classification: a key driven before the learn started must
-     * still be let go. `cs.gestures.Reset()` discards any half-recognised gesture
-     * so a press in flight when the learn began cannot complete afterwards.
+     * still be let go.
      */
     if (wizard_.Active()) {
         cs.reader.Update(now_ms);
         if (cs.key_driven && now_ms >= cs.key_released_at_ms) ReleaseKey(index);
-        cs.gestures.Reset();
+
+        if (index == wizard_.TargetChannelIndex()) {
+            // The channel the user is programming: drive the gesture's predefined
+            // slot level, HELD for as long as the gesture stands, so the head unit
+            // captures a stable, distinct voltage. This is the 2022
+            // `PROGRAM_ALT_KEY` hold, restored.
+            //
+            // **The unresolved case presents the SINGLE slot, not the button's raw
+            // centre.** The user's goal is THREE distinct functions per key with no
+            // app (single/double/long). If an unresolved press presented the raw
+            // centre and a resolved SINGLE presented a slot, the head unit would
+            // capture a different voltage depending on WHEN the user pressed "set",
+            // and the button's plain function would be ambiguous. Presenting
+            // SINGLE's slot from the first tick makes every gesture a slot and the
+            // four cases (unresolved, SINGLE, DOUBLE, LONG) collapse to three
+            // stable levels, matching what normal operation later sends.
+            const Gesture g = (wizard_.ProgrammedGesture() == Gesture::kNone)
+                                  ? Gesture::kSingle
+                                  : wizard_.ProgrammedGesture();
+            const int slot = GestureSlotIndex(wizard_.TargetButtonOrdinal(), g);
+            if (slot >= 0) {
+                if (slot != program_hold_slot_ || !cs.key_driven) {
+                    // A new gesture (or the hold lapsed): drive the level. Once
+                    // driven it is HELD -- re-writing the DAC every tick would be
+                    // pointless I2C traffic and a second thing that can latch a DAC
+                    // fault, so the steady state below only keeps the hold alive.
+                    const int target_mv = GestureSlotLevelMv(slot, IdleKeyMv(index));
+                    if (target_mv > 0) DriveBoundLevelMv(index, target_mv, now_ms);
+                    program_hold_slot_ = slot;
+                } else {
+                    // Push the safety-release deadline forward so the branch-top
+                    // release does not cut the hold short after `send_duration_ms`.
+                    // The DAC is NOT re-written here.
+                    cs.key_released_at_ms = now_ms + timings_.send_duration_ms;
+                }
+                // Remember the channel so the release on AUX1-let-go can let the
+                // line go even after the wizard has handed back (see ServiceLearn).
+                program_hold_channel_ = index;
+            }
+        } else {
+            // A press on some OTHER input during the hold is being taught, not
+            // driven: discard any half-recognised gesture so it cannot complete.
+            cs.gestures.Reset();
+        }
         return;
     }
 
@@ -2021,32 +2125,54 @@ void SystemOrchestrator::ServiceChannel(uint8_t index, uint64_t now_ms) {
             if (resolved.found) {
                 RunBindingActions(index, resolved, now_ms);
             } else {
-                // The button was RECOGNISED but its gesture is not bound, so there
-                // is no action to run. The device then behaves as a STOCK WHEEL:
-                // it presents that button's own level, one bounded pulse. This is
-                // the 2022 design's default -- `lookup_single/double/long_press_val`
-                // always presented the key, and only `program_alt_key` overrode it --
-                // and it is what makes the no-app product work, because a fresh
-                // device learned by AUX1 alone has windows but no bindings
-                // (`ConfigDefault` ships `binding_count = 0`), and every runtime
-                // binding otherwise comes from a config the app pushes.
+                // The button was RECOGNISED but its gesture is not bound. In the
+                // FIRST-INSTALL case -- the user programmed a button headlessly and
+                // the head unit captured a level per gesture -- the device must
+                // present a DISTINCT, STABLE level per gesture so the function the
+                // head unit was taught actually fires.
                 //
-                // Without this the learned ladder NEVER drove a key: the press
-                // resolved to nothing, the line was released, and KEY_UNKNOWN was
-                // played -- the exact silent failure the user reported, invisible
-                // because the learn itself beeped LEARN_OK.
+                // **This is the 2022 default, restored (spec §6.6 rule 4).** The
+                // old firmware's `lookup_single/double/long_press_val` sent a
+                // different level per gesture; presenting the button's ONE centre
+                // for all three (which this used to do) made the head unit's
+                // gesture-blind input see the same command for every gesture, so
+                // the double/long functions a user programmed did nothing --
+                // exactly the "it doesn't work" the user reported.
                 //
-                // The head unit is gesture-blind, so it does not matter WHICH
-                // gesture landed here: single, double and long all present the same
-                // button, which is precisely what a stock wheel does. What a
-                // gesture MEANS is a binding; the default is that it means the
-                // button itself.
+                // The level comes from the predefined slot table (`GestureLevels`),
+                // indexed by the button's ordinal and the gesture, so the SAME
+                // gesture always sends the SAME voltage regardless of rail or
+                // temperature -- the compensation property the user asked for.
                 const uint8_t bi = ev.button_index;
                 const LadderProfile &ladder = config_.channels[index].ladder;
-                if (bi < ladder.count &&
-                    PresentLevel(index, ladder.buttons[bi].mv_center, ladder.learned_idle_mv,
-                                 now_ms)) {
-                    buzzer_.Play(BuzzerPattern::kKeyAccepted);
+                const int slot = GestureSlotIndex(bi, ev.gesture);
+                bool presented = false;
+                if (slot >= 0) {
+                    const int slot_mv = GestureSlotLevelMv(slot, head_unit_idle_mv_[index]);
+                    if (slot_mv > 0) {
+                        presented = DriveBoundLevelMv(index, slot_mv, now_ms);
+                    }
+                }
+                if (presented) {
+                    // The per-press click is OPTIONAL and OFF by default (the user:
+                    // "normal switch operation should not cause a beep"). An
+                    // explicit BUZZ action still plays (that is a deliberate ask),
+                    // and KEY_UNKNOWN below still plays, because that reports a
+                    // press that matched nothing.
+                    if (config_.settings.key_click_enabled) {
+                        buzzer_.Play(BuzzerPattern::kKeyAccepted);
+                    }
+                } else if (bi < ladder.count &&
+                           PresentLevel(index, ladder.buttons[bi].mv_center,
+                                        ladder.learned_idle_mv, now_ms)) {
+                    // No gesture slot (a ladder with more buttons than the table
+                    // admits): fall back to the button's own level, the stock-wheel
+                    // behaviour. A gesture on such a button cannot be distinguished
+                    // -- which is why the table is sized for the full ladder -- but
+                    // the button still works as a plain press.
+                    if (config_.settings.key_click_enabled) {
+                        buzzer_.Play(BuzzerPattern::kKeyAccepted);
+                    }
                 } else {
                     // No usable head-unit idle (or no such button): there is nothing
                     // to map the level ONTO, and a fabricated denominator would land

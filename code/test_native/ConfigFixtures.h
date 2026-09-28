@@ -29,6 +29,10 @@ inline Config MakeConfig() {
     c.settings.buzzer_level = 2;
     c.settings.led_level = 2;
     c.settings.temp_comp_enabled = true;
+    // The per-press click, set TRUE here for the same reason as the trigger below:
+    // the shipping default is FALSE, so a fixture left at the default could not
+    // tell "round-trips" from "the encoder dropped it".
+    c.settings.key_click_enabled = true;
     c.settings.maintenance_timeout_ms = 300000;   // spec 8.2's default window
     // FR-33's next-boot trigger, set TRUE here on purpose: a fixture field left at
     // its zero value cannot distinguish "round-trips correctly" from "the encoder

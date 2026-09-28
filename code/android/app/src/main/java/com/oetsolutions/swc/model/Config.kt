@@ -221,6 +221,15 @@ data class DeviceSettings(
     val buzzerLevel: Int = 2,
     val ledLevel: Int = 2,
     val tempCompEnabled: Boolean = true,
+    /**
+     * The per-press "click" acknowledgement — a short KEY_ACCEPTED beep on every
+     * recognised switch press.
+     *
+     * **OFF by default**, matching the firmware: normal switch operation is silent
+     * unless the user opts in. Only the DEFAULT acknowledgement is gated; an
+     * explicit BUZZ action and the KEY_UNKNOWN report are unaffected.
+     */
+    val keyClickEnabled: Boolean = false,
     val maintenanceTimeoutMs: Long = 300_000L,
     /**
      * FR-33's next-boot maintenance trigger (spec 8.2): the device opens its setup

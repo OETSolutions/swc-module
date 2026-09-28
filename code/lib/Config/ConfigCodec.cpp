@@ -559,6 +559,7 @@ cJSON *EncodeSettings(const DeviceSettings &s) {
     AddU32(o, "buzzer_level", s.buzzer_level);
     AddU32(o, "led_level", s.led_level);
     cJSON_AddBoolToObject(o, "temp_comp_enabled", s.temp_comp_enabled);
+    cJSON_AddBoolToObject(o, "key_click_enabled", s.key_click_enabled);
     AddU32(o, "maintenance_timeout_ms", s.maintenance_timeout_ms);
     cJSON_AddBoolToObject(o, "maintenance_on_boot", s.maintenance_on_boot);
     return o;
@@ -717,6 +718,17 @@ bool DecodeSettings(const cJSON *o, DeviceSettings *s) {
     if (!ReadU8(o, "buzzer_level", &s->buzzer_level)) return false;
     if (!ReadU8(o, "led_level", &s->led_level)) return false;
     if (!ReadBool(o, "temp_comp_enabled", &s->temp_comp_enabled)) return false;
+    // OPTIONAL, like `maintenance_on_boot` below: a config written before this
+    // field existed has no `key_click_enabled`, and the on-disk format is JSON
+    // with no schema bump to lean on. ABSENT means false (the shipping default),
+    // which is what the device does now anyway -- a present-but-malformed value
+    // still fails the whole decode, because silently defaulting THAT is the
+    // wrong-value shape this rule exists to avoid.
+    s->key_click_enabled = false;
+    const cJSON *kce = Member(o, "key_click_enabled");
+    if (kce != nullptr && !ReadBool(o, "key_click_enabled", &s->key_click_enabled)) {
+        return false;
+    }
     if (!ReadU32(o, "maintenance_timeout_ms", &s->maintenance_timeout_ms)) return false;
     // OPTIONAL, unlike every field above: a config written before FR-33's
     // next-boot trigger existed has no `maintenance_on_boot`, and the on-disk

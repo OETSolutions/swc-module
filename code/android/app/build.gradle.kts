@@ -33,8 +33,14 @@ android {
         // from a background service. Raising this requires re-reading the spec's BAL
         // section first; it is a product decision, not a build detail.
         targetSdk = 34
-        versionCode = 1
-        versionName = "0.1.0"
+        // 1.0.0: the first release with the complete no-app feature set — the
+        // headless Pico-style gesture programming (§8.2) and the slot-level
+        // defaults that make single/double/long reach three head-unit functions
+        // with no app. `versionCode` must increase by at least 1 per published
+        // artifact; it is reset to a plain monotonic integer rather than derived
+        // from the name, so a future hotfix cannot collide.
+        versionCode = 2
+        versionName = "1.0.0"
     }
 
     // Compose is enabled HERE (Task 21, the UI) and not in Task 20, where it

@@ -68,3 +68,10 @@ scratch.txt
 jlcpcb
 *.log
 *.FCBak
+
+# Editor / IDE state. `.vscode/settings.json` here pins an ABSOLUTE path
+# containing a username (`cmake.sourceDirectory`), which must not be committed
+# (the repo is scrubbed of personal identifiers), and it is machine-specific
+# anyway. `code/.gitignore` already ignores most of `code/.vscode/`; this covers
+# the root one.
+.vscode/

@@ -19,12 +19,14 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
+import androidx.compose.material3.Switch
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.Alignment
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -156,6 +158,25 @@ fun BindingScreen(
             }
         }
         Button(onClick = onSave, enabled = state.problems.isEmpty()) { Text("Save to device") }
+
+        // The per-press click, OPTIONAL and off by default: "normal switch operation
+        // should not cause a beep, but the beep for it can be enabled optionally in
+        // the app if used." Toggling persists immediately (this is a device setting,
+        // not a pending edit), so a user hears the difference without a Save.
+        Row(
+            Modifier.fillMaxWidth().padding(top = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Column(Modifier.weight(1f)) {
+                Text("Beep on each press", style = MaterialTheme.typography.bodyMedium)
+                Text(
+                    "Off by default. When on, the adapter beeps once for every " +
+                        "button press it recognises.",
+                    style = MaterialTheme.typography.bodySmall,
+                )
+            }
+            Switch(checked = state.keyClickEnabled, onCheckedChange = state.onSetKeyClick)
+        }
     }
 }
 
@@ -226,6 +247,13 @@ data class BindingUiState(
      * A save failure must be *shown* and must leave Save *enabled*.
      */
     val saveError: String? = null,
+    /**
+     * The per-press "click" — a short beep on every recognised switch press.
+     * OFF by default; this is where the user opts in.
+     */
+    val keyClickEnabled: Boolean = false,
+    /** Toggle the per-press click and persist it to the device. */
+    val onSetKeyClick: (Boolean) -> Unit = {},
 )
 
 /**

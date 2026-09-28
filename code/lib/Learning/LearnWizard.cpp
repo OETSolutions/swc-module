@@ -59,6 +59,10 @@ void LearnWizard::Arm(uint64_t now_ms) {
     target_adc_ = ADC_CH_SWC1;
     target_idle_mv_ = 0;
     target_existing_index_ = -1;
+    target_channel_index_ = 0xFF;
+    target_button_ordinal_ = 0xFF;
+    programmed_gesture_ = Gesture::kNone;
+    gesture_.Reset();
     seed_idle_mv_ = 0;
     seed_framed_ = false;
     sample_started_ms_ = 0;
@@ -79,6 +83,11 @@ void LearnWizard::Abandon(uint64_t now_ms) {
     (void)now_ms;
     state_ = State::kExit;
     exited_ = true;
+    // Drop the programming gesture: an abandoned hold is not a programmed button,
+    // and leaving it set would let the caller drive a slot for a learn that was
+    // never committed (the 3 s maintenance escalation reaches here).
+    programmed_gesture_ = Gesture::kNone;
+    target_button_ordinal_ = 0xFF;
     if (buzzer_ != nullptr) buzzer_->Play(BuzzerPattern::kProgramExit);
     if (leds_ != nullptr) leds_->SetStat(LedStatPattern::kSolid);
 }
@@ -161,6 +170,9 @@ void LearnWizard::BeginOn(const LearnInput &in, int first_mv) {
     have_measurement_ = false;
     switch_sum_mv_ = 0;
     switch_count_ = 0;
+    target_channel_index_ = in.is_ladder ? in.wire_channel : 0xFF;
+    programmed_gesture_ = Gesture::kNone;
+    gesture_.Reset();
 
     if (in.is_ladder) {
         // SEED the ladder so a learn ADDS a button rather than replacing the
@@ -212,6 +224,16 @@ void LearnWizard::BeginOn(const LearnInput &in, int first_mv) {
         target_existing_index_ = -1;
     }
 
+    // In the ladder branch, also resolve the ORDINAL the gesture-level table is
+    // indexed by. The re-measure match ran above against the profile WITH the
+    // rebased siblings, so `target_existing_index_` is the button's position in
+    // that ladder; a new button will be APPENDED at `profile_.count`, so its
+    // ordinal is that. Capturing it here -- at the same place the measurement
+    // starts -- keeps the gesture slot and the committed button index in step.
+    target_button_ordinal_ = (target_existing_index_ >= 0)
+                                 ? static_cast<uint8_t>(target_existing_index_)
+                                 : static_cast<uint8_t>(profile_.count);
+
     // Spec 7.4 step 3: LEARN_PROMPT -- the device has the input and is measuring.
     if (buzzer_ != nullptr) buzzer_->Play(BuzzerPattern::kLearnPrompt);
     if (leds_ != nullptr) leds_->SetStat(LedStatPattern::kAlternate);
@@ -247,7 +269,39 @@ void LearnWizard::Sample(const LearnInput &in, uint64_t now_ms, int temp_tenths_
     if (mv < 0) return;   // a failed read is not a measurement
 
     const int off = mv - target_idle_mv_;
-    if ((off < 0 ? -off : off) < kDetectMv) return;   // at idle: not a press
+    const bool at_idle = (off < 0 ? -off : off) < kDetectMv;
+
+    /*
+     * Detect the GESTURE being programmed (spec 7.5), from the target's own press
+     * pattern while the modifier is held.
+     *
+     * The 2022 design reached `PROGRAM_ALT_KEY` on a double/long completed under
+     * the modifier, and held that gesture's level for the head unit to capture;
+     * this is the same recognition, driven through the SAME gesture machine the
+     * runtime uses so the two cannot disagree about what a double or a long is.
+     * The target is one known button, so its "level" here is just held/not-held --
+     * `kPressed` while off idle, `kIdle` at rest -- and the button index is 0.
+     *
+     * Called EVERY tick, including at idle, because the machine resolves a SINGLE
+     * on the IDLE tick after the double-press window closes; skipping the idle
+     * ticks would leave a tap unresolved.
+     *
+     * `bindings` defaults to has_double/has_long true, so DOUBLE and LONG are both
+     * recognised: during programming the user is choosing among all three, so none
+     * may be optimised away as "no ambiguity to resolve".
+     */
+    {
+        GestureEvent ev{};
+        if (gesture_.Update(at_idle ? ChannelLevel::kIdle : ChannelLevel::kPressed, 0,
+                             now_ms, &ev)) {
+            // A resolved gesture replaces any earlier one: the user's last press
+            // is the one they mean to program. `kSingle` is captured too, so a
+            // plain tap programs the SINGLE slot explicitly.
+            if (ev.gesture != Gesture::kNone) programmed_gesture_ = ev.gesture;
+        }
+    }
+
+    if (at_idle) return;   // at idle: not a press
 
     if (sample_started_ms_ == 0) sample_started_ms_ = now_ms;
     // The safety cap: a stuck line would otherwise sample forever. Once it has

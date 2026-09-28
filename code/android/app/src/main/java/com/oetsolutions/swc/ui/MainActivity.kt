@@ -134,6 +134,7 @@ fun AppRoot(model: AppViewModel) {
         onEnterMaintenance = model::enterMaintenance,
         onExitMaintenance = model::exitMaintenance,
         onPushOverUsb = picker::launch,
+        onSetKeyClick = model::setKeyClick,
     )
 }
 
@@ -152,6 +153,7 @@ fun AppRoot() = AppScaffold(
     onEnterMaintenance = {},
     onExitMaintenance = {},
     onPushOverUsb = {},
+    onSetKeyClick = {},
 )
 
 @Composable
@@ -168,6 +170,7 @@ private fun AppScaffold(
     onEnterMaintenance: () -> Unit,
     onExitMaintenance: () -> Unit,
     onPushOverUsb: () -> Unit,
+    onSetKeyClick: (Boolean) -> Unit,
 ) {
     var screen by remember { mutableStateOf(Screen.LINK) }
     Scaffold(
@@ -202,7 +205,7 @@ private fun AppScaffold(
                 )
                 Screen.LADDER -> LadderScreen(state = ladder)
                 Screen.BINDINGS -> BindingScreen(
-                    state = bindings,
+                    state = bindings.copy(onSetKeyClick = onSetKeyClick),
                     onEdit = onEdit,
                     onSave = onSave,
                 )

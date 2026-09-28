@@ -103,6 +103,22 @@ struct DeviceSettings {
     uint8_t        buzzer_level;      // 0..3
     uint8_t        led_level;         // 0..3
     bool           temp_comp_enabled;
+    // The per-press "click" acknowledgement (spec 7.2's KEY_ACCEPTED on a normal
+    // switch press). **OFF by default**, per the user: "normal switch operation
+    // should not cause a beep, but the beep for it can be enabled optionally in
+    // the app if used." A driver tapping a wheel button at speed does not want a
+    // chirp every time; the option is there for those who do.
+    //
+    // It gates ONLY the DEFAULT acknowledgement. An explicit `BUZZ` action the
+    // user bound still plays, because that is a deliberate ask, and KEY_UNKNOWN
+    // still plays, because it reports a press that matched nothing -- a condition
+    // the user needs to know about rather than a routine confirmation.
+    //
+    // Placed to fill the padding slot before the `uint32_t` (the three bytes above
+    // plus this byte are exactly the 4-byte alignment the field needs), so adding
+    // it costs no size -- `sizeof(Config)` is a load-bearing number (the
+    // static_assert below).
+    bool           key_click_enabled;
     uint32_t       maintenance_timeout_ms;
     // FR-33's third trigger (spec 8.2): "Config flag on next boot -- for a user
     // who wants it up immediately after flashing."
@@ -115,10 +131,6 @@ struct DeviceSettings {
     // exact state FR-38 exists to forbid. `SystemOrchestrator::Boot` therefore
     // clears it and persists that clear the first time it acts on it, so the one
     // boot the user asked for is the only one that opens it.
-    //
-    // Declared LAST so the two bools and the `uint32_t` pack without padding --
-    // `Config` is held by value in places and every byte shows up in the NVS blob
-    // budget (ConfigCodec.h).
     bool           maintenance_on_boot;
 };
 

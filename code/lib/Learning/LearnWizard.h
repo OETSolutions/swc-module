@@ -5,6 +5,7 @@
 #include "Analog/LadderDecode.h"
 #include "Feedback/BuzzerGrammar.h"
 #include "Feedback/LedGrammar.h"
+#include "Gesture/GestureStateMachine.h"
 #include "HAL/IHAL.h"
 #include "Learning/LearnSession.h"
 
@@ -91,6 +92,48 @@ public:
     // press without reaching the idle band -- the same reasoning as the AUX1
     // profile's own wide window.
     static constexpr int kSwitchToleranceMv = 1600;
+
+    /*
+     * How long the named button must be HELD before the wizard calls it a LONG
+     * press (spec 7.5's third gesture). The caller passes this as the gesture
+     * machine's `long_press_ms`, so the wizard's gesture and the runtime's agree
+     * by construction -- a second constant here would be a second answer to "what
+     * is a long press".
+     */
+    static constexpr uint32_t kProgramLongPressMs = 750;
+
+    /*
+     * The gesture the user is programming, as detected from the target button's
+     * own press DURING the hold.
+     *
+     * **Why the wizard owns this.** The 2022 design reached `PROGRAM_ALT_KEY` from
+     * a double/long press completed while the modifier was held, and the caller
+     * then held that gesture's level on the output. This wizard already reads the
+     * target's level every tick to MEASURE it (`Sample`), so it is the one place
+     * that can also see the PRESS PATTERN -- and doing it here rather than in
+     * `ServiceChannel` keeps the modifier's press suppressed from the normal
+     * gesture path (a press during a learn is being TAUGHT, never driven).
+     *
+     * `kNone` means no gesture has been programmed yet this hold: the caller then
+     * holds the button's own level (the "program the single" case, and also the
+     * default while the user has not yet chosen a gesture).
+     */
+    Gesture ProgrammedGesture() const { return programmed_gesture_; }
+
+    /*
+     * The ordinal of the target button within its channel's ladder, once one has
+     * been named -- the `button_ordinal` the gesture-level table is indexed by.
+     * 0xFF when no target is named (or the target is an AUX switch, which has no
+     * ladder ordinal and therefore no gesture slot).
+     */
+    uint8_t TargetButtonOrdinal() const { return target_button_ordinal_; }
+
+    /*
+     * The channel INDEX (0/1) of the target once it is named, or 0xFF when none
+     * (or the target is an AUX switch, which has no channel). The caller uses it
+     * to know which channel's KEY line to hold the programming level on.
+     */
+    uint8_t TargetChannelIndex() const { return target_channel_index_; }
 
     /*
      * Begin a learn: AUX1 has been held past `kEnterHoldMs`. Plays PROGRAM_ENTER
@@ -197,6 +240,26 @@ private:
     AdcChannel target_adc_ = ADC_CH_SWC1;
     int        target_idle_mv_ = 0;
     int        target_existing_index_ = -1;
+    // The target's channel INDEX (0/1 for SWC1/SWC2), 0xFF for an AUX switch.
+    uint8_t    target_channel_index_ = 0xFF;
+    // The target button's ORDINAL in the channel's COMMITTED ladder -- the
+    // coordinate the gesture-level table is indexed by. For a re-measure it is the
+    // matched existing index; for a new button it is the slot the append will fill.
+    // 0xFF when there is no ordinal (an AUX switch, or a full ladder).
+    uint8_t    target_button_ordinal_ = 0xFF;
+
+    // The gesture detected from the target's own press while the modifier is held
+    // (spec 7.5). `kNone` until one resolves; reset per hold.
+    Gesture    programmed_gesture_ = Gesture::kNone;
+    // The press-pattern detector: the target's held/not-held is fed to this as the
+    // ONE button's level, so DOUBLE/LONG are recognised while the learn runs. Its
+    // timings are the DEFAULTS except that LONG uses `kProgramLongPressMs`, so the
+    // programming gesture is defined in one place rather than inheriting whatever
+    // `long_press_ms` a config happens to carry -- a user editing their runtime
+    // feel must not silently change what "hold to program a long press" means.
+    GestureStateMachine gesture_{GestureTimings{
+        /*debounce_ms=*/25, /*double_press_off_ms=*/500, kProgramLongPressMs,
+        /*send_duration_ms=*/200}};
     // The target's own id from the caller's list, for a SWITCH (an AUX config
     // entry names itself). A ladder's ids are generated, so this is unused there.
     const char *in_id_ = nullptr;

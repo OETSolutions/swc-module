@@ -1,0 +1,118 @@
+# Release: build the firmware for a version tag and publish it as a GitHub Release.
+#
+# **Why a tag-triggered workflow and not a hand-run `gh release create`.** The
+# device's OTA check (spec 9.5) fetches
+#   https://github.com/OETSolutions/swc-module/releases/latest/download/version_manifest.json
+# and the app fetches the SAME URL (its `kReleaseManifestUrl`). So a release is a
+# PROTOCOL ARTIFACT, not just a convenience: the manifest's `firmware.sha256` must
+# be the hash of the exact `firmware.bin` asset beside it, and its `version` must
+# equal the firmware's baked-in version (what `hello` reports). Generating those
+# two files in one job, from the same build, is the only way they cannot disagree.
+#
+# The manifest shape is enforced by `code/tools/gen_release_manifest.py` against
+# the firmware's own parser rules (ReleaseCheck.cpp) -- see that script's header.
+#
+# Triggers on a `vX.Y.Z` tag push only. `main` also carries a branch workflow
+# (`firmware.yml`) that runs the gates on every push; this one additionally
+# PUBLISHES, so it is deliberately narrow.
+
+name: release
+
+on:
+  push:
+    tags:
+      # The same tag filter as the reference project's release workflow
+      # (`coop_controller`), so the pattern is known to work under GitHub's
+      # filter syntax (which is glob-like, not regex — `+` means "one or more of
+      # the previous match", so this reads "v, digits, dot, digits, dot, digits").
+      - "v[0-9]+.[0-9]+.[0-9]+"
+
+# Required to create a Release and upload its assets. Without this the
+# `softprops/action-gh-release` step 403s.
+permissions:
+  contents: write
+
+jobs:
+  firmware-release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 6.1.19 and nothing else -- the same pin `firmware.yml` documents at
+      # length (Core 6.2.0 deletes tool-scons mid-build; 6.1.18 is refused by the
+      # platform). A release build must not discover that afresh.
+      - run: pip install "platformio==6.1.19"
+
+      - name: Install the IDF component manager
+        run: python3 -m ensurepip --upgrade && pip install 'idf-component-manager~=2.2'
+
+      # The version the firmware REPORTS (`hello`'s fw_version) and the version the
+      # manifest ADVERTISES must be the same string, or a device would be offered
+      # an update it is already running -- or miss its own. Both come from the tag
+      # here, with the leading `v` stripped.
+      - name: Derive the release version from the tag
+        id: ver
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      # A release must not ship code whose host suite fails. This is the same
+      # suite `firmware.yml` runs; re-running it here is the point -- the release
+      # job is self-contained, so a tag cut from a branch that never ran the gate
+      # still cannot publish a red build.
+      - name: Native unit tests
+        working-directory: code
+        env:
+          SWC_FW_VERSION: ${{ steps.ver.outputs.version }}
+          SWC_GIT_SHA: ${{ github.sha }}
+        run: pio test -e native
+
+      - name: Build the release firmware
+        working-directory: code
+        env:
+          SWC_FW_VERSION: ${{ steps.ver.outputs.version }}
+          SWC_GIT_SHA: ${{ github.sha }}
+        run: pio run -e esp32s3
+
+      - name: Size gate (spec 10.5, R-1)
+        working-directory: code
+        run: python3 tools/check_size.py
+
+      # The manifest is generated from the built binary, so its sha256 and
+      # size_bytes describe exactly the asset uploaded below.
+      - name: Generate the OTA manifest
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          python3 code/tools/gen_release_manifest.py \
+            --version "$VERSION" \
+            --firmware code/.pio/build/esp32s3/firmware.bin \
+            --url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${GITHUB_REF_NAME}/firmware.bin" \
+            --channel stable \
+            --out version_manifest.json
+          cat version_manifest.json
+
+      # `version_manifest.json` MUST keep that exact name: it is the asset the
+      # `latest/download` alias resolves. `firmware.bin` must too -- the manifest's
+      # url above is built from the tag, and the device downloads whatever that URL
+      # returns.
+      - name: Publish the release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            code/.pio/build/esp32s3/firmware.bin
+            version_manifest.json
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            Firmware release **${{ steps.ver.outputs.version }}**.
+
+            Assets:
+            - `firmware.bin` — the ESP32-S3 application image (flash at `0x20000`).
+            - `version_manifest.json` — the OTA manifest the device and the Android
+              app fetch from `releases/latest/download/version_manifest.json`.
+
+            Generated from tag `${{ github.ref_name }}` (`${{ github.sha }}`) by
+            `.github/workflows/release.yml`.

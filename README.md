@@ -94,6 +94,7 @@ and the reasoning behind each component choice: **[DESIGN.md](DESIGN.md)**.
 
 | Document | Contents |
 | --- | --- |
+| **[MANUAL.md](MANUAL.md)** | How to install and use the adapter — wiring, learning buttons, bindings, the app, firmware updates, troubleshooting |
 | **[DESIGN.md](DESIGN.md)** | Requirements, block diagram, theory of operation, design rules, key design decisions |
 | **[MANUFACTURING.md](MANUFACTURING.md)** | BOM generation, part list, assembly-cost analysis, fabrication output, ordering decisions |
 | **[CHANGELOG.md](CHANGELOG.md)** | Revision history, accepted limitations, open items |

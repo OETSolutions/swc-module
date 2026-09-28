@@ -290,6 +290,32 @@ class AppViewModel(
         setMaintenance(false)
     }
 
+    /**
+     * Turn the per-press "click" on or off and persist it to the device.
+     *
+     * The click is a device SETTING (`settings.key_click_enabled`), off by default.
+     * It is written immediately — unlike a binding edit it has no Save step, so the
+     * user hears the change as soon as they toggle rather than after a second
+     * action. The optimistic UI state is reverted to the device's answer by the
+     * config push that a successful set triggers.
+     */
+    fun setKeyClick(enabled: Boolean) {
+        scope.launch {
+            // Show the switch moved immediately; a failed write re-renders from the
+            // device's config (`onConfig`), so the toggle cannot lie for long.
+            _bindings.value = _bindings.value.copy(keyClickEnabled = enabled)
+            val current = client.config.value
+            val merged = current.copy(
+                settings = current.settings.copy(keyClickEnabled = enabled),
+            )
+            try {
+                saveConfig(merged)
+            } catch (e: Exception) {
+                // Leave the optimistic state; the next config push corrects it.
+            }
+        }
+    }
+
     private fun setMaintenance(want: Boolean) {
         if (_link.value.maintenanceBusy) return
         scope.launch {
@@ -749,6 +775,7 @@ class AppViewModel(
         _bindings.value = _bindings.value.copy(
             cells = buildCells(config),
             problems = ConfigJson.problems(config).map { it.toString() },
+            keyClickEnabled = config.settings.keyClickEnabled,
         )
         // The maintenance card names the window's length, and the window is a
         // SETTING (`maintenance_timeout_ms`), not a constant — so the card must

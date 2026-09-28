@@ -19,9 +19,12 @@ one home.** Reference, never copy.
 | Document | Owns | Audience |
 | --- | --- | --- |
 | `README.md` | What the project is; front page, repository guide, credits | Anyone arriving |
+| `MANUAL.md` | How to install and use the product: wiring, the on-device learn, bindings, the Android app, firmware updates, feedback reference, troubleshooting | End users |
 | `DESIGN.md` | Requirements, block diagram, theory of operation, design rules, key design decisions | Anyone reading the circuit |
 | `MANUFACTURING.md` | BOM generation, part list, assembly cost, fabrication output, ordering decisions | Anyone ordering |
 | `CHANGELOG.md` | Revision history (Keep a Changelog), accepted limitations, open items | Anyone asking "what changed" |
+| `code/docs/HANDOFF.md` | Firmware + Android app session handoff: verify loop, bench rig, device-only blind spots, open FR items, release process | Agents working on `code/` |
+| `.github/workflows/` | CI (`firmware.yml`, `android.yml`) and the tag-triggered release (`release.yml`) | Anyone touching CI or cutting a release |
 | `AGENTS.md` (this file) | How to work on the files: rules, toolchain, verify loop, gotchas, current state | Coding agents |
 | `CLAUDE.md` | Nothing — a pointer to this file | Claude Code |
 | `tools/README.md` | The direct-write scripts in detail | Agents using `tools/` |
